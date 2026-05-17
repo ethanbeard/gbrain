@@ -1422,8 +1422,24 @@ export class MinionQueue {
    * CASE must repeat the COALESCE rather than reference the assigned column.
    * The map binds as a RAW object (never JSON.stringify into ::jsonb — the
    * postgres.js double-encode trap; PGLite hides it, real PG does not).
+   *
+   * `lowPriRateCap` (optional, local patch): if set, jobs with `priority >= 0`
+   * are only claimable when fewer than `lowPriRateCap` such jobs have started
+   * in the last rolling hour. Jobs with `priority < 0` always claim regardless
+   * of this cap — they're considered "interactive/important" and reserve their
+   * own headroom against external rate limits (e.g. Anthropic 5h window).
+   * When unset, no rate limit is applied (preserves prior behavior).
+   *
+   * The cap check runs in the same statement as the UPDATE via a CTE, so
+   * there's no TOCTOU between counting and claiming.
    */
-  async claim(lockToken: string, lockDurationMs: number, queue: string, registeredNames: string[]): Promise<MinionJob | null> {
+  async claim(
+    lockToken: string,
+    lockDurationMs: number,
+    queue: string,
+    registeredNames: string[],
+    lowPriRateCap?: number,
+  ): Promise<MinionJob | null> {
     if (registeredNames.length === 0) return null;
 
     // Direct (session-mode) pool: claim opens the lock that renewLock then
@@ -1442,7 +1458,14 @@ export class MinionQueue {
     // repair, foreign tooling) must not grant a ~24-day lease to a worker
     // that crashes before its first renewal (or a 1ms one that thrashes).
     const rows = await this.engine.executeRawDirect<Record<string, unknown>>(
-      `UPDATE minion_jobs SET
+      `WITH low_pri_starts AS (
+         SELECT COUNT(*)::int AS cnt
+         FROM minion_jobs
+         WHERE started_at IS NOT NULL
+           AND started_at > now() - INTERVAL '1 hour'
+           AND priority >= 0
+       )
+       UPDATE minion_jobs SET
         status = 'active',
         lock_token = $1,
         lock_until = now() + ((CASE WHEN COALESCE(lock_duration_ms, ($6::jsonb ->> name)::int) IS NULL THEN $2
@@ -1459,12 +1482,17 @@ export class MinionQueue {
        WHERE id = (
          SELECT id FROM minion_jobs
          WHERE queue = $3 AND status = 'waiting' AND name = ANY($4)
+           AND (
+             priority < 0
+             OR $7::int IS NULL
+             OR (SELECT cnt FROM low_pri_starts) < $7::int
+           )
          ORDER BY priority ASC, created_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT 1
        )
        RETURNING *`,
-      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS]
+      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS, lowPriRateCap ?? null]
     );
     return rows.length > 0 ? rowToMinionJob(rows[0]) : null;
   }

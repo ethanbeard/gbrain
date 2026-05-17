@@ -293,6 +293,7 @@ export class MinionWorker extends EventEmitter {
       jobIsolation: opts?.jobIsolation ?? 'inline',
       childCliInvocation: opts?.childCliInvocation ?? null,
       childTiniPath: opts?.childTiniPath ?? '',
+      lowPriRateCap: opts?.lowPriRateCap ?? 0,
     };
     // Process isolation contract: 'process' without a resolved child CLI
     // invocation would silently execute handlers INLINE while the evict path
@@ -707,6 +708,7 @@ export class MinionWorker extends EventEmitter {
               this.opts.lockDuration,
               this.opts.queue,
               this.registeredNames,
+              this.opts.lowPriRateCap > 0 ? this.opts.lowPriRateCap : undefined,
             );
           } catch (e) {
             // issue #1678 (Codex #1): a reaped pooler socket / nulled instance

@@ -369,6 +369,7 @@ USAGE
   gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
                    [--health-interval MS] [--nice N]
                    [--job-isolation inline|process]
+                   [--low-pri-rate-cap N]
   gbrain jobs supervisor [start] [--detach] [--json]
                          [--concurrency N] [--queue Q] [--pid-file PATH]
                          [--max-crashes N] [--health-interval N]
@@ -1609,6 +1610,26 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         }
       }
 
+      // --low-pri-rate-cap: rolling-hour cap on starts of jobs with priority >= 0.
+      // Default unset (no cap). When > 0, the claim SQL gates low-priority jobs
+      // so they collectively never exceed N starts per hour, leaving headroom
+      // for `priority < 0` jobs (which are exempt and always claimable). This
+      // implements a "background tier shares leftover budget" policy against
+      // external rate limits — e.g. the Anthropic Max 5-hour message window
+      // (~900 msg/5h on the alt account). Setting this to 90 caps low-pri at
+      // 50% of that ceiling, preserving the remaining 50% for interactive
+      // / `priority < 0` work even when a background backlog is draining.
+      const lowPriRateCapRaw = parseFlag(args, '--low-pri-rate-cap');
+      let lowPriRateCap: number | undefined;
+      if (lowPriRateCapRaw !== undefined) {
+        const parsed = parseInt(lowPriRateCapRaw, 10);
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          console.error(`Error: --low-pri-rate-cap must be a non-negative integer (jobs/hour), got "${lowPriRateCapRaw}"`);
+          process.exit(1);
+        }
+        lowPriRateCap = parsed;
+      }
+
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
@@ -1635,6 +1656,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       const worker = new MinionWorker(engine, {
         queue: queueName, concurrency, maxRssMb, healthCheckInterval,
         jobIsolation, childCliInvocation, childTiniPath,
+        ...(lowPriRateCap !== undefined ? { lowPriRateCap } : {}),
       });
       await registerBuiltinHandlers(worker, engine);
 
@@ -1706,7 +1728,10 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       const isolationNote = jobIsolation === 'process'
         ? `, isolation: process (child cli: ${childCliInvocation?.cmd}${childTiniPath ? ', tini' : ''})`
         : '';
-      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote}${niceNote}${isolationNote})`);
+      const rateCapNote = lowPriRateCap !== undefined && lowPriRateCap > 0
+        ? `, low-pri-rate-cap: ${lowPriRateCap}/hr (priority >= 0)`
+        : '';
+      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote}${niceNote}${isolationNote}${rateCapNote})`);
       console.log(`Registered handlers: ${worker.registeredNames.join(', ')}`);
 
       // Register in the live worker registry (issue #1815) so jobs stats / doctor

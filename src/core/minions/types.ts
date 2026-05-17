@@ -256,6 +256,15 @@ export interface MinionWorkerOpts {
   childCliInvocation?: { cmd: string; argsPrefix: string[] } | null;
   /** tini path for wrapping job children ('' = absent, direct spawn). */
   childTiniPath?: string;
+  /** Rolling-hour rate cap for low-priority jobs (priority >= 0). When > 0,
+   *  the claim query gates `priority >= 0` jobs to at most N starts per
+   *  rolling hour, computed across the whole `minion_jobs` table (all queues).
+   *  Jobs with `priority < 0` are exempt and always claimable. 0 or unset =
+   *  no rate limit (default behavior — matches the maxRssMb convention).
+   *  Pairs with the convention that negative priority means "interactive /
+   *  reserve budget" and positive means "background / share remaining headroom."
+   *  (Local patch — not upstream.) */
+  lowPriRateCap?: number;
 }
 
 // --- Job Context (passed to handlers) ---
