@@ -13,7 +13,7 @@ src/core/ai/gateway.ts	4515	ratchet	grown v0.46.26.0 megawave: config-plane prob
 src/cli.ts	3741	ratchet	grown v0.46.26.0 megawave: SIGCHLD reaper install, silent-failure surfacing, confirm-race gate (#2443 #2898 #2297); grown wave-g (#4488 #4508): in-band error exit codes + think --source validation
 src/core/cycle.ts	3186	ratchet	grown v0.46.26.0 megawave (#4102 #2608) + master v0.46.26.0 cycle-start orphan recovery; +10 wave G #3974: cycle-sync uncommitted-drift warn; grown wave-g (#4416): synthesize_concepts source threading
 src/commands/serve-http.ts	3319	ratchet	grown v0.46.25.0 D2: /mcp per-request teardown (#2844); grown wave-g (#4474): resolve-IPC socket under --http via shared helper
-src/commands/jobs.ts	3115	ratchet	grown v0.46.26.0 megawave (#4098 #2308) + master v0.46.26.0 worker startup recovery + stats gating; +typed provider-failure logging on the facts-absorb catch (#4308)
+src/commands/jobs.ts	3140	ratchet	grown v0.46.26.0 megawave (#4098 #2308) + master v0.46.26.0 worker startup recovery + stats gating; +typed provider-failure logging on the facts-absorb catch (#4308); +local carried patches (dead-jobs doctor, --low-pri-rate-cap)
 src/core/search/hybrid.ts	2954	ratchet	grown v0.46.26.0 megawave: CRAG escalation seam, degradation visibility, excludePrivate knobs-fold v23 (#1663 #3873 #4352); grown #4356: semantic-cache-hit slice honors resolved mode searchLimit (double-resolution caveat); grown #4414: offset!==0 cache-skip widening + knobs-hash v24; grown #4487: chunkless rows join the cosine blend (no raw-score head start); grown wave-g (#4480 #4415): shared salience/recency resolution + pattern-aware cache keying
 src/core/engine.ts	2509	ratchet	grown v0.46.26.0 megawave: relational/visibility/usage contract surface (#4352 #4218); grown wave-g (#4524 #4527): orphans-mode contract + removeLink deleted count
 src/commands/autopilot.ts	2641	ratchet	grown v0.46.26.0 megawave (#4300 #4285 #3696) + master v0.46.27.0 env-file lane + boot warning + reload-safe install (#2608 #4443) + 1 nosemgrep dataflow annotation (path-traversal audit)
@@ -24,9 +24,9 @@ src/core/cycle/synthesize.ts	2818	ratchet	merged waves; grown v0.46.26.0 megawav
 src/commands/embed.ts	1901	ratchet	lowered v0.46.26.0: embedBatchWithBackoff + retry cluster peeled to core/embed-retry.ts (core/commands layering fix); grown wave-g (#4530): per-model input-limit wiring
 src/core/types.ts	1946	ratchet	grown v0.46.26.0 megawave: EvidenceOpts, pacing/usage result fields, PageFilters growth (#4352 #4218)
 src/commands/skillpack.ts	1360	ratchet
-src/core/minions/queue.ts	2442	ratchet	grown #4078 + megawave probe-liveness unlatch (#4310) + master private-queue lifecycle: recovery classifier + monotonic lease
+src/core/minions/queue.ts	2470	ratchet	grown #4078 + megawave probe-liveness unlatch (#4310) + master private-queue lifecycle: recovery classifier + monotonic lease; +local carried patches (dead-jobs doctor, --low-pri-rate-cap)
 src/commands/init.ts	1950	ratchet	grown v0.46.x keyless capability notices
-src/commands/integrations.ts	1736	ratchet	grown v0.46.26.0 megawave (#4039 connector compat) + 1 nosemgrep dataflow annotation (path-traversal audit)
+src/commands/integrations.ts	1808	ratchet	grown v0.46.26.0 megawave (#4039 connector compat) + 1 nosemgrep dataflow annotation (path-traversal audit); +local carried patches (dead-jobs doctor, --low-pri-rate-cap)
 src/core/minions/handlers/subagent.ts	1834	ratchet	merged: master v131 settle rework + dream-wave C5 peel + C6 accounting + C7 lease heartbeats/lost-lease aborts + C9 oneshot dispatch + adversarial fix batches; grown by #4078 subagent-loop capability fix; +6 lines (reasoning-item replay: adaptContentBlocksToChatBlocks handles 'reasoning' blocks); +3 wave G #4514: Anthropic-via-OpenRouter allowed on the subagent loop
 src/commands/bootstrap.ts	2010	ratchet	grandfathered at merge (grew past the 1500 cap on master); raised for #4066 HOME_WORKSPACE_GUARD_EXEMPT (status/uninstall/harness)
 src/core/minions/worker.ts	1560	ratchet	grandfathered at merge (grew past the 1500 cap on master, #4170); grown v0.46.11.0 five-issue wave
