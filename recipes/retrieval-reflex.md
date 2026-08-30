@@ -7,10 +7,15 @@ category: reflex
 install_kind: copy-into-host-repo
 requires: []
 secrets: []
-health_checks:
-  - type: command
-    argv: [gbrain, doctor, --json]
-    label: Retrieval reflex wiring (see retrieval_reflex_health)
+# Local patch 2026-08-30: health check retired. The command check ran the
+# ENTIRE `gbrain doctor --json` (~50s on this brain) under executeHealthCheck's
+# hard 10s spawnSync timeout, so it was killed and reported FAIL on every
+# integrations-doctor fire regardless of reflex state — while gbrain's own
+# authoritative `retrieval_reflex_health` check reports ok ("postgres direct;
+# enabled"). The policy skill was never installed into this host repo, and the
+# pointer-layer heartbeat last fired 2026-08-03 (the upgrade window); nothing
+# on the host schedules it. Reflex health remains visible via `gbrain doctor`.
+health_checks: []
 setup_time: 2 min
 cost_estimate: "$0 — zero-LLM deterministic layer + a prose policy skill"
 ---
