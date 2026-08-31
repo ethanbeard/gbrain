@@ -19,6 +19,7 @@ import rateLimit from 'express-rate-limit';
 import { randomBytes, createHash, createHmac } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
 import { isValidRepoName } from '../core/github-source.ts';
+import { createMetricsCounters, metricsTrackingMiddleware, renderPrometheusMetrics } from './serve-http-metrics.ts';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -31,13 +32,13 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, opAllowedForBoundClient } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
+import { GBRAIN_MCP_INSTRUCTIONS } from '../mcp/instructions.ts';
 import {
   GBrainOAuthProvider,
   validateTokenEndpointAuthMethod,
   dcrRegistrationContext,
   DEFAULT_DCR_TTL_MIN_SECONDS,
 } from '../core/oauth-provider.ts';
-import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
@@ -428,26 +429,25 @@ export async function probeHealth(
 }
 
 /**
- * Lightweight liveness probe. Races `SELECT 1` against the same timeout
- * `probeHealth` uses, returns the same tagged-union result type, but the
- * 200 body is intentionally bare: `{status, version, engine}` — no engine
- * stats. Stats moved to `/admin/api/full-stats` (admin auth) in v0.28.10
- * because `getStats()`'s six count(*) queries exceeded HEALTH_TIMEOUT_MS
- * on production brains through PgBouncer, producing false 503s that
- * triggered orchestrator restart cascades and advisory-lock pile-ups.
+ * Races an abortable `SELECT 1` against `probeHealth`'s timeout; Postgres
+ * cancels the losing query while PGLite only discards its eventual result.
  */
 export async function probeLiveness(
-  sql: SqlQuery,
+  engine: BrainEngine,
   engineName: string,
   version: string,
   timeoutMs: number = HEALTH_TIMEOUT_MS,
 ): Promise<ProbeHealthResult> {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  const controller = new AbortController();
   try {
     await Promise.race([
-      sql`SELECT 1`,
+      engine.executeRaw('SELECT 1', undefined, { signal: controller.signal }),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('health_timeout')), timeoutMs);
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error('health_timeout'));
+        }, timeoutMs);
       }),
     ]);
     return {
@@ -456,7 +456,7 @@ export async function probeLiveness(
       body: { status: 'ok', version, engine: engineName },
     };
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'unknown';
+    const msg = controller.signal.aborted ? 'health_timeout' : (e instanceof Error ? e.message : 'unknown');
     return {
       ok: false,
       status: 503,
@@ -982,6 +982,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   app.use(cookieParser());
 
+  // #3893 (reimplemented from @y2688): request metrics. Mounted here, BEFORE
+  // every route — Express only applies `app.use` middleware to routes
+  // registered after it, and the original PR mounted the tracker after most
+  // routes, so they were never counted. The /metrics route itself lives
+  // below requireAdmin's definition.
+  const metricsCounters = createMetricsCounters();
+  app.use(metricsTrackingMiddleware(metricsCounters));
+
   // ---------------------------------------------------------------------------
   // CORS (v0.41.3, T7 — default-deny on every OAuth endpoint)
   // ---------------------------------------------------------------------------
@@ -1057,7 +1065,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     max: 10,
     standardHeaders: true,
     legacyHeaders: false,
-    message: 'Too many magic-link attempts. Wait a minute before trying again.',
+    // Object message → express-rate-limit serializes it as JSON, matching the
+    // other /admin routes. Neutral wording: the bucket is shared across
+    // /admin/login, /admin/api/issue-magic-link, AND /admin/auth/:token.
+    message: { error: 'rate_limited', message: 'Too many admin auth attempts. Try again shortly.' },
   });
 
   app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
@@ -1330,7 +1341,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // /admin/api/full-stats (requireAdmin). See probeLiveness above for the why.
   // ---------------------------------------------------------------------------
   app.get('/health', async (_req, res) => {
-    const result = await probeLiveness(sql, config.engine || 'pglite', VERSION);
+    const result = await probeLiveness(engine, config.engine || 'pglite', VERSION);
     res.status(result.status).json(result.body);
   });
 
@@ -1339,8 +1350,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // v0.40 D15.5: safeHexEqual extracted to src/core/timing-safe.ts so the new
   // /webhooks/github HMAC verifier reuses the same constant-time compare.
-  // POST /admin/login — JSON body with token (for programmatic/UI login)
-  app.post('/admin/login', express.json(), (req, res) => {
+  // POST /admin/login — JSON body with token (for programmatic/UI login).
+  // Rate-limited (shared adminAuthRateLimiter bucket, 10/min/IP) so the
+  // bootstrap-token credential surface can't be hammered — same
+  // defense-in-depth posture as /admin/auth/:token below.
+  app.post('/admin/login', adminAuthRateLimiter, express.json(), (req, res) => {
     const token = req.body?.token;
     if (!token || typeof token !== 'string') {
       res.status(400).json({ error: 'Token required' });
@@ -1410,7 +1424,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // POST /admin/api/issue-magic-link — agent-callable mint endpoint.
   // Auth: Authorization: Bearer <bootstrapToken>. Returns one-time nonce.
-  app.post('/admin/api/issue-magic-link', express.json(), (req: Request, res: Response) => {
+  // Rate-limited (shared adminAuthRateLimiter bucket, 10/min/IP): this route
+  // verifies the bootstrap token too, so it gets the same brute-force/DoS
+  // metering as /admin/login and /admin/auth/:token.
+  app.post('/admin/api/issue-magic-link', adminAuthRateLimiter, express.json(), (req: Request, res: Response) => {
     const auth = (req.headers.authorization || '') as string;
     const m = auth.match(/^Bearer\s+(\S+)$/i);
     if (!m) {
@@ -1487,6 +1504,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
     next();
   }
+
+  // #3893 (reimplemented from @y2688): Prometheus exposition. Admin-gated —
+  // request/error/latency series profile a personal brain's usage, so this
+  // is not a public surface (the original PR served it unauthenticated).
+  app.get('/metrics', requireAdmin, (_req: Request, res: Response) => {
+    res.set('Content-Type', 'text/plain; version=0.0.4');
+    res.send(renderPrometheusMetrics(metricsCounters));
+  });
 
   // ---------------------------------------------------------------------------
   // Admin API endpoints
@@ -2318,9 +2343,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // Create a fresh MCP server per request (stateless)
     const server = new Server(
       { name: 'gbrain', version: VERSION },
-      { capabilities: { tools: {} } },
+      { capabilities: { tools: {} }, instructions: GBRAIN_MCP_INSTRUCTIONS },
     );
-
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       // WP1 honest catalog: the advertised list is exactly what THIS token
       // can call. Three per-request filters, cheapest first:

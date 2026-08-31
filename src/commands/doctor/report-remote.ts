@@ -15,6 +15,7 @@ import { loadConfig } from '../../core/config.ts';
 import { loadCompletedMigrations } from '../../core/preferences.ts';
 import { compareVersions } from '../migrations/index.ts';
 import { resolveHoursEnv } from '../../core/env-number.ts';
+import { schemaVersionHealth } from '../../core/schema-version-health.ts';
 import {
   type Check,
   type DoctorReport,
@@ -49,6 +50,7 @@ import {
   checkLinkResolutionOpportunity,
   checkFederationHealth,
   checkSelfUpgradeHealth,
+  multiSourceDriftGitRootSkipNote,
 } from '../doctor.ts';
 import {
   checkSchemaPackActive,
@@ -109,21 +111,10 @@ export async function doctorReportRemote(
   try {
     const versionStr = await engine.getConfig('version');
     const version = parseInt(versionStr || '0', 10);
-    if (version >= LATEST_VERSION) {
-      checks.push({ name: 'schema_version', status: 'ok', message: `Version ${version} (latest: ${LATEST_VERSION})` });
-    } else if (version === 0) {
-      checks.push({
-        name: 'schema_version',
-        status: 'fail',
-        message: `No schema version recorded. Migrations never ran. Run \`gbrain apply-migrations --yes\` on the host.`,
-      });
-    } else {
-      checks.push({
-        name: 'schema_version',
-        status: 'warn',
-        message: `Version ${version}, latest is ${LATEST_VERSION}. Run \`gbrain apply-migrations --yes\` on the host.`,
-      });
-    }
+    checks.push({
+      name: 'schema_version',
+      ...schemaVersionHealth(version, LATEST_VERSION, { remote: true }),
+    });
   } catch {
     checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
   }
@@ -298,19 +289,35 @@ export async function doctorReportRemote(
         });
       } else if (result.count > 0) {
         const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
+        const skipNote = result.git_root_skipped.length > 0
+          ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+          : '';
         checks.push({
           name: 'multi_source_drift',
           status: 'warn',
           message:
             `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
             `(e.g., ${sampleStr}). Likely pre-v0.30.3 misroutes OR an incomplete initial sync. ` +
-            `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.`,
+            `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.` +
+            skipNote,
         });
       } else {
+        // #4712: see the local doctor's twin check — 'ok' would misreport
+        // "verified clean" if every candidate source was skipped and no
+        // walk actually ran.
+        const allSkipped =
+          result.git_root_skipped.length > 0 &&
+          result.git_root_skipped.length >= nonDefaultWithPath.length;
         checks.push({
           name: 'multi_source_drift',
-          status: 'ok',
-          message: 'No cross-source slug drift detected.',
+          status: allSkipped ? 'warn' : 'ok',
+          message: allSkipped
+            ? `Multi-source drift check performed no verification` +
+              multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+            : result.git_root_skipped.length > 0
+              ? `No cross-source slug drift detected among checked sources.` +
+                multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+              : 'No cross-source slug drift detected.',
         });
       }
     }

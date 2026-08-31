@@ -6,7 +6,7 @@ import type {
   ReservedConnection,
   DreamVerdict, DreamVerdictInput,
   FileSpec, FileRow,
-  TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow,
+  TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow, TakeEmbeddingInput,
   TakeResolution, SynthesisEvidenceInput,
   TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
   FactRow, FactInsertStatus,
@@ -37,9 +37,9 @@ import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatch
 import type {
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
 } from './types.ts';
-import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { DREAM_VERDICT_TTL_SECONDS, MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { executeRawJsonb, type SqlValue } from './sql-query.ts';
-import { sanitizeForJsonb, buildLinkRows, buildTimelineRows } from './batch-rows.ts';
+import { sanitizeForJsonb, sanitizeText, buildLinkRows, buildTimelineRows } from './batch-rows.ts';
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.generated.ts';
 import { verifySchema } from './schema-verify.ts';
@@ -89,6 +89,7 @@ import { privatePagesFilterFragment } from './search/private-visibility.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { PageMissingError } from './engine-errors.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
@@ -682,6 +683,9 @@ export class PostgresEngine implements BrainEngine {
             ? tx`AND source_id = ${sourceId}`
             : tx``;
       const deletedCondition = includeDeleted ? tx`` : tx`AND deleted_at IS NULL`;
+      // #3931: anchor on sourceIds[0] (caller's own resolved source, see
+      // localFederatedSourceIds) instead of a hardcoded 'default'.
+      const anchorSourceId = sourceIds && sourceIds.length > 0 ? sourceIds[0] : 'default';
       const rows = await tx`
         SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
                effective_date, effective_date_source,
@@ -689,14 +693,11 @@ export class PostgresEngine implements BrainEngine {
                contextual_retrieval_mode
         FROM pages
         WHERE slug = ${slug} ${sourceCondition} ${deletedCondition}
-        ORDER BY (source_id = 'default') DESC, source_id ASC
+        ORDER BY (source_id = ${anchorSourceId}) DESC, source_id ASC
         LIMIT 1
       `;
-      // Deterministic multi-source tiebreak: without an ORDER BY, LIMIT 1 on a
-      // slug that exists in several sources returned an ARBITRARY row.
-      // Default-source-first (then stable alpha) — plain alpha would prefer
-      // e.g. 'archive' over 'default'. Engine parity: pglite-engine.ts carries
-      // the identical clause.
+      // Deterministic multi-source tiebreak: anchor-source-first, then stable
+      // alpha. Engine parity: pglite-engine.ts carries the identical clause.
       if (rows.length === 0) return null;
       return rowToPage(rows[0]);
     });
@@ -785,7 +786,7 @@ export class PostgresEngine implements BrainEngine {
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
     const rows = await sql`
       INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${sanitizeText(page.title)}, ${sanitizeText(page.compiled_truth)}, ${sanitizeText(page.timeline || '')}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
       ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
@@ -876,6 +877,29 @@ export class PostgresEngine implements BrainEngine {
     `;
     if (rows.length === 0) return null;
     return { slug: rows[0].slug as string };
+  }
+
+  /**
+   * #4587 — batch soft-delete primitive. See BrainEngine.softDeletePages
+   * JSDoc. Mirrors deletePages' shape (empty-array early-return, batch-size
+   * throw, RETURNING slug) with softDeletePage's `deleted_at IS NULL`
+   * idempotency predicate. Nothing cascades — the 72h purge phase owns the
+   * eventual hard delete.
+   */
+  async softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `softDeletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const sql = this.sql;
+    const rows = await sql<{ slug: string }[]>`
+      UPDATE pages SET deleted_at = now()
+       WHERE slug = ANY(${slugs}::text[]) AND source_id = ${opts.sourceId} AND deleted_at IS NULL
+      RETURNING slug
+    `;
+    return rows.map(r => r.slug);
   }
 
   async restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean> {
@@ -2344,12 +2368,17 @@ export class PostgresEngine implements BrainEngine {
         `$${paramIdx++}, ${embeddingImagePh})`,
       );
 
+      // NUL/lone-surrogate cleanup ONCE into a local shared by BOTH binds:
+      // the md5() embedded_text_hash input and the stored chunk_text must see
+      // the same bytes, or the hash diverges from the sanitized stored text
+      // (and the raw NUL would still abort the INSERT via the md5 param).
+      const sanitizedChunkText = sanitizeText(chunk.chunk_text);
       // Param push order MUST match placeholder allocation order.
       if (embeddingStr) params.push(embeddingStr);
       if (embeddingImageStr) params.push(embeddingImageStr);
-      if (embeddingStr) params.push(chunk.chunk_text); // embedded_text_hash md5() input
+      if (embeddingStr) params.push(sanitizedChunkText); // embedded_text_hash md5() input
       params.push(
-        pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
+        pageId, chunk.chunk_index, sanitizedChunkText, chunk.chunk_source,
         chunk.model || resolvedModel, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,
@@ -2921,36 +2950,41 @@ export class PostgresEngine implements BrainEngine {
     const toSrc = opts?.toSourceId ?? 'default';
     const originSrc = opts?.originSourceId ?? 'default';
 
-    // Pre-check existence so we can throw a clear error (ON CONFLICT DO UPDATE
-    // returns 0 rows when source SELECT is empty, indistinguishable from missing
-    // page). Source-qualified — pre-v0.18 the bare slug check matched ANY source,
-    // letting addLink succeed even when the intended source row was missing.
-    const exists = await sql`
-      SELECT 1 FROM pages WHERE slug = ${from} AND source_id = ${fromSrc}
-      INTERSECT
-      SELECT 1 FROM pages WHERE slug = ${to} AND source_id = ${toSrc}
-    `;
-    if (exists.length === 0) {
-      throw new Error(`addLink failed: page "${from}" (source=${fromSrc}) or "${to}" (source=${toSrc}) not found`);
-    }
     // Default link_source to 'markdown' for back-compat with pre-v0.13 callers.
-    // Mirror addLinksBatch's VALUES + JOIN-on-(slug, source_id) shape. The old
-    // `FROM pages f, pages t` cross-product fanned out across every source
-    // containing either slug, so a multi-source brain silently created edges
-    // pointing at the wrong pages.
     const src = linkSource ?? 'markdown';
-    await sql`
-      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
-      SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field
-      FROM (VALUES (${from}, ${to}, ${linkType || ''}, ${sanitizeForJsonb(context || '')}, ${src}, ${originSlug ?? null}, ${originField ?? null}, ${fromSrc}, ${toSrc}, ${originSrc}))
-        AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id)
-      JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
-      JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
-      LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
-      ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
-        context = EXCLUDED.context,
-        origin_field = EXCLUDED.origin_field
+    // #4109: resolve both required endpoints and upsert from ONE statement
+    // snapshot — a separate pre-check raced concurrent hard deletes (a delete
+    // winning between check and insert made a zero-row upsert look like
+    // success). The lookups stay source-qualified per endpoint (JOIN-on-
+    // (slug, source_id), not the pre-v0.18 cross-product that fanned out
+    // across sources containing either slug). FOR KEY SHARE makes a
+    // concurrent hard delete linearize around the mutation: a delete that
+    // wins first is observed as a missing endpoint; a mutation that wins
+    // first holds the referenced rows through the insert instead of leaking
+    // a raw FK violation.
+    const [result] = await sql`
+      WITH endpoint_state AS (
+        SELECT
+          (SELECT id FROM pages WHERE slug = ${from} AND source_id = ${fromSrc} FOR KEY SHARE) AS from_id,
+          (SELECT id FROM pages WHERE slug = ${to} AND source_id = ${toSrc} FOR KEY SHARE) AS to_id,
+          (SELECT id FROM pages WHERE slug = ${originSlug ?? null} AND source_id = ${originSrc} FOR KEY SHARE) AS origin_id
+      ), upserted AS (
+        INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
+        SELECT s.from_id, s.to_id, ${linkType || ''}, ${sanitizeForJsonb(context || '')}, ${src}, s.origin_id, ${originField ?? null}
+        FROM endpoint_state s
+        WHERE s.from_id IS NOT NULL AND s.to_id IS NOT NULL
+        ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
+          context = EXCLUDED.context,
+          origin_field = EXCLUDED.origin_field
+        RETURNING 1
+      )
+      SELECT
+        endpoint_state.from_id IS NOT NULL AS from_exists,
+        endpoint_state.to_id IS NOT NULL AS to_exists
+      FROM endpoint_state
     `;
+    if (!result?.from_exists) throw new PageMissingError('addLink', 'from', from, fromSrc);
+    if (!result.to_exists) throw new PageMissingError('addLink', 'to', to, toSrc);
   }
 
   async addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number> {
@@ -3629,10 +3663,10 @@ export class PostgresEngine implements BrainEngine {
     }));
   }
 
-  async getBacklinkCounts(slugs: string[]): Promise<Map<string, number>> {
-    const result = new Map<string, number>();
-    if (slugs.length === 0) return result;
-    for (const s of slugs) result.set(s, 0);
+  async getBacklinkCounts(pageIds: number[]): Promise<Map<number, number>> {
+    const result = new Map<number, number>();
+    if (pageIds.length === 0) return result;
+    for (const id of pageIds) result.set(id, 0);
 
     // v0.41.18.0 D12: filter mentions OUT of backlink-count for search
     // ranking. `link_source='mentions'` rows are auto-linked body-text
@@ -3642,17 +3676,19 @@ export class PostgresEngine implements BrainEngine {
     // --by-mention run, boosting popular-mention pages over intentional-
     // backlink pages. `IS DISTINCT FROM` is NULL-safe so legacy rows with
     // NULL link_source still count (NULL != 'mentions' → row included).
+    // #4380: keyed by p.id, not slug — grouping by bare slug summed every
+    // namesake's backlinks across sources, boosting zero-backlink pages.
     const sql = this.sql;
     const rows = await sql`
-      SELECT p.slug as slug, COUNT(l.id)::int as cnt
+      SELECT p.id as page_id, COUNT(l.id)::int as cnt
       FROM pages p
       LEFT JOIN links l ON l.to_page_id = p.id
         AND l.link_source IS DISTINCT FROM 'mentions'
-      WHERE p.slug = ANY(${slugs}::text[])
-      GROUP BY p.slug
+      WHERE p.id = ANY(${pageIds}::int[])
+      GROUP BY p.id
     `;
-    for (const r of rows as unknown as { slug: string; cnt: number }[]) {
-      result.set(r.slug, Number(r.cnt));
+    for (const r of rows as unknown as { page_id: number; cnt: number }[]) {
+      result.set(Number(r.page_id), Number(r.cnt));
     }
     return result;
   }
@@ -3923,31 +3959,38 @@ export class PostgresEngine implements BrainEngine {
   ): Promise<boolean> {
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
-    if (!opts?.skipExistenceCheck) {
-      const exists = await sql`SELECT 1 FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}`;
-      if (exists.length === 0) {
-        throw new Error(`addTimelineEntry failed: page "${slug}" (source=${sourceId}) not found`);
-      }
-    }
-    // ON CONFLICT DO NOTHING via the (page_id, date, md5(summary), source)
-    // unique index (#3737: md5-keyed so long summaries fit the btree row cap).
-    // #3827: RETURNING 1 makes the outcome observable — 0 rows means either
-    // page missing OR duplicate; with the existence check above (default) the
-    // false return unambiguously means "deduplicated", and under
-    // skipExistenceCheck the caller asserts the page exists. Source-qualify
-    // the page-id lookup so multi-source brains don't fan timeline rows out
-    // across every source containing the slug.
+    // #4109: page resolution and insertion share ONE statement snapshot, so a
+    // concurrent hard delete linearizes before the lookup (missing) or after
+    // the insert (success) instead of surfacing a raw FK violation; FOR KEY
+    // SHARE holds the referenced row through the insert. ON CONFLICT DO
+    // NOTHING via the (page_id, date, md5(summary), source) unique index
+    // (#3737: md5-keyed so long summaries fit the btree row cap).
+    // #3827: the `inserted` flag makes the outcome observable — with the
+    // page_exists throw below (default) a false return unambiguously means
+    // "deduplicated", and under skipExistenceCheck the caller asserts the
+    // page exists. Source-qualify the page-id lookup so multi-source brains
+    // don't fan timeline rows out across every source containing the slug.
     // Free-text body fields are NUL + lone-surrogate sanitized (#2011) so a
     // surrogate from sliced/imported content can't reach the (later) ::jsonb
     // batch path or corrupt the row; identity fields (slug, date) are left raw.
-    const inserted = await sql`
-      INSERT INTO timeline_entries (page_id, date, source, summary, detail)
-      SELECT id, ${entry.date}::date, ${sanitizeForJsonb(entry.source || '')}, ${sanitizeForJsonb(entry.summary)}, ${sanitizeForJsonb(entry.detail || '')}
-      FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}
-      ON CONFLICT (page_id, date, md5(summary), source) DO NOTHING
-      RETURNING 1
+    const [result] = await sql`
+      WITH page_state AS (
+        SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId} FOR KEY SHARE
+      ), inserted AS (
+        INSERT INTO timeline_entries (page_id, date, source, summary, detail)
+        SELECT id, ${entry.date}::date, ${sanitizeForJsonb(entry.source || '')}, ${sanitizeForJsonb(entry.summary)}, ${sanitizeForJsonb(entry.detail || '')}
+        FROM page_state
+        ON CONFLICT (page_id, date, md5(summary), source) DO NOTHING
+        RETURNING 1
+      )
+      SELECT
+        EXISTS(SELECT 1 FROM page_state) AS page_exists,
+        EXISTS(SELECT 1 FROM inserted) AS inserted
     `;
-    return inserted.length > 0;
+    if (!result?.page_exists && !opts?.skipExistenceCheck) {
+      throw new PageMissingError('addTimelineEntry', 'page', slug, sourceId);
+    }
+    return result?.inserted === true;
   }
 
   async addTimelineEntriesBatch(entries: TimelineBatchInput[], opts?: BatchOpts): Promise<number> {
@@ -4007,13 +4050,13 @@ export class PostgresEngine implements BrainEngine {
   // JOIN event page; hide soft-deleted event projections (read-time, not just
   // doctor); order by COALESCE(event effective_date, date) for intra-day
   // sequence. Source scope: federated sourceIds[] > scalar sourceId > unscoped.
-  private chronicleSourceCond(opts?: { sourceId?: string; sourceIds?: string[] }) {
+  // ep=true: the ep LEFT JOIN carries the same scope so out-of-scope event fields null out (#2200 origin-join shape).
+  private chronicleSourceCond(opts?: { sourceId?: string; sourceIds?: string[] }, ep = false) {
     const sql = this.sql;
-    return opts?.sourceIds && opts.sourceIds.length > 0
-      ? sql`AND p.source_id = ANY(${opts.sourceIds}::text[])`
-      : opts?.sourceId
-        ? sql`AND p.source_id = ${opts.sourceId}`
-        : sql``;
+    if (opts?.sourceIds && opts.sourceIds.length > 0)
+      return ep ? sql`AND ep.source_id = ANY(${opts.sourceIds}::text[])` : sql`AND p.source_id = ANY(${opts.sourceIds}::text[])`;
+    if (opts?.sourceId) return ep ? sql`AND ep.source_id = ${opts.sourceId}` : sql`AND p.source_id = ${opts.sourceId}`;
+    return sql``;
   }
 
   async getTimelineForDate(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]> {
@@ -4030,7 +4073,7 @@ export class PostgresEngine implements BrainEngine {
              ep.frontmatter->'event'->>'kind' AS kind
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE te.date >= ${lower} AND te.date <= ${upper}
         AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
         ${this.chronicleSourceCond(opts)}
@@ -4051,7 +4094,7 @@ export class PostgresEngine implements BrainEngine {
              ep.frontmatter->'event'->>'kind' AS kind
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE te.date >= ${date}::date
         AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
         ${kindCond}
@@ -4073,7 +4116,7 @@ export class PostgresEngine implements BrainEngine {
              ep.frontmatter->'event'->>'kind' AS kind
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE EXTRACT(MONTH FROM te.date) = EXTRACT(MONTH FROM ${target})
         AND EXTRACT(DAY FROM te.date) = EXTRACT(DAY FROM ${target})
         AND te.date < ${target}
@@ -4097,7 +4140,7 @@ export class PostgresEngine implements BrainEngine {
       SELECT te.date::text AS last_date, ep.slug AS last_event_slug
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
         AND te.date <= ${seenThrough}
         AND (
@@ -4191,7 +4234,7 @@ export class PostgresEngine implements BrainEngine {
         // Close the prior row's valid window at the new fact's valid_from (or now()).
         await sql`UPDATE facts SET valid_until = COALESCE(${validFrom}::timestamptz, now()), superseded_by = ${newId}
                    WHERE id = ${current.id} AND valid_until IS NULL`;
-        supersededId = current.id;
+        supersededId = Number(current.id);
       }
     }
     return { action: supersededId ? 'superseded_prior' : 'inserted', factId: newId, supersededId };
@@ -4397,6 +4440,8 @@ export class PostgresEngine implements BrainEngine {
              score, content_type, segments, entities, model, triage_version
       FROM dream_verdicts
       WHERE file_path = ${filePath} AND content_hash = ${contentHash}
+        -- NULL = pre-TTL row in the #4657 bootstrap window; a miss here re-judges the corpus
+        AND (expires_at IS NULL OR expires_at > now())
     `;
     if (rows.length === 0) return null;
     const r = rows[0];
@@ -4415,12 +4460,16 @@ export class PostgresEngine implements BrainEngine {
 
   async putDreamVerdict(filePath: string, contentHash: string, verdict: DreamVerdictInput): Promise<void> {
     const sql = this.sql;
+    // Expiry is computed server-side (now() + TTL) so it lives on the same
+    // clock as the `expires_at > now()` read predicate and judged_at.
     await sql`
       INSERT INTO dream_verdicts (file_path, content_hash, worth_processing, reasons,
-                                  score, content_type, segments, entities, model, triage_version)
+                                  score, content_type, segments, entities, model, triage_version,
+                                  expires_at)
       VALUES (${filePath}, ${contentHash}, ${verdict.worth_processing}, ${sql.json(verdict.reasons as Parameters<typeof sql.json>[0])},
               ${verdict.score}, ${verdict.content_type}, ${sql.json(verdict.segments as unknown as Parameters<typeof sql.json>[0])},
-              ${sql.json(verdict.entities as Parameters<typeof sql.json>[0])}, ${verdict.model}, ${verdict.triage_version})
+              ${sql.json(verdict.entities as Parameters<typeof sql.json>[0])}, ${verdict.model}, ${verdict.triage_version},
+              now() + make_interval(secs => ${DREAM_VERDICT_TTL_SECONDS}))
       ON CONFLICT (file_path, content_hash) DO UPDATE SET
         worth_processing = EXCLUDED.worth_processing,
         reasons = EXCLUDED.reasons,
@@ -4430,8 +4479,15 @@ export class PostgresEngine implements BrainEngine {
         entities = EXCLUDED.entities,
         model = EXCLUDED.model,
         triage_version = EXCLUDED.triage_version,
-        judged_at = now()
+        judged_at = now(),
+        expires_at = EXCLUDED.expires_at
     `;
+  }
+
+  async sweepDreamVerdicts(): Promise<number> {
+    const sql = this.sql;
+    const result = await sql`DELETE FROM dream_verdicts WHERE expires_at <= now()`;
+    return result.count ?? 0;
   }
 
   // ============================================================
@@ -4705,6 +4761,8 @@ export class PostgresEngine implements BrainEngine {
     return takesImpl.listStaleTakes(this.takesDeps);
   }
 
+  async updateTakeEmbeddings(rowsIn: TakeEmbeddingInput[], opts?: BatchOpts): Promise<number> { return takesImpl.updateTakeEmbeddings(this.takesDeps, rowsIn, opts); }
+
   async updateTake(
     pageId: number,
     rowNum: number,
@@ -4812,8 +4870,15 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Stats + health
-  async getStats(): Promise<BrainStats> {
+  async getStats(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainStats> {
     const sql = this.sql;
+    // #4592: optional source scope. NULL = brain-wide (trusted local); a
+    // scope array confines EVERY counter — including chunk/link/tag/timeline
+    // counts and pages_by_type — so a scoped remote grant can't recover an
+    // excluded source's numbers by subtraction. Derived tables scope through
+    // their page joins; links count only when BOTH endpoints are in scope.
+    // The joins are FK-total, so the NULL-scope numbers are unchanged.
+    const scope: string[] | null = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : null);
     // S2: embedded_count keys on the registry-ACTIVE column (fallback to
     // legacy on a broken registry — diagnostics never crash).
     const colId = await this.activeEmbeddingColId({ fallbackToLegacy: true });
@@ -4823,19 +4888,32 @@ export class PostgresEngine implements BrainEngine {
         -- search filter and getPage default — soft-deleted is hidden everywhere
         -- the user looks. Chunks/links stay raw because they still occupy
         -- storage until the autopilot purge phase runs.
-        (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
-        (SELECT count(*) FROM content_chunks) as chunk_count,
+        (SELECT count(*) FROM pages p WHERE p.deleted_at IS NULL
+           AND (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))) as page_count,
+        (SELECT count(*) FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+          WHERE (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))) as chunk_count,
         -- Keyed on the stored VECTOR, not embedded_at: a schema rebuild NULLs
         -- every vector without touching embedded_at, and this count must not
         -- report a dark column as embedded.
-        (SELECT count(*) FROM content_chunks WHERE ${sql.unsafe(colId)} IS NOT NULL) as embedded_count,
-        (SELECT count(*) FROM links) as link_count,
-        (SELECT count(DISTINCT tag) FROM tags) as tag_count,
-        (SELECT count(*) FROM timeline_entries) as timeline_entry_count
+        (SELECT count(*) FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+          WHERE cc.${sql.unsafe(colId)} IS NOT NULL
+            AND (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))) as embedded_count,
+        -- EXISTS (not JOIN) so a legacy dead link (missing endpoint row)
+        -- still counts in the unscoped view exactly as before.
+        (SELECT count(*) FROM links l
+          WHERE (${scope}::text[] IS NULL
+             OR (EXISTS (SELECT 1 FROM pages pf WHERE pf.id = l.from_page_id AND pf.source_id = ANY(${scope}))
+                 AND EXISTS (SELECT 1 FROM pages pt WHERE pt.id = l.to_page_id AND pt.source_id = ANY(${scope}))))) as link_count,
+        (SELECT count(DISTINCT t.tag) FROM tags t JOIN pages p ON p.id = t.page_id
+          WHERE (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))) as tag_count,
+        (SELECT count(*) FROM timeline_entries te JOIN pages p ON p.id = te.page_id
+          WHERE (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))) as timeline_entry_count
     `;
 
     const types = await sql`
-      SELECT type, count(*)::int as count FROM pages WHERE deleted_at IS NULL GROUP BY type ORDER BY count DESC
+      SELECT type, count(*)::int as count FROM pages p WHERE p.deleted_at IS NULL
+        AND (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))
+      GROUP BY type ORDER BY count DESC
     `;
     const pages_by_type: Record<string, number> = {};
     for (const t of types) {
@@ -4853,8 +4931,14 @@ export class PostgresEngine implements BrainEngine {
     };
   }
 
-  async getHealth(): Promise<BrainHealth> {
+  async getHealth(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainHealth> {
     const sql = this.sql;
+    // #4592: optional source scope — same contract as getStats. Every count,
+    // coverage numerator AND denominator, degree, and the islanded predicate
+    // confine to the scope; a link only contributes when BOTH endpoints are
+    // in scope (a granted→ungranted edge must not leak the far side's
+    // existence through a degree or rescue a page from orphan-hood).
+    const scope: string[] | null = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : null);
     // Bug 11 doc-drift fix — orphan_pages means "islanded" (no inbound AND
     // no outbound links). The raw islanded list is filtered through the same
     // policy as `gbrain orphans` so convention pages do not count against
@@ -4866,11 +4950,17 @@ export class PostgresEngine implements BrainEngine {
     // S2: coverage + missing_embeddings key on the registry-ACTIVE column.
     const colId = await this.activeEmbeddingColId({ fallbackToLegacy: true });
     const [h] = await sql`
-      WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
+      WITH scoped_pages AS (
+        SELECT id, slug, frontmatter, deleted_at, source_id FROM pages p
+        WHERE (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))
+      ),
+      entity_pages AS (
+        SELECT id, slug FROM scoped_pages WHERE id IN (
+          SELECT id FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
+        )
       )
       SELECT
-        (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
+        (SELECT count(*) FROM scoped_pages WHERE deleted_at IS NULL) as page_count,
         -- Coverage is the stored-VECTOR truth over ELIGIBLE chunks: keyed on
         -- embedding (not embedded_at, which a schema rebuild leaves stale) and
         -- excluding embed_skip pages from BOTH sides so a brain with zero
@@ -4884,11 +4974,13 @@ export class PostgresEngine implements BrainEngine {
               / count(*) FILTER (WHERE NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip'))::float
          END
          FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id) as embed_coverage,
+         JOIN scoped_pages p ON p.id = cc.page_id) as embed_coverage,
         0 as stale_pages,
         0 as orphan_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
+           AND (${scope}::text[] IS NULL
+                OR EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.from_page_id))
         ) as dead_links,
         -- missing_embeddings uses the same predicate as the thing that
         -- resolves it: buildStaleChunkWhere / countStaleChunks, i.e. what
@@ -4905,11 +4997,14 @@ export class PostgresEngine implements BrainEngine {
         -- step from a number that 'embed --stale' reports as 0, so the step
         -- cannot move it and 'doctor --remediate' re-plans it every pass.
         (SELECT count(*) FROM content_chunks cc
-           JOIN pages p ON p.id = cc.page_id
+           JOIN scoped_pages p ON p.id = cc.page_id
           WHERE cc.${sql.unsafe(colId)} IS NULL
             AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip')
         ) as missing_embeddings,
-        (SELECT count(*) FROM links) as link_count,
+        (SELECT count(*) FROM links l
+          WHERE (${scope}::text[] IS NULL
+             OR (EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.from_page_id)
+                 AND EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.to_page_id)))) as link_count,
         (SELECT count(*) FROM entity_pages) as entity_page_count,
         -- gbrain#4153 consistency: an inbound link counts toward coverage
         -- only when its SOURCE page is live — the same endpoint-liveness rule
@@ -4918,7 +5013,7 @@ export class PostgresEngine implements BrainEngine {
         -- AND islanded in one payload.
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM links l
-                       JOIN pages src ON src.id = l.from_page_id
+                       JOIN scoped_pages src ON src.id = l.from_page_id
                        WHERE l.to_page_id = e.id AND src.deleted_at IS NULL))::float /
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as link_coverage,
         (SELECT count(*) FROM entity_pages e
@@ -4926,11 +5021,24 @@ export class PostgresEngine implements BrainEngine {
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as timeline_coverage
     `;
 
+    // X8 (#4592): a degree counts an edge only when its FAR endpoint is in
+    // scope too — otherwise a granted→ungranted edge leaks through the count.
+    // NULL scope keeps the historical raw degree (far-endpoint EXISTS against
+    // an unfiltered pages row is FK-total for live links; dead links kept by
+    // the OR NOT EXISTS arm so unscoped output is byte-identical).
     const connected = await sql`
       SELECT p.slug,
-             (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
+             (SELECT count(*) FROM links l
+               WHERE (l.from_page_id = p.id
+                      AND (${scope}::text[] IS NULL
+                           OR EXISTS (SELECT 1 FROM pages fp WHERE fp.id = l.to_page_id AND fp.source_id = ANY(${scope}))))
+                  OR (l.to_page_id = p.id
+                      AND (${scope}::text[] IS NULL
+                           OR EXISTS (SELECT 1 FROM pages fp WHERE fp.id = l.from_page_id AND fp.source_id = ANY(${scope}))))
+             )::int as link_count
       FROM pages p
       WHERE p.type IN ('entity', 'person', 'company') AND p.deleted_at IS NULL
+        AND (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))
       ORDER BY link_count DESC
       LIMIT 5
     `;
@@ -4949,22 +5057,33 @@ export class PostgresEngine implements BrainEngine {
     // TARGET is live. Without this, get_health's orphan_pages disagreed with
     // `gbrain orphans` whenever a soft-deleted page still linked to (or was
     // linked from) a live one.
+    // #4592: out-of-scope endpoints cannot rescue a page from orphan-hood —
+    // the caller's graph IS its grant.
     const pageScopeRows = await sql<{ slug: string; islanded: boolean; has_timeline: boolean }[]>`
       SELECT p.slug,
              (NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages src ON src.id = l.from_page_id
-                          WHERE l.to_page_id = p.id AND src.deleted_at IS NULL)
+                          WHERE l.to_page_id = p.id AND src.deleted_at IS NULL
+                            AND (${scope}::text[] IS NULL OR src.source_id = ANY(${scope})))
               AND NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages tgt ON tgt.id = l.to_page_id
-                          WHERE l.from_page_id = p.id AND tgt.deleted_at IS NULL)) as islanded,
+                          WHERE l.from_page_id = p.id AND tgt.deleted_at IS NULL
+                            AND (${scope}::text[] IS NULL OR tgt.source_id = ANY(${scope})))) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
       FROM pages p
       WHERE p.deleted_at IS NULL
+        AND (${scope}::text[] IS NULL OR p.source_id = ANY(${scope}))
     `;
 
     const pageCount = Number(h.page_count);
     const embedCoverage = Number(h.embed_coverage);
-    const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
+    // Scoped: sum the scalar-sourceId counter per grant (grants are small);
+    // the unmatchable __all__ sentinel scalar fail-closes to 0 naturally.
+    const stalePages = scope === null
+      ? await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })
+      : (await Promise.all(scope.map(sid =>
+          this.countStalePagesForExtraction({ sourceId: sid, versionTs: LINK_EXTRACTOR_VERSION_TS }),
+        ))).reduce((a, b) => a + b, 0);
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
     const linkablePages = pageScopeRows.filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
     const linkablePageCount = linkablePages.length;
@@ -5228,6 +5347,17 @@ export class PostgresEngine implements BrainEngine {
         SELECT key FROM config WHERE key LIKE ${pattern} ESCAPE '\\' ORDER BY key
       `;
       return rows.map(r => r.key);
+    });
+  }
+
+  async getAllConfig(): Promise<Record<string, string>> {
+    return this.connRetry(async () => {
+      const rows = await this.sql<{ key: string; value: string }[]>`
+        SELECT key, value FROM config
+      `;
+      const out: Record<string, string> = {};
+      for (const row of rows) out[row.key] = row.value;
+      return out;
     });
   }
 

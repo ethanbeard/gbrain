@@ -19,7 +19,18 @@ The epistemological layer. WHO believes WHAT, with confidence weight and time.
 - `holder=world kind=fact` "acme-example raised a Series C" (w=1.0)
 - `holder=brain kind=hunch` "alice-example has a hero/rescuer pattern" (w=0.70)
 
-**Query surface:** `gbrain takes list`, `gbrain takes search`, `gbrain think`
+**Query surface:** `gbrain takes list`, `gbrain takes search`, `gbrain takes search --semantic`, `gbrain think`
+
+Run `gbrain takes embed` after extraction to populate the take vectors used by
+semantic search and the `think` vector stream. `gbrain takes embed --dry-run`
+shows the pending provider work without making calls.
+
+The `takes.embedding` column follows your configured embedding dimension
+(migration v142): if the configured model's width differs from the column,
+the migration resizes it and clears every existing take vector by design —
+run `gbrain takes embed` once after upgrading to repopulate them. Until you
+do, `think` falls back to keyword-only takes retrieval and
+`takes search --semantic` simply reports no semantic matches.
 
 ## Facts (hot memory — `facts` table, v0.31)
 
@@ -27,7 +38,9 @@ Personal knowledge from the brain owner's conversations. Real-time capture.
 
 - **Source:** Extracted per-turn from conversation by the facts hook (Haiku)
 - **Scope:** Single-user — only the brain owner's stated knowledge
-- **Kinds:** `event`, `preference`, `commitment`, `belief`, `fact`
+- **Kinds:** `event`, `preference`, `commitment`, `belief`, `fact`, `idea`
+  (`idea` is extractor/DB-only — the frozen `remember` verb enum stays at five,
+  per `docs/protocol/MEMORY_VERBS_v1.md`)
 - **Lifecycle:** Hot storage, real-time. Captured as conversations happen.
 - **Bridge:** Dream cycle `consolidate` phase promotes hot facts → cold takes nightly
 

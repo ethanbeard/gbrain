@@ -8,6 +8,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
+import { heartbeatPath } from './integrations.ts';
 import { VERSION } from '../version.ts';
 
 // --- Types ---
@@ -74,6 +75,31 @@ function saveOffers(offers: FeatureOffersFile) {
     mkdirSync(dir, { recursive: true });
     writeFileSync(offersPath(), JSON.stringify(offers, null, 2));
   } catch { /* best-effort */ }
+}
+
+// Real-world check: did this integration actually get set up?
+// Heartbeat files are written by Hermes during install (and by other hosts),
+// so they are the source of truth for "is this wired up" — not just whether
+// a secret env var happens to be exported in this shell.
+function integrationHeartbeatExists(recipeId: string): boolean {
+  try {
+    const heartbeat = heartbeatPath(recipeId);
+    if (!existsSync(heartbeat)) return false;
+    const lines = readFileSync(heartbeat, 'utf-8')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean);
+    return lines.some(line => {
+      try {
+        const evt = JSON.parse(line);
+        return evt?.event === 'setup_complete';
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
 }
 
 function shouldPitch(rec: FeatureRecommendation, offers: FeatureOffersFile, currentVersion: string): boolean {
@@ -154,9 +180,15 @@ export async function scanFeatures(engine: BrainEngine): Promise<FeatureScanResu
     // `every` made any recipe with alternative auth paths permanently
     // "unconfigured", since a ClawVisor user never sets GOOGLE_CLIENT_ID and
     // vice versa.
-    const unconfigured = RECIPE_META.filter(r =>
-      !r.secrets.some(s => process.env[s])
-    );
+    // A recipe also counts as configured if a real setup heartbeat file exists
+    // on disk (wired up via Hermes/another host). Env-only checks produced
+    // false "not configured" reports for integrations that were actually
+    // installed.
+    const unconfigured = RECIPE_META.filter(r => {
+      const envOk = r.secrets.some(s => !!process.env[s]);
+      if (envOk) return false;
+      return !integrationHeartbeatExists(r.id);
+    });
     if (unconfigured.length > 0) {
       recommendations.push({
         id: 'no-integrations', priority: 2,
@@ -197,8 +229,15 @@ async function executeAutoFix(rec: FeatureRecommendation, engine: BrainEngine): 
     switch (rec.id) {
       case 'missing-embeddings':
       case 'low-coverage': {
-        const { runEmbed } = await import('./embed.ts');
-        await runEmbed(engine, ['--stale']);
+        // X6 (#4599): go through the CORE seam, not the CLI wrapper —
+        // runEmbed maps a stall-watchdog abort to process.exit(1), which
+        // would kill this whole auto-fix loop mid-run. The core returns an
+        // error RESULT; assertEmbedNotStalled turns it into a throw that
+        // this function's catch reports as { success: false }.
+        const { runEmbedCore } = await import('./embed.ts');
+        const { assertEmbedNotStalled } = await import('../core/embed-stall.ts');
+        const result = await runEmbedCore(engine, { stale: true, singleFlight: true });
+        assertEmbedNotStalled(result);
         return { success: true, output: 'Stale embeddings refreshed' };
       }
       case 'zero-links': {

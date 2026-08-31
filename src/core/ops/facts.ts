@@ -35,7 +35,7 @@ import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 const extract_facts: Operation = {
   name: 'extract_facts',
   description:
-    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
+    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
   params: {
     turn_text: { type: 'string', required: true, description: 'The user message or page body to extract facts from. Sanitized via INJECTION_PATTERNS before the LLM call.' },
     session_id: { type: 'string', description: 'Opaque session id (e.g. topic-id from MCP _meta.session_id, or CLI --session). Stored on each fact for the recall --session filter. Not an auth surface. NOTE (#4206): the session survives on the DB row at insert time, but the `## Facts` fence has no session column — a fence rebuild/reconcile re-derives rows session-less. Treat fence-backed facts as session-less across rebuilds.' },
@@ -180,7 +180,7 @@ const recall: Operation = {
     include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
     supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (facts with superseded_by set), newest first by COALESCE(expired_at, valid_until).' },
     limit: { type: 'number', description: 'Per-arm cap: max fact rows AND max search results. Default 50, cap 100.' },
-    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied client-side after recall.' },
+    grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied in SQL before the limit, so matches on high-cardinality entities are found even outside the newest-N window.' },
     include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
   },
   scope: 'read',
@@ -268,6 +268,7 @@ const recall: Operation = {
             activeOnly: !includeExpired,
             limit,
             visibility,
+            grep: grep ?? undefined,
             excludeAuditRows: true,
           });
         })),
@@ -280,6 +281,7 @@ const recall: Operation = {
             activeOnly: !includeExpired,
             limit,
             visibility,
+            grep: grep ?? undefined,
             excludeAuditRows: true,
           }),
         )),
@@ -295,6 +297,7 @@ const recall: Operation = {
               activeOnly: !includeExpired,
               limit,
               visibility,
+              grep: grep ?? undefined,
               excludeAuditRows: true,
             }),
           )),
@@ -310,6 +313,7 @@ const recall: Operation = {
             activeOnly: !includeExpired,
             limit,
             visibility,
+            grep: grep ?? undefined,
             excludeAuditRows: true,
           }),
         )),
@@ -325,7 +329,11 @@ const recall: Operation = {
     // filter is belt-and-braces defense in depth, not the primary guard.
     rows = rows.filter((r) => !(AUDIT_ROW_SOURCES as readonly string[]).includes(r.source));
 
-    if (grep) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
+    // Engines apply grep in SQL (pre-limit). This client-side pass stays only
+    // as the filter for the supersessions branch, which bypasses FactListOpts.
+    if (grep && p.supersessions === true) {
+      rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
+    }
 
     // v0.32: optional pending-consolidation count piggy-backed on the recall
     // response. Single round trip on thin-client; omitted when not requested

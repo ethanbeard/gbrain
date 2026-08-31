@@ -15,6 +15,12 @@
  *   - synthesize: [EXPENSIVE prefix, annotations, clean `unavailable` with
  *     suggestion when no LLM is configured [c10]
  *   - forget: idempotency (expired:false), not_found with suggestion
+ *   - error-path envelopes [B6]: every error fixture's envelope carries
+ *     protocol_version: 1 + a non-empty suggestion (entity missing name,
+ *     context_pack malformed since, synthesize keyless unavailable — the
+ *     runner's expectErrorCode branch checks code + suggestion only, so the
+ *     protocol_version pin lives here), and a keyless --synthesize runner
+ *     pass exercises the synthesize error arm end-to-end
  *   - writeSingleFact supersession rule [X1] + degraded dedup (embed seam)
  *   - negative conformance self-test [F3]: the runner FAILS a lying server
  *   - fixture mirror drift guard (cases.json === embedded module)
@@ -45,7 +51,7 @@ import {
   __setEmbedTransportForTests,
 } from '../src/core/ai/gateway.ts';
 import { __setUsageLogPathForTests } from '../src/core/verbs/usage-log.ts';
-import { withEnv } from './helpers/with-env.ts';
+import { emptyHome, withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let home: string;
@@ -101,12 +107,21 @@ async function callRemote(name: string, params: Record<string, unknown>) {
   return { isError: res.isError === true, body: JSON.parse(res.content[0].text) };
 }
 
-async function seedEntityPage(slug: string, title: string, body = 'A synthetic test entity.') {
+async function seedPage(
+  slug: string,
+  title: string,
+  type: string,
+  body = 'Synthetic test content.',
+) {
   const put = operationsByName['put_page'];
   await put.handler(localCtx(), {
     slug,
-    content: `---\ntitle: ${title}\ntype: person\n---\n\n# ${title}\n\n${body}\n`,
+    content: `---\ntitle: ${title}\ntype: ${type}\n---\n\n# ${title}\n\n${body}\n`,
   });
+}
+
+async function seedEntityPage(slug: string, title: string, body = 'A synthetic test entity.') {
+  await seedPage(slug, title, 'person', body);
 }
 
 describe('recall — G1B superset + budget packing', () => {
@@ -172,6 +187,32 @@ describe('recall — G1B superset + budget packing', () => {
 });
 
 describe('remember — contract behavior', () => {
+  it("kind enum is frozen at the 5 protocol kinds — 'idea' is extractor/DB-only", () => {
+    // docs/protocol/MEMORY_VERBS_v1.md:39-41 — the remember verb's kind enum
+    // is a frozen protocol surface. The extractor/DB taxonomy gained 'idea'
+    // (engine.ts FactKind, migration v145); the protocol enum MUST NOT.
+    const kindEnum = operationsByName['remember'].params?.kind?.enum ?? [];
+    expect(kindEnum).toEqual(['event', 'preference', 'commitment', 'belief', 'fact']);
+    expect(kindEnum).not.toContain('idea');
+  });
+
+  it("recall's RESPONSE kind enum admits 'idea' — the reader must not be told a lie", () => {
+    // The INPUT freeze above is the protocol contract (a caller cannot WRITE
+    // an idea through the verb). The response side describes what the system
+    // actually RETURNS: the extractor and the facts table carry 'idea', so a
+    // stored idea fact flows back through recall. A response schema omitting
+    // it would declare a contract the system itself violates. Widening a
+    // response enum is strictly permissive for consumers.
+    const { RESPONSE_SCHEMAS } = require('../src/core/verbs.ts') as {
+      RESPONSE_SCHEMAS: Record<string, Record<string, unknown>>;
+    };
+    const facts = ((RESPONSE_SCHEMAS.recall as Record<string, Record<string, Record<string, unknown>>>)
+      .properties?.facts) as Record<string, Record<string, Record<string, Record<string, unknown>>>>;
+    const kindEnum = facts?.items?.properties?.kind?.enum as string[] | undefined;
+    expect(kindEnum).toEqual(['event', 'preference', 'commitment', 'belief', 'fact', 'idea']);
+    // ...while the remember INPUT enum stays frozen at five (asserted above).
+  });
+
   it('rejects empty provenance with provenance_required + a populated suggestion', async () => {
     const { isError, body } = await callRemote('remember', { fact: 'x', provenance: '   ' });
     expect(isError).toBe(true);
@@ -219,6 +260,66 @@ describe('remember — contract behavior', () => {
 });
 
 describe('entity — card, arms, zero LLM', () => {
+  it('prefers an entity page when a newer conversation has the same exact title', async () => {
+    await seedEntityPage('people/jordan-example', 'Jordan Example');
+    await seedPage(
+      'conversations/jordan-example-session',
+      'Jordan Example',
+      'conversation',
+      'A newer conversation transcript with the same title.',
+    );
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = CASE slug
+            WHEN 'people/jordan-example' THEN '2026-01-01T00:00:00Z'::timestamptz
+            ELSE '2026-02-01T00:00:00Z'::timestamptz
+          END
+        WHERE source_id = 'default'
+          AND slug IN ('people/jordan-example', 'conversations/jordan-example-session')`,
+    );
+
+    const { isError, body } = await callRemote('entity', { name: 'Jordan Example' });
+    expect(isError).toBe(false);
+    expect(body.card.entity.slug).toBe('people/jordan-example');
+    expect(body.suggestions).toContainEqual(expect.objectContaining({
+      slug: 'conversations/jordan-example-session',
+    }));
+  });
+
+  it('keeps an explicit namespaced slug above an entity-shaped exact-title collision', async () => {
+    await seedPage('notes/exact-target', 'Operational Runbook', 'note');
+    await seedEntityPage('people/slug-shaped-title', 'notes/exact-target');
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = CASE slug
+            WHEN 'notes/exact-target' THEN '2026-01-01T00:00:00Z'::timestamptz
+            ELSE '2026-02-01T00:00:00Z'::timestamptz
+          END
+        WHERE source_id = 'default'
+          AND slug IN ('notes/exact-target', 'people/slug-shaped-title')`,
+    );
+
+    const { body } = await callRemote('entity', { name: 'notes/exact-target' });
+    expect(body.card.entity.slug).toBe('notes/exact-target');
+  });
+
+  it('keeps an explicit alias above entity-type preference', async () => {
+    await seedEntityPage('people/alias-title-collision', 'Jordan Alias');
+    await seedPage('notes/alias-target', 'Archived Context', 'note');
+    await engine.setPageAliases('notes/alias-target', 'default', ['jordan alias']);
+
+    const { body } = await callRemote('entity', { name: 'Jordan Alias' });
+    expect(body.card.entity.slug).toBe('notes/alias-target');
+  });
+
+  it('retains a non-entity exact-title page as the fallback when no entity page exists', async () => {
+    await seedPage('notes/release-checklist', 'Release Checklist', 'note');
+
+    const { body } = await callRemote('entity', { name: 'Release Checklist' });
+    expect(body.found).toBe(true);
+    expect(body.card.entity.slug).toBe('notes/release-checklist');
+  });
+
   it('resolves an exact namespaced slug to a schema-valid card with the chat gateway rigged to throw', async () => {
     __setChatTransportForTests(() => {
       throw new Error('entity must NEVER call the chat LLM');
@@ -284,6 +385,16 @@ describe('entity — card, arms, zero LLM', () => {
     expect(body.card.backlink_count).toBe(0);
   });
 
+  it('[B6] missing required name is invalid_params with protocol_version 1 + a populated suggestion', async () => {
+    const { isError, body } = await callRemote('entity', {});
+    expect(isError).toBe(true);
+    expect(body.error).toBe('invalid_params');
+    expect(body.protocol_version).toBe(1);
+    expect(typeof body.suggestion).toBe('string');
+    expect(body.suggestion.trim().length).toBeGreaterThan(0);
+    expect(validateAgainstSchema(body, ERROR_SCHEMA)).toEqual([]);
+  });
+
   it('remote card never carries private commitment facts (fence test)', async () => {
     await seedEntityPage('people/fence-test', 'Fence Test Person');
     await callRemote('remember', {
@@ -337,6 +448,38 @@ describe('synthesize — marked expensive + unavailable conversion [c10]', () =>
     expect(Array.isArray(body.warnings)).toBe(true);
     const violations = validateAgainstSchema(body, RESPONSE_SCHEMAS.synthesize);
     expect(violations).toEqual([]);
+  });
+
+  it('[B6/c10] keyless synthesize is a clean unavailable error with protocol_version 1 + a populated suggestion', async () => {
+    // Forced-keyless hermetically: clear the module-global gateway (a prior
+    // configureGateway env snapshot would satisfy resolveAnthropicKey), drop
+    // the env var, and point GBRAIN_HOME at an empty dir so a dev machine's
+    // real ~/.gbrain/config.json key can't flip the assertion (see emptyHome).
+    resetGateway();
+    const { isError, body } = await withEnv(
+      { ANTHROPIC_API_KEY: undefined, GBRAIN_HOME: emptyHome() },
+      async () => callRemote('synthesize', { question: 'keyless error-path probe' }),
+    );
+    expect(isError).toBe(true);
+    expect(body.error).toBe('unavailable');
+    expect(body.protocol_version).toBe(1);
+    expect(typeof body.suggestion).toBe('string');
+    expect(body.suggestion.trim().length).toBeGreaterThan(0);
+    expect(validateAgainstSchema(body, ERROR_SCHEMA)).toEqual([]);
+  });
+});
+
+describe('context_pack — error-path envelope [B6]', () => {
+  it('malformed since is invalid_params with protocol_version 1 + an ISO 8601 fix in the suggestion', async () => {
+    const { isError, body } = await callRemote('context_pack', {
+      entities: 'people/nobody-here',
+      since: 'not-a-timestamp',
+    });
+    expect(isError).toBe(true);
+    expect(body.error).toBe('invalid_params');
+    expect(body.protocol_version).toBe(1);
+    expect(body.suggestion).toContain('ISO 8601');
+    expect(validateAgainstSchema(body, ERROR_SCHEMA)).toEqual([]);
   });
 });
 
@@ -472,10 +615,12 @@ describe('writeSingleFact — supersession rule [X1] + degraded dedup', () => {
   });
 
   it('reports degraded_dedup when no embedding provider is configured', async () => {
-    const r = await writeSingleFact(engine, 'default', {
-      fact: 'a fact written with no embedding provider',
-      provenance: 'test', entity: 'people/degraded-test',
-    });
+    const r = await withNoEmbeddingProvider(() =>
+      writeSingleFact(engine, 'default', {
+        fact: 'a fact written with no embedding provider',
+        provenance: 'test', entity: 'people/degraded-test',
+      }),
+    );
     expect(r.status).toBe('inserted');
     expect(r.degraded_dedup).toBe(true);
   });
@@ -502,38 +647,76 @@ describe('conformance runner — negative self-test [F3]', () => {
 
   it('a certifier that cannot fail certifies nothing: missing fields, bad enums, wrong id types all flag', async () => {
     // Mutation 1: remember drops the required `status` field.
-    const r1 = await runConformance(
-      lyingClient((verb, body) => (verb === 'remember' ? (({ status: _s, ...rest }) => rest)(body as { status?: unknown } & Record<string, unknown>) : body)),
-      { marker: 'neg1' },
+    const r1 = await withNoEmbeddingProvider(() =>
+      runConformance(
+        lyingClient((verb, body) => (verb === 'remember' ? (({ status: _s, ...rest }) => rest)(body as { status?: unknown } & Record<string, unknown>) : body)),
+        { marker: 'neg1' },
+      ),
     );
     expect(r1.ok).toBe(false);
 
     // Mutation 2: remember returns an out-of-enum status.
-    const r2 = await runConformance(
-      lyingClient((verb, body) => (verb === 'remember' ? { ...body, status: 'absorbed' } : body)),
-      { marker: 'neg2' },
+    const r2 = await withNoEmbeddingProvider(() =>
+      runConformance(
+        lyingClient((verb, body) => (verb === 'remember' ? { ...body, status: 'absorbed' } : body)),
+        { marker: 'neg2' },
+      ),
     );
     expect(r2.ok).toBe(false);
 
     // Mutation 3: recall re-types fact_id to a number (the opaque-string mandate [T4]).
-    const r3 = await runConformance(
-      lyingClient((verb, body) => {
-        if (verb !== 'recall' || !Array.isArray((body as { facts?: unknown[] }).facts)) return body;
-        return {
-          ...body,
-          facts: (body.facts as Array<Record<string, unknown>>).map(f => ({ ...f, fact_id: Number(f.fact_id) })),
-        };
-      }),
-      { marker: 'neg3' },
+    const r3 = await withNoEmbeddingProvider(() =>
+      runConformance(
+        lyingClient((verb, body) => {
+          if (verb !== 'recall' || !Array.isArray((body as { facts?: unknown[] }).facts)) return body;
+          return {
+            ...body,
+            facts: (body.facts as Array<Record<string, unknown>>).map(f => ({ ...f, fact_id: Number(f.fact_id) })),
+          };
+        }),
+        { marker: 'neg3' },
+      ),
     );
     expect(r3.ok).toBe(false);
 
     // Honest server passes (sanity: the failures above are the mutations' doing).
-    const honest = await runConformance(lyingClient((_v, b) => b), { marker: 'pos1' });
+    const honest = await withNoEmbeddingProvider(() =>
+      runConformance(lyingClient((_v, b) => b), { marker: 'pos1' }),
+    );
     const failures = honest.results.filter(r => r.status === 'fail');
     expect(failures).toEqual([]);
   }, 20_000); // v0.45.7: two full runConformance passes now exercise 7 verbs;
   // the default 5s budget flakes under the parallel shard runner (red-team F6).
+
+  it('[B6] keyless self-cert with --synthesize passes via the unavailable error arm (cases run, never skip)', async () => {
+    // The synthesize fixtures are dual-mode (keyed servers answer, keyless
+    // servers must return the clean `unavailable` envelope). This run is the
+    // CI assertion of the ERROR arm: forced keyless (no gateway, no env key,
+    // empty config home — the chat transport seam is cleared by beforeEach)
+    // with the cost gate OPEN, both synthesize cases must EXECUTE and pass
+    // through the runner's unavailable+suggestion+ERROR_SCHEMA checks.
+    resetGateway();
+    const honest: ConformanceClient = {
+      listTools: async () =>
+        VERB_NAMES.map(name => ({
+          name,
+          description: name === 'synthesize' ? '[EXPENSIVE / SLOW] x' : `MEMORY VERB (v1): ${name}`,
+        })),
+      callTool: async (name, params) => {
+        const res = await dispatchToolCall(engine, name, params, {
+          remote: true, takesHoldersAllowList: ['world'], sourceId: 'default',
+        });
+        return { isError: res.isError, text: res.content[0].text };
+      },
+    };
+    const r = await withEnv({ ANTHROPIC_API_KEY: undefined, GBRAIN_HOME: emptyHome() }, async () =>
+      runConformance(honest, { marker: `keyless-${Date.now().toString(36)}`, synthesize: true }),
+    );
+    expect(r.results.filter(x => x.status === 'fail')).toEqual([]);
+    const synth = r.results.filter(x => x.verb === 'synthesize' && !x.name.startsWith('tools/list') && !x.name.startsWith('synthesize is marked'));
+    expect(synth.length).toBeGreaterThanOrEqual(2);
+    expect(synth.every(x => x.status === 'pass')).toBe(true);
+  }, 20_000);
 });
 
 describe('fixture mirror + surface invariants', () => {
@@ -568,7 +751,9 @@ describe('fixture mirror + surface invariants', () => {
         return { isError: res.isError, text: res.content[0].text };
       },
     };
-    const r = await runConformance(fiveVerbClient, { marker: `five-${Date.now()}` });
+    const r = await withNoEmbeddingProvider(() =>
+      runConformance(fiveVerbClient, { marker: `five-${Date.now()}` }),
+    );
     // The additive verbs must appear ONLY as skips — never executed, never failed.
     const additive = r.results.filter((x) => x.verb === 'context_pack' || x.verb === 'delta');
     expect(additive.length).toBeGreaterThan(0);
@@ -580,3 +765,24 @@ describe('fixture mirror + surface invariants', () => {
     expect(advertFails).toEqual([]);
   });
 });
+
+function withNoEmbeddingProvider<T>(fn: () => T | Promise<T>): Promise<T> {
+  return withEnv(
+    {
+      GBRAIN_HOME: emptyHome(),
+      OPENAI_API_KEY: undefined,
+      VOYAGE_API_KEY: undefined,
+      GOOGLE_GENERATIVE_AI_API_KEY: undefined,
+    },
+    async () => {
+      resetGateway();
+      __setEmbedTransportForTests(null);
+      try {
+        return await fn();
+      } finally {
+        resetGateway();
+        __setEmbedTransportForTests(null);
+      }
+    },
+  );
+}

@@ -447,6 +447,10 @@ export interface DomainBankRow {
 }
 
 export interface SalienceOpts {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** Window in days. Default 14. */
   days?: number;
   /** Max rows to return (clamped at 100). Default 20. */
@@ -487,10 +491,10 @@ export interface SalienceResult {
  *
  * Why a dedicated engine method instead of composing `listPages` +
  * `getBacklinkCounts` in memory:
- *   - `getBacklinkCounts` groups by bare `slug`, so the same slug in two
- *     sources collapses/contaminates the count. This query counts inbound
- *     links per page row (`to_page_id = p.id`), which is source-correct by
- *     construction.
+ *   - `getBacklinkCounts` is page-id-keyed (source-correct since #4380),
+ *     but composing it with `listPages` in memory still costs a second
+ *     round-trip. This query counts inbound links per page row
+ *     (`to_page_id = p.id`) inside the one source-scoped query.
  *   - `listPages` returns full `Page` rows (bodies). 500 stub bodies per
  *     type per source is not a memory guarantee. This projection carries
  *     only `body_len`, never the body.
@@ -547,11 +551,17 @@ export const ENRICH_ORDER_SQL: Record<EnrichCandidatesOpts['order'], string> = {
  * current count exceeds `mean + sigma * stddev`. Year cohort deferred to v0.30.
  */
 export interface AnomaliesOpts {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** ISO date (YYYY-MM-DD). Default = today (UTC). */
   since?: string;
   /** Days of history for the baseline. Default 30. */
   lookback_days?: number;
-  /** Sigma threshold. Default 3.0. */
+  /** Sigma threshold. Default 3.0. Scope note: the source scope above is
+   *  applied to BOTH the baseline and today windows so the anomaly math
+   *  stays consistent. */
   sigma?: number;
 }
 
@@ -640,7 +650,7 @@ export interface StaleChunkRow {
   slug: string;
   chunk_index: number;
   chunk_text: string;
-  chunk_source: 'compiled_truth' | 'timeline';
+  chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code';
   model: string | null;
   token_count: number | null;
   /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */

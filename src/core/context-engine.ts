@@ -16,6 +16,7 @@
 import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
+import { backupNagReadOnlyConsult, backupNoticeText, loadBackupStatus } from './backup/status-file.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
 
@@ -813,6 +814,13 @@ export function createGBrainContextEngine(ctx: {
     checkpointMemo.set(sessionId, memo);
   }
   let _envelope: string | null = null;
+  // Monthly backup-coverage line: in-process 24h latch. assemble() composes
+  // server-side and cannot know delivery, so this channel NEVER writes nag
+  // state (read-only consult of the shared dampener + global monthly cap).
+  // The latch advances on every CONSULT (not just shows) so a long-lived
+  // serve pays at most one file read per 24h — an ok verdict must not cost
+  // I/O on every turn, and a repeat line stays impossible.
+  let _backupCheckedAt = 0;
   async function envelope(): Promise<string> {
     if (_envelope !== null) return _envelope;
     try {
@@ -950,6 +958,63 @@ export function createGBrainContextEngine(ctx: {
     memo.polls = 0;
     memo.settled = false;
     memoSet(sessionId, memo);
+
+    // Memorable receipt (additive, opt-in, memorableGateAllowed-gated): the
+    // segment above is SPOOLED, i.e. durable, so the receipt describes real
+    // banked work. OpenClaw has no session end — capture is per-compaction by
+    // design (documented as compaction-only coverage; the post-last-compaction
+    // tail is never captured). One receipt per distinct window hash; a retried
+    // identical compaction dedups on content_hash inside the helper. The
+    // whole block is fail-open for the checkpoint: any refusal in here can
+    // never change the checkpoint's status. cfg was loaded fresh THIS call,
+    // so `gbrain config set …enabled false` applies on the next compaction
+    // without a gateway restart (GBRAIN_MEMORABLE, an env, needs one).
+    // This lane NEVER compacts the receipts file — the hook lane is the ONE
+    // compactor of session-receipts.jsonl
+    // (same single-rewriter rule as the relay-file trim: two processes doing
+    // read-filter-rename can drop each other's receipts; an append racing a
+    // rename loses at most its own line, the accepted class). It also skips
+    // the block entirely once the host's compact() deadline has fired:
+    // everything below (tail read, PATH walk, spawn) is work delaying the
+    // banked return.
+    try {
+      const hb = await import('./context/hook-heartbeat.ts');
+      if (!deadlineHit() && (await hb.memorableGateAllowed(cfg)).allowed) {
+        // Entropy parity with the hook lane [red-team]: the segment file was
+        // vendor-scanned only — its rendering feeds the Cathedral-5 ledger
+        // hash and cannot change — but the relay child derives its egress
+        // task line from that text. Re-scan with highEntropy and REFUSE the
+        // relay when it finds anything the vendor pass missed (fail-closed;
+        // the next compaction window re-evaluates).
+        const scan = await import('./secret-scan.ts');
+        if (scan.redactFindings(rendered.text, { highEntropy: true }).redactions.length > 0) {
+          throw new Error('entropy_hit'); // caught below — receipt+relay skipped, checkpoint unaffected
+        }
+        // Same span rule as the hook lane: windowTurns is a suffix of
+        // tail.turns, so calls are filtered to the window's origin.
+        const startTurnIndex = tail.turns.length - windowTurns.length;
+        const toolCallsJson = await hb.redactedToolCallsJson(tail.toolCalls, tail.toolCallTurnIndexes, startTurnIndex);
+        await hb.recordAndRelayReceipt({
+          session_id: sessionId,
+          harness: 'openclaw',
+          corpus_path: `${dir}/${segs.segmentFileName(sessionId, w.hash)}`,
+          content_hash: w.hash,
+          turn_count: windowTurns.length,
+          workspace_root: workspaceDir,
+          // Structurally true here: renderSegmentText returned non-null above
+          // (scan_unavailable already skipped this whole path), and
+          // redactedToolCallsJson throws into this catch on scanner failure —
+          // an unscanned payload can never reach the receipt on this lane.
+          tool_calls_json: toolCallsJson,
+          secret_scan_ok: true,
+          // trimRelayFile here too: an openclaw-ONLY host has no session-end
+          // hook lane, and without a trimmer the child-appended relay file
+          // grows forever behind the bounded tail read. Concurrent trims from
+          // both lanes converge (newest-keeping, tmp+rename); the residual
+          // loss window stays the single in-flight append.
+        }, { skipReceiptsCompaction: true, trimRelayFile: true }); // hook lane stays the ONE receipts compactor
+      }
+    } catch { /* receipt is additive — never fails the checkpoint */ }
 
     // Segment is spooled (durable); a deadline from here on degrades to
     // 'banked' — the sweep backstop extracts it later.
@@ -1091,7 +1156,7 @@ export function createGBrainContextEngine(ctx: {
       return { ingested: true };
     },
 
-    async assemble({ sessionId, sessionKey, messages, tokenBudget, availableTools, citationsMode }) {
+    async assemble({ sessionId, sessionKey, messages, tokenBudget, availableTools, citationsMode, prompt }) {
       // Lazy SDK load on first method call (was top-level await pre-L0-B).
       await ensureSdkLoaded();
 
@@ -1099,6 +1164,16 @@ export function createGBrainContextEngine(ctx: {
       // turn; a host that sends messages:undefined (or a non-array) must not
       // take down the whole context pipeline.
       const msgs = Array.isArray(messages) ? messages : [];
+
+      // Some OpenClaw runtimes (e.g. the codex-app-server in 2026.7.x) deliver
+      // the current user turn via `prompt` with an empty `messages` array.
+      // Synthesize a single user turn so the Retrieval Reflex still sees the
+      // text (the deterministic live-context/pass-through path is unaffected).
+      const effectiveMessages = msgs.length > 0
+        ? msgs
+        : (typeof prompt === 'string' && prompt.trim()
+            ? ([{ role: 'user', content: prompt }] as typeof msgs)
+            : msgs);
 
       // 1. Generate deterministic context (<5ms, zero LLM calls)
       const liveCtx = generateLiveContext(workspaceDir);
@@ -1131,11 +1206,11 @@ export function createGBrainContextEngine(ctx: {
       // nothing salient resolves. Detect + point, never auto-dump bodies.
       const reflexAddition = await buildReflexAddition({
         workspaceDir,
-        currentUserText: getLastUserText(msgs),
-        priorContextText: getPriorContextText(msgs),
+        currentUserText: getLastUserText(effectiveMessages),
+        priorContextText: getPriorContextText(effectiveMessages),
         // v0.43 (#2095): rolling window — assistant-introduced entities and
         // named-antecedent follow-ups from recent turns now resolve too.
-        windowTurns: getWindowTurns(msgs),
+        windowTurns: getWindowTurns(effectiveMessages),
         resolveEntities: ctx.resolveEntities,
       });
 
@@ -1148,6 +1223,22 @@ export function createGBrainContextEngine(ctx: {
       if (checkpointBlock) parts.push(checkpointBlock);
       if (memoryAddition) parts.push(memoryAddition);
       if (reflexAddition) parts.push(reflexAddition);
+
+      // Monthly backup-coverage warning (⚠ idiom, model-visible). Bounded by
+      // the recording channels' budget without ever spending it; fail-open.
+      try {
+        const now = Date.now();
+        if (now - _backupCheckedAt > 24 * 60 * 60 * 1000) {
+          _backupCheckedAt = now;
+          const backupStatus = loadBackupStatus();
+          if (backupStatus && backupNagReadOnlyConsult(backupStatus, now)) {
+            const note = backupNoticeText(backupStatus, 'human');
+            if (note) parts.push(`- ⚠️ ${note}`);
+          }
+        }
+      } catch {
+        /* a notice must never break context assembly */
+      }
 
       // 4. Pass through messages unchanged (legacy assembly)
       return {

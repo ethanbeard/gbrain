@@ -99,6 +99,7 @@ import { salienceOperations } from './ops/salience.ts';
 
 import { volunteer_context, find_experts, find_contradictions, find_trajectory } from './ops/insights.ts';
 import { transcriptsOperations } from './ops/transcripts.ts';
+import { connectorsOperations } from './ops/connectors.ts';
 import { sourcesOperations } from './ops/sources.ts';
 import { factsOperations } from './ops/facts.ts';
 import { codeIntelOperations } from './ops/code-intel.ts';
@@ -106,6 +107,7 @@ import { embeddingMigrationOperations } from './ops/embedding-migration.ts';
 import { imageOperations } from './ops/image.ts';
 import { schemaPacksOperations } from './ops/schema-packs.ts';
 import { skilloptOperations } from './ops/skillopt.ts';
+import { loopsOperations } from './ops/loops.ts';
 import { chronicleOperations } from './ops/chronicle.ts';
 import { extractionOperations } from './ops/extraction.ts';
 import { entityIdentityOperations } from './ops/entity-identity.ts';
@@ -176,7 +178,7 @@ export const operations: Operation[] = [
   ...requestToolsOperations,
   // v0.29: Salience + anomalies (get_recent_salience, find_anomalies —
   // ops/salience.ts) + recent transcripts (ops/transcripts.ts)
-  ...salienceOperations, ...transcriptsOperations,
+  ...salienceOperations, ...transcriptsOperations, ...connectorsOperations,
   // v0.42.x (#2390): Life Chronicle timeline reads + ontology +
   // volunteer_chronicle/backfill — ops/chronicle.ts
   ...chronicleOperations,
@@ -209,6 +211,8 @@ export const operations: Operation[] = [
   ...schemaPacksOperations,
   // v0.41.18.0 run_onboard + v0.41.20.0 run_skillopt — ops/skillopt.ts
   ...skilloptOperations,
+  // v0.47: open-loop engine (who is waiting on you) — ops/loops.ts
+  ...loopsOperations,
 ];
 
 // ---------------------------------------------------------------------------
@@ -288,6 +292,8 @@ const OP_AREAS: Record<string, string> = {
   // #4224 cross-source entity identity (v1 manual-only)
   entity_identity_link: 'entities', entity_identity_unlink: 'entities',
   entity_identity_list: 'entities',
+  // v0.47 open-loop engine (google source kind)
+  open_loops: 'loops', loops_close: 'loops', loops_mute: 'loops',
   // insight / signal reads
   get_recent_salience: 'insights', find_anomalies: 'insights',
   find_contradictions: 'insights', find_experts: 'insights',

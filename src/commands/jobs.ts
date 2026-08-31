@@ -8,6 +8,7 @@ import type { FactsBackstopResult } from '../core/facts/backstop.ts';
 // Leaf module (no flag surface of its own) — see that file for why this
 // isn't imported from extract-conversation-facts.ts directly (#4135).
 import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
+import { assertEmbedNotStalled } from '../core/embed-stall.ts';
 import { assertEmbedBackfillQueueAdmission } from '../core/minions/embed-backfill-admission.ts';
 import { isProtectedJobName } from '../core/minions/protected-names.ts';
 import { MinionQueue, deriveWedgeSignal } from '../core/minions/queue.ts';
@@ -112,12 +113,20 @@ const GATEWAY_REFRESH_JOB_NAMES = new Set([
   'extract_facts',
   'extract-atoms-drain',
   'embed-backfill',
+  // connector-sync's PGLite embed kickoff calls runEmbedCore inline (the
+  // embedding gateway), so it must see a refreshed gateway config like the
+  // other embed jobs — otherwise a worker booted before `config set` embeds
+  // nothing on the catch-up.
+  'connector-sync',
   'extract-takes-from-pages',
   'embed-catch-up',
   // #3387: chronicle_extract's judge is a gateway chat call — without the
   // refresh a worker booted before `config set` never saw the DB-plane chat
   // model and every extraction silently returned no_events.
   'chronicle_extract',
+  // Open-loop commitment extraction (google source kind): same judge shape
+  // as chronicle_extract, same stale-gateway failure class.
+  'loops_extract',
 ]);
 
 function registerBuiltinJob(
@@ -2265,6 +2274,9 @@ export async function registerBuiltinHandlers(
         job.updateProgress({ done, total, embedded, phase: 'embed.pages' }).catch(() => {});
       },
     });
+    // #4599 (X6): a stall-watchdog abort is an error RESULT from core; the
+    // handler layer converts it to a FAILED JOB (throw) — never process.exit.
+    assertEmbedNotStalled(embedResult);
     // Report what happened, not a constant. `embedded: true` claimed a dry run
     // had embedded, which is the same lie in miniature: `gbrain jobs get`
     // showed it. `embedded` stays the key it always was and stays truthy on a
@@ -2348,6 +2360,19 @@ export async function registerBuiltinHandlers(
       tz,
       signal: (job as { signal?: AbortSignal }).signal,
     });
+  });
+
+  // Open-loop commitment/decision extraction over google-source email pages
+  // (src/core/google/loops-extract.ts). Enqueued by runGoogleSync on trickle
+  // threads within the recent window, idempotency-keyed per page revision,
+  // capped per sweep. Kill switch: config loops.extraction_enabled.
+  registerBuiltinJob(worker, engine, 'loops_extract', async (job) => {
+    const slug = typeof job.data.slug === 'string' ? job.data.slug : undefined;
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    if (!slug || !sourceId) throw new Error('loops_extract job requires data.slug and data.sourceId');
+    const threadId = typeof job.data.threadId === 'string' ? job.data.threadId : undefined;
+    const { runLoopsExtract } = await import('../core/google/loops-extract.ts');
+    return await runLoopsExtract(engine, { slug, sourceId, ...(threadId ? { threadId } : {}) });
   });
 
   // v0.41.39 (#1700) — enrich. NOT in PROTECTED_JOB_NAMES: per-call cost is
@@ -2971,6 +2996,13 @@ export async function registerBuiltinHandlers(
     const { makeEmbedBackfillHandler } = await import('../core/minions/handlers/embed-backfill.ts');
     return await makeEmbedBackfillHandler(engine)(job);
   });
+  // connector-sync: fetch a chat provider's history and ingest it. Fetch+ingest
+  // needs no LLM, but the PGLite embed kickoff calls runEmbedCore inline, so
+  // it's in GATEWAY_REFRESH_JOB_NAMES (gateway refresh before the handler).
+  registerBuiltinJob(worker, engine, 'connector-sync', async (job) => {
+    const { makeConnectorSyncHandler } = await import('../core/minions/handlers/connector-sync.ts');
+    return await makeConnectorSyncHandler(engine)(job);
+  });
 
   // v0.41.18.0 (A10, T7): extract-ner handler for the gbrain onboard
   // remediation pipeline. Wraps extractNerLinks; emits typed_ner kind
@@ -3023,7 +3055,7 @@ export async function registerBuiltinHandlers(
       priority?: 'recent';
       includeNullSignature?: boolean;
     };
-    return await runEmbedCore(engine, {
+    const catchUpResult = await runEmbedCore(engine, {
       stale: true,
       catchUp: true,
       batchSize: data.batchSize,
@@ -3033,6 +3065,9 @@ export async function registerBuiltinHandlers(
       // widening through; absent = grandfather clause stays (unchanged).
       includeNullSignature: !!data.includeNullSignature,
     });
+    // #4599 (X6): stall abort → failed job (throw), same as the embed handler.
+    assertEmbedNotStalled(catchUpResult);
+    return catchUpResult;
   });
 
   // v0.42 type-unification (T10): unify-types PROTECTED handler. Pack-upgrade

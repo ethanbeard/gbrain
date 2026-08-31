@@ -52,6 +52,22 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
     return { runner, calls };
   }
 
+  // Harness detection MUST be pinned, not inherited from the host. The
+  // production default is Bun.which(), which reads the real password-database
+  // HOME and ignores this test's remapped HOME/PATH — so without this seam the
+  // suite silently asserts different things depending on which agent CLIs the
+  // machine happens to have installed. Concretely: `claude` is on a developer
+  // laptop's PATH but absent on a GitHub runner, so the claude lane never ran
+  // in CI, no `claude mcp add` was exec'd, and no user-scope settings file was
+  // written — failing at lines 175 and 220 every night since 2026-08-17 while
+  // passing locally. Both harnesses are declared present here because that is
+  // the scenario these assertions describe.
+  const HARNESS_DETECT = {
+    claude: () => true,
+    codex: () => true,
+    opencode: () => false,
+  } as const;
+
   async function capture<T>(fn: () => Promise<T>): Promise<{ result: T; out: string; err: string }> {
     const origLog = console.log;
     const origErr = console.error;
@@ -150,7 +166,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
     const { runner } = makeClaudeRunner();
     const { result, err } = await withEnv(envFor(), () =>
       capture(() =>
-        runBootstrap(['harness', '--yes', '--port', String(PORT), '--harness', 'codex'], { runner }),
+        runBootstrap(['harness', '--yes', '--port', String(PORT), '--harness', 'codex'], { runner, harnessDetect: HARNESS_DETECT }),
       ),
     );
     expect(result).toBe(1);
@@ -170,7 +186,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
             '--token', token,
             '--gbrain-bin', '/opt/fake/gbrain',
           ],
-          { runner },
+          { runner, harnessDetect: HARNESS_DETECT },
         ),
       ),
     );
@@ -192,11 +208,13 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
     expect((settings.permissions as { allow: string[] }).allow).toContain('mcp__gbrain');
     expect(Object.keys(settings.hooks as object).length).toBe(5);
 
-    // codex lane: managed block with the inline token; preexisting content intact
+    // codex lane: managed block with the inline http_headers credential
+    // (#4574 — never bearer_token); preexisting content intact
     const toml = readFileSync(codexConfig(), 'utf8');
     expect(toml).toContain('# preexisting codex config');
     expect(toml).toContain(CODEX_TOML_BLOCK_BEGIN);
-    expect(toml).toContain(`bearer_token = "${token}"`);
+    expect(toml).toContain(`http_headers = { Authorization = "Bearer ${token}" }`);
+    expect(toml).not.toContain('bearer_token');
 
     // receipt: all confirmed; supplied token → minted:false
     const home = join(parent, '.gbrain');
@@ -214,7 +232,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
   test('--status: live probes, token recovered from the codex block, exit 0', async () => {
     const { runner } = makeClaudeRunner();
     const { result, out } = await withEnv(envFor(), () =>
-      capture(() => runBootstrap(['harness', '--status'], { runner })),
+      capture(() => runBootstrap(['harness', '--status'], { runner, harnessDetect: HARNESS_DETECT })),
     );
     expect(result).toBe(0);
     expect(out).toMatch(/serve: OK/);
@@ -224,7 +242,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
   test('--remove: host wiring cleared, codex config byte-identical to pre-apply, receipt consumed', async () => {
     const { runner } = makeClaudeRunner();
     const { result } = await withEnv(envFor(), () =>
-      capture(() => runBootstrap(['harness', '--remove', '--yes'], { runner })),
+      capture(() => runBootstrap(['harness', '--remove', '--yes'], { runner, harnessDetect: HARNESS_DETECT })),
     );
     expect(result).toBe(0);
     expect(readFileSync(codexConfig(), 'utf8')).toBe('# preexisting codex config\nmodel = "o5"\n');

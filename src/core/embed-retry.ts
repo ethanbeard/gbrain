@@ -14,6 +14,7 @@
 
 import { embedBatch } from './embedding.ts';
 import { serr } from './console-prefix.ts';
+import { noteEmbedApiResponse } from './embed-stall.ts';
 import { titleTierCorpusGeneration } from './contextual-retrieval-service.ts';
 import type { BrainEngine } from './engine.ts';
 import type { Page } from './types.ts';
@@ -213,8 +214,15 @@ export async function embedBatchWithBackoff(
       // D4a + D8: maxRetries:0 disables the SDK's stacked retries (so this
       // wrapper is the single source of truth) and abortSignal threads
       // through to the gateway so an in-flight HTTP request cancels mid-fetch.
-      return await embedBatch(texts, { maxRetries: 0, ...(signal && { abortSignal: signal }) });
+      const out = await embedBatch(texts, { maxRetries: 0, ...(signal && { abortSignal: signal }) });
+      // #4599: every SETTLED embed attempt ticks the stall watchdog's
+      // liveness clock (T6 — API-response grain, successes here, errors in
+      // the catch). Liveness is diagnostic; the stall TRIGGER stays keyed on
+      // successful chunk progress in the caller.
+      noteEmbedApiResponse();
+      return out;
     } catch (e: unknown) {
+      noteEmbedApiResponse();
       // If the budget fired we may have been aborted mid-fetch; bubble out.
       // This check is what keeps caller-initiated aborts out of BOTH retry
       // branches below (#3374) — an abort is never reclassified as transient.
@@ -275,7 +283,8 @@ export function transientBackoffMs(attempt: number, rng: () => number = Math.ran
 
 /**
  * #3374 — transient NETWORK failures: socket timeouts, connection resets,
- * DNS blips. Structured detection first (error `code` / TimeoutError name
+ * DNS blips (including Bun's `DNS_ETIMEOUT` code and `ETIMEOUT` getaddrinfo
+ * message). Structured detection first (error `code` / TimeoutError name
  * through the cause chain, matching statusFromCause's walk), message-match
  * fallback for wrappers that strip the code. Deliberately does NOT match
  * caller-initiated aborts: the retry loop re-checks `signal.aborted` BEFORE
@@ -284,7 +293,7 @@ export function transientBackoffMs(attempt: number, rng: () => number = Math.ran
  * @internal exported for unit tests.
  */
 export function isTransientNetworkEmbedError(e: unknown): boolean {
-  const TRANSIENT_CODES = /^(ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|EPIPE|ECONNABORTED|EAI_AGAIN|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)$/;
+  const TRANSIENT_CODES = /^(DNS_ETIMEOUT|ETIMEOUT|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|EPIPE|ECONNABORTED|EAI_AGAIN|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET)$/;
   let cur: unknown = e;
   for (let depth = 0; depth < 5 && cur !== undefined && cur !== null; depth++) {
     const obj = cur as { code?: unknown; name?: unknown; cause?: unknown };
@@ -293,5 +302,5 @@ export function isTransientNetworkEmbedError(e: unknown): boolean {
     cur = obj.cause;
   }
   const msg = e instanceof Error ? e.message : String(e);
-  return /\b(ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|EPIPE|EAI_AGAIN)\b|socket hang up|fetch failed|connect(ion)? timeout|connection (reset|closed)|network (error|timeout)|request timed out|timed out/i.test(msg);
+  return /\b(DNS_ETIMEOUT|ETIMEOUT|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|EPIPE|EAI_AGAIN)\b|socket hang up|fetch failed|connect(ion)? timeout|connection (reset|closed)|network (error|timeout)|request timed out|timed out/i.test(msg);
 }

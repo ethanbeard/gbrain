@@ -61,6 +61,7 @@ import {
   writeCommittedClaudeHooks,
   removeClaudeHooks,
 } from '../core/bootstrap/hooks.ts';
+import { removeCodexHooks, writeCodexHooks } from '../core/bootstrap/codex-hooks.ts';
 import {
   guardReceiptOverwrite,
   readHarnessReceiptState,
@@ -75,10 +76,12 @@ import {
   codexBlockOwnsName,
   codexPluginProvidesName,
   ensureHarnessHome,
+  harnessDetectDeps,
   parseHarnessArgs,
   removeHarness,
   statusHarness,
   type HarnessDeps,
+  type HarnessDetectOverrides,
 } from '../core/bootstrap/harness.ts';
 import { claudeUserSettingsPath, codexConfigPath, opencodeConfigDir, opencodeGlobalConfigPath, opencodeProjectConfigPath } from '../core/bootstrap/host-specs.ts';
 import {
@@ -99,6 +102,7 @@ import {
   type StatusReport,
 } from '../core/bootstrap/status.ts';
 import { verifyWorkspace, resolveVerifySourceId, deriveWorkspaceSourceId } from '../core/bootstrap/verify.ts';
+import { auditWritebackContract, repairWritebackContract } from '../core/bootstrap/contract.ts';
 
 export const BOOTSTRAP_HELP = `gbrain bootstrap — paste-in agent install (Claude Code / Codex / opencode)
 
@@ -116,6 +120,8 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
   render [--force] [--only F] [--minimal]
                                   Render identity files from the confirmed answers.
                                   Never clobbers; --force backs up first.
+  contract [--repair]             Audit the same-turn GBrain write-back contract.
+                                  --repair appends it additively and backs up AGENTS.md.
   hooks [--harness claude-code|codex|opencode] [--repair] [--no-hooks] [--gbrain-bin <path>]
                                   Register MCP (+ per-turn hooks on Claude Code,
                                   ON by default; --no-hooks opts out, GBRAIN_HOOKS=0
@@ -172,6 +178,9 @@ const SUBCOMMAND_HELP: Record<string, string> = {
   render:
     'gbrain bootstrap render [--force] [--only F] [--minimal]\n' +
     '  Render identity files from the confirmed interview answers. Never clobbers; --force backs up first.',
+  contract:
+    'gbrain bootstrap contract [--repair]\n' +
+    '  Audit AGENTS.md for the same-turn GBrain write-back contract. --repair appends a marker-owned block and backs up the original.',
   repo:
     'gbrain bootstrap repo\n' +
     '  Create the dedicated PRIVATE GitHub repo (or adopt an EMPTY private repo you created\n' +
@@ -685,6 +694,20 @@ async function runStatus(ws: string, rest: string[], home: string): Promise<numb
     );
   }
   return 0;
+}
+
+async function runContract(ws: string, rest: string[]): Promise<number> {
+  const repair = rest.includes('--repair');
+  if (!repair) {
+    const audit = auditWritebackContract(ws);
+    console.log(JSON.stringify(audit, null, 2));
+    return audit.ok ? 0 : 1;
+  }
+  return withLock(ws, async () => {
+    const result = repairWritebackContract(ws);
+    console.log(JSON.stringify(result, null, 2));
+    return result.ok ? 0 : 1;
+  });
 }
 
 /** One copy of the A8 invalidation warning — shared by --set and --skip so
@@ -1498,7 +1521,35 @@ async function runHooks(
         );
       }
     } else if (harness === 'codex') {
-      console.log('gbrain does not wire Codex hooks yet — per-turn context is the AGENTS.md pull protocol (stated plainly; the codex hook lane is a filed follow-up).');
+      if (hooksConsent) {
+        // Codex hooks are user-global (one hooks.json per CODEX_HOME) and
+        // TRUST-GATED: the writer lands both the hooks.json entry and its
+        // config.toml trusted_hash, or codex silently never runs it. The
+        // command carries NO GBRAIN_SOURCE — hooks.json is machine-global, a
+        // baked source would stamp every codex session on this machine with
+        // this repo's source; session-end resolves from the payload instead.
+        const r = writeCodexHooks({ gbrainBin });
+        if (r.ok) {
+          hooksWritten = true;
+          console.log(
+            `codex SessionEnd hook installed in ${r.hooksPath} (+ trust entry in ${r.configPath}) — session capture is live for the WHOLE machine's codex sessions. Turn off any time with GBRAIN_HOOKS=0, or remove with \`gbrain bootstrap uninstall\`.`,
+          );
+          console.log('note: per-turn context on codex stays the AGENTS.md pull protocol — this hook is session-END capture only (v1).');
+          for (const note of r.notes) console.error(note);
+        } else {
+          for (const note of r.notes) console.error(note);
+          if (!mcpSkipped) {
+            appendReceiptRegistration(home, ws, { host: harness, scope: 'user', detail: 'mcp' });
+          }
+          return 1;
+        }
+      } else {
+        console.log(
+          noHooks
+            ? 'codex hooks skipped (--no-hooks) — per-turn context is the AGENTS.md pull protocol; re-enable with `gbrain bootstrap hooks --harness codex`.'
+            : 'codex hooks declined (HOOKS_CONSENT set to no) — per-turn context is the AGENTS.md pull protocol; re-enable with `gbrain bootstrap hooks --harness codex`.',
+        );
+      }
     } else {
       console.log(
         'gbrain does not wire opencode\'s plugin/event system yet — per-turn context is the AGENTS.md ' +
@@ -1625,7 +1676,7 @@ export function workspaceBrainStats(ws: string): { sources: string[]; pages: num
 
 /** `gbrain bootstrap harness` (#4043) — machine-level, no workspace, no
  * agent.json. Locks on the gbrain HOME (there is no workspace to lock). */
-async function runHarness(rest: string[], home: string, runner: ExecRunner): Promise<number> {
+async function runHarness(rest: string[], home: string, runner: ExecRunner, detect?: HarnessDetectOverrides): Promise<number> {
   const flags = parseHarnessArgs(rest);
   if (flags.error) {
     console.error(flags.error);
@@ -1639,6 +1690,7 @@ async function runHarness(rest: string[], home: string, runner: ExecRunner): Pro
     gbrainBin: resolveGbrainBin(),
     isTTY: process.stdout.isTTY === true,
     prompt: promptLine,
+    ...harnessDetectDeps(detect),
   };
   // [X12] --status is READ-ONLY: no home mkdir, no lock — it must work (and
   // stay side-effect-free) even while an apply/remove holds the mutex.
@@ -1752,6 +1804,9 @@ async function runUninstall(ws: string, rest: string[], home: string, runner: Ex
           break;
         }
         case 'codex': {
+          const rh = removeCodexHooks();
+          if (rh.removed) console.log(`removed gbrain's codex SessionEnd hook (${rh.hooksPath}) + its trust entry (${rh.configPath})`);
+          for (const note of rh.notes) console.error(note);
           if (pluginOwned) {
             console.log('MCP server was provided by the gbrain plugin (not registered by bootstrap) — leaving it; `codex plugin remove gbrain@gbrain` removes the plugin.');
             break;
@@ -1866,6 +1921,8 @@ export interface RunBootstrapOpts {
   /** Spawn seam for the opencode `mcp list` probe (tests capture argv, cwd,
    * and env; the default holds a real Bun.spawn handle so timeouts kill). */
   probeSpawn?: OpencodeProbeSpawn;
+  /** Harness-detection seam; see HarnessDetectOverrides in core/bootstrap/harness.ts. */
+  harnessDetect?: HarnessDetectOverrides;
 }
 
 /** Dispatch. Returns the process exit code (cli.ts passes it to setCliExitVerdict). */
@@ -1877,7 +1934,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
   }
   const rest = args.slice(1);
 
-  const KNOWN = new Set(['status', 'interview', 'render', 'repo', 'hooks', 'verify', 'attach', 'uninstall', 'harness', 'cloud-setup-script']);
+  const KNOWN = new Set(['status', 'interview', 'render', 'contract', 'repo', 'hooks', 'verify', 'attach', 'uninstall', 'harness', 'cloud-setup-script']);
   if (!KNOWN.has(sub)) {
     console.error(`unknown subcommand: ${sub}`);
     console.error(BOOTSTRAP_HELP);
@@ -1958,6 +2015,9 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
       case 'render':
         code = await runRender(ws, rest, home);
         break;
+      case 'contract':
+        code = await runContract(ws, rest);
+        break;
       case 'repo':
         code = await runRepo(ws, rest, home, runner);
         break;
@@ -1974,7 +2034,7 @@ export async function runBootstrap(args: string[], opts: RunBootstrapOpts = {}):
         code = await runUninstall(ws, rest, home, runner);
         break;
       case 'harness':
-        code = await runHarness(rest, home, runner);
+        code = await runHarness(rest, home, runner, opts.harnessDetect);
         break;
       default:
         return 2; // unreachable

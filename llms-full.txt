@@ -80,8 +80,19 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 - **Configure:** [`docs/ENGINES.md`](./docs/ENGINES.md),
   [`docs/guides/live-sync.md`](./docs/guides/live-sync.md),
   [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md).
+- **Bring in your chat history:** `gbrain transcripts ingest` imports a
+  downloaded ChatGPT / Claude export (or agent session logs); `gbrain connectors`
+  connects the account and syncs new conversations live, incrementally and on an
+  opt-in schedule (cookie/OAuth credentials stay on your machine, 0600). Full
+  guide: [`docs/guides/chat-connectors.md`](./docs/guides/chat-connectors.md).
 - **Debug:** [`docs/GBRAIN_VERIFY.md`](./docs/GBRAIN_VERIFY.md),
   [`docs/guides/minions-fix.md`](./docs/guides/minions-fix.md), `gbrain doctor --fix`.
+  Database unreachable — or any `GBRAIN_DB_ACCESS <reason>` marker in gbrain
+  output: `gbrain engine status --probe` (which engine, where its URL comes from,
+  classified reachability), then `gbrain db-repair` to diagnose and
+  `gbrain db-repair --yes` to apply safe fixes. All three are engine-free — they
+  work while the database is down. Full loop:
+  [`docs/ENGINES.md`](./docs/ENGINES.md#engine-detection-and-access-repair).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
   [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes` (manual schema-only).
@@ -116,6 +127,17 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   to opt out). Non-metric event rows (`meeting`, `job_change`,
   `location_change`) ride through the same pipeline via `facts.event_type`;
   pass `kind: 'event'` or `'all'` to `find_trajectory` to query them.
+- **Answer "who is waiting on me?":** connect the user's Google account once
+  (`gbrain google setup` — two user interactions; relay the `[SHOW USER]`
+  blocks verbatim), then `gbrain waiting --json` returns the ranked people
+  waiting on the user, what they promised, evidence quotes, and Gmail deep
+  links. Manage loops with `gbrain loops done|drop|mute`. It refuses on
+  stale data and names the exact sync command to run first. Guides:
+  [`docs/guides/google-connect.md`](./docs/guides/google-connect.md) (setup +
+  every error and its fix),
+  [`docs/guides/open-loops.md`](./docs/guides/open-loops.md) (how detection
+  works); the harness protocol lives in
+  [`skills/google-loops/SKILL.md`](./skills/google-loops/SKILL.md).
 - **Everything else:** [`./llms.txt`](./llms.txt) is the full documentation map.
   [`./llms-full.txt`](./llms-full.txt) is the same map with core docs inlined for
   single-fetch ingestion.
@@ -231,10 +253,12 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
   `src/core/pglite-engine.ts`, `src/core/postgres-engine.ts`, and
   `src/core/migrate.ts`, dependencies previously reached through runtime dynamic
   imports use static top-level imports. Besides the snapshot loader's lazy
-  `require()` cluster in `pglite-engine.ts:tryLoadSnapshot` (fs/crypto/
-  migrate/pglite-schema + one gateway shape lookup — lazy so production
-  builds without the test-fixture path don't eager-load; the guard now
-  matches `require()` calls too), the only dynamic-`import()` exceptions
+  `require()` cluster in `pglite-engine.ts:tryLoadSnapshot` (fs/crypto + one
+  gateway shape lookup — lazy so production builds without the test-fixture
+  path don't eager-load; the snapshot hash reads migrate.ts/pglite-schema.ts
+  FILE BYTES, never the loaded modules, so coverage instrumentation can't
+  skew it; the guard now matches `require()` calls too), the only
+  dynamic-`import()` exceptions
   are the four `ai/gateway.ts` lookups in both engines'
   `initSchema()` and `_upsertChunksOnce()` methods; each remains lazy inside a
   local `try/catch` because the gateway has a large provider/config closure and,
@@ -300,9 +324,13 @@ detail on demand.)
 | any file in `src/` (what it does + its invariants) | `docs/architecture/KEY_FILES.md` — find the file's entry |
 | search / ranking / hybrid / retrieval | `docs/architecture/RETRIEVAL.md` + the `search/*` entries in `KEY_FILES.md` |
 | search modes / cost knobs | `docs/guides/search-modes.md` |
+| engine detection / Postgres adoption / DB-access repair / degraded serve (`engine status`, `db-repair`, `init --prefer-postgres`, `GBRAIN_DB_ACCESS`) | `docs/ENGINES.md` ("Engine detection and access repair" + "Local Postgres") |
 | embedding spend gates / cost gate / `spend.posture` / off switches | `docs/operations/spend-controls.md` |
+| the monthly backup-coverage check (`gbrain backup`, render channels, nag budget) | `docs/operations/backup-check.md` + the `backup/*` entries in `KEY_FILES.md` |
 | push-based context (volunteer/watch/reflex window) | `docs/guides/push-context.md` |
 | checkpoint compaction / compiled context files (`gbrain compile-context`) | `docs/guides/checkpoint-compaction.md` + `docs/guides/ambient-recall.md` |
+| Memorable integration / session receipts / relay consent (`integrations.memorable.*`) | `docs/memorable-agents.md` + the hook-heartbeat/capture-spec/codex-hooks entries in `KEY_FILES.md` |
+| chat connectors (live ChatGPT/Claude history sync — `gbrain connectors`) | `docs/guides/chat-connectors.md` + the `src/core/connectors/*` entries in `KEY_FILES.md` |
 | schema packs / page types / extraction | `docs/architecture/schema-packs.md`, `type-taxonomy.md`, `lens-packs.md` |
 | thin-client / remote MCP / cross-modal | `docs/architecture/thin-client.md` |
 | memory verbs / MCP tool surface (`--surface`) / conformance | `docs/protocol/MEMORY_VERBS_v1.md` + the `verbs*`/`surface.ts`/`protocol.ts` entries in `KEY_FILES.md` |
@@ -311,6 +339,8 @@ detail on demand.)
 | bulk-command progress wiring | `docs/progress-events.md` |
 | eval methodology / metrics | `docs/eval/` |
 | brains vs sources / topology | `docs/architecture/brains-and-sources.md`, `topologies.md` |
+| google connector (Gmail/Calendar/Contacts, OAuth) / credential vault | `docs/guides/google-connect.md` + the `creds/*` + `google/*` entries in `KEY_FILES.md` |
+| open loops / `gbrain waiting` / commitment extraction | `docs/guides/open-loops.md` + the `loops*` entries in `KEY_FILES.md` |
 | skill routing | `skills/RESOLVER.md` |
 | agent bootstrap (paste-in install, hooks, `gbrain bootstrap`, sweep, keyless) | `docs/guides/bootstrap.md` + `docs/designs/AGENT_BOOTSTRAP_PLAN.md` + the KEY_FILES bootstrap cluster |
 | shipping a release / CHANGELOG / PR conventions | `docs/RELEASING.md` (ship IRON RULES stay inline below) |
@@ -517,9 +547,10 @@ filed for held-out corpus growth, cross-vendor verification, hierarchical
 area-of-areas, embedding-based pre-router, and the run-1 vs run-2
 prompt-design ablation methodology.
 
-**Operational health (v0.19.1):** smoke-test (8 post-restart health checks with auto-fix
-for Bun, CLI, DB, worker, Zod CJS, gateway, API key, brain repo; user-extensible via
-`~/.gbrain/smoke-tests.d/*.sh`).
+**Operational health (v0.19.1):** smoke-test (8 post-restart health checks; bounded
+auto-fix for Bun, CLI, and Zod CJS; read-only worker topology via native supervisor
+status with duplicate detection; DB, gateway, API key, brain repo; user-extensible
+via `~/.gbrain/smoke-tests.d/*.sh`).
 
 **Conventions:** `skills/conventions/` has cross-cutting rules (quality, brain-first,
 model-routing, test-before-bulk, cross-modal). `skills/_brain-filing-rules.md` and
@@ -893,13 +924,60 @@ before considering the ship complete.
 
 Files that MUST be checked on every ship:
 - README.md — does it reflect new features, commands, or setup steps?
-- CLAUDE.md — does it reflect new files, test files, or architecture changes?
+- `docs/architecture/KEY_FILES.md` — new or changed files in `src/`, and their
+  invariants, are recorded HERE. This is the on-demand layer behind the Reference
+  map, and it is where per-file and per-version detail belongs.
+- CLAUDE.md — only if an always-loaded rule, the Reference map, or the dispatcher
+  changed. **CLAUDE.md is a map, not a log**: it is read in full at the start of every
+  session, so entries are condensed or deleted as they go stale, never appended to.
+  If an update adds a file inventory, a test inventory, or an "as of vX.Y.Z" note,
+  it belongs in the on-demand layer above instead.
 - CHANGELOG.md — does it cover every commit?
 - TODOS.md — are completed items marked done?
 - docs/ — do any guides need updating?
 
 A ship without updated docs is an incomplete ship. Period.
 
+
+## "Say to your agent" rule: every feature doc addresses the END USER (IRON RULE)
+
+GBrain is installed and operated by an AI agent. Most users never type a
+`gbrain` command — they talk to their harness (Claude Code, Codex, OpenClaw,
+Hermes, Cursor). Documentation that only shows CLI blocks serves the operator
+and abandons the end user.
+
+**The rule:** whenever a feature is added or explained in a public-facing doc
+(README, CHANGELOG, docs/guides, tutorials), include the common end-user block:
+
+    **Say to your agent:** *"<natural-language prompt>"* — *"<optional second phrasing>"*
+
+- 1-3 quoted phrases a user can literally type into ANY harness (a 4th is fine
+  when it hands off to an adjacent skill, e.g. a capture block that also points
+  at cold-start's "fill my brain"). Plain English, outcome-framed ("connect my
+  chatgpt account and pull my whole history into the brain"); don't dress a bare
+  command name as a sentence.
+- **When a skill backs the feature, the phrases MUST come from (or contain) the
+  skill's frontmatter `triggers:`** — those are what the harness actually
+  routes on (baseline routing is substring match), so the doc and the router can
+  never drift apart. Verify each phrase against the real trigger before shipping.
+  The skills section of README points at `skills/RESOLVER.md` as the full
+  phrasebook.
+- **When NO skill backs the feature (a CLI-only path), be honest:** the phrase
+  states the outcome and names the command the agent runs for it ("Run a search
+  benchmark against LongMemEval — your agent runs `gbrain eval longmemeval`"),
+  rather than implying a trigger that doesn't exist.
+- Grouping two phrases for the SAME skill with a `/` (e.g. *"Brain health"* /
+  *"check backlinks"*) is allowed; separate distinct destinations with an em-dash.
+- CLI blocks stay — they serve operators and the agents themselves. The say
+  block sits adjacent, not instead.
+- CHANGELOG: every feature entry's "To take advantage of vX" block carries a
+  say line alongside the commands.
+- Same privacy bar as everything else public: generic placeholders in the
+  phrases, never real names.
+
+Litmus test: a non-technical user reads the section and knows the exact
+sentence to type into their agent. If they'd have to translate a flag into
+English themselves, the section fails.
 
 ## Privacy rule: scrub real names from public docs
 
@@ -1136,9 +1214,10 @@ export OPENAI_API_KEY=sk-...          # alternative for vector search; also powe
 export ANTHROPIC_API_KEY=sk-ant-...   # automatic fact extraction + chat models; also improves search via query expansion
 ```
 
-Save to shell profile or `.env`, or store in `~/.gbrain/config.json` (file plane). Do
-NOT use `gbrain config set` for API keys — it writes the DB plane, which the provider
-pipeline never reads. For the autopilot daemon, put keys AND process-level env
+Save to shell profile or `.env`, or store in `~/.gbrain/config.json` (file plane).
+`gbrain config set <vendor>_api_key` also works for the vendor keys above — those
+keys (like `database_url`/`database_path`) are file-plane routed, so the write lands
+where the provider pipeline actually reads. For the autopilot daemon, put keys AND process-level env
 (`NODE_EXTRA_CA_CERTS`, proxy vars, custom base URLs) in `~/.gbrain/env` — a 0600
 file created by `gbrain autopilot --install` and sourced by the daemon wrapper;
 interactive shell rc files never reach daemon shells, and the path honors
@@ -1167,6 +1246,64 @@ mkdir -p ~/brain && cd ~/brain && git init
 Read `~/gbrain/docs/GBRAIN_RECOMMENDED_SCHEMA.md` and set up the MECE directory
 structure (people/, companies/, concepts/, etc.) inside the user's brain repo,
 NOT inside ~/gbrain.
+
+### Engine preference for harness installs (optional — the Postgres-first lane)
+
+`gbrain init` (above) stays the zero-config default: PGLite, embedded, no
+server. If you are installing gbrain FOR an agent harness (Codex, Claude Code,
+or any setup that wants concurrent connections, multi-machine access, or
+1000+ pages), prefer Postgres instead:
+
+```bash
+gbrain init --prefer-postgres [--allow-docker] [--allow-create-db] [--local-postgres] [--json]
+```
+
+This walks a 5-rung ladder — first usable rung wins; every reachable-but-unusable
+rung prints a one-line note and falls through; only the PGLite floor is terminal:
+
+| Rung | Uses | Needs |
+|---|---|---|
+| 1. env URL | an existing Postgres. `GBRAIN_DATABASE_URL` is stated intent and adopted as-is; a bare `DATABASE_URL` (deploy platforms point it at the APP's database) is adopted only when the target is already a gbrain brain or holds no tables at all | `GBRAIN_DATABASE_URL` (or `DATABASE_URL`, subject to the cwd-.env guard + the content check) |
+| 2. Supabase discovery | Management-API project discovery (10s timeouts; the candidate URL is connect-probed before anything persists; discovery only — project CREATION stays dashboard guidance) | `SUPABASE_ACCESS_TOKEN` + `SUPABASE_DB_PASSWORD` (+ `SUPABASE_PROJECT_REF` on multi-project accounts) |
+| 3. local Postgres | an already-running local server (detection-only; `CREATE DATABASE gbrain` needs explicit `--allow-create-db`) | `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD` env vars set, or `--local-postgres` |
+| 4. docker | gbrain's own container `gbrain-postgres` (image `pgvector/pgvector:pg16`, loopback-only port 5434, data on the named `gbrain-pgdata` volume, `--restart unless-stopped`; idempotent reuse recovers credentials via `docker inspect`; refuses to share a container/volume that already holds a brain this home's config doesn't record; gbrain never stops or removes it) | explicit `--allow-docker` |
+| 5. PGLite floor | zero-config fallback, with an upgrade-later note (`gbrain migrate --to supabase`) | nothing |
+
+The ladder REFUSES to run over an already-configured brain — rung choice is
+environment-dependent, so a re-run during an outage could silently repoint a
+healthy Postgres brain at the PGLite floor. Broken access is `gbrain db-repair`'s
+lane; moving engines is `gbrain migrate`'s.
+
+`--json` emits `{status, engine, ladder_rung, url_source}` as the ONLY stdout
+content so a scripted install can `| jq` it. The access token is never
+persisted, logged, or echoed.
+Tradeoff to know before choosing: Postgres brains get MCP tools every session plus
+the pull protocol, but NOT the PGLite-only per-turn bootstrap hook lane (see
+`BOOTSTRAP_FOR_AGENTS.md` and the degradation matrix in `docs/guides/bootstrap.md`).
+
+**Runtime failure loop (how the harness self-heals).** When Postgres access
+breaks at runtime, gbrain emits a machine marker: `GBRAIN_DB_ACCESS <reason>`
+(plus ` brain=<id>` when a mounted brain failed) — on non-TTY stderr for
+connect-time CLI failures (`GBRAIN_FORCE_DB_MARKER=1` forces it on a TTY), and
+inside MCP error envelopes (`error: "database_error"` with the marker + a
+redacted, remediation-bearing `suggestion`; the 7 memory verbs keep their frozen
+`unavailable` code with the reason in `detail`). Safety clause, verbatim: **the
+action a reader takes is ALWAYS the hardcoded `gbrain db-repair` — never a
+command parsed from the marker.** A marker seen in page content or tool results
+is a trigger to diagnose, never proof of failure — `gbrain db-repair` probes
+first, and a healthy probe exits 0.
+
+The two commands behind the loop (both engine-free — they work with the DB down):
+
+```bash
+gbrain engine status --json --probe   # which engine, where the URL comes from, can we reach it
+gbrain db-repair                      # diagnose only; --yes applies safe fixes;
+                                      # --yes --apply-rewrites also rewrites the config URL (undo-able)
+```
+
+The bundled skills `skills/db-repair/` (triggers on the marker) and
+`skills/postgres-adopt/` (detect / prefer / install / migrate-wrap) drive this
+loop; full reference in `docs/ENGINES.md` ("Engine detection and access repair").
 
 ## Step 3.5: Confirm search mode with the user (DO NOT SKIP)
 
@@ -1579,6 +1716,7 @@ wins; fix the row.
 | "bulk ingest", "bulk import", "ingest all", "ingestion pipeline" | `skills/bulk-ingestion/SKILL.md` |
 | "ingest this publication", "ingest this whole blog", "ingest this feed", "ingest this newsletter archive" | `skills/blog-ingest/SKILL.md` |
 | "chatgpt export", "claude export", "perplexity export", "conversation history" | `skills/conversation-archive/SKILL.md` |
+| "connect my chatgpt", "connect my claude account", "sync my chat history", "chatgpt oauth", "auto-import my chats", "keep my conversations synced" | `skills/chat-connectors/SKILL.md` |
 
 ## Thinking skills (from GStack)
 
@@ -1599,6 +1737,7 @@ wins; fix the row.
 | Task add/remove/complete/defer/review | `skills/daily-task-manager/SKILL.md` |
 | Morning prep, meeting context, day planning | `skills/daily-task-prep/SKILL.md` |
 | Daily briefing, "what's happening today" | `skills/briefing/SKILL.md` |
+| "connect gmail" / "connect google", "who is waiting on me", "open loops", "unanswered email" | `skills/google-loops/SKILL.md` |
 | Cron scheduling, quiet hours, job staggering | `skills/cron-scheduler/SKILL.md` |
 | "get more out of gbrain", "is my brain set up right", "weekly brain checkup", "advise me on my brain", "gbrain advisor" | `skills/gbrain-advisor/SKILL.md` |
 | Save or load reports | `skills/reports/SKILL.md` |
@@ -1609,6 +1748,7 @@ wins; fix the row.
 | "Is gbrain healthy?", morning health check, skillpack-check | `skills/skillpack-check/SKILL.md` |
 | "harvest this skill into gbrain", "publish this skill to gbrain", "lift this skill upstream", "share this skill with other gbrain clients", "promote my skill to gbrain" | `skills/skillpack-harvest/SKILL.md` |
 | Post-restart health + auto-fix, "did the container restart break anything", smoke test | `skills/smoke-test/SKILL.md` |
+| `GBRAIN_DB_ACCESS`, "gbrain database error", "gbrain connection refused", "brain database is down", "cannot reach the brain database", "fix gbrain database access", "repair gbrain postgres" | `skills/db-repair/SKILL.md` |
 | Cross-modal review, second opinion | `skills/cross-modal-review/SKILL.md` |
 | "Validate skills", skill health check | `skills/testing/SKILL.md` |
 | Webhook setup, external event processing | `skills/webhook-transforms/SKILL.md` |
@@ -1627,6 +1767,7 @@ wins; fix the row.
 | "Now what?", "fill my brain", "cold start", "bootstrap my data", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
 | "agent workspace bootstrap", "install gbrain into this agent workspace", "gbrain bootstrap", "paste-in install", "set up the maintenance sweep" | Run `gbrain bootstrap` (paste-in workspace install: interview + identity files + hooks + sweep). See `docs/guides/bootstrap.md` |
 | "wire this box's coding agents to the brain", "framework-spawned sessions need brain access", "wire gbrain hooks without a workspace", "hook Claude Code/Codex to the running serve" | Run `gbrain bootstrap harness --yes` (machine-level wiring to a running `serve --http`: scoped token + user-scope MCP + headless pre-approval + hooks; no agent.json). See the "Local harness mode" section of `docs/guides/bootstrap.md` |
+| "which gbrain engine", "pglite or postgres", "gbrain engine status", "upgrade to postgres", "switch gbrain to postgres", "install postgres for gbrain", "move my brain to supabase", "set up postgres for the brain" | `skills/postgres-adopt/SKILL.md` |
 | "Migrate from Obsidian/Notion/Logseq" | `skills/migrate/SKILL.md` |
 | "Switch embedding provider" / "migrate my embeddings" / "switch reranker" / "ZeroEntropy" / "provider_sunset" / "search stopped working after a provider shutdown" | `skills/migrations/v0.46.3.0.md` |
 | Brain health check, maintenance run | `skills/maintain/SKILL.md` |
@@ -1656,7 +1797,7 @@ When multiple skills could match:
 3. If the user mentions a person/company, check if enrich or query fits better
 4. Chaining is explicit in each skill's Phases section
 5. When in doubt, ask the user (see `skills/ask-user/SKILL.md` for the choice-gate pattern)
-6. Publication/feed URL or a whole blog archive → blog-ingest; a single article/tweet URL → idea-ingest; video/audio/PDF → media-ingest; AI-chat exports or session transcripts → conversation-archive
+6. Publication/feed URL or a whole blog archive → blog-ingest; a single article/tweet URL → idea-ingest; video/audio/PDF → media-ingest; AI-chat export FILE or session transcripts → conversation-archive; CONNECT an account for live/automatic sync ("connect my chatgpt", "keep synced") → chat-connectors
 7. Identity/personality content (who the agent is, voice, persona) → soul-audit; token/structure hygiene of the always-loaded context stack → context-audit
 8. "Why is X slow/stale" measurement-first ops triage → measure-before-you-fix; code debugging ("why is this function broken") → investigate (GStack)
 
@@ -1790,7 +1931,7 @@ answers. Ask before anything destructive. You are not done until
 
 Codex will ask for command approvals during the install — approving them is the sandbox working as intended. What you get, in about 15 minutes: a short interview (6 required questions) → your agent's identity (SOUL.md, USER.md, MEMORY.md) rendered from your own answers, never invented → a local PGLite brain (2 seconds, no server, no Docker) → MCP wired so every session can search and write memory → a **private** GitHub repo, created and privacy-verified, as your agent's durable body. Works with **zero API keys** — keyword search plus memory your agent writes itself; one optional key upgrades capabilities (OpenAI: semantic search + automatic fact extraction; Voyage: semantic search; Anthropic: fact extraction). Codex reads brain context through its tools each turn (pull-based). The click moment: tell it one small thing to remember, restart Codex, then ask for it back — the answer comes from the brain, not from this chat's context (which the restart cleared). That cross-session round-trip is the whole product; "what's my name / my top jobs?" is answered from your identity files, which is nice but not the same trick.
 
-Two things worth understanding once it's running: **you own the brain** — every memory is a markdown file in that private repo (read it, clone it to a second machine, delete it and the brain is gone) — and **the first skill to run is `cold-start`**: say "fill my brain" and your agent imports your Gmail, calendar, and contacts (via [ClawVisor](https://clawvisor.com), an OAuth vault so the agent never holds raw tokens) or offline archives like Google Takeout, one consented step at a time. An empty brain is a database; a filled one is a memory.
+Two things worth understanding once it's running: **you own the brain** — every memory is a markdown file in that private repo (read it, clone it to a second machine, delete it and the brain is gone) — and **the first skill to run is `cold-start`**: say "fill my brain" and your agent imports your Gmail, calendar, and contacts — via the native connector (`gbrain google setup`, tokens in gbrain's local credential vault, never held by the agent), via [ClawVisor](https://clawvisor.com) (a hosted OAuth gateway), or from offline archives like Google Takeout — one consented step at a time. An empty brain is a database; a filled one is a memory.
 
 > **Prefer to make the repo yourself?** Create a new **empty** private repo **under your own GitHub account** (no README/.gitignore/license), clone it, open the clone in Codex, and paste the same block — bootstrap detects your empty repo and adopts it instead of creating one. The repo must be empty and personal-account-owned; org-owned repos are refused (create one under your account, or let bootstrap make it).
 
@@ -1907,6 +2048,8 @@ gbrain think "who's working on AI agents at portfolio companies?"
 
 **`gbrain think`** runs the same retrieval, then composes a synthesized answer across the results with explicit citations to the source pages AND an honest note on what the brain doesn't know yet. The gap analysis is the differentiator: the answer tells you when a page is stale, when a claim is uncited, when two pages contradict each other, when there's a hole you should fill.
 
+**Say to your agent:** *"What do we know about acme-example?"* — *"Tell me about alice-example before my meeting tomorrow"* — *"Search for who's working on AI agents."* Your agent routes these to the brain automatically; you never type the commands yourself.
+
 **Why it compounds.** Pair the brain layer with `find_trajectory` and you get answers like *"how have the company's metrics changed AND what does the team look like right now AND what did they promise / share AND when did we last meet AND what's the value-add I can offer here"*: well-scored, well-cited, in one shot. That's the strategic moat. That's why building a 150K-page brain is worth the effort.
 
 `gbrain agent run "..."` exposes the same surface to a sub-agent through the Minions queue, with crash-safe two-phase persistence. Same answers, durable.
@@ -1924,6 +2067,8 @@ SLUG=$(gbrain capture "..." --quiet)
 
 The page lands in the database and on disk in one move. Default slug `inbox/YYYY-MM-DD-<hash8>` so captures cluster in a predictable triage location. On thin-client installs the verb routes through MCP to the server: same command, same UX.
 
+**Say to your agent:** *"Remember this: ..."* — *"Save this thought to my brain"* — *"Capture this."* And to fill an empty brain from your existing life: *"Fill my brain"* (the cold-start skill walks your email, calendar, contacts, and archives one consented step at a time).
+
 For webhook ingestion (Zapier / IFTTT / Apple Shortcuts):
 
 ```bash
@@ -1935,6 +2080,20 @@ curl -X POST https://your-brain/ingest \
 
 For mobile capture, the inbox folder source picks up anything dropped into
 `~/.gbrain/inbox/` from iOS Shortcuts / AirDrop / Drafts / Finder.
+
+Your Gmail, calendar, and contacts sync natively. `gbrain google setup` walks
+bring-your-own OAuth end to end (your own free Google Cloud client — you own
+the app and the tokens, which live only in a local credential vault), registers
+a `--kind google` source, runs a bounded first sync, and ends with the
+open-loop engine's killer output:
+
+```bash
+gbrain google setup    # connect Gmail/Calendar/Contacts → first sync → first digest
+gbrain waiting         # who is waiting on you, what you promised, with receipts
+```
+
+Setup + troubleshooting: [`docs/guides/google-connect.md`](docs/guides/google-connect.md).
+How the open-loop engine decides who's waiting: [`docs/guides/open-loops.md`](docs/guides/open-loops.md).
 
 Your other agents' histories import in one command. `gbrain transcripts ingest`
 parses agent session logs (Claude Code, Codex, OpenClaw, Hermes) and extracted
@@ -1951,6 +2110,30 @@ gbrain transcripts ingest ~/Downloads/conversations.json  # consumer export (unz
 gbrain transcripts ingest --max-bytes 4gb <store>          # oversized store; omit to keep per-format caps
 gbrain transcripts status                    # found vs imported, per harness
 ```
+
+**Say to your agent:** *"Import my conversations from my chatgpt export at ~/Downloads/conversations.json"* — *"Archive my session transcripts"* — and later, *"When did I first discuss agent memory?"* (the archive answers origin questions with dated quotes).
+
+Or connect the account and skip the manual export entirely. `gbrain connectors`
+syncs your ChatGPT and Claude conversation history live, using your own browser
+session cookie — incrementally (a durable per-provider watermark, plus a
+trailing-window gap-heal), through the same redaction + idempotency pipeline, and
+optionally on a schedule. Credentials stay on your machine (`~/.gbrain/connectors/*.json`,
+0600) and are sent only to the provider's own host:
+
+```bash
+gbrain connectors auth chatgpt --cookie -    # paste the Cookie header (stdin keeps it out of argv)
+gbrain connectors sync chatgpt --dry-run     # preview, then --limit 5, then --full
+gbrain config set connectors.chatgpt.auto_sync true   # opt-in daily auto-sync (+ gbrain autopilot --install)
+```
+
+**Say to your agent:** *"Connect my chatgpt account and pull my whole history into the brain"* — *"Connect my claude account"* — *"Keep my conversations synced automatically."* Your agent walks you through the cookie capture, runs the dry-run → sample → full sequence, and sets up the schedule if you opt in.
+
+Full contract, automation lanes, and the Cloudflare caveat: [docs/guides/chat-connectors.md](docs/guides/chat-connectors.md).
+
+(Not to be confused with the **inbound** "Connectors" above — those add gbrain
+as an MCP connector *inside* ChatGPT/Claude/Perplexity so those assistants can
+search your brain. `gbrain connectors` goes the other way: it pulls your
+conversation history *from* those accounts *into* the brain.)
 
 Third-party skillpacks can ship custom ingestion sources (Granola, Linear,
 voice, OCR) against the versioned `IngestionSource` contract at
@@ -1975,6 +2158,8 @@ gbrain schema suggest               # LLM-refined proposals on top of detect
 gbrain schema review-candidates     # human gate: promote / rename / ignore
 gbrain schema use my-pack           # activate
 ```
+
+**Say to your agent:** *"My schema isn't matching my notes — propose new types from my corpus"* — *"Add a page type for lab results to my brain's schema."* The schema-author skill runs the detect → suggest → review flow for you.
 
 The active pack threads through every read + write path: `parseMarkdown` infers page type from the pack's path prefixes; `whoknows` scopes expert routing to types declared `expert_routing: true`; `extract_facts` runs only on `extractable: true` types; the search cache folds the pack name + version into its key so cross-pack contamination is structurally impossible. Switch packs and the brain re-interprets itself; switch back and nothing's lost.
 
@@ -2007,13 +2192,15 @@ Want to see a tutorial that isn't here yet? [Open an issue](https://github.com/g
 
 The whole loop is described in [`docs/architecture/topologies.md`](docs/architecture/topologies.md) with diagrams.
 
+**Say to your agent:** *"Set up autopilot"* (installs the cron that runs the loop) — *"Run dream"* — *"Did the dream cycle run?"*
+
 ## Capabilities
 
-**Hybrid search.** Vector (HNSW on pgvector) + BM25 keyword + reciprocal-rank fusion + source-tier boost + intent-aware query rewriting. Three named search modes (`conservative`, `balanced`, `tokenmax`) bundle the cost/quality knobs into a single config key. Live cost/recall comparisons in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md). The install picker default-applies `tokenmax` (it recommends `conservative` for Haiku-class subagent tiers or keyless setups); a brain with `search.mode` unset resolves to `balanced` at query time. The cross-encoder reranker is on in `balanced` and `tokenmax`, off in `conservative` — new installs get Voyage `rerank-2.5`; brains that never set `search.reranker.model` still fall back to the deprecated ZeroEntropy `zerank-2` (hosted API ends 2026-09-04) until the September cutover. Per-query graph signals notice when a top result is a hub for THAT query (adjacency boost), is corroborated across team brains (cross-source boost), or is being crowded out by weak chunks from a chatty session (session demote). Run `gbrain search "<query>" --explain` to see per-stage attribution: base score, every boost that fired, what it multiplied. `gbrain doctor` ships a `graph_signals_coverage` check; `gbrain search stats` shows fire counts and failure breakdowns. Vector retrieval pools the best chunk per page, so a page surfaces on its strongest evidence instead of losing to a neighbor on one weak chunk. Queries that match a page's title phrase or a declared free-text alias (`gbrain reindex --aliases` backfills existing pages) get boosted to the page they name. Every result carries an `evidence` tag (why it matched) and a `create_safety` hint (`exists` / `probable` / `unknown`) so an agent decides whether a page already exists instead of guessing from a raw score. `gbrain search diagnose "<query>" --target <slug>` traces which retrieval layer surfaces (or misses) a page.
+**Hybrid search.** Vector (HNSW on pgvector) + BM25 keyword + reciprocal-rank fusion + source-tier boost + intent-aware query rewriting. Three named search modes (`conservative`, `balanced`, `tokenmax`) bundle the cost/quality knobs into a single config key. Live cost/recall comparisons in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md). The install picker default-applies `tokenmax` (it recommends `conservative` for Haiku-class subagent tiers or keyless setups); a brain with `search.mode` unset resolves to `balanced` at query time. The cross-encoder reranker is on in `balanced` and `tokenmax`, off in `conservative` — new installs get Voyage `rerank-2.5`; brains that never set `search.reranker.model` still fall back to the deprecated ZeroEntropy `zerank-2` (hosted API ends 2026-09-04) until the September cutover. Per-query graph signals notice when a top result is a hub for THAT query (adjacency boost), is corroborated across team brains (cross-source boost), or is being crowded out by weak chunks from a chatty session (session demote). Run `gbrain search "<query>" --explain` to see per-stage attribution: base score, every boost that fired, what it multiplied. `gbrain doctor` ships a `graph_signals_coverage` check; `gbrain search stats` shows fire counts and failure breakdowns. Vector retrieval pools the best chunk per page, so a page surfaces on its strongest evidence instead of losing to a neighbor on one weak chunk. Queries that match a page's title phrase or a declared free-text alias (`gbrain reindex --aliases` backfills existing pages) get boosted to the page they name. Every result carries an `evidence` tag (why it matched) and a `create_safety` hint (`exists` / `probable` / `unknown`) so an agent decides whether a page already exists instead of guessing from a raw score. `gbrain search diagnose "<query>" --target <slug>` traces which retrieval layer surfaces (or misses) a page. **Say to your agent:** *"Tune my retrieval"* — *"What search mode am I running?"* — *"Why did this page rank first?"* (your agent runs `gbrain search --explain`).
 
-**Self-wiring knowledge graph.** Every `put_page` extracts entity refs from markdown/wikilinks/typed-link syntax and writes edges with zero LLM calls. Typed edges (`attended`, `works_at`, `invested_in`, `founded`, `advises`, `mentions`, …). Multi-hop traversal via `gbrain graph-query`. The graph is what produces the +31.4 P@5 lift over vector-only RAG. **Obsidian-style vaults:** bare `[[note-name]]` wikilinks that point across folders — you wrote `[[struktura]]` but the page lives at `projects/struktura.md` — resolve by basename once you opt in with `gbrain config set link_resolution.global_basename true`. Off by default; `gbrain doctor` tells you how many edges you'd gain before you flip it. See [migrating an Obsidian vault](INSTALL_FOR_AGENTS.md#step-45-wire-the-knowledge-graph).
+**Self-wiring knowledge graph.** Every `put_page` extracts entity refs from markdown/wikilinks/typed-link syntax and writes edges with zero LLM calls. Typed edges (`attended`, `works_at`, `invested_in`, `founded`, `advises`, `mentions`, …). Multi-hop traversal via `gbrain graph-query`. The graph is what produces the +31.4 P@5 lift over vector-only RAG. **Say to your agent:** *"Who works at acme-example?"* — *"What's the relationship between fund-a and widget-co?"* — *"What connections does alice-example have?"* **Obsidian-style vaults:** bare `[[note-name]]` wikilinks that point across folders — you wrote `[[struktura]]` but the page lives at `projects/struktura.md` — resolve by basename once you opt in with `gbrain config set link_resolution.global_basename true`. Off by default; `gbrain doctor` tells you how many edges you'd gain before you flip it. See [migrating an Obsidian vault](INSTALL_FOR_AGENTS.md#step-45-wire-the-knowledge-graph).
 
-**Job queue (Minions).** BullMQ-shaped, Postgres-native job queue. Durable subagents (LLM tool loops that survive crashes via two-phase pending→done persistence), shell jobs with audit, child jobs with cascading timeouts, rate leases for outbound providers, attachments via S3/Supabase storage. Opt-in per-job process isolation (`gbrain jobs work --job-isolation process`) runs each claimed job in its own SIGKILL-able child process, so a stuck handler dies for real and a crash takes one job instead of the whole worker; when the worker's DB health probe fails, it names the failing layer (`pool_starved` vs `server_unreachable`) instead of a blanket "DB unreachable". Sizing and rollout guidance in [`docs/guides/minions-deployment.md`](docs/guides/minions-deployment.md); probe-verdict triage in [`docs/guides/queue-operations-runbook.md`](docs/guides/queue-operations-runbook.md). Replaces "spawn subagent as fire-and-forget Promise" with something that recovers from anything.
+**Job queue (Minions).** BullMQ-shaped, Postgres-native job queue. Durable subagents (LLM tool loops that survive crashes via two-phase pending→done persistence), shell jobs with audit, child jobs with cascading timeouts, rate leases for outbound providers, attachments via S3/Supabase storage. Opt-in per-job process isolation (`gbrain jobs work --job-isolation process`) runs each claimed job in its own SIGKILL-able child process, so a stuck handler dies for real and a crash takes one job instead of the whole worker; when the worker's DB health probe fails, it names the failing layer (`pool_starved` vs `server_unreachable`) instead of a blanket "DB unreachable". Sizing and rollout guidance in [`docs/guides/minions-deployment.md`](docs/guides/minions-deployment.md); probe-verdict triage in [`docs/guides/queue-operations-runbook.md`](docs/guides/queue-operations-runbook.md). Replaces "spawn subagent as fire-and-forget Promise" with something that recovers from anything. **Say to your agent:** *"Run this as a background task and tell me when it's done"* — *"Submit a gbrain job for the backfill"* — *"What's running in the background?"*
 
 **Non-English brains (FTS language config).** The Postgres full-text search tokenizer is configurable via `GBRAIN_FTS_LANGUAGE`. Defaults to `english`. Set it to any text-search configuration that exists in your Postgres instance:
 
@@ -2031,26 +2218,84 @@ gbrain reindex-search-vector --dry-run    # preview row counts
 gbrain reindex-search-vector --yes        # recreate triggers + backfill
 ```
 
-The command is idempotent (re-running with the same language is a no-op for vector content) and uses the same recreate-and-backfill primitives as the migration. For accent-insensitive Portuguese (`pt_br`), see [docs/guides/multi-language-fts.md](docs/guides/multi-language-fts.md) for the `unaccent` + portuguese stemmer recipe.
+The command is idempotent (re-running with the same language is a no-op for vector content) and uses the same recreate-and-backfill primitives as the migration. For accent-insensitive Portuguese (`pt_br`), see [docs/guides/multi-language-fts.md](docs/guides/multi-language-fts.md) for the `unaccent` + portuguese stemmer recipe. **Say to your agent:** *"Set my brain's search language to Portuguese and reindex."*
 
 **50+ curated skills** (the current list lives in [`skills/manifest.json`](skills/manifest.json)). Routing lives in [`skills/RESOLVER.md`](skills/RESOLVER.md). Covers signal capture, ingest (idea / media / meeting), enrichment, querying, brain ops, citation fixing, daily task management, cron scheduling, reports, voice, soul audit, skill creation, eval framework, and migrations. Skills are markdown files (tool-agnostic), packaged as a single skillpack the installer drops into your agent workspace.
 
-**Eval framework.** `gbrain eval longmemeval` runs the public [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval) benchmark against your hybrid retrieval. `gbrain eval export` + `gbrain eval replay` capture real queries and replay them against code changes (set `GBRAIN_CONTRIBUTOR_MODE=1`). `gbrain eval cross-modal` cross-checks an output against the task using three different-provider frontier models. `gbrain eval retrieval-quality` runs NamedThingBench, which hard-gates the named-thing retrieval families (title-substring, alias-synonym, generic-to-named, multi-chunk-dilution) so a regression in "find the page this query names" fails CI loudly. `gbrain eval brainbench` runs the cross-harness memory conformance suite: know-to-ask, push precision/recall, write-back fidelity, and cross-session continuity, scored per harness seam (your OpenClaw's production pipeline plus Claude Code and Codex injection contracts) against a committed 141-fixture synthetic corpus — hermetic by default (in-memory PGLite, no keys, seconds), and CI gates every PR against master's committed baseline. Methodology in [`docs/eval/BRAINBENCH.md`](docs/eval/BRAINBENCH.md); search-mode methodology in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md).
+**Say to your agent — the phrasebook.** You never invoke a skill by name; you say what you want and your agent routes it. Every skill declares its trigger phrases in its frontmatter, and [`skills/RESOLVER.md`](skills/RESOLVER.md) is the full human-readable phrasebook — one table of "when you say this, this skill fires." A taste: *"Ingest this PDF"* (media-ingest) — *"What's happening today?"* (briefing) — *"Fill my brain"* (cold-start) — *"Brain health"* / *"check backlinks"* (maintain — either phrase routes there) — *"Is my brain set up right?"* (gbrain-advisor) — *"Did the restart break anything?"* (smoke-test) — *"Run this as a background task"* (minion-orchestrator). If you're ever unsure what to say, ask your agent: *"What can my brain do?"* and have it read the resolver back to you.
 
-**Brain consistency.** `gbrain eval suspected-contradictions` samples retrieval pairs, layered date pre-filter, query-conditioned LLM judge, persistent cache. Surfaces conflicts between takes + facts the agent has written. Wired into the daily dream cycle.
+**Eval framework.** `gbrain eval longmemeval` runs the public [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval) benchmark against your hybrid retrieval. `gbrain eval export` + `gbrain eval replay` capture real queries and replay them against code changes (set `GBRAIN_CONTRIBUTOR_MODE=1`). `gbrain eval cross-modal` cross-checks an output against the task using three different-provider frontier models. `gbrain eval retrieval-quality` runs NamedThingBench, which hard-gates the named-thing retrieval families (title-substring, alias-synonym, generic-to-named, multi-chunk-dilution) so a regression in "find the page this query names" fails CI loudly. `gbrain eval brainbench` runs the cross-harness memory conformance suite: know-to-ask, push precision/recall, write-back fidelity, and cross-session continuity, scored per harness seam (your OpenClaw's production pipeline plus Claude Code and Codex injection contracts) against a committed 141-fixture synthetic corpus — hermetic by default (in-memory PGLite, no keys, seconds), and CI gates every PR against master's committed baseline. Methodology in [`docs/eval/BRAINBENCH.md`](docs/eval/BRAINBENCH.md); search-mode methodology in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md). **Say to your agent:** *"Run a regression check on retrieval"* — *"Run a search benchmark against LongMemEval"* — your agent runs `gbrain eval brainbench` / `gbrain eval longmemeval` for the full suites.
 
-**Agent-authored schema (v0.40.7.0).** Your brain has a shape — what page types exist (`person`, `meeting`, `paper`, `case`, `lab-result`), what they link to (`attended`, `authored`, `prescribed-by`), what facts get extracted automatically. The default ships with 22 universal types, but your brain's actual shape is not the default shape. Agents can now evolve that shape on your behalf via 14 `gbrain schema` CLI verbs + a batched MCP op (`schema_apply_mutations`, admin scope, NOT localOnly so remote agents reach it over HTTPS). Atomic file locks, audit log with the agent's identity, chunked UPDATE backfill in 1000-row batches that never wedge concurrent writers. The brain stops being a pile of notes and becomes something with structure. **Why it matters:** [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator). **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md). **Agent skill:** [`skills/schema-author/SKILL.md`](skills/schema-author/SKILL.md).
+**Brain consistency.** `gbrain eval suspected-contradictions` samples retrieval pairs, layered date pre-filter, query-conditioned LLM judge, persistent cache. Surfaces conflicts between takes + facts the agent has written. Wired into the daily dream cycle. **Say to your agent:** *"Did the dream cycle run — what contradictions did it surface?"* — *"Fact-check what we have on acme-example"* (claim-by-claim live-source verification) — or have your agent run `gbrain eval suspected-contradictions` directly.
+
+**Agent-authored schema (v0.40.7.0).** Your brain has a shape — what page types exist (`person`, `meeting`, `paper`, `case`, `lab-result`), what they link to (`attended`, `authored`, `prescribed-by`), what facts get extracted automatically. The default ships with 22 universal types, but your brain's actual shape is not the default shape. Agents can now evolve that shape on your behalf via 14 `gbrain schema` CLI verbs + a batched MCP op (`schema_apply_mutations`, admin scope, NOT localOnly so remote agents reach it over HTTPS). Atomic file locks, audit log with the agent's identity, chunked UPDATE backfill in 1000-row batches that never wedge concurrent writers. The brain stops being a pile of notes and becomes something with structure. **Say to your agent:** *"Add a page type to my schema for case files"* — *"My brain has untyped pages — propose new types from my corpus."* **Why it matters:** [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator). **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md). **Agent skill:** [`skills/schema-author/SKILL.md`](skills/schema-author/SKILL.md).
 
 ## Integrations
 
-Data flowing into the brain. Each integration is a recipe — markdown + setup hints — that ships in `recipes/` and is discoverable via `gbrain integrations list`.
+Data flowing into the brain. Each integration is a recipe — markdown + setup hints — that ships in `recipes/` and is discoverable via `gbrain integrations list`. **Say to your agent:** *"Set up voice calls into my brain"* — *"Wire my email and calendar into the brain"* — your agent reads the recipe and walks the setup with you.
 
 - **Voice**: Phone calls create brain pages via Twilio + OpenAI Realtime (or DIY STT+LLM+TTS). Setup recipe: [`recipes/twilio-voice-brain.md`](recipes/twilio-voice-brain.md).
-- **Email + calendar**: webhook handlers that route to brain signals. [`docs/integrations/meeting-webhooks.md`](docs/integrations/meeting-webhooks.md).
+- **Gmail + Calendar + Contacts (native)**: the google source kind syncs threads, events, and contacts through your own OAuth client and runs the open-loop engine on top (`gbrain waiting`). Setup: [`docs/guides/google-connect.md`](docs/guides/google-connect.md); recipes: [`recipes/email-to-brain.md`](recipes/email-to-brain.md), [`recipes/calendar-to-brain.md`](recipes/calendar-to-brain.md).
+- **Email + calendar (webhooks)**: webhook handlers that route to brain signals. [`docs/integrations/meeting-webhooks.md`](docs/integrations/meeting-webhooks.md).
 - **Embedding providers**: a dozen providers covered — Voyage (default: `voyage-4` @ 1024d), OpenAI, OpenRouter, Google Gemini, Azure OpenAI, MiniMax, Alibaba DashScope, Zhipu, Ollama (local), llama.cpp llama-server (local), LiteLLM proxy, plus ZeroEntropy (deprecated — hosted API ends 2026-09-04). Pricing matrix + decision tree in [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md).
 - **Rerankers**: Voyage `rerank-2.5` hosted (the new-install default; reranking is on in `balanced` and `tokenmax` modes, same `VOYAGE_API_KEY` as embeddings), ZeroEntropy `zerank-2` (deprecated — hosted API ends 2026-09-04; still the fallback for brains that never set `search.reranker.model`), plus the `llama-server-reranker` recipe for fully-local cross-encoder rerank via llama.cpp — runs Qwen3-Reranker or self-hosted zerank weights against the same `gateway.rerank()` seam. Setup walkthrough in [`docs/ai-providers/llama-server-reranker.md`](docs/ai-providers/llama-server-reranker.md).
-- **Credential gateway**: vault-aware secret distribution. [`docs/integrations/credential-gateway.md`](docs/integrations/credential-gateway.md).
+- **Credential vault + gateway**: `gbrain creds` manages OAuth and API credentials in a local vault ([`recipes/credential-gateway.md`](recipes/credential-gateway.md)); agent-side vault-aware secret distribution: [`docs/integrations/credential-gateway.md`](docs/integrations/credential-gateway.md).
 - **MCP clients**: every major MCP client is supported. [`docs/mcp/`](docs/mcp/) per-client setup.
+- **Memorable (procedural memory)**: optional, off by default. Your brain remembers *what* happened; Memorable makes your agent remember *how* — finished sessions become replayable procedures stored on your machine (in a standalone local store, or inside your brain database if you opt in), recalled when a similar task comes back. See the section below, and [`docs/memorable-agents.md`](docs/memorable-agents.md) for the agent-facing detail.
+
+### Memorable — remember how, not just what (optional)
+
+The third time your agent fixes the same class of bug, it shouldn't re-diagnose it from scratch. Without procedural memory, every session starts cold: re-explore the codebase, re-find the file, re-discover which command actually verifies the fix. [Memorable](https://www.memorable.sh) closes that loop. Once enabled, a finished session's real tool calls — what ran, with what arguments, and (where the harness records it) whether each step succeeded — become an ordered, replayable *procedure*: steps, trigger signature, preconditions, postconditions. It is stored **on your machine**, in a standalone local store by default or inside your existing brain database if you opt in (the fine print explains the trade-off). Next time a similar task shows up:
+
+```sh
+memorable recall "the order-validation tests are failing again"
+# → 0.981  procedures/ab12cd34-fix-failing-order-tests  [lexical]
+memorable show procedures/ab12cd34-fix-failing-order-tests
+# → last time this landed in src/orders/validate.js and
+#   ./test.sh verified it — the steps, in order, with real outcomes
+```
+
+Your agent skips the diagnosis it already did once and goes straight to the fix. That's the whole product: **capture is automatic** (nothing to remember at the end of a session), and **recall is one command** at the start of the next.
+
+**Say to your agent:** *"Set up Memorable so you remember how tasks were done"* — your agent installs and initializes the CLI (`npm i -g memorable-cli`, `memorable init`, `memorable enable`); you then run the one consent step below yourself. Day to day: *"Before you start, check Memorable for how we did this last time"* — your agent runs `memorable recall "<the task in your words>"` — and *"What has Memorable stored so far?"* — your agent runs `memorable list`.
+
+**Turn it on (three steps, the last one is yours):**
+
+```sh
+npm i -g memorable-cli                    # 1. the CLI, published on npm (closed source)
+memorable init && memorable enable         # 2. standalone local store + let Memorable record sessions
+                                           #    (`memorable init gbrain` stores procedures in your brain DB
+                                           #     instead — trade-off in the fine print's first bullet)
+gbrain config set integrations.memorable.enabled true   # 3. YOU run this: gbrain shows exactly what
+                                                         #    leaves the machine and asks you to approve it
+```
+
+Step 3 is mandatory and interactive by design — the relay stays off until you accept gbrain's disclosure prompt. There is no account to create and no embedding model to configure (your gbrain provider is reused if present; otherwise Memorable's server computes the embedding for you). From then on, capture runs itself: Claude Code and Codex sessions are recorded at session end. OpenClaw capture runs per compaction but does not yet yield stored procedures (it records tool names only, which the service rejects as not replayable — details in the fine print).
+
+#### The fine print (read before enabling)
+
+**Provenance, stated plainly:** the `memorable` CLI is a closed-source npm package published by a third party (Memorable, not gbrain), with no public source repository and no build attestation gbrain can verify. Enabling the relay means a third-party binary runs at your session boundaries and sends redacted session data to Memorable's extraction API. gbrain itself never sends anything off-machine for this integration.
+
+**What gbrain verifies vs. what is Memorable's claim** — the split matters:
+
+- *gbrain-verified (enforced by gbrain's own code):*
+  - The relay is OFF by default and stays off until you accept gbrain's disclosure prompt (`gbrain config set integrations.memorable.enabled true`). The consent stamp it writes lives in a gbrain-private file the CLI has never written, so the CLI flipping the config flag out-of-band can never activate the relay before you have consented once; gbrain-side disable/unset revokes the stamp and forces a fresh disclosure.
+  - Tool-call arguments are secret-scanned with the high-entropy rules before they reach the receipt.
+  - The relay process gbrain launches at session end is additionally skipped without positive evidence of Memorable-side consent.
+  - `GBRAIN_MEMORABLE=0` (any common negative spelling, trimmed — no env value can enable) kills everything.
+  - `gbrain doctor`'s `memorable_relay_health` names every broken or half-consented state.
+- *Memorable's claims (from its docs and observable client behavior — gbrain cannot verify the server side):* the extraction API is stateless, raw traces are not kept long-term, only derived "nodes" are stored, and there is no shared graph across users. Note the anonymous `mk_` API key means there is also no account through which to exercise deletion of anything the server did retain.
+
+How it fits gbrain's model:
+
+- **Where procedures live — know the trust shape.** Standalone mode (`memorable init`, the default in the block above) stores procedures in a local store under `~/.memorable` and keeps the CLI out of your brain database entirely — the safer choice for sensitive brains. In gbrain-backend mode (`memorable init gbrain`), procedures become ordinary pages in a dedicated non-federated `memorable` source in the brain you already run; Memorable's *service* never connects to your database, but the closed-source *CLI* then has full local access to the whole brain database (that is how it stores procedures).
+- **Recall is mostly local — with one exception.** Lookup is exact + lexical first, then semantic through your own embedding provider. If you have **no** local provider configured and the lexical match misses, the CLI sends the query text (your task description, up to 8 KB) to Memorable's `/v1/embed` — recall is not always free of egress.
+- **Per-harness capture.** Claude Code and Codex sessions are captured at session end (Codex via a trust-gated `hooks.json` entry that `gbrain bootstrap` manages); OpenClaw sessions are captured **per compaction** — short sessions that never compact are not captured, and the tail after the last compaction never is. OpenClaw capture currently records tool *names* only (arguments unobserved in its session format so far), and Memorable's API refuses name-only traces as not replayable — expect OpenClaw relays to be rejected until argument capture lands. Any other harness can hand a trace over directly: `memorable ingest trace.json`.
+- **The store prunes itself, and you can prune it too.** Re-recording refreshes identical revisions and keeps different approaches side by side; `memorable list` / `memorable prune` manage the store, in every consent mode. Local gbrain-side artifacts (`~/.gbrain/integrations/hooks/session-receipts.jsonl` + `memorable-relay.jsonl`) are size-capped, and a one-line purge removes them (see the docs).
+- **On/off is explicit — and the CLI writes gbrain's config.** `memorable enable | disable | setup` flips `integrations.memorable.enabled` in `~/.gbrain/config.json` itself (out-of-band). That flag alone never activates the relay: gbrain's disclosure consent is separate, revoked by `gbrain config set integrations.memorable.enabled false` or `gbrain config unset …`, and re-required whenever the capture surface grows (a new harness lane invalidates old consent by design).
+
+The receipt shape, per-command egress table, troubleshooting, and the full consent model are documented in [`docs/memorable-agents.md`](docs/memorable-agents.md).
+
 
 ## Architecture
 
@@ -2063,6 +2308,8 @@ Data flowing into the brain. Each integration is a recipe — markdown + setup h
 **Why the graph matters.** Vector search returns chunks that are semantically close. The graph returns chunks that are factually connected. Hybrid search pulls from both; auto-linking on every write keeps the graph fresh. Deep dive: [`docs/architecture/RETRIEVAL.md`](docs/architecture/RETRIEVAL.md).
 
 ## Troubleshooting
+
+**Say to your agent first:** *"Run a brain health check and fix what you find"* — this routes to the maintain skill, which runs `gbrain doctor` and either auto-fixes or prints the exact repair command; your agent can run the whole loop (*"Get my brain health score to 90"* uses the remediation planner with a cost cap). The sections below are for when you want the manual path.
 
 **PGLite crashes at startup with `RuntimeError: Aborted()` (often right after a macOS upgrade)?** Not a macOS incompatibility — the OS-upgrade reboot killed gbrain mid-write and tore the data dir's WAL. gbrain now repairs this automatically on the next command (data preserved, backup kept); if auto-repair is disabled or skipped, run `gbrain pglite-repair --dry-run` to diagnose and `gbrain pglite-repair --yes` to repair in place. Full recovery ladder (repair → rebuild → engine switch) in [`docs/ENGINES.md` — Troubleshooting: startup abort](docs/ENGINES.md#troubleshooting-startup-abort-runtimeerror-aborted) and [`docs/INSTALL.md`](docs/INSTALL.md#pglite-crashes-on-macos-26x-tahoe).
 
@@ -2191,7 +2438,7 @@ the page PK, soft-delete-filtered, source-safe) and completes in seconds.
 - [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — why schemas matter: 7 killer use cases, the structural argument for typed page kinds, the agent-co-curates pattern (v0.40.7.0)
 - [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md) — 5-minute walkthrough: fork the bundled pack, add a custom type, backfill existing pages, prove the wiring via `gbrain whoknows`
 - [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory
-- [`docs/guides/`](docs/guides/) — how-to runbooks (sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion)
+- [`docs/guides/`](docs/guides/) — how-to runbooks (google connect, open loops, sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion)
 - [`docs/integrations/`](docs/integrations/) — connecting external data sources (voice, email, calendar, embedding providers)
 - [`docs/mcp/`](docs/mcp/) — per-client MCP setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
 - [`docs/eval/`](docs/eval/) — eval framework, metric glossary, methodology
@@ -2329,7 +2576,7 @@ RRF fusion, multi-query expansion, and 4-layer dedup are engine-agnostic. They o
 - JSONB for frontmatter with GIN index
 - Connection pooling via Supabase Supavisor (port 6543)
 
-**Hosting:** Supabase Pro ($25/mo, zero-ops, pgvector built in) is the managed path; self-hosted Postgres + pgvector (Docker or Homebrew — recipe in the troubleshooting section below) works the same.
+**Hosting:** Supabase Pro ($25/mo, zero-ops, pgvector built in) is the managed path; self-hosted Postgres + pgvector (Docker or Homebrew — see the "Local Postgres" section below) works the same.
 
 ### Opt-in RLS source-scope binding (`GBRAIN_RLS_SCOPE_BINDING`)
 
@@ -2375,6 +2622,50 @@ per-request scope binding — unwrapped paths (writes, admin/maintenance reads)
 run under the role default and are not backstopped per caller. This is layer 2;
 the app-layer source filters remain layer 1 and stay mandatory. Behavioral pins
 live in `test/postgres-engine-rls-scope.test.ts`.
+
+## Local Postgres
+
+Self-hosted Postgres + pgvector gives you the PostgresEngine without a Supabase
+account. Two paths:
+
+**Homebrew (macOS)** — contributed by @roysaurav:
+
+```bash
+brew install postgresql@17
+brew services start postgresql@17
+createdb gbrain
+cd /tmp && git clone --branch v0.8.0 https://github.com/pgvector/pgvector.git
+cd pgvector && make && make install
+psql gbrain -c "CREATE EXTENSION IF NOT EXISTS vector;"
+gbrain init --url postgresql://localhost:5432/gbrain
+gbrain doctor
+```
+
+`gbrain init --url <conn>` writes the config file and runs the schema setup in
+one step. To point an EXISTING brain config at a different database without
+re-initializing, use `gbrain config set database_url <conn>` — it routes to the
+file plane (`~/.gbrain/config.json`), infers `engine: postgres`, and works even
+when the current database is unreachable. Hand-editing config.json is no longer
+needed.
+
+**Ladder-driven (harness installs)** — `gbrain init --prefer-postgres` probes
+for a usable Postgres before falling back to PGLite: an env URL, Supabase
+Management-API discovery (`SUPABASE_ACCESS_TOKEN` + `SUPABASE_DB_PASSWORD`), a
+local server (only when `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD` are set or
+`--local-postgres` is passed; `CREATE DATABASE gbrain` needs explicit
+`--allow-create-db`), or — with explicit `--allow-docker` — gbrain's own
+container `gbrain-postgres` (image `pgvector/pgvector:pg16`, loopback-only
+host port 5434, data on the named `gbrain-pgdata` volume,
+`--restart unless-stopped`). The ladder REFUSES over an already-configured
+brain (re-runs during an outage must never let the PGLite floor overwrite a
+healthy Postgres config — that lane is `gbrain db-repair`), and a bare
+`DATABASE_URL` is adopted only when the target is already a gbrain brain or
+holds no tables at all (`GBRAIN_DATABASE_URL` is always stated intent).
+gbrain starts and reuses that container but never stops or removes it; an
+existing container is reused with its REAL credentials recovered via
+`docker inspect`, never a freshly generated password — and never reused when
+its database already holds a brain this home's config doesn't record.
+Details in INSTALL_FOR_AGENTS.md ("Engine preference for harness installs").
 
 ## PGLiteEngine
 
@@ -2464,24 +2755,136 @@ version bump changes it.
    Required for *catalog* corruption (58P01 / pgvector load failure) — WAL
    repair cannot fix that class.
 4. **Switch engines.** `gbrain init --supabase`, or native Postgres +
-   pgvector (recipe below, contributed by @roysaurav):
-
-   ```bash
-   brew install postgresql@17
-   brew services start postgresql@17
-   createdb gbrain
-   cd /tmp && git clone --branch v0.8.0 https://github.com/pgvector/pgvector.git
-   cd pgvector && make && make install
-   psql gbrain -c "CREATE EXTENSION IF NOT EXISTS vector;"
-   # ~/.gbrain/config.json: { "engine": "postgres",
-   #   "database_url": "postgresql://localhost:5432/gbrain" }
-   gbrain apply-migrations --yes && gbrain doctor
-   ```
+   pgvector — see the "Local Postgres" section above for the full recipe
+   (Homebrew or the `gbrain init --prefer-postgres` ladder).
 
 `gbrain doctor` runs a `pglite_data_dir` check whenever a PGLite brain fails
 to connect: it diagnoses the dir from disk, names the repair command, reports
 retained repair backups, and escalates when repairs keep recurring (that
 means the unclean-shutdown genesis is still active — see the ladder's rung 4).
+
+## Engine detection and access repair
+
+Two engine-free commands answer "which engine is this brain on?" and "why can't
+I reach it, and what fixes it?" — both work with the database down, which is the
+point. They anchor the runtime availability loop: classified failure →
+`GBRAIN_DB_ACCESS <reason>` marker → the bundled `skills/db-repair/` skill →
+`gbrain db-repair`.
+
+### `gbrain engine status [--json] [--probe] [--brain <id>]`
+
+Reports (JSON `schema_version: 1`): the effective engine vs the config-file
+engine (they can differ under a transient env URL), `db_url_source`, an
+env-shadow note when a cwd-.env `DATABASE_URL` is being excluded by the #427
+guard (with the precedence note when both `GBRAIN_DATABASE_URL` and
+`DATABASE_URL` are set), redacted URLs only, and — on Postgres — a
+zero-round-trip pooler block (Supabase pooler detection, prepared-statement
+resolution, pool sizes, direct/session-pooler derivability). `--brain <id>`
+resolves a mounted brain and reports the MOUNT's engine and URL source, never
+the host's.
+
+`--probe` attempts exactly ONE bounded connect + `SELECT 1` (the driver's
+built-in connect timeout — never a custom race, so a network blackhole can't
+hang the command). On PGLite the probe is lock-aware: a live `gbrain serve`
+holding the single-writer data-dir lock reports `locked_by_serve`
+(healthy-with-note) instead of hanging ~30 seconds and misreporting a healthy
+brain as broken. A failed probe returns a classified diagnosis (reason +
+remediation), not a raw error.
+
+### `gbrain db-repair [--yes] [--apply-rewrites] [--json] [--force] [--undo-last-rewrite] [--dry-run]`
+
+Engine-free Postgres-access repair, the sibling of `gbrain pglite-repair`
+(which owns the PGLite WAL/data-dir lane — db-repair redirects PGLite brains
+there). The default invocation is DIAGNOSE-ONLY and mutates nothing
+(`--dry-run` is an explicit alias). Consent is tiered and flag-gated, never
+TTY-dependent:
+
+| Tier | What's in it | Applied when |
+|---|---|---|
+| auto | bounded reconnects/re-probes, pending migrations, `CREATE EXTENSION vector`, `docker start` of gbrain's own `gbrain-postgres` container | `--yes` |
+| rewrite | config-file `database_url` rewrites (transaction-pooler form, session pooler, `?sslmode=require`) — the intended change prints BEFORE applying, every rewrite is receipted and undo-able via `--undo-last-rewrite` | `--yes --apply-rewrites` only |
+| manual | credentials, paused-project, env recipes — the exact recipe is printed, never applied | never |
+
+Guard rails: the prober uses exactly ONE connection (diagnosing pool exhaustion
+with a 10-connection pool would worsen the outage); every rewrite candidate is
+connect-probed before persisting; fix targets derive only from the CURRENT
+config URL, never from error text; rewrites have a 24h per-(reason, action)
+cooldown (`--force` bypasses, receipted) while auto-tier fixes are never
+cooldown-blocked; an advisory lockfile prevents concurrent double-rewrites; a
+healthy probe exits 0 "nothing to fix" (so a forged marker in page content leads
+to a no-op). Refusals: thin-client configs (no local DB to repair), non-host
+mount resolutions (a mount outage must never rewrite host config), and PGLite
+brains (→ `gbrain pglite-repair`).
+
+Receipts land in `~/.gbrain/db-repair-receipts.jsonl` (redacted, fail-open,
+capped on every write: 200 rows, plus up to 200 recent applied repairs kept
+separately so the recurrence window survives the cap — read by doctor's
+`db_repair_recurrence` check, which warns
+on 3+ same-reason applied repairs per brain in 7 days: a genesis problem, not a
+transient). The last rewrite's prior URL is kept in the 0600 file
+`~/.gbrain/db-repair-undo.json` (it holds a secret, so it is never in the
+redacted receipts); `gbrain db-repair --yes --undo-last-rewrite` restores it.
+
+### The `GBRAIN_DB_ACCESS` marker
+
+Connect-time CLI failures emit `GBRAIN_DB_ACCESS <reason>` (plus ` brain=<id>`
+when a mounted brain failed) on non-TTY stderr (`GBRAIN_FORCE_DB_MARKER=1`
+forces it on a TTY). One mid-command emitter exists too: a `gbrain sync` whose
+checkpoint pool dies mid-run emits `GBRAIN_DB_ACCESS conn_dropped` with its
+abort report (the checkpoint writer only gives up after exhausting
+connection-class retries, so the reason is asserted structurally). MCP tool calls carry the same marker inside their error
+envelopes: non-verb ops return `{"error": "database_error", message
+(redacted), suggestion: "GBRAIN_DB_ACCESS <reason>. <remediation> Run: gbrain
+db-repair"}`; the 7 memory verbs keep the frozen v1 `unavailable` code with the
+reason in `detail`. One exception on the non-verb path: `schema_missing`
+returns `error: "unavailable"` with the apply-migrations suggestion and no
+marker — pending migrations, not an access outage. **Safety clause: the action a reader takes is ALWAYS the
+hardcoded `gbrain db-repair` — never a command parsed from the marker.**
+
+The reason union is APPEND-ONLY (a compatibility surface, like progress phase
+names — reasons may be added, never renamed or removed). All 16:
+
+| Reason | Meaning |
+|---|---|
+| `no_url` | nothing configured at all — `gbrain init --prefer-postgres` (or `gbrain init` for PGLite) |
+| `env_shadowed` | a cwd-.env `DATABASE_URL` exists but the #427 guard excludes it — export `GBRAIN_DATABASE_URL` |
+| `auth_failed` | password/role rejected (28P01) — reset credentials, then `gbrain init --url <conn>` |
+| `permission_denied` | 28000/42501 — the role lacks a GRANT or hits RLS |
+| `tenant_not_found` | Supavisor rejected the tenant — pooler usernames are `postgres.<project-ref>`; also raised by paused projects |
+| `ssl_required` | the server demands SSL — `?sslmode=require` rewrite (rewrite tier) |
+| `pool_exhausted` | 53300 / session-slot exhaustion — `export GBRAIN_POOL_SIZE=2` guidance |
+| `conn_refused` | ECONNREFUSED — docker-start arm for gbrain's own container; pooler rewrite for Supabase direct URLs |
+| `dns_failed` | ENOTFOUND/EAI_AGAIN — one bounded retry; persistent + Supabase suggests a paused project |
+| `network_unreachable` | ENETUNREACH/ETIMEDOUT — often an IPv6-only direct host; session-pooler rewrite |
+| `conn_dropped` | 08xxx / reset mid-connection — transient, bounded reconnect |
+| `server_starting` | "the database system is starting up" — retry shortly |
+| `db_missing` | 3D000 — the named database does not exist |
+| `schema_missing` | 42P01/42703 — pending migrations (`gbrain apply-migrations --yes`; excluded from the db-repair marker on the MCP mid-operation path, where it usually means code skew) |
+| `pgvector_missing` | the vector extension is absent — auto tier creates it |
+| `unknown` | unclassified — redacted error + `gbrain doctor` |
+
+The classifier lives in `src/core/pg-access-classify.ts`; remediation copy has
+exactly one home (that module) — db-repair, doctor, and MCP dispatch all render
+its `remediation`, and skills reference the command rather than duplicating
+recipe text.
+
+### Degraded-mode serve
+
+When Postgres is unreachable at `gbrain serve` STARTUP, serve no longer dies:
+it boots on a lazy-reconnect engine, each tool call attempts a single reconnect
+(minimum ~5s between real attempts — no connect storms), and until one succeeds
+tool calls return the classified envelopes above. The call that triggers the
+successful reconnect gets a retry-once error rather than a result
+(`GBRAIN_RECOVERED_RETRY` — "retry this call"; its source scope was resolved
+before recovery); every call after it gets full service, and MCP
+`tools/list_changed` tells clients that handshook during degraded mode to
+refresh their catalog. Structured
+`[gbrain-serve] DEGRADED:` / `[gbrain-serve] RECOVERED:` lines land on stderr
+for harness-log forensics. Kill switch: `GBRAIN_SERVE_DEGRADED=0` (or `false`)
+restores die-on-startup. Scope: Postgres startup failures only — PGLite startup failures
+keep die-on-startup (that lane's repair is `gbrain pglite-repair`), and
+mid-session outages ride the engine's own reconnect plus the per-call
+classified envelopes.
 
 ## JSONB writes: never double-encode (the #2339 trap)
 
@@ -3112,6 +3515,16 @@ Sync only indexes "syncable" markdown files. These are excluded by design:
   (`node_modules/`, `dist/`, `build/`, `venv/`)
 - Meta files: `README.md`, `index.md`, `schema.md`, `log.md`, `RESOLVER.md`
 
+A dot-directory you deliberately keep content in (say `.decisions/`) can be
+waived back in with `--include-hidden '<glob>'` on `gbrain sync` — the glob
+names exactly which hidden paths to admit
+(`gbrain sync --include-hidden '.decisions/**'`); everything else hidden
+stays pruned, and vendored/generated exclusions are never waived. Two
+bounds: the flag scopes a single sync invocation (it cannot combine with
+`--all` — register the subdirectory as the source's `local_path` instead),
+and it does not reach a non-git directory's filesystem-walk import fallback
+(every git-tracked source, the normal case, is covered).
+
 Everything else is ordinary synced content — including `ops/` (the bundled
 daily-task-manager skill files its canonical page under `ops/tasks`).
 
@@ -3352,9 +3765,11 @@ The synthesize phase is a two-stage cascade: a cheap scored triage
 (utility-tier model, one call per new transcript) gates the expensive
 per-transcript synthesis subagents. The dials:
 
-- `dream.triage.threshold` (default 0.5) — the gate. Scores are cached, so
-  retuning it re-gates instantly with **zero** new LLM calls. Raise it if too
-  much routine content synthesizes; lower it if real signal is being skipped.
+- `dream.triage.threshold` (default 0.5) — the score bar, and the first of the
+  two ways a transcript passes the gate (the verified-segment rescue below is
+  the second). Scores are cached, so retuning it re-gates instantly with
+  **zero** new LLM calls. Raise it if too much routine content synthesizes;
+  lower it if real signal is being skipped.
 - `models.dream.triage` — the triage model (default: utility tier / Haiku).
 - `dream.triage.max_chars` (default 24000, floor 1000) — per-transcript
   sample window (head/middle/tail) sent to the judge. Not part of cache
@@ -3363,6 +3778,20 @@ per-transcript synthesis subagents. The dials:
 - `dream.triage.max_tokens` (default 2048, floor 256) — judge output budget.
 - `dream.triage.concurrency` (default 4, clamped 1–16) — concurrent judge
   calls.
+- **Verified-segment rescue** (buried-signal recovery, $0): a transcript whose
+  score lands in `[dream.triage.rescue_floor, threshold)` still passes when at
+  least `dream.triage.rescue_min_segments` (default 2; **0 disables**) of the
+  judge's own quoted segments verify as substrings of the transcript AND its
+  content type is in `dream.triage.rescue_content_types` (default
+  `mixed,reflection,idea,strategy,people` — never routine/technical). Zero
+  extra LLM calls; works on cached verdicts; `dream retriage` reads the same
+  gate, so a reconcile sweep never cancels rescued jobs. Telemetry:
+  `details.triage.rescue_checked` / `rescue_fired`.
+- `dream.synthesize.quote_verify` (default on) — the mechanical post-write
+  quote verify/repair pass on newly-created dream pages (paraphrased "quotes"
+  are repaired to verbatim transcript slices or unquoted; never invented).
+  The off switch is the incident escape hatch; telemetry lands in
+  `details.synthesis.quote_verify`.
 - `dream.synthesize.max_turns` (default 16) — synthesis turn budget for
   agentic children and oneshot fallbacks (the default oneshot path — see
   the next section — is a single completion and never spends turns). The
@@ -3383,12 +3812,15 @@ per-transcript synthesis subagents. The dials:
   for busy deployments.
 
 Maintenance recipe — after changing the threshold, upgrading through a
-`TRIAGE_VERSION` bump, or to drain a queued synthesis backlog:
+`TRIAGE_VERSION` bump (the eval fix wave ships v2: peak-not-average scoring —
+the first post-upgrade cycle re-judges the corpus within the `max_ms` budget
+and defers the rest to following cycles), or to drain a queued synthesis
+backlog:
 
 ```bash
 gbrain dream retriage --dry-run          # what would change (zero LLM calls)
-gbrain dream retriage --reconcile-queue  # re-score + cancel below-threshold queued jobs
-gbrain dream retriage --audit-rejects 20 # synthesis-model second opinion on 20 rejects
+gbrain dream retriage --reconcile-queue  # re-score + cancel queued jobs that fail the gate
+gbrain dream retriage --audit-rejects 20 # synthesis-model second opinion on 20 gate rejects
 ```
 
 ### Synthesis speed: oneshot mode + the drain pool
@@ -3428,6 +3860,25 @@ nightly retries exactly the failed transcripts; a run whose EVERY child
 died fails the phase loudly. Synthesis children also fail (dead-letter)
 when every attempted page write failed — `completed` can no longer mean
 "zero pages written".
+
+Three more fields answer "what did that cost and did it land":
+
+- `spend` — what the phase actually spent, `cost_basis: 'in+out+cache_read'`.
+  Children are summed from `minion_jobs` token counts priced at the configured
+  synthesis model; triage comes from the pass's own usage. `total_usd` is
+  `null` unless BOTH price, so an unpriced model reads as unknown rather than
+  as a fake `0`. `details.triage` carries the judge's own `tokens_in` /
+  `tokens_out` / `cost_usd` on the same terms.
+- `children_zero_pages` — children that completed but wrote no page. A number
+  that climbs here means the model is producing valid-but-empty output, which
+  a green phase status alone would hide.
+- `quote_verify` — what the post-write quote pass touched: spans checked,
+  repaired, and stripped, pages skipped as pre-existing, unbalanced paragraphs,
+  and the warn-only ungrounded numeric/date claim count.
+
+Per-call spend also lands in the `chat_usage_log` ledger with a phase tag:
+the orchestrator's own calls under `phase:synthesize`, each drained child
+under its own `job:<name>`, so the two never double-count.
 
 ### What It Does
 
@@ -4557,6 +5008,12 @@ await oauthProvider.registerClientManual(
 For self-service client registration (Dynamic Client Registration, RFC 7591),
 start the server with `--enable-dcr`. DCR is off by default.
 
+Native MCP clients register cleanly: `redirect_uris` may use an app custom
+scheme (RFC 8252, e.g. `myapp://callback`) or `http://` loopback alongside
+`https://`; scopes the server doesn't know are filtered rather than fatal;
+and malformed registration metadata is rejected with HTTP 400
+`invalid_client_metadata` (never a 500), so a client can correct and retry.
+
 DCR requests may include an optional `token_ttl_seconds` field (integer,
 seconds) to request a per-client access-token lifetime. The server clamps the
 request into an admin-configured window — never rejects over it — persists the
@@ -4964,9 +5421,12 @@ near-duplicates may insert; dedup and supersession ride embedding similarity).
 
 One known person/company/project card. NEVER errors on a miss.
 
-Resolution (frozen precedence): alias > exact title > slug/slug-suffix; ties
-break on most-recently-touched. Multi-hit ⇒ best match's card + runners-up in
-`suggestions`. Miss ⇒ `found: false` + keyword near-misses with
+Resolution (frozen precedence): alias > exact slug > exact title > slug-suffix.
+When multiple pages share an exact title, canonical entity types (`person`,
+`company`, `organization`, `entity`) outrank note/conversation containers;
+most-recently-touched breaks ties within the same match shape. A non-entity
+exact-title page remains a valid fallback. Multi-hit ⇒ best match's card +
+runners-up in `suggestions`. Miss ⇒ `found: false` + keyword near-misses with
 `create_safety` hints.
 
 Response: `{ protocol_version, found, latency_ms, card?, suggestions? }`.
@@ -4978,6 +5438,28 @@ backlink_count, active_fact_count }`.
   facts stripped); remote callers never see private facts in the card.
 - `open_threads` (best-effort in v1): active commitment-kind facts + timeline
   entries from the last 90 days, capped at 3.
+
+#### entity open_threads loop backing (v0.47, additive)
+
+On brains running the open-loop engine, `open_threads` entries may
+additionally be DERIVED from `open_loops` rows (they rank ahead of raw
+commitment facts under the same cap; a loop-projected fact is never
+duplicated as a second entry). This is the sanctioned implementation-defined
+derivation of the frozen surface: such entries keep `kind: 'commitment'`
+(the frozen enum is unchanged) even for unanswered-thread and
+pending-decision loops — the ADDITIVE-FOREVER optional fields disambiguate:
+
+- `direction` — `owed_by_me` / `owed_to_me` (commitments), `my_turn`
+  (unanswered inbound: the owner owes a reply), `their_turn` (unanswered
+  outbound: the owner is waiting on them).
+- `due` — ISO due date when known, else null.
+- `counterparty` — the person slug the loop groups under.
+- `status` — loop status (always `open` on cards).
+- `loop_id` — the open_loops row id (`loops_close` takes it).
+
+All five are absent on threads not backed by a loop row and on pre-v0.47
+servers; a server that omits them still certifies. Same propagation to the
+per-entity cards and top-level `open_threads` of `context_pack`.
 - `edges`: top ~10 typed edges, mentions excluded, out-edges first.
 - The p99 < 100ms promise is op-layer latency (transport excluded), CI-gated
   on a 20K-page corpus. 200K validation recipe below.
@@ -5007,15 +5489,15 @@ pre-v0.45.x servers; a server that omits them still certifies):
   `extractive_fallback` (the LLM compose step failed but retrieval succeeded —
   `answer` is an extractive digest quoting ONLY retrieved pages, `sources`
   cite the digested pages). The remaining enum values (`empty_answer`,
-  `not_json`, `no_llm`, `model_unusable`, `llm_error`) name compose-failure
-  states a non-verb `think` surface may report; the verb converts them to the
-  fallback or a typed error and never emits them itself.
+  `not_json`, `output_truncated`, `no_llm`, `model_unusable`, `llm_error`)
+  name compose-failure states a non-verb `think` surface may report; the verb
+  converts them to the fallback or a typed error and never emits them itself.
 - `pages_gathered` / `takes_gathered` — retrieval counts behind the answer.
 - `warnings` — machine-stable pipeline warning codes (e.g.
-  `LLM_OUTPUT_NOT_JSON`, `SYNTHESIS_EMPTY_ANSWER`, `LLM_CALL_FAILED: <class>`
-  where `<class>` is one of the closed set `timeout` | `rate_limited` |
-  `network` | `provider_error` — raw provider detail never rides the wire,
-  `MODEL_NOT_USABLE:<reason>`).
+  `LLM_OUTPUT_NOT_JSON`, `LLM_OUTPUT_TRUNCATED`, `SYNTHESIS_EMPTY_ANSWER`,
+  `LLM_CALL_FAILED: <class>` where `<class>` is one of the closed set
+  `timeout` | `rate_limited` | `network` | `provider_error` — raw provider
+  detail never rides the wire, `MODEL_NOT_USABLE:<reason>`).
 
 Precedence (frozen): compose failure + NON-EMPTY gather ⇒
 `extractive_fallback` — the digest is composed exclusively from gathered
@@ -5026,7 +5508,9 @@ call time (429 / timeout / 5xx / network) are caught into `llm_error` and
 follow the same precedence. No LLM configured stays the `unavailable`
 configure-and-retry error regardless of gather — an extractive digest would
 mask the misconfiguration forever. Refusals parse as `not_json` (coarse on
-purpose, no dedicated status).
+purpose, no dedicated status); a `max_tokens`-cut envelope parses as
+`output_truncated` (warning `LLM_OUTPUT_TRUNCATED`) so a too-small output
+budget is distinguishable from malformed model output.
 
 ### forget(id, reason?) — write
 
@@ -5221,6 +5705,44 @@ gbrain doctor --json
 
 **If it fails:** The doctor output includes specific fix instructions for each
 check. See `skills/setup/SKILL.md` Error Recovery table.
+
+### 1a. Migration Plan and DB Probe
+
+**Command:**
+
+```bash
+gbrain apply-migrations --list      # per-version status: applied / partial / wedged / pending / future
+gbrain apply-migrations --dry-run   # what a real run would apply or resume
+```
+
+Both surfaces are read-only — they never run orchestrators or schema
+migrations, even when combined with `--yes`. Each prints a `Database:` probe
+line above the plan, so an unreachable database is distinguishable from a
+clean one (the two used to render the identical all-pending plan):
+
+- `Database: connected, schema vN (latest M)` — the pre-flight probe
+  connected. N behind M means schema migrations are pending; a plain run with
+  `--yes` applies them.
+- `Database: UNREACHABLE (<reason>)` — the pre-flight connect failed. The
+  reason is scrubbed through both credential redactors (URL userinfo +
+  connection-info), so it is safe to paste into issues and CI logs.
+- `Database: not probed (<reason>)` — no probe was attempted. Normal on
+  PGLite (`pglite manages schema in-process`): the orchestrators handle the
+  schema lifecycle internally there, and the probe would briefly hold the
+  single-writer lock.
+
+**Expected:** `Database: connected, schema vN (latest N)` on Postgres, or
+`Database: not probed (pglite manages schema in-process)` on PGLite, followed
+by `All migrations up to date.`
+
+**If it fails:** an unreachable database does not stop a default run —
+orchestrator migrations still run their filesystem-only phases. Scripts and
+CI that need a hard signal add `--require-db`: with it, `--list` and
+`--dry-run` exit 1 when the probe failed, and a real run prints the probe
+line and aborts with exit 1 before any orchestrator runs. The observational
+sibling is `gbrain doctor --no-migrate`, which connects probe-only so a
+clean-or-behind schema is reported on as-is instead of being auto-migrated
+before the health checks run.
 
 ---
 

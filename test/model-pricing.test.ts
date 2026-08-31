@@ -64,6 +64,13 @@ describe('CANONICAL_PRICING — table integrity', () => {
     );
   });
 
+  // Retired ids stay priced so historical usage/audit rows still resolve;
+  // the live successors have to be priced for anything new to be estimated.
+  test('the live Gemini ids are priced alongside the retired ones', () => {
+    expect(CANONICAL_PRICING['google:gemini-2.5-flash']).toEqual({ input: 0.3, output: 2.5 });
+    expect(CANONICAL_PRICING['google:gemini-2.5-flash-lite']).toEqual({ input: 0.1, output: 0.4 });
+  });
+
   // #4218 drift guard extension: cache_read/cache_write are DERIVED from the
   // input rate via the exported multipliers — a hand-edited cache number that
   // drifts from input*mult fails here.
@@ -167,6 +174,18 @@ describe('DRIFT GUARD — derived views stay equal to canonical (re-hardcode tri
       expect(p.input_per_1m).toBe(c!.input);
       expect(p.output_per_1m).toBe(c!.output);
     }
+  });
+
+  test('openai recipe expansion cost equals canonical gpt-5.6-luna input price', async () => {
+    // The recipe's expansion touchpoint hardcodes a per-1M cost with a
+    // "gpt-5.6-luna baseline" comment; the canonical table is the single
+    // home for that number. Keyed pin (luna is the declared baseline) so a
+    // price refresh that touches only one of the two homes fails here.
+    const { openai } = await import('../src/core/ai/recipes/openai.ts');
+    const canonical = CANONICAL_PRICING['openai:gpt-5.6-luna'];
+    expect(canonical).toBeDefined();
+    expect(openai.touchpoints?.expansion?.models?.[0]).toBe('gpt-5.6-luna');
+    expect(openai.touchpoints?.expansion?.cost_per_1m_tokens_usd).toBe(canonical.input);
   });
 
   test('cross-modal panel models are all priced from canonical', () => {
