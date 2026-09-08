@@ -115,6 +115,12 @@ it nightly and Phase 4 below (plus most of Phase 2's hygiene checks) is
 covered. The pseudocode that follows is the harness-side variant for agents
 that also do LLM-driven entity sweeps and memory consolidation on top.
 
+Nightly summaries land on the calendar day you actually lived: the cycle
+buckets by explicit `--date` > `cycle.timezone` config > the host's IANA
+timezone > UTC, so a run scheduled after local midnight lands on the day
+you lived, not on the UTC date. When the host clock's zone isn't yours (a cloud box on
+UTC), pin it once: `gbrain config set cycle.timezone America/Los_Angeles`.
+
 ### Synthesis cost control: the triage cascade
 
 The synthesize phase is a two-stage cascade: a cheap scored triage
@@ -157,7 +163,7 @@ per-transcript synthesis subagents. The dials:
   and slow the queue. Completeness comes from triage coverage (every file
   scored, minus files deferred under the `max_ms` budget below) plus
   segment-guided prompts, not model size. If written-page counts
-  drop after upgrading, set it back to 30 and check
+  are low, raise it to 30 and check
   `details.synthesis.avg_turns` for cap pressure.
 - `dream.triage.max_ms` (default 5 min) — per-cycle wall-clock budget for
   judging NEW files; a big cold corpus triages across a few cycles (cached
@@ -168,9 +174,9 @@ per-transcript synthesis subagents. The dials:
   for busy deployments.
 
 Maintenance recipe — after changing the threshold, upgrading through a
-`TRIAGE_VERSION` bump (the eval fix wave ships v2: peak-not-average scoring —
-the first post-upgrade cycle re-judges the corpus within the `max_ms` budget
-and defers the rest to following cycles), or to drain a queued synthesis
+`TRIAGE_VERSION` bump (the current version scores peak-not-average; after a
+bump the first cycle re-judges the corpus within the `max_ms` budget and
+defers the rest to following cycles), or to drain a queued synthesis
 backlog:
 
 ```bash
@@ -181,7 +187,7 @@ gbrain dream retriage --audit-rejects 20 # synthesis-model second opinion on 20 
 
 ### Synthesis speed: oneshot mode + the drain pool
 
-Above the triage cascade sit the execution dials (#4216/#4194):
+Above the triage cascade sit the execution dials:
 
 - `dream.synthesize.mode` (default `oneshot`) — how each synthesis child
   runs. `oneshot` makes ONE tool-less completion against a prompt that
@@ -192,7 +198,9 @@ Above the triage cascade sit the execution dials (#4216/#4194):
   backfilled at phase end by a bounded pass over just the pages the phase
   wrote — never a source-wide sweep). A response that fails any check automatically
   falls back to the classic agentic loop **in the same job** — no lost work,
-  no resubmission. Typical effect: 10+ provider round-trips per transcript
+  no resubmission. The oneshot attempt and its fallback calls are both paid
+  provider work and both are included in synthesis token/spend telemetry.
+  Typical effect: 10+ provider round-trips per transcript
   (up to the 16-turn default cap, more on raised `max_turns`) → 1. Revert
   dial: `gbrain config set dream.synthesize.mode agentic`.
 - `dream.synthesize.link_manifest` (default on) — the zero-embed
@@ -208,13 +216,15 @@ Above the triage cascade sit the execution dials (#4216/#4194):
 Reading the phase report (`details.synthesis`): `mode`, `oneshot_jobs` /
 `fallback_jobs` / `agentic_jobs` + a `fallback_reasons` histogram (a rising
 fallback rate means the model is failing the output contract — check the
-top reason before considering the agentic revert), `queue_wait_ms_p50/p95`
+top reason before considering the agentic revert; `length` includes malformed
+responses whose output usage reached the requested output cap even when the
+provider stop reason was ambiguous), `queue_wait_ms_p50/p95`
 and `child_runtime_ms_p50/p95` (a slow-but-healthy drain is visible instead
 of indistinguishable from a stuck one), and `dead_jobs`/`degraded`. A run
 with any non-completed child does NOT stamp the cooldown, so the next
 nightly retries exactly the failed transcripts; a run whose EVERY child
 died fails the phase loudly. Synthesis children also fail (dead-letter)
-when every attempted page write failed — `completed` can no longer mean
+when every attempted page write failed — `completed` never means
 "zero pages written".
 
 Three more fields answer "what did that cost and did it land":

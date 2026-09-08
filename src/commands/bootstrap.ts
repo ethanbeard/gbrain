@@ -32,7 +32,7 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { VERSION } from '../version.ts';
-import { loadConfig, loadConfigFileOnly, toEngineConfig } from '../core/config.ts';
+import { loadConfig, loadConfigFileOnly, saveConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import { resolveGbrainHome } from '../core/gbrain-home.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
@@ -144,6 +144,9 @@ Subcommands (run \`gbrain bootstrap status\` first — it is the resume entrypoi
                                   pre-approval, lifecycle hooks (user scope, or per --project
                                   dir), codex config block, opencode config entry. No
                                   agent.json needed. Idempotent; --remove tears it down.
+                                  --source ID: the source the hooks + token bind to
+                                  (default: sources.default, else the sole populated
+                                  non-default source, else default).
                                   (--local is an accepted no-op alias.)
   cloud-setup-script              Print the paste-ready cloud environment setup
                                   script (installs the gbrain binary into the
@@ -575,6 +578,33 @@ function consentAnswer(ws: string, key: string): string | undefined {
   return bank.questions[key]?.default;
 }
 
+/**
+ * WP8: map the interview's SURFACE_MULTIUSER consent answer onto the
+ * machine-local `brain.audience` declaration (file mirror — engine-free by
+ * bootstrap's contract; the audience classifier reads it as a declaration
+ * fallback and the harness advisory gates on it). 'shared' → declare
+ * shared; the 'single-principal' default declares nothing (personal is the
+ * classifier's own default posture, and staying silent keeps a later
+ * explicit `gbrain config set brain.audience` the stronger signal).
+ * SET-IF-UNSET only; never throws (bootstrap must not die on a config
+ * write). Exported for tests.
+ */
+export function applyDeclaredAudienceFromInterview(ws: string): void {
+  try {
+    const answer = (consentAnswer(ws, 'SURFACE_MULTIUSER') ?? '').trim().toLowerCase();
+    if (answer !== 'shared') return;
+    const cfg = (loadConfigFileOnly() ?? { engine: 'pglite' }) as GBrainConfig;
+    if (cfg.brain?.audience) return; // explicit declaration wins — never overwrite
+    cfg.brain = { ...(cfg.brain ?? {}), audience: 'shared' };
+    saveConfig(cfg);
+    console.log(
+      'brain.audience=shared declared (from the interview) — ambient-writeback consent nudges will not fire on this brain.',
+    );
+  } catch {
+    /* declaration is advisory — never blocks the wire phase */
+  }
+}
+
 /** Post-render machine receipt [CX2-1/CX2-12]; preserves an existing same-
  * workspace receipt's ownership fields (mirrors attach.ts). */
 function writeRenderReceipt(home: string, ws: string): void {
@@ -762,6 +792,14 @@ async function runInterview(ws: string, rest: string[]): Promise<number> {
     }
     if (r.invalidatedConfirmation) warnInvalidatedConfirmation();
     console.log(`${key} recorded.`);
+    // Apply the audience declaration the moment the answer lands (red-team
+    // review, this wave): the agent runs `gbrain init` (the engine phase)
+    // BETWEEN interview and wire, and init's writeback consent nudge
+    // classifies the fresh brain — a shared declaration applied only at
+    // runHooks time would arrive too late, so a team-brain bootstrap would
+    // get the personal-brain ask and burn the fire-once sentinel. The
+    // runHooks call stays as the idempotent backstop.
+    if (key === 'SURFACE_MULTIUSER') applyDeclaredAudienceFromInterview(ws);
     return 0;
   }
   const skipIdx = rest.indexOf('--skip');
@@ -1042,6 +1080,13 @@ async function runHooks(
     return 1;
   }
   const sourceId = state.manifest.source_id;
+
+  // WP8: the interview's declared audience becomes the machine-local
+  // brain.audience declaration (file mirror; the classifier and the harness
+  // advisory both honor it, and a later `gbrain config set brain.audience`
+  // dual-writes the DB row too). Set-if-unset only — an operator's explicit
+  // declaration is never overwritten by a re-run.
+  applyDeclaredAudienceFromInterview(ws);
 
   const gbrainBin = flagValue(rest, '--gbrain-bin') ?? resolveGbrainBin();
   if (!gbrainBin) {

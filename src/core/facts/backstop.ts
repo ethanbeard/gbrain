@@ -42,6 +42,19 @@ import type { ResolutionSource } from '../entities/resolve.ts';
 import { isFactsBackstopEligible } from './eligibility.ts';
 import type { PageType } from '../types.ts';
 
+/**
+ * Notability-filter vocabulary shared by the durable facts-absorb payload
+ * writer (queue mode below) and its only reader, the minion handler in
+ * commands/jobs.ts. #4870: the reader must accept every value the writer can
+ * send; `coerceNotabilityFilter` is the validated pass-through (unknown or
+ * absent → 'all', the documented default).
+ */
+export const NOTABILITY_FILTERS = ['all', 'high-only', 'medium-and-up'] as const;
+export type FactNotabilityFilter = typeof NOTABILITY_FILTERS[number];
+export function coerceNotabilityFilter(v: unknown): FactNotabilityFilter {
+  return (NOTABILITY_FILTERS as readonly unknown[]).includes(v) ? (v as FactNotabilityFilter) : 'all';
+}
+
 export interface FactsBackstopCtx {
   engine: BrainEngine;
   /** Brain source identifier; default 'default'. */
@@ -56,12 +69,14 @@ export interface FactsBackstopCtx {
    *   - 'file_upload'        — file_upload import path
    *   - 'code_import'        — code import path
    *   - 'hook:compact'       — compaction-boundary checkpoint harvest (cathedral 5)
+   *   - 'hook:writeback'     — ambient-writeback Stop-hook backstop (WP4)
    */
-  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact';
+  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact' | 'hook:writeback';
   /** Execution mode — D8. Default 'queue' (fire-and-forget). */
   mode?: 'queue' | 'inline';
-  /** Notability filter — D4. Default 'all'; sync uses 'high-only'. */
-  notabilityFilter?: 'all' | 'high-only';
+  /** Notability filter — D4. Default 'all'; sync uses 'high-only'; the
+   * ambient-writeback lane uses 'medium-and-up' in salient mode. */
+  notabilityFilter?: FactNotabilityFilter;
   /** Abort signal for shutdown propagation. */
   abortSignal?: AbortSignal;
   /** Mirrors OperationContext.remote for trust-aware logging paths. */
@@ -331,7 +346,6 @@ export async function runFactsBackstop(
             // re-runnable), never a silent consume.
             max_attempts: 5,
             backoff_delay: 60_000,
-            timeout_ms: 180_000,
           },
         );
         return { mode: 'queue', enqueued: true, queueDepth: 0 };
@@ -461,6 +475,9 @@ async function runPipeline(
       turnText: parsedPage.compiled_truth,
       isDreamGenerated: false,  // eligibility check already rejected dream pages
       ref: parsedPage.slug,
+      // #4819: page provenance for DB-only rows. The turn-path entry
+      // (runFactsPipeline) has no page, so it leaves this unset.
+      pageSlug: parsedPage.slug,
     },
     ctx,
     abortSignal,
@@ -495,7 +512,7 @@ async function runPipeline(
  * fallback regardless of local_path.
  */
 async function runPipelineWithBody(
-  input: { turnText: string; isDreamGenerated: boolean; ref?: string },
+  input: { turnText: string; isDreamGenerated: boolean; ref?: string; pageSlug?: string },
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
@@ -518,7 +535,7 @@ async function runPipelineWithBody(
 
 /** The actual pipeline body — always runs inside a BudgetTracker scope (#4210). */
 async function runPipelineBodyInner(
-  input: { turnText: string; isDreamGenerated: boolean; ref?: string },
+  input: { turnText: string; isDreamGenerated: boolean; ref?: string; pageSlug?: string },
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
@@ -541,7 +558,9 @@ async function runPipelineBodyInner(
   // suppression pass 'high-only' (sync does).
   const notabilityAdmission = filter === 'high-only'
     ? { allowed: ['high'] as const, invalid: 'drop' as const }
-    : undefined;
+    : filter === 'medium-and-up'
+      ? { allowed: ['high', 'medium'] as const, invalid: 'drop' as const }
+      : undefined;
   const outcome = await extractFactsFromTurnWithOutcome({
     turnText: input.turnText,
     sessionId: ctx.sessionId,
@@ -707,9 +726,11 @@ async function runPipelineBodyInner(
       source_session: f.source_session ?? null,
       confidence: f.confidence,
       embedding: f.embedding ?? null,
-      // #4206: caller event-time fallback + provenance context.
+      // #4206: caller event-time fallback + provenance context. #4819: a
+      // DB-only row has no fence to name the page it came from, so the page
+      // path's slug fills context when the caller passed no sourceSlug.
       valid_from: f.valid_from ?? ctx.validFrom,
-      context: ctx.sourceSlug ?? null,
+      context: ctx.sourceSlug ?? input.pageSlug ?? null,
     };
     const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: legacy DB-only fallback for unparented / thin-client facts (no entity page to fence onto)
     fact_ids.push(result.id);
@@ -794,7 +815,7 @@ async function runPipelineBodyInner(
           embedding: f.embedding ?? null,
           // #4206: caller event-time fallback + provenance context.
           valid_from: f.valid_from ?? ctx.validFrom,
-          context: ctx.sourceSlug ?? null,
+          context: ctx.sourceSlug ?? input.pageSlug ?? null,
         };
         const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: stub-guard / unresolvable-target fallback for unprefixed or fallback-resolved entity slugs (no fenceable page or usable tree)
         fact_ids.push(legacyResult.id);
@@ -826,7 +847,7 @@ async function runPipelineBodyInner(
           embedding: f.embedding ?? null,
           // #4206: caller event-time fallback + provenance context.
           valid_from: f.valid_from ?? ctx.validFrom,
-          context: ctx.sourceSlug ?? null,
+          context: ctx.sourceSlug ?? input.pageSlug ?? null,
         };
         const legacyResult = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: DB-only fallback when the fence lane declined the write (write_through opt-out race / localPath echo)
         fact_ids.push(legacyResult.id);

@@ -44,6 +44,7 @@ import { loadWorkspaceAllowlist, matchesGlob, scanFiles, type SecretFinding } fr
 import { PUSH_DENY_GLOBS, verifyRemotePrivacy, readPushStatuses, summarizePushStatuses } from '../workspace-push.ts';
 import { FACTS_DEFAULT_VISIBILITY_KEY } from '../facts/visibility.ts';
 import { byteFloors } from './render.ts';
+import { CLAUDE_HOOK_EVENTS, GBRAIN_HOOK_MARKER_KEY, claudeUserSettingsPath } from './host-specs.ts';
 import { BOOTSTRAP_TEMPLATES, loadQuestionBank } from './assets.ts';
 import { readManifest, writeManifest } from './format.ts';
 import { status as interviewStatus } from './interview.ts';
@@ -53,6 +54,7 @@ import { auditWritebackContract } from './contract.ts';
 import {
   ensureIpcSecret,
   resolveSocketPath,
+  socketHasLiveListener,
   startResolveIpcServer,
 } from '../context/resolve-ipc.ts';
 import { assembleTurnContext } from '../context/turn-context.ts';
@@ -368,29 +370,48 @@ function checkMcpJsonHygiene(ws: string): VerifyCheck {
   }
 }
 
-/** [D12 upgrade-path guard]: an event carried by BOTH hook files double-fires
- * every turn (possible when the committed carrier arrives via git pull onto a
- * machine whose local file predates the dedupe-aware writers). Warn-only. */
-function checkHookCarrierOverlap(ws: string): VerifyCheck {
+/** [D12 upgrade-path guard, #4585]: an event carried by MORE THAN ONE hook
+ * carrier double-fires every turn — Claude Code merges hook scopes, so the
+ * carriers compared are ALL the files that can inject a gbrain hook for this
+ * workspace: user-scope settings.json (what `bootstrap harness` writes) plus
+ * workspace-scope .claude/settings.json and .claude/settings.local.json
+ * (what `bootstrap hooks` writes). Same-scope overlap arises when the
+ * committed carrier arrives via git pull onto a machine whose local file
+ * predates the dedupe-aware writers; cross-scope overlap arises when both
+ * installers ran on the same box. Warn-only. Exported for tests
+ * (userSettingsPath injectable). */
+export function checkHookCarrierOverlap(
+  ws: string,
+  userSettingsPath = claudeUserSettingsPath(),
+): VerifyCheck {
   const id = 'hook_carrier_overlap';
   try {
-    const events = (['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] as const).filter((event) => {
-      const has = (rel: string): boolean => {
+    const carriers: Array<{ label: string; path: string }> = [
+      { label: 'user-scope settings.json', path: userSettingsPath },
+      { label: '.claude/settings.json', path: join(ws, '.claude', 'settings.json') },
+      { label: '.claude/settings.local.json', path: join(ws, '.claude', 'settings.local.json') },
+    ];
+    const overlaps: string[] = [];
+    for (const event of CLAUDE_HOOK_EVENTS) {
+      const hits = carriers.filter(({ path }) => {
         try {
-          const parsed = JSON.parse(readFileSync(join(ws, rel), 'utf8')) as { hooks?: Record<string, unknown> };
+          const parsed = JSON.parse(readFileSync(path, 'utf8')) as { hooks?: Record<string, unknown> };
           const groups = parsed?.hooks?.[event];
-          return Array.isArray(groups) && JSON.stringify(groups).includes('"_gbrain"');
+          return Array.isArray(groups) && JSON.stringify(groups).includes(`"${GBRAIN_HOOK_MARKER_KEY}"`);
         } catch {
           return false;
         }
-      };
-      return has(join('.claude', 'settings.json')) && has(join('.claude', 'settings.local.json'));
-    });
-    if (events.length === 0) return { id, ok: true, detail: 'no event fires from both hook carriers' };
+      });
+      if (hits.length >= 2) overlaps.push(`${event} (${hits.map((h) => h.label).join(' + ')})`);
+    }
+    if (overlaps.length === 0) return { id, ok: true, detail: 'no event fires from more than one hook carrier' };
     return {
       id,
       ok: true, // warn-only self-repair channel
-      detail: `WARN: ${events.join(', ')} fire from BOTH .claude/settings.json and settings.local.json (double-fire) — run \`gbrain bootstrap hooks --repair\` to dedupe`,
+      detail:
+        `WARN: double-fire — ${overlaps.join('; ')} carry a gbrain hook in more than one carrier. ` +
+        'Workspace-scope duplication: run `gbrain bootstrap hooks --repair`. ' +
+        'User-scope + workspace overlap: remove one installer\'s wiring (`gbrain bootstrap harness --remove` or `gbrain bootstrap uninstall`), then re-run the one you keep.',
     };
   } catch (e) {
     return { id, ok: true, detail: `carrier overlap probe failed (${(e as Error).message})` };
@@ -885,10 +906,12 @@ async function checkHooksSmoke(engine: BrainEngine, ws: string, sourceId: string
   // in-process IPC server, so it manufactured the exact condition it was
   // testing — a serve posture that never binds IPC (the old `serve --http`)
   // still passed verify while every production hook degraded to no_serve.
-  // A present socket now means "a live serve is the provider; exercise IT";
-  // only when NO socket exists do we self-provide (plumbing-only smoke) and
-  // say so honestly in the result.
-  const liveSocket = existsSync(socketPath);
+  // A LIVE socket now means "a live serve is the provider; exercise IT";
+  // only when nothing listens do we self-provide (plumbing-only smoke) and
+  // say so honestly in the result. Probed, not existsSync'd: a socket file a
+  // dead serve left behind must not read as a live provider (the smoke would
+  // "exercise" a listener that isn't there and fail as no_serve).
+  const liveSocket = await socketHasLiveListener(socketPath);
   try {
     if (!liveSocket) {
       const secret = ensureIpcSecret(dataDir);

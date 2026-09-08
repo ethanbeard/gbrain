@@ -37,9 +37,9 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { createHash } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
+import { contentHash } from '../utils.ts';
 import type { Page } from '../types.ts';
 import {
   resolvePhantomCanonical,
@@ -48,6 +48,7 @@ import {
 import {
   parseFactsFence,
   renderFactsTable,
+  replaceOrInsertFactsFence,
   FACTS_FENCE_BEGIN,
   FACTS_FENCE_END,
   type ParsedFact,
@@ -176,31 +177,6 @@ export function stripFenceAndFrontmatterAndLeadingH1(body: string): string {
 }
 
 /**
- * Compute the canonical content_hash for a page. Matches
- * `src/core/import-file.ts:241`'s shape exactly so `gbrain sync`'s
- * idempotency check sees the redirected canonical as unchanged.
- */
-function computePageContentHash(parsed: {
-  title: string;
-  type: string;
-  compiled_truth: string;
-  timeline: string;
-  frontmatter: Record<string, unknown>;
-  tags: string[];
-}): string {
-  return createHash('sha256')
-    .update(JSON.stringify({
-      title: parsed.title,
-      type: parsed.type,
-      compiled_truth: parsed.compiled_truth,
-      timeline: parsed.timeline,
-      frontmatter: parsed.frontmatter,
-      tags: [...parsed.tags].sort(),
-    }))
-    .digest('hex');
-}
-
-/**
  * Block-on-busy lock acquisition with bounded retry. Returns null when
  * total timeout elapses without a successful acquire.
  */
@@ -264,16 +240,9 @@ function appendPhantomFenceRowsToCanonical(
 
   if (appended === 0) return 0;
 
-  const newFence = renderFactsTable(merged);
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  let newBody: string;
-  if (beginIdx !== -1 && endIdx !== -1) {
-    newBody = body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length);
-  } else {
-    const sep = body.endsWith('\n') ? '\n' : '\n\n';
-    newBody = `${body}${sep}## Facts\n\n${newFence}\n`;
-  }
+  // Shared placement rule (#4756): replace in place, else insert ABOVE the
+  // timeline sentinel — never a blind EOF append below `## Timeline`.
+  const newBody = replaceOrInsertFactsFence(body, renderFactsTable(merged));
 
   // Atomic write: .tmp first, parse-validate, rename.
   const tmpPath = `${canonicalPath}.tmp`;
@@ -449,12 +418,17 @@ export async function tryRedirectPhantom(
 
   // Codex #7: refresh canonical's compiled_truth + content_hash so the
   // next `gbrain sync` sees the canonical as unchanged. We re-parse the
-  // disk body and recompute the hash with the same shape import-file
-  // uses, so the idempotency check round-trips byte-for-byte.
+  // disk body and recompute the hash with the SHARED canonical helper
+  // (`utils.ts:contentHash` — the #3694 single formula: ephemeral
+  // frontmatter keys stripped, tags-key deleted, timeline||''), so the
+  // idempotency check round-trips byte-for-byte. A private copy of the
+  // shape lived here before and drifted (no ephemeral strip), so any
+  // captured canonical got a hash the importer never reproduced and the
+  // next sync re-chunked + re-embedded it.
   const newCanonicalBody = fs.readFileSync(canonicalPath, 'utf-8');
   const reparsed = parseMarkdown(newCanonicalBody, `${canonical}.md`);
   const canonicalTags = await engine.getTags(canonical, { sourceId });
-  const newContentHash = computePageContentHash({
+  const newContentHash = contentHash({
     title: reparsed.title,
     type: reparsed.type,
     compiled_truth: reparsed.compiled_truth,

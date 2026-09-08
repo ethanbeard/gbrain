@@ -270,6 +270,12 @@ export async function runTranscriptsIngest(
           if (opts.dryRun) {
             outcome.statuses = rendered.parts.map(() => 'planned' as const);
             result.pages.planned += rendered.parts.length;
+            // #4762: a planned session is new work too, so the --limit gate
+            // above truncates the preview like the real run. A dry run cannot
+            // see hash-skips (no engine reads), so `--dry-run --limit N` shows
+            // the first N eligible sessions — an upper bound on what the write
+            // path would import.
+            newWorkSessions++;
           } else {
             // The RESOLVED base slug: identity dedup can resolve part 1 to an
             // EXISTING page under a different slug (same session id, changed
@@ -396,12 +402,13 @@ export async function runTranscriptsIngest(
       if (step.done && step.value) {
         const diag = step.value;
         fileOutcome.skippedLines = diag.skippedLines;
-        if (diag.bytesRead > 0 && diag.sessions === 0) {
+        if (diag.bytesRead > 0 && diag.sessions === 0 && !diag.expectedEmpty) {
           fileOutcome.drift = true;
           result.driftFiles++;
           // A drifting file may hold sessions a fixed parser will surface
           // later (torn hermes copy, transient format break) — the shared
-          // watermark must not advance past it.
+          // watermark must not advance past it. expectedEmpty (a grok
+          // tool/reasoning-only session) is understood, not drifted.
           result.cleanScan = false;
         }
         if (diag.skippedLines > 0) {

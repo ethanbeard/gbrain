@@ -48,11 +48,11 @@ import {
   logSubagentSubmission,
   logSubagentHeartbeat,
 } from './subagent-audit.ts';
-import { resolveModel, isAnthropicProvider, isOpenRouterAnthropic, TIER_DEFAULTS } from '../../model-config.ts';
+import { resolveModel, isAnthropicProvider, isOpenRouterSubagentFamily, TIER_DEFAULTS } from '../../model-config.ts';
 import { splitProviderModelId, normalizeModelId } from '../../model-id.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
-import { toolLoop as gatewayToolLoop, isThinkingByDefaultModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
+import { toolLoop as gatewayToolLoop, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
 import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { runSubagentOneshot, ONESHOT_TOOL_USE_ID_PREFIX } from './subagent-oneshot.ts';
@@ -81,9 +81,9 @@ const DEFAULT_RATE_KEY = 'anthropic:messages';
 /**
  * Resolve the per-turn output-token cap (#2778). Per-job data wins, then the
  * `agent.max_output_tokens` config row, then a model-aware default: 32000 for
- * thinking-by-default Claude 5 models (#4087 — they burn most of the budget on
- * internal reasoning; the flat 8192 default produced zero-tool-call truncated
- * runs even after the gateway learned to detect them), 8192 for everything
+ * thinking-by-default models (#4087 Claude 5 by name, #4172 recipe-declared
+ * such as DeepSeek v4: they burn most of the budget on internal reasoning; the
+ * flat 8192 default produced zero-tool-call truncated runs), 8192 for everything
  * else (was a hardcoded 4096 that made pages >~12KB unwritable via put_page).
  * Invalid values (NaN / zero / negative) fall through to the next tier.
  */
@@ -99,7 +99,7 @@ export function resolveMaxOutputTokens(
     const n = Number(configRaw);
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
-  return isThinkingByDefaultModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
+  return isThinkingModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
 /**
@@ -437,10 +437,11 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // #2753: share the doctor's truthiness set. Before this, the doctor accepted
     // yes/on but the worker did not, so `config set ... yes` reported healthy
     // here and still refused the job below.
-    // OpenRouter Anthropic is not `isAnthropicProvider` (the Messages SDK
-    // cannot speak OR). Auto-enable the gateway loop so the legacy pin
-    // does not refuse `openrouter:anthropic/…` when the flag is off.
-    const useGatewayLoop = isConfigTruthy(useGatewayLoopRaw) || isOpenRouterAnthropic(model);
+    // OpenRouter routes are not `isAnthropicProvider` (the Messages SDK
+    // cannot speak OR). Auto-enable the gateway loop for the OR families
+    // that have a live abort/retry pin (anthropic/, deepseek/) so the legacy
+    // pin does not refuse them when the flag is off.
+    const useGatewayLoop = isConfigTruthy(useGatewayLoopRaw) || isOpenRouterSubagentFamily(model);
     if (!useGatewayLoop && !isAnthropicProvider(model)) {
       throw new Error(
         `subagent job: resolved model "${model}" is non-Anthropic but agent.use_gateway_loop is not enabled. ` +

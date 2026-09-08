@@ -16,9 +16,14 @@ import {
   PROVIDER_TIER_DEFAULTS,
   isAnthropicProvider,
   isOpenRouterAnthropic,
+  isOpenRouterSubagentFamily,
   _resetDeprecationWarningsForTest,
 } from '../src/core/model-config.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { withEnv } from './helpers/with-env.ts';
 
 class StubEngine {
   readonly kind = 'pglite' as const;
@@ -316,6 +321,17 @@ describe('resolveModel — v0.31.12 tier system', () => {
     expect(isOpenRouterAnthropic('')).toBe(false);
   });
 
+  test('isOpenRouterSubagentFamily matches the OR families with a live abort/retry pin', () => {
+    expect(isOpenRouterSubagentFamily('openrouter:anthropic/claude-haiku-4.5')).toBe(true);
+    expect(isOpenRouterSubagentFamily('openrouter:deepseek/deepseek-v4-flash')).toBe(true);
+    expect(isOpenRouterSubagentFamily('openrouter:DeepSeek/deepseek-chat')).toBe(true);
+    expect(isOpenRouterSubagentFamily('openrouter:openai/gpt-5.2')).toBe(false);
+    expect(isOpenRouterSubagentFamily('openrouter:google/gemini-3-flash-preview')).toBe(false);
+    expect(isOpenRouterSubagentFamily('deepseek:deepseek-v4-flash')).toBe(false);
+    expect(isOpenRouterSubagentFamily('anthropic:claude-sonnet-4-6')).toBe(false);
+    expect(isOpenRouterSubagentFamily('')).toBe(false);
+  });
+
   test('alias-chain conflict: forward + reverse for same id (Codex F6)', async () => {
     // Codex F6: if both forward and reverse aliases exist, depth cap (2)
     // prevents infinite loop. Canonicalization is deterministic — terminates
@@ -488,6 +504,64 @@ describe('providerKeyReady + resolveEffectiveChatModel (shared runtime/report re
     });
     expect(resolveEffectiveChatModel(null, { OPENAI_API_KEY: 'sk-test' })).toEqual({
       model: openaiStaticTierFallback().reasoning, source: 'tier_default',
+    });
+  });
+});
+
+// ─── #3813: no anthropic/openai key + a SERVABLE file-plane pin ────────────
+// resolveTierDefault walked PROVIDER_TIER_DEFAULTS (anthropic, openai) and
+// returned the Anthropic TIER_DEFAULTS floor when neither key was present —
+// even when ~/.gbrain/config.json pinned a servable third provider (the
+// DeepSeek-only install from the issue). Every bare `resolveTierDefault(tier)`
+// caller (extract_atoms, facts classify, page-summary, ...) then called a
+// provider with no key. Real config.json under a temp GBRAIN_HOME: the
+// no-env branch is the code path under test, so no injected env here.
+describe('resolveTierDefault — servable file-plane pin beats the Anthropic floor when no anthropic/openai key (#3813)', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'gbrain-model-config-pin-'));
+    mkdirSync(join(home, '.gbrain'));
+    writeFileSync(
+      join(home, '.gbrain', 'config.json'),
+      JSON.stringify({
+        engine: 'pglite',
+        expansion_model: 'deepseek:deepseek-v4-flash',
+        chat_model: 'deepseek:deepseek-v4-pro',
+      }),
+    );
+    process.env.GBRAIN_HOME = home;
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test('DEEPSEEK_API_KEY only → utility follows expansion_model, other tiers follow chat_model', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: 'sk-test' }, () => {
+      expect(resolveTierDefault('utility')).toBe('deepseek:deepseek-v4-flash');
+      expect(resolveTierDefault('reasoning')).toBe('deepseek:deepseek-v4-pro');
+      expect(resolveTierDefault('deep')).toBe('deepseek:deepseek-v4-pro');
+    });
+  });
+
+  test('no key at all → the pin is unservable → TIER_DEFAULTS unchanged', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: undefined }, () => {
+      expect(resolveTierDefault('utility')).toBe(TIER_DEFAULTS.utility);
+      expect(resolveTierDefault('reasoning')).toBe(TIER_DEFAULTS.reasoning);
+    });
+  });
+
+  test('ANTHROPIC_API_KEY present → key walk wins, the pin is ignored (keyed routing unchanged)', async () => {
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-ant-test', DEEPSEEK_API_KEY: 'sk-test' }, () => {
+      expect(resolveTierDefault('utility')).toBe(TIER_DEFAULTS.utility);
+      expect(resolveTierDefault('reasoning')).toBe(TIER_DEFAULTS.reasoning);
+    });
+  });
+
+  test('injected env stays hermetic: no config read, so no pin', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: 'sk-test' }, () => {
+      expect(resolveTierDefault('utility', { DEEPSEEK_API_KEY: 'sk-test' })).toBe(TIER_DEFAULTS.utility);
     });
   });
 });

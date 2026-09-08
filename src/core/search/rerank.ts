@@ -10,7 +10,13 @@
  * Fail-open posture: every error class (auth, network, timeout, rate-limit,
  * payload-too-large, unknown) logs to the rerank-audit JSONL and returns
  * the original RRF order unchanged. Search reliability beats reranker
- * quality; a flaky upstream must never break search.
+ * quality; a flaky upstream must never break search. Two classes are SKIPS
+ * rather than failures — `no_key` (provider key absent) and
+ * `sunset_short_circuit` (provider dead past its announced date): the
+ * gateway already wrote the one per-process audit row, so this layer returns
+ * at once without a per-query row and reports the skip through
+ * `opts.onSkip` so hybrid.ts can stamp a `reranker_skipped` degraded entry
+ * (visible in `--explain`, telemetry and the eval rows; never stderr).
  *
  * Caller (hybridSearch) decides whether the reranker fires via
  * `opts.reranker?.enabled`. Mode-bundle resolution defaults this to `true`
@@ -22,6 +28,12 @@ import type { SearchResult } from '../types.ts';
 import { rerank as gatewayRerank, RerankError, type RerankInput, type RerankResult } from '../ai/gateway.ts';
 import { BudgetExhausted } from '../budget/budget-tracker.ts';
 import { logRerankFailure, type RerankFailureReason } from '../rerank-audit.ts';
+import { estimateTokens } from '../chunkers/token-estimate.ts';
+import { truncateUtf8 } from '../text-safe.ts';
+import { warnOncePerProcess } from '../utils.ts';
+
+/** #4648: the two audited success-shaped pass-through causes. */
+export type RerankPassThroughReason = 'empty_result_set' | 'malformed_shape';
 
 export interface RerankerOpts {
   enabled: boolean;
@@ -34,11 +46,30 @@ export interface RerankerOpts {
   /** Per-call timeout in ms (default 5000 — propagates to gateway.rerank). */
   timeoutMs?: number;
   /**
+   * #4648: fired when the provider answered SUCCESSFULLY but with an
+   * empty/malformed result set for a non-empty document batch, so the
+   * results passed through in raw RRF order unscored. hybridSearch uses it
+   * to stamp the response meta's degraded[] channel so callers can tell
+   * "reranker off" from "reranker died silently". Best-effort: a throwing
+   * callback never breaks search.
+   */
+  onPassThrough?: (reason: RerankPassThroughReason) => void;
+  /**
    * Test seam — when set, applyReranker calls this instead of gateway.rerank.
    * Production must NEVER set this.
    */
   rerankerFn?: (input: RerankInput) => Promise<RerankResult[]>;
+  /**
+   * v0.48.2 — fired when the reranker is SKIPPED without reordering
+   * (`no_key` / `sunset_short_circuit`). hybrid.ts stamps the degraded
+   * entry; nothing is written to stderr. Never fired for genuine failures
+   * (those keep the per-query audit row instead).
+   */
+  onSkip?: (reason: RerankSkipReason) => void;
 }
+
+/** The two skip classes (no HTTP call, no per-query audit row). */
+export type RerankSkipReason = 'no_key' | 'sunset_short_circuit';
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
 function hashQuery(query: string): string {
@@ -54,6 +85,38 @@ function classifyRerankFailure(err: unknown): RerankFailureReason {
     return 'budget';
   }
   return 'unknown';
+}
+
+// Per-document ceiling for the reranker call. A chunk at the chunker ceiling
+// (DEFAULT_MAX_CHUNK_TOKENS=2000, sized to llama-server's 2048 ubatch) plus the
+// query plus the server-side reranker template cannot fit that same ubatch, so
+// a pooled self-hosted reranker (llama-server, TEI) 500s and applyReranker
+// fails open to raw RRF. 1400 = 2048 minus query/template headroom minus a
+// Qwen-family tokenizer margin (cl100k estimate; Qwen runs ~35% worse on
+// hex-heavy text). The cap applies to every provider, hosted included: prose
+// chunks (~300 words) are untouched; code/CJK chunks at the chunker ceiling
+// lose up to ~1/3 of their tail before scoring — the same trade
+// DEFAULT_MAX_CHUNK_TOKENS already makes on the embed side.
+const RERANK_MAX_DOC_TOKENS = 1400;
+const RERANK_MAX_DOC_CHARS = 6000;
+
+/**
+ * Trim a reranker document to ~RERANK_MAX_DOC_TOKENS (char cap first, then
+ * shrink by measured ratio). Every cut goes through `truncateUtf8` so a shrink
+ * never orphans a UTF-16 surrogate — serde/nlohmann-based servers reject a lone
+ * surrogate in the JSON body, which would trade the 500 for a 400.
+ */
+export function capRerankDoc(text: string): string {
+  // ASCII is <=1 token/char and Qwen-family ~1 token/char on CJK, so a doc
+  // under the token ceiling in chars cannot overflow it: skip the tokenizer.
+  if (text.length <= RERANK_MAX_DOC_TOKENS) return text;
+  let doc = truncateUtf8(text, RERANK_MAX_DOC_CHARS);
+  for (let i = 0; i < 4; i++) {
+    const tokens = estimateTokens(doc);
+    if (tokens <= RERANK_MAX_DOC_TOKENS) break;
+    doc = truncateUtf8(doc, Math.floor(doc.length * (RERANK_MAX_DOC_TOKENS / tokens) * 0.95));
+  }
+  return doc;
 }
 
 /**
@@ -83,7 +146,11 @@ export async function applyReranker(
   // Document text — chunk_text is the matched span. Fall back to title if
   // empty (shouldn't happen in practice; defensive). Empty docs would
   // confuse the reranker, but we still send them — the upstream model decides.
-  const documents = head.map(r => r.chunk_text || r.title || '');
+  // Cap each document so a self-hosted reranker (llama-server, TEI) with a
+  // small physical batch never 500s on an oversized code/hex-heavy chunk.
+  // Token-aware, not just char-capped, because hex-dense pages tokenize at
+  // ~1 char/token. See capRerankDoc for what this costs hosted providers.
+  const documents = head.map(r => capRerankDoc(r.chunk_text || r.title || ''));
 
   let reranked: RerankResult[];
   try {
@@ -96,11 +163,15 @@ export async function applyReranker(
     });
   } catch (err) {
     const reason = classifyRerankFailure(err);
-    // #3657 post-sunset short-circuit: the gateway already wrote the ONE
-    // per-process-per-model audit row (and the once-per-process stderr line)
-    // when it skipped the HTTP call — a per-query row here would flood the
-    // audit file on every search until the user migrates. Fail open at once.
-    if (reason === 'sunset_short_circuit') return results;
+    // #3657 post-sunset short-circuit + v0.48.2 no_key: the gateway already
+    // wrote the ONE per-process-per-model audit row (and, for the sunset case
+    // only, the once-per-process stderr line) when it skipped the HTTP call —
+    // a per-query row here would flood the audit file on every search until
+    // the user migrates / adds the key. Fail open at once, tell the caller.
+    if (reason === 'sunset_short_circuit' || reason === 'no_key') {
+      try { opts.onSkip?.(reason); } catch { /* caller hook must never break search */ }
+      return results;
+    }
     const errorSummary = err instanceof Error ? err.message : String(err);
     try {
       logRerankFailure({
@@ -116,8 +187,44 @@ export async function applyReranker(
     return results;
   }
 
-  // Defensive: if the reranker returned a malformed shape, pass through.
-  if (!Array.isArray(reranked) || reranked.length === 0) return results;
+  // Defensive: if the reranker returned a malformed shape, pass through —
+  // but never silently (#4648). A provider that answers HTTP 200 with an
+  // empty/malformed result set for a non-empty batch (verified live against
+  // an OpenAI-shaped endpoint answering `{"results":[]}`) previously took
+  // this branch with NO audit row while the throw path above was audited —
+  // so an empty failure log falsely implied every search was reranked.
+  // Same fail-open posture as the catch: audit + one stderr note per
+  // process per reason, then return the input unchanged.
+  if (!Array.isArray(reranked) || reranked.length === 0) {
+    const reason: RerankPassThroughReason = Array.isArray(reranked)
+      ? 'empty_result_set'
+      : 'malformed_shape';
+    try {
+      logRerankFailure({
+        model: opts.model ?? 'unknown',
+        reason,
+        query_hash: hashQuery(query),
+        doc_count: documents.length,
+        error_summary: reason === 'empty_result_set'
+          ? `provider answered successfully with an empty result set for ${documents.length} document(s); results passed through unreranked`
+          : 'provider answered successfully with a non-array result shape; results passed through unreranked',
+      });
+    } catch {
+      // Audit logging must never break search.
+    }
+    warnOncePerProcess(
+      `rerank-passthrough:${reason}`,
+      `[gbrain] reranker returned ${reason === 'empty_result_set' ? 'an empty result set' : 'a malformed shape'} — ` +
+        'results passed through in RRF order unscored (audited to rerank-failures; further occurrences this process are silent). ' +
+        'Check the rerank endpoint and `gbrain doctor`.',
+    );
+    try {
+      opts.onPassThrough?.(reason);
+    } catch {
+      // Meta stamping must never break search.
+    }
+    return results;
+  }
 
   // Build the reordered head. We keep ONLY indices the reranker returned
   // (so a top_n response with fewer items than head.length naturally

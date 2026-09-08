@@ -966,6 +966,32 @@ describe('parseTimelineEntries', () => {
     expect(parseTimelineEntries('Just some plain text.')).toEqual([]);
   });
 
+  test('skips generated backlink receipts because their dates are not entity events (#4277)', () => {
+    const entries = parseTimelineEntries(
+      '- **2026-06-13** | Referenced in [Acme](../companies/acme.md)',
+    );
+    expect(entries).toEqual([]);
+  });
+
+  test('skips a receipt without swallowing the real entries around it (#4277)', () => {
+    const content = `## Timeline
+- **2026-01-15** | Met with Alice
+- **2026-06-13** | Referenced in [Acme](../companies/acme.md)
+- **2026-07-01** | Signed the term sheet`;
+    const entries = parseTimelineEntries(content);
+    expect(entries.map(e => e.summary)).toEqual(['Met with Alice', 'Signed the term sheet']);
+  });
+
+  test('keeps a Source — Summary pipe bullet whose summary merely mentions Referenced in', () => {
+    // Write-through renders `- **DATE** | source — summary`; the receipt
+    // guard must only fire when the rest STARTS with the generated marker.
+    const entries = parseTimelineEntries(
+      '- **2026-06-13** | inbox — Referenced in [Acme](../companies/acme.md) — follow up',
+    );
+    expect(entries.length).toBe(1);
+    expect(entries[0].source).toBe('inbox');
+  });
+
   test('handles mixed content (timeline lines interspersed with prose)', () => {
     const content = `Some intro paragraph.
 
@@ -1850,9 +1876,11 @@ describe('extractFrontmatterLinks — [[wikilink]] related: values (end-to-end)'
 // normalizeBasename previously stripped everything outside [a-z0-9\s-],
 // so a CJK basename collapsed to '' (every lookup missed) and accented
 // names diverged from slugifySegment ('Café' → 'caf' vs 'cafe'). It now
-// mirrors slugifySegment's normalization (NFD → strip accents → NFC →
-// lowercase → SLUG_WORD_CHARS filter), so display names in any script
-// produce the same key the slug grammar produces.
+// follows slugifySegment's normalization (NFD → strip accents → NFC →
+// lowercase → SLUG_WORD_CHARS filter) and then folds stroke letters to
+// ASCII via latin-fold (#4855) — so the key can differ from a page slug
+// that kept đ/ø/ł; the dir-hint candidate step tries both forms (see the
+// #4855 describe at the end of this file).
 
 describe('normalizeBasename — CJK + accent folding (#2367)', () => {
   test('Korean display name normalizes to the slugifySegment form, not empty', () => {
@@ -1873,6 +1901,30 @@ describe('normalizeBasename — CJK + accent folding (#2367)', () => {
     const idx = buildBasenameIndex(['meetings/루카텍-올핸즈-미팅']);
     expect(queryBasenameIndex(idx, '루카텍 올핸즈 미팅'))
       .toEqual(['meetings/루카텍-올핸즈-미팅']);
+  });
+
+  // Stroke letters (đ ł ø ß …) have no Unicode decomposition, so the accent
+  // strip leaves them unfolded and the key diverges from the ASCII page slug
+  // — the lookup then misses in silence. Each name here carries BOTH a
+  // decomposing accent (folded by the strip) and a stroke letter (folded by
+  // the shared table), so a half-fix handling only one class still fails.
+  test('stroke letters fold to the ASCII form the page slug uses', () => {
+    expect(normalizeBasename('Đức Example')).toBe('duc-example');
+    expect(normalizeBasename('Łukasz Example')).toBe('lukasz-example');
+    expect(normalizeBasename('Søren Example')).toBe('soren-example');
+  });
+
+  test('basename index: a stroke-letter display name hits its ASCII slug tail', () => {
+    const idx = buildBasenameIndex(['people/duc-example', 'people/lukasz-example']);
+    expect(queryBasenameIndex(idx, 'Đức Example')).toEqual(['people/duc-example']);
+    expect(queryBasenameIndex(idx, 'Łukasz Example')).toEqual(['people/lukasz-example']);
+  });
+
+  test('index side folds too, so a stroke-letter slug stays reachable', () => {
+    // Symmetry: both sides run through normalizeBasename, so a page whose own
+    // slug kept the stroke letter still answers to the ASCII display name.
+    const idx = buildBasenameIndex(['people/đuc-example']);
+    expect(queryBasenameIndex(idx, 'Duc Example')).toEqual(['people/đuc-example']);
   });
 
   test('end-to-end: bare CJK wikilink resolves via the basename index', async () => {
@@ -2080,5 +2132,67 @@ describe('extractPageLinks — role prior suppressed in Timeline/See-also', () =
       expect(c).toBeDefined();
       expect(c!.linkType).toBe('mentions');
     }
+  });
+});
+
+// #4062 lane, #4855 grammar: the flag-off root-exact candidate tried ONLY
+// slugifyPath, which keeps stroke letters (`đuc-example`) while a brain that
+// synced the folded name lives at `duc-example`. Try both grammars — exact
+// slugs, existence-checked downstream — so `[[Đức Example]]` reaches either.
+describe('#4062 — bare [[name]] direct candidate tries both slug grammars', () => {
+  const resolver: SlugResolver = { async resolve() { return null; } };
+
+  test('flag-off: a stroke-letter wikilink emits the folded AND unfolded root slugs', async () => {
+    const r = await extractPageLinks(
+      'notes/some-page', 'met [[Đức Example]] today', {}, 'concept' as any,
+      resolver, { globalBasename: false, skipFrontmatter: true },
+    );
+    expect(r.candidates.map(c => c.targetSlug).sort()).toEqual(['duc-example', 'đuc-example']);
+    expect(new Set(r.candidates.map(c => c.linkSource))).toEqual(new Set(['markdown']));
+  });
+
+  test('flag-off: an ASCII wikilink still emits exactly one candidate (grammars agree)', async () => {
+    const r = await extractPageLinks(
+      'notes/some-page', 'see [[Example Rail]]', {}, 'concept' as any,
+      resolver, { globalBasename: false, skipFrontmatter: true },
+    );
+    expect(r.candidates.map(c => c.targetSlug)).toEqual(['example-rail']);
+  });
+
+  test('flag-off: self-loop guard covers the folded form too', async () => {
+    const r = await extractPageLinks(
+      'duc-example', 'this is [[Đức Example]] itself', {}, 'concept' as any,
+      resolver, { globalBasename: false, skipFrontmatter: true },
+    );
+    expect(r.candidates.map(c => c.targetSlug)).toEqual(['đuc-example']);
+  });
+});
+
+// ─── #4855: the dir-hint candidate step tries BOTH slug grammars ──────────
+//
+// normalizeBasename folds stroke letters to ASCII (latin-fold), but the
+// page-slug grammar (sync.ts slugifySegment, #3417) deliberately keeps them,
+// so a page synced from `Đức Example.md` lives at 'people/đuc-example'. The
+// dir-hint step must try the unfolded form too, or a hint hit turns into a
+// miss — fatal on the FS resolver, which has no fuzzy step 3 to rescue it.
+
+describe('makeResolver — dir-hint step tries both slug grammars (#4855)', () => {
+  function pagesOnly(slugs: string[]): BrainEngine {
+    const lookup = new Set(slugs);
+    return {
+      async getPage(slug: string) { return lookup.has(slug) ? { slug } as any : null; },
+      async findByTitleFuzzy() { return null; },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+  }
+
+  test('unfolded page slug (sync grammar) still resolves from the stroke-letter display name', async () => {
+    const r = makeResolver(pagesOnly(['people/đuc-example']));
+    expect(await r.resolve('Đức Example', 'people')).toBe('people/đuc-example');
+  });
+
+  test('folded ASCII page slug resolves from the same display name', async () => {
+    const r = makeResolver(pagesOnly(['people/duc-example']));
+    expect(await r.resolve('Đức Example', 'people')).toBe('people/duc-example');
   });
 });

@@ -99,6 +99,34 @@ Repeat `gbrain google connect --account work@yourco.com` per account; each
 account becomes its own source (`gbrain sources add gmail-work --kind google
 --account work@yourco.com`) with independent sync cursors and locks.
 
+## Secondary calendars
+
+The calendar sweep reads ONE calendar per source (so each keeps its own
+incremental sync token) and defaults to the account's primary calendar.
+Shared, subscribed, and secondary calendars the granted `calendar.readonly`
+scope already covers are ingested by pointing an additional source at them:
+
+```bash
+gbrain google calendars                 # list every calendar the account can
+                                        # read (* marks the primary), with ids
+gbrain google calendars --json          # { ok, status, account, calendars[],
+                                        #   next_action.command } for agents
+gbrain sources add family-cal --kind google --account you@example.com \
+  --services calendar --calendar-id "family0123456789@group.calendar.google.com"
+```
+
+**Say to your agent:** *"list the calendars my google account can read"* —
+*"ingest my family calendar into the brain"* (your agent runs
+`gbrain google calendars`, then `gbrain sources add … --calendar-id <id>`).
+
+Each source's incremental sync token is bound to the calendar it was minted
+for. Re-pointing an existing source at a different calendar (its
+`g_calendar_id` config key) is safe: the next sweep notices the change, logs
+`[google] calendar changed (<old> → <new>)`, discards the old cursor, and
+re-lists the new calendar from a fresh window instead of replaying the old
+calendar's delta. Pages already imported from the previous calendar stay in
+the brain until you remove them — they are not reconciled automatically.
+
 ## Continuous sync
 
 Google sources are ordinary gbrain sources: `gbrain sync --source <id>`,
@@ -126,6 +154,25 @@ the run partial without blocking it. A single thread that repeatedly fails to fe
 consecutive failures instead of wedging the sync forever;
 `gbrain sync --source <id> --full` retries skipped threads with a fresh
 ledger.
+
+### Rate limits during backfill
+
+A large mailbox backfilling a wide `--history-days` window can trip Gmail's
+per-user rate limit in bursts — Google answers with HTTP 403
+(`rateLimitExceeded` / `userRateLimitExceeded`) or 429, and it clears on its
+own within seconds to low minutes. The client retries a rate-limited request
+patiently — 6 attempts by default, exponential backoff with jitter capped at
+60s, honoring `Retry-After` when Google sends one — before finally giving up
+and reporting `rate_limited`. That budget is deliberately much larger than
+the 2-attempt budget used for other retryable failures (like a 401 needing a
+token refresh): giving up too early used to mean a thread that would have
+succeeded a few seconds later was instead skipped for the rest of the sync.
+
+Even when a thread's retry budget IS exhausted, a rate-limit failure is never
+counted toward the poison-skip threshold — unlike a genuine per-thread
+failure (a malformed message, a permissions edge case), a rate limit says
+nothing about that specific thread, so the sweep keeps retrying it on every
+future run instead of silently giving up on it.
 
 ## Other ways to reach Google (no gbrain OAuth)
 

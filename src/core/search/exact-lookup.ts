@@ -31,8 +31,10 @@
  * Fail-open everywhere: a probe error returns the organic results unchanged.
  */
 
+import { sanitizeRemoteBody } from '../remote-body.ts';
+import { hasReadPolicy } from './read-policy-sql.ts';
 import type { BrainEngine } from '../engine.ts';
-import type { SearchResult } from '../types.ts';
+import type { SearchResult, PageReadPolicy } from '../types.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { isLookupShapedQuery } from './query-intent.ts';
 import { applySupersedeDownrank } from './hybrid.ts';
@@ -48,7 +50,7 @@ export function isSlugShapedQuery(query: string): boolean {
   return q.length > 0 && !/\s/.test(q) && q.includes('/') && !q.startsWith('/') && !q.endsWith('/');
 }
 
-export interface ExactLookupOpts {
+export interface ExactLookupOpts extends PageReadPolicy {
   sourceId?: string;
   sourceIds?: string[];
   /**
@@ -116,8 +118,8 @@ export async function structuralExactLookup(
     for (const scope of scopes) {
       try {
         const page = scope != null
-          ? await engine.getPage(q, { sourceId: scope })
-          : await engine.getPage(q); // gbrain-allow-unscoped-getpage — read-only first-match; no paired write
+          ? await engine.getPage(q, { sourceId: scope, excludePrivate: opts.excludePrivate })
+          : await engine.getPage(q, { excludePrivate: opts.excludePrivate }); // gbrain-allow-unscoped-getpage — read-only first-match; no paired write
         if (!page) continue;
         push({
           page_id: page.id,
@@ -125,7 +127,7 @@ export async function structuralExactLookup(
           title: page.title,
           type: page.type,
           source_id: page.source_id ?? scope ?? 'default',
-          chunk_text: (page.compiled_truth ?? '').slice(0, 200),
+          chunk_text: sanitizeRemoteBody(page.compiled_truth ?? '').slice(0, 200),
           chunk_index: 0,
           chunk_id: 0,
           score: 0, // caller assigns the injection score
@@ -159,7 +161,7 @@ export async function structuralExactLookup(
   // `superseded`); tier scores are assigned by the caller afterwards, so the
   // stage's score mutation on dropped rows is irrelevant.
   try {
-    await applySupersedeDownrank(hits, engine);
+    await applySupersedeDownrank(hits, engine, hasReadPolicy(opts) ? opts : undefined);
   } catch {
     // fail-open: filter unavailable (pre-links schema) → keep hits
   }
@@ -193,16 +195,32 @@ export async function applyExactLookupTier(
 
   for (const hit of hits) {
     injectScore += 1e-6;
-    const idx = out.findIndex(
-      (r) => r.slug === hit.slug && (r.source_id ?? 'default') === (hit.source_id ?? 'default'),
-    );
-    if (idx >= 0) {
-      // Promote in place: identity match outranks every scored row.
-      out[idx].score = injectScore;
-      out[idx].exact_lookup = hit.exact_lookup;
-      if (hit.alias_hit) out[idx].alias_hit = true;
+    const matchingIndexes: number[] = [];
+    for (let i = 0; i < out.length; i++) {
+      const r = out[i];
+      if (r.slug === hit.slug && (r.source_id ?? 'default') === (hit.source_id ?? 'default')) {
+        matchingIndexes.push(i);
+      }
+    }
+    if (matchingIndexes.length > 0) {
+      // Search is chunk-grained, but an exact identity lookup is page-grained.
+      // Promote the strongest existing chunk (identity match outranks every
+      // scored row) and remove the same page's remaining chunks — dedup allows
+      // 2 chunks/page, so without the collapse the canonical page could appear
+      // twice on the wire for an exact identity lookup.
+      const idx = matchingIndexes.reduce((best, cand) =>
+        out[cand].score > out[best].score ? cand : best,
+      );
+      const promoted = out[idx];
+      promoted.score = injectScore;
+      promoted.exact_lookup = hit.exact_lookup;
+      if (hit.alias_hit) promoted.alias_hit = true;
       if (hit.title_match_boost) {
-        out[idx].title_match_boost = Math.max(out[idx].title_match_boost ?? 1.0, hit.title_match_boost);
+        promoted.title_match_boost = Math.max(promoted.title_match_boost ?? 1.0, hit.title_match_boost);
+      }
+      // Splice highest-index-first so earlier removals don't shift later ones.
+      for (let k = matchingIndexes.length - 1; k >= 0; k--) {
+        if (matchingIndexes[k] !== idx) out.splice(matchingIndexes[k], 1);
       }
       continue;
     }

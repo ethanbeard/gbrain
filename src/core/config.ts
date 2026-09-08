@@ -34,6 +34,25 @@ export interface GBrainConfig {
    * `gbrain config set` routes these two dotted keys here, not to the DB. */
   push?: { allow_unverified_remote?: boolean };
   hooks?: { stop_push_debounce_min?: number | string };
+  /** Ambient-writeback MIRROR of the DB-plane `memory.*` keys — `gbrain
+   * config set memory.*` dual-writes both planes so the engine-free Stop-hook
+   * child and the stdio boot resolve see the same truth the serve does. The
+   * DB plane stays authoritative (the serve-side harvest gate re-checks it).
+   * Resolved by src/core/facts/writeback-config.ts. */
+  /** Declared brain audience MIRROR (WP8; DB plane authoritative like
+   * `memory.*`): the engine-free bootstrap-harness lane gates its
+   * ambient-writeback enable-nudge on it — a shared-declared brain is never
+   * nudged. Written by `gbrain config set brain.audience personal|shared`. */
+  brain?: { audience?: string };
+  memory?: {
+    auto_writeback?: string;
+    auto_writeback_transient_ttl?: string;
+    /** Visibility POSTURE cache stamped by `config set memory.*` (which has
+     * the engine to resolve the DB-plane facts.default_visibility) so the
+     * engine-free bootstrap-harness renderer can embed it. Doctor's
+     * block-drift check catches staleness against DB truth. */
+    visibility_posture?: string;
+  };
   /**
    * Third-party integration gates, file-plane (read by engine-free hook
    * children). `integrations.memorable.enabled` gates the optional
@@ -46,8 +65,7 @@ export interface GBrainConfig {
    * memorableGateAllowed in core/context/hook-heartbeat.ts.
    */
   integrations?: { memorable?: { enabled?: boolean } };
-  /** Monthly backup-coverage check (src/core/backup/). File-plane: read by
-   * engine-free render sites (hook children, the cli.ts startup rail). */
+  /** Monthly backup-coverage check. File-plane for engine-free hook children. */
   backup?: { check_enabled?: boolean | string; check_interval_days?: number | string };
   database_url?: string;
   database_path?: string;
@@ -92,6 +110,7 @@ export interface GBrainConfig {
    * voyage_api_key above.
    */
   dashscope_api_key?: string;
+  deepseek_api_key?: string;
   /**
    * LiteLLM proxy API key. File-plane slot folded into the gateway env as
    * LITELLM_API_KEY (optional in the litellm recipe — proxies may run
@@ -123,9 +142,8 @@ export interface GBrainConfig {
    * auth alternative to the Entra flow below.
    */
   azure_openai_api_key?: string;
-  /** Azure OpenAI (keyless/Entra). Non-secret endpoint + deployment + Entra opt-in,
-   * folded into the gateway env so the azure-openai recipe works in any shell.
-   * The bearer token is minted at request time via `az` — no secret stored here. */
+  /** Azure OpenAI (keyless/Entra). Non-secret endpoint/deployment + Entra opt-in;
+   * bearer token is minted at request time via `az` — no secret stored here. */
   azure_openai_endpoint?: string;
   azure_openai_deployment?: string;
   azure_openai_use_entra?: string;
@@ -313,6 +331,14 @@ export interface GBrainConfig {
    * reverts on the next turn with a config edit, no redeploy.
    */
   retrieval_reflex_lexical_arms?: boolean;
+  /**
+   * 2026-08 fix wave — kill switch for the reflex's volunteer arm (Arm 2:
+   * confidence-gated volunteered pages fused after the pointer budget, parity
+   * with the claude-code turn-context lane). Default ON (absent = enabled).
+   * File-plane / env (GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER) only — same plane as
+   * the other reflex knobs; the incident lever is the env var.
+   */
+  retrieval_reflex_volunteer?: boolean;
   embedding_image_ocr?: boolean;
   embedding_image_ocr_model?: string;
 
@@ -358,6 +384,15 @@ export interface GBrainConfig {
     /** Master switch for the built-in junk-pattern set. Default: true.
      *  Env override: `GBRAIN_NO_JUNK_PATTERNS=1` flips to false. */
     junk_patterns_enabled?: boolean;
+    /** #4702 — built-in junk-pattern names to skip individually (e.g.
+     *  `['access_denied']` for a brain whose pages quote that error rather
+     *  than being it). Finer than `junk_patterns_enabled: false` (the
+     *  coarser knob, which drops EVERY pattern) and than the `disabled`
+     *  kill-switch (which also drops the load-bearing size gates). Unknown
+     *  names are ignored. DB plane accepts a JSON array or a comma-
+     *  separated list: `gbrain config set content_sanity.disabled_patterns
+     *  access_denied,error_title`. */
+    disabled_patterns?: string[];
     /** Master kill-switch for all sanity checks. When true, ingest emits
      *  loud stderr per page but lets everything through. Default: false.
      *  Env override: `GBRAIN_NO_SANITY=1` flips to true. */
@@ -468,6 +503,14 @@ export interface GBrainConfig {
    */
   mcp?: {
     /**
+     * #4748 — deployment-specific identity and routing guidance appended to
+     * the canonical operating contract in the MCP initialize response (all
+     * three transports). Distinguishes brains sharing one tool catalog.
+     * `GBRAIN_MCP_INSTRUCTIONS` env overrides this slot; blank/absent keeps
+     * the initialize response byte-identical to the canonical contract.
+     */
+    instructions?: string;
+    /**
      * Gate for `list_skills` / `get_skill` over a REMOTE transport. Runtime
      * default is OFF (absent key → OFF) so an upgrade never silently grants
      * existing read tokens host-skill read. `gbrain init` writes `true` for new
@@ -522,6 +565,17 @@ export interface GBrainConfig {
  * thin-client install?" check used by the CLI dispatch guard, doctor
  * branch, and remote subcommands.
  */
+/**
+ * The ONE robust negative parse for boolean env kill switches (2026-08 wave
+ * DRY sweep — previously copy-pasted at four sites with cross-referencing
+ * comments): case-insensitive false/0/off/no, so an operator typing FALSE or
+ * off mid-incident never gets a silent no-op (adversarial F11). An env value
+ * that is unset or empty is NOT "disabled" — callers gate on presence first.
+ */
+export function isEnvDisabled(value: string): boolean {
+  return /^(false|0|off|no)$/i.test(value.trim());
+}
+
 export function isThinClient(config: GBrainConfig | null): boolean {
   return !!config?.remote_mcp;
 }
@@ -601,7 +655,12 @@ export function loadConfigFileOnly(): GBrainConfig | null {
  * The file list is a superset of Bun's auto-load set across NODE_ENV values
  * so the guard doesn't depend on replicating Bun's exact selection logic.
  */
-const CWD_DOTENV_FILES = ['.env', '.env.local', '.env.development', '.env.production', '.env.test'];
+const CWD_DOTENV_FILES = [
+  '.env', '.env.local',
+  '.env.development', '.env.development.local',
+  '.env.production', '.env.production.local',
+  '.env.test', '.env.test.local',
+];
 
 /**
  * All values assigned to `key` across the .env files in `dir`. Collecting
@@ -749,11 +808,14 @@ export function loadConfig(): GBrainConfig | null {
       : {}),
     ...(process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS
       ? {
-          // Case-insensitive + common negatives — incident escape hatch;
-          // mirrors reflex.ts:lexicalArmsEnabled (adversarial F11).
-          retrieval_reflex_lexical_arms: !/^(false|0|off|no)$/i.test(
-            process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS.trim(),
-          ),
+          // Incident escape hatch — shared isEnvDisabled parse (also used by
+          // reflex.ts:lexicalArmsEnabled/volunteerEnabled).
+          retrieval_reflex_lexical_arms: !isEnvDisabled(process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS),
+        }
+      : {}),
+    ...(process.env.GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER
+      ? {
+          retrieval_reflex_volunteer: !isEnvDisabled(process.env.GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER),
         }
       : {}),
     ...(process.env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
@@ -970,6 +1032,25 @@ export async function loadConfigWithEngine(
   const dbJunkDisposition = await dbStr('content_sanity.junk_disposition');
   const dbMaxMarkupRatioStr = await dbStr('content_sanity.max_markup_ratio');
   const dbProseCheckEnabled = await dbBool('content_sanity.prose_check_enabled');
+  // #4702: per-pattern opt-out. Accepts a JSON array ('["access_denied"]')
+  // or a comma-separated list ('access_denied,error_title'); malformed JSON
+  // falls back to the comma parse so a hand-typed value still lands.
+  const dbDisabledPatternsStr = await dbStr('content_sanity.disabled_patterns');
+  let dbDisabledPatterns: string[] | undefined;
+  if (dbDisabledPatternsStr !== undefined) {
+    const raw = dbDisabledPatternsStr.trim();
+    if (raw.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          dbDisabledPatterns = parsed.filter((x): x is string => typeof x === 'string');
+        }
+      } catch { /* fall through to comma parse */ }
+    }
+    if (dbDisabledPatterns === undefined) {
+      dbDisabledPatterns = raw.split(',').map(s => s.trim()).filter(Boolean);
+    }
+  }
 
   const existingCS = merged.content_sanity ?? {};
   const mergedCS: NonNullable<GBrainConfig['content_sanity']> = { ...existingCS };
@@ -997,6 +1078,9 @@ export async function loadConfigWithEngine(
   }
   if (mergedCS.prose_check_enabled === undefined && dbProseCheckEnabled !== undefined) {
     mergedCS.prose_check_enabled = dbProseCheckEnabled;
+  }
+  if (mergedCS.disabled_patterns === undefined && dbDisabledPatterns !== undefined) {
+    mergedCS.disabled_patterns = dbDisabledPatterns;
   }
   if (Object.keys(mergedCS).length > 0) {
     merged.content_sanity = mergedCS;
@@ -1162,6 +1246,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'openrouter_api_key',
   'voyage_api_key',
   'dashscope_api_key',
+  'deepseek_api_key',
   'litellm_api_key',
   'together_api_key',
   'google_api_key',
@@ -1236,6 +1321,36 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #4415: per-brain query-intent pattern extensions (JSON bank→regex[]),
   // merged over the shipped banks in src/core/search/query-intent.ts.
   'search.intent_patterns',
+  // 2026-08 fix wave (E5a): the adaptive-return / autocut / CRAG knobs were
+  // read by the search path but never registered — `gbrain config set`
+  // rejected them, making the documented config plane a no-op. Read sites:
+  // return-policy.ts (adaptive_return*), mode.ts (autocut*), ops/search.ts
+  // (crag_*). NOTE: `search.crag_think` (default off) runs `think` — an LLM
+  // call — on weak-graded local queries when enabled; it respects
+  // spend.posture, but enabling it is a per-query spend decision.
+  // `search.crag_escalation` (default off) also spends when enabled: the
+  // high-ceiling re-run sets expansion=true (one LLM multi-query call per
+  // weak-graded query), and unlike crag_think it is reachable by remote
+  // callers — attacker-shaped weak queries drive that spend (ship security
+  // review). See docs/operations/spend-controls.md.
+  'search.adaptive_return',
+  'search.adaptive_return_entity_max',
+  'search.adaptive_return_other_max',
+  'search.adaptive_return_min_keep',
+  'search.autocut',
+  'search.autocut_jump',
+  'search.autocut_min_keep',
+  'search.autocut_min_top',
+  // Ranker wave: shared RRF weight budget for expansion variant lists (mode.ts reads; `legacy` | (0, 4]).
+  'search.expansion_variant_budget',
+  // Ranker wave (R1): relational-arm rows re-pinned above reranked text rows (mode.ts reads; `off` | 0..10).
+  'search.relational_rerank_pin',
+  // Ranker wave (Phase E2): keyword-arm confidence floor — weak keyword arm fuses at half weight (mode.ts reads; `off` | (0, 1]).
+  'search.keyword_arm_confidence_floor',
+  // Ranker wave (Phase E3): metadata boost gate — `lexical` skips post-fusion metadata boosts when the vector arm was the only voter (mode.ts reads; `always` | `lexical`).
+  'search.metadata_boost_gate',
+  'search.crag_escalation',
+  'search.crag_think',
   // Models tier system (v0.31.12)
   'models.default',
   'models.tier.utility',
@@ -1282,10 +1397,36 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'loops.extraction_enabled',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
+  // #3852: operator-set system-prompt appendix for the facts extractor (e.g.
+  // a durable-vs-ephemeral rubric for agent work-session transcripts).
+  // Composes with BOTH honest-notability prompt variants.
+  'facts.extraction_prompt_appendix',
+  // #3852: kill-switch for the deterministic junk gate on extracted fact text
+  // (plan narration / provider error strings / meta-chatter). Default on.
+  'facts.extraction_junk_filter',
   // [ENG-8] Brain-level default visibility for facts writes when the caller
   // didn't specify one: 'private' (default) | 'world'. Resolved by
   // src/core/facts/visibility.ts; explicit caller values always win.
   'facts.default_visibility',
+  // Ambient memory writeback (opt-in, default OFF): 'off' | 'salient' | 'all'.
+  // DUAL-PLANE: `gbrain config set` writes the DB plane (authoritative — the
+  // serve-side harvest gate re-checks it) AND mirrors into the file plane's
+  // `memory` slot (read by the engine-free Stop-hook child and the stdio
+  // serve's boot resolve). Resolved by src/core/facts/writeback-config.ts.
+  'memory.auto_writeback',
+  // TTL the instruction template tells agents to pass on TRANSIENT facts
+  // (health/location/travel/mood/near-term schedule). Duration shorthand
+  // only ('3d', '12h'), positive, capped at 365d; default '3d'.
+  'memory.auto_writeback_transient_ttl',
+  // Fire-once sentinel for the ambient-writeback consent nudge (WP8):
+  // stamped 'true' after the init/post-upgrade ask has been shown once.
+  'memory.auto_writeback_notice_shown',
+  // Declared brain audience: 'personal' | 'shared'. Set by the operator, by
+  // company-brainify's Phase-5 handoff (shared), or from the bootstrap
+  // interview. Declaration beats the conservative client-count heuristic in
+  // src/core/facts/writeback-audience.ts; the consent nudge fires only on
+  // personal brains and never auto-enables anything.
+  'brain.audience',
   // Conversation parser LLM fallback. Deliberately register the exact key,
   // not a conversation_parser.* prefix: fallback is the only live opt-in
   // consumer, while the polish scaffold remains unwired.
@@ -1339,6 +1480,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'emotional_weight.high_tags',
   'emotional_weight.user_holder',
   // Cycle phase config
+  // #4348: IANA timezone that owns the dream-cycle calendar day (summary
+  // bucketing). Unset → host timezone → UTC. Validated at set time.
+  'cycle.timezone',
   'cycle.grade_takes.write_gstack_learnings',
   // #4102: off switch for the propose_takes LLM phase (default ON; the
   // phase ships in the default list). Read by src/core/cycle/propose-takes.ts.
@@ -1352,6 +1496,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'content_sanity.junk_disposition',
   'content_sanity.max_markup_ratio',
   'content_sanity.prose_check_enabled',
+  // #4702: per-pattern opt-out (JSON array or comma-separated names) —
+  // finer than junk_patterns_enabled (all patterns) / disabled (kill-switch).
+  'content_sanity.disabled_patterns',
   // MCP skill-catalog publishing (PR1)
   'mcp.publish_skills',
   'mcp.publish_skills_prompted',

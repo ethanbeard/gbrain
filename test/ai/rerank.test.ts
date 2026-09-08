@@ -163,7 +163,7 @@ describe('gateway.rerank() — happy path', () => {
 describe('gateway.rerank() — error classification', () => {
   beforeEach(() => configureZE());
 
-  test('missing required reranker API key → RerankError(auth) before HTTP call', async () => {
+  test('missing required reranker API key → RerankError(no_key) before HTTP call (v0.48.2; auth = key present but rejected)', async () => {
     configureGateway({
       reranker_model: 'zeroentropyai:zerank-2',
       env: {},
@@ -179,7 +179,7 @@ describe('gateway.rerank() — error classification', () => {
       throw new Error('should have thrown');
     } catch (err) {
       expect(err).toBeInstanceOf(RerankError);
-      expect((err as RerankError).reason).toBe('auth');
+      expect((err as RerankError).reason).toBe('no_key');
       expect((err as Error).message).toContain('ZEROENTROPY_API_KEY');
       expect(called).toBe(false);
     }
@@ -517,7 +517,7 @@ describe('gateway.rerank() — v0.46.3 Voyage wire dialect', () => {
     await expect(rerank({ query: 'q', documents: ['a'] })).rejects.toThrow(RerankError);
   });
 
-  test('missing VOYAGE_API_KEY → RerankError auth (fail-open class)', async () => {
+  test('missing VOYAGE_API_KEY → RerankError no_key (fail-open skip class)', async () => {
     resetGateway();
     configureGateway({ reranker_model: 'voyage:rerank-2.5', env: {} });
     __setRerankTransportForTests(async () =>
@@ -528,7 +528,8 @@ describe('gateway.rerank() — v0.46.3 Voyage wire dialect', () => {
       expect.unreachable('should have thrown');
     } catch (e) {
       expect(e).toBeInstanceOf(RerankError);
-      expect((e as RerankError).reason).toBe('auth');
+      expect((e as RerankError).reason).toBe('no_key');
+      expect((e as Error).message).toContain('VOYAGE_API_KEY');
     }
   });
 
@@ -541,5 +542,56 @@ describe('gateway.rerank() — v0.46.3 Voyage wire dialect', () => {
     });
     await rerank({ query: 'q', documents: ['a'] });
     expect(body.model).toBe('rerank-2.5-lite');
+  });
+
+  // #4938: pre-fix the recipe allowlisted only the rerank-2.5 pair, so
+  // gateway.rerank() threw `Model "rerank-3" is not listed for Voyage AI
+  // reranker` before the request ever reached the transport — an operator
+  // could not opt into Voyage's current generation at all.
+  test('rerank-3 passes the allowlist and reaches the wire (#4938)', async () => {
+    configureVoyage('voyage:rerank-3');
+    let capturedUrl = '';
+    let body: any = null;
+    __setRerankTransportForTests(async (url, init) => {
+      capturedUrl = url;
+      body = JSON.parse(String(init?.body ?? '{}'));
+      return mockResp({
+        object: 'list',
+        data: [{ index: 0, relevance_score: 0.91 }],
+        model: 'rerank-3',
+      });
+    });
+    const out = await rerank({ query: 'q', documents: ['a'], topN: 1 });
+    // Same endpoint + same top-N key as the 2.5 pair: the wire is unchanged.
+    expect(capturedUrl).toBe('https://api.voyageai.com/v1/rerank');
+    expect(body.model).toBe('rerank-3');
+    expect(body.top_k).toBe(1);
+    expect(out).toEqual([{ index: 0, relevanceScore: 0.91 }]);
+  });
+
+  test('rerank-3-lite passes the allowlist (#4938)', async () => {
+    configureVoyage('voyage:rerank-3-lite');
+    let body: any = null;
+    __setRerankTransportForTests(async (_url, init) => {
+      body = JSON.parse(String(init?.body ?? '{}'));
+      return mockResp({ results: [{ index: 0, relevance_score: 0.9 }] });
+    });
+    await rerank({ query: 'q', documents: ['a'] });
+    expect(body.model).toBe('rerank-3-lite');
+  });
+
+  test('the allowlist still rejects an unlisted Voyage reranker (#4938)', async () => {
+    // The fix widens the allowlist; it must not disable it. A typo'd or
+    // retired model still fails locally instead of burning a wire call.
+    configureVoyage('voyage:rerank-9000');
+    let called = false;
+    __setRerankTransportForTests(async () => {
+      called = true;
+      return mockResp({ results: [] });
+    });
+    await expect(rerank({ query: 'q', documents: ['a'] })).rejects.toThrow(
+      /rerank-9000.*not listed/s,
+    );
+    expect(called).toBe(false);
   });
 });

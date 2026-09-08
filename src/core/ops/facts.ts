@@ -1,3 +1,4 @@
+import { readHolders } from './context.ts';
 /**
  * Hot-memory (facts) operation cluster — pure move from operations.ts
  * (v0.46.x tranche 3): extract_facts, the extended `recall` verb, the
@@ -14,7 +15,7 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError, verbError } from './contract.ts';
-import { sourceScopeOpts, stampEvidenceSafe } from './context.ts';
+import { federatedSearchScope, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { hybridSearchCached, stampContentFlags } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
@@ -24,6 +25,7 @@ import { isAvailable } from '../ai/gateway.ts';
 // #4209: the named entity-hints cap — surfaced in the extract_facts param
 // description and the entity_hints_used/_dropped response fields.
 import { ENTITY_HINTS_CAP } from '../facts/extract.ts';
+import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
 import type { SearchResult } from '../types.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
@@ -175,7 +177,7 @@ const recall: Operation = {
     entity: { type: 'string', description: 'Entity slug (canonical). Returns facts about this entity newest first.' },
     query: { type: 'string', description: 'MEMORY_VERBS v1: free-text retrieval over pages (hybrid search arm). Response adds results[] (slug, title, chunk, evidence, create_safety, provenance). Combinable with entity (both arms run). Degrades to keyword-only search when no embedding provider is configured (search_degraded notes it; never an error).' },
     budget_tokens: { type: 'number', description: 'MEMORY_VERBS v1: server-side token budget (char/4 estimate). Facts pack first, then results. Response adds budget_tokens, budget_used, dropped_count.' },
-    since: { type: 'string', description: 'ISO 8601 datetime or duration shorthand (e.g. "8 hours ago"). Filters the FACTS arm only.' },
+    since: { type: 'string', description: 'ISO 8601 datetime or duration shorthand (e.g. "8 hours ago"). Filters the FACTS arm only, on event time (valid_from, falling back to created_at); composes with `entity` and `session_id`. An unparseable value is rejected (invalid_params).' },
     session_id: { type: 'string', description: 'Source session id (e.g. topic-A). Returns facts captured in that session.' },
     include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
     supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (facts with superseded_by set), newest first by COALESCE(expired_at, valid_until).' },
@@ -246,8 +248,32 @@ const recall: Operation = {
 
     let rows: FactRows = [];
 
+    // `since` is parsed once, up front, and a value that does not parse is
+    // rejected instead of silently widening the window: a caller that asked
+    // for "facts since T" must never receive every fact (or none) because
+    // T was malformed.
+    const since = p.since !== undefined ? parseSinceParam(p.since) : null;
+    if (p.since !== undefined && !since) {
+      throw verbError(
+        'invalid_params',
+        `since is not a parseable timestamp or duration: "${String(p.since).slice(0, 60)}"`,
+        'Pass an ISO 8601 datetime (e.g. "2026-08-11T00:00:00Z"), Unix epoch millis, or a duration such as "8 hours ago" / "2d".',
+      );
+    }
+    const entityParam = typeof p.entity === 'string' && p.entity.length > 0 ? (p.entity as string) : null;
+    const sessionParam = typeof p.session_id === 'string' && p.session_id.length > 0 ? (p.session_id as string) : null;
+    // Shared per-source opts for the fact-list arms (visibility, grep and the
+    // audit exclusion all filter at the ENGINE level, before each source's
+    // LIMIT, so a hidden newest row never consumes a slot).
+    const listOpts = {
+      activeOnly: !includeExpired,
+      limit,
+      visibility,
+      grep: grep ?? undefined,
+      excludeAuditRows: true,
+    };
+
     if (p.supersessions === true) {
-      const since = parseSinceParam(p.since);
       // Visibility filters at the ENGINE level (before each source's LIMIT),
       // same as the sibling fact-list arms — a post-merge filter would let a
       // private newest row consume a limit slot and hide an older world row.
@@ -259,63 +285,49 @@ const recall: Operation = {
         // valid_until) — ontology supersessions carry valid_until only.
         (rec) => rec.expired_at ?? rec.valid_until ?? rec.created_at,
       );
-    } else if (typeof p.entity === 'string' && p.entity.length > 0) {
+    } else if (since) {
+      // Composed window: `since` ANDs onto `entity` and/or `session_id` in
+      // ONE engine query, so the time cutoff lands before the SQL LIMIT. The
+      // window is measured on EVENT time, COALESCE(valid_from, created_at),
+      // exactly like the since-only arm: "what happened to this entity (or
+      // in this session) since T" is a question about when the underlying
+      // events occurred, not about when a batch extraction wrote the rows.
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
       rows = mergeNewest(
         await Promise.all(factSources.map(async (src) => {
-          const slug = (await resolveEntitySlug(ctx.engine, src, p.entity as string)) ?? (p.entity as string);
-          return ctx.engine.listFactsByEntity(src, slug, {
-            activeOnly: !includeExpired,
-            limit,
-            visibility,
-            grep: grep ?? undefined,
-            excludeAuditRows: true,
+          const entitySlug = entityParam
+            ? ((await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam)
+            : undefined;
+          return ctx.engine.listFactsSince(src, since, {
+            ...listOpts,
+            eventTime: true,
+            entitySlug,
+            sessionId: sessionParam ?? undefined,
           });
+        })),
+        byEventTime,
+      );
+    } else if (entityParam) {
+      const { resolveEntitySlug } = await import('../entities/resolve.ts');
+      rows = mergeNewest(
+        await Promise.all(factSources.map(async (src) => {
+          const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
+          return ctx.engine.listFactsByEntity(src, slug, listOpts);
         })),
         (rec) => rec.valid_from ?? rec.created_at,
       );
-    } else if (typeof p.session_id === 'string' && p.session_id.length > 0) {
+    } else if (sessionParam) {
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
-          ctx.engine.listFactsBySession(src, p.session_id as string, {
-            activeOnly: !includeExpired,
-            limit,
-            visibility,
-            grep: grep ?? undefined,
-            excludeAuditRows: true,
-          }),
+          ctx.engine.listFactsBySession(src, sessionParam, listOpts),
         )),
         byCreated,
       );
-    } else if (p.since !== undefined) {
-      const since = parseSinceParam(p.since);
-      if (since) {
-        rows = mergeNewest(
-          await Promise.all(factSources.map(src =>
-            ctx.engine.listFactsSince(src, since, {
-              eventTime: true,
-              activeOnly: !includeExpired,
-              limit,
-              visibility,
-              grep: grep ?? undefined,
-              excludeAuditRows: true,
-            }),
-          )),
-          byEventTime,
-        );
-      }
     } else {
       // No filter: return recent across the granted source(s).
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
-          ctx.engine.listFactsSince(src, new Date(0), {
-            eventTime: true,
-            activeOnly: !includeExpired,
-            limit,
-            visibility,
-            grep: grep ?? undefined,
-            excludeAuditRows: true,
-          }),
+          ctx.engine.listFactsSince(src, new Date(0), { ...listOpts, eventTime: true }),
         )),
         byEventTime,
       );
@@ -369,24 +381,31 @@ const recall: Operation = {
     let searchResults: SearchResult[] = [];
     let searchDegraded: string | undefined;
     if (queryText) {
-      const searchScope = sourceScopeOpts(ctx);
+      // #3242 parity (#4707): the page-search arm widens an unqualified
+      // no-grant caller across the transport-computed federated set, exactly
+      // like search/query/get_page/list_pages/resolve_slugs. sourceScopeOpts
+      // alone pinned this arm to the scalar source, so a `federated: true`
+      // source was invisible to recall while visible to every sibling read op.
+      const searchScope = federatedSearchScope(ctx);
       // #4352 — recall's page-search arm enforces `visibility: private` for
       // untrusted callers (matches the facts arms' world-only filter above).
       const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
       const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
       if (!isAvailable('embedding')) {
-        const raw = await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, ...searchScope });
+        const raw = await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope });
         searchResults = dedupResults(raw);
         // #3783 — direct FTS path: every row is a keyword hit by construction.
         markKeywordHits(searchResults);
         stampEvidenceSafe(searchResults);
-        await stampContentFlags(ctx.engine, searchResults);
+        await stampContentFlags(ctx.engine, searchResults, { ...searchScope, excludePrivate });
         searchDegraded = 'keyword_only_no_embedding_provider';
       } else {
         searchResults = await hybridSearchCached(ctx.engine, queryText, {
           limit,
           expansion: false,
           excludePrivate,
+          requireSafeChunks: ctx.remote !== false,
+          takesHoldersAllowList: readHolders(ctx),
           ...searchScope,
         });
       }
@@ -615,8 +634,30 @@ const delta: Operation = {
     }
     // NORMALIZE to ISO immediately (red-team F4): the raw string is echoed
     // into the injectable `text` block, so an attacker-shaped-but-parseable
-    // `since` must never reach rendering verbatim.
-    const explicitSince = rawSince !== null ? new Date(Date.parse(rawSince)).toISOString() : null;
+    // `since` must never reach rendering verbatim. A value already in the
+    // canonical microsecond shape `listPages` projects (`next_cursor.since`
+    // passed back) is kept verbatim: rounding it through a JS Date would
+    // re-select every same-millisecond row on the resumed wake.
+    // The verbatim passthrough must round-trip: a calendar-invalid but
+    // Date.parse-able value (2026-02-31T…) would otherwise reach the
+    // ::timestamptz cast raw and surface as an engine error, not invalid_params.
+    if (
+      rawSince !== null &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(rawSince) &&
+      new Date(rawSince).toISOString().slice(0, 19) !== rawSince.slice(0, 19)
+    ) {
+      throw verbError(
+        'invalid_params',
+        `delta: since is not a valid ISO 8601 calendar timestamp: "${rawSince.slice(0, 60)}"`,
+        'Pass a real calendar datetime, e.g. since: "2026-08-11T00:00:00Z".',
+      );
+    }
+    const explicitSince =
+      rawSince === null
+        ? null
+        : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(rawSince)
+          ? rawSince
+          : new Date(Date.parse(rawSince)).toISOString();
     const sessionId = typeof p.session_id === 'string' && p.session_id.trim() ? p.session_id : null;
     // Cursor namespace (pre-landing review, fail-closed): 'local' is RESERVED
     // for the trusted CLI/hook lane, gated on STRICT ctx.remote === false —
@@ -858,46 +899,31 @@ function parseSinceParam(raw: unknown): Date | null {
  * Throws verbError('invalid_params') on anything unparseable.
  */
 export function parseTtlParam(raw: unknown): Date | null {
-  if (raw == null) return null;
-  if (typeof raw !== 'string') {
+  // Grammar lives in the dependency-free leaf (core/facts/ttl-parse.ts — E1,
+  // ambient-writeback wave) so the engine-free hook lane shares it without
+  // importing this module's gateway-reaching graph. This wrapper owns the
+  // wire contract: the verbError copy below is byte-identical to the
+  // pre-extraction messages.
+  const parsed = parseTtlShorthand(raw);
+  if (parsed.ok) return parsed.validUntil;
+  if (parsed.code === 'not_string') {
     throw verbError(
       'invalid_params',
       `ttl must be a string, got ${typeof raw}.`,
       'Pass a duration like "30d" or "12h", or an absolute ISO 8601 timestamp like "2026-07-12T00:00:00Z".',
     );
   }
-  const s = raw.trim();
-  if (!s) return null;
-
-  // ISO-8601 DURATION syntax is a documented trap — reject with the fix.
-  if (/^P(T|\d)/i.test(s) && /^P(?:\d+[YMWD])*(?:T(?:\d+[HMS])+)?$/i.test(s)) {
+  if (parsed.code === 'iso_duration') {
+    const s = parsed.input;
     throw verbError(
       'invalid_params',
       `ttl "${s}" looks like an ISO-8601 duration, which is not accepted.`,
       `Use the shorthand form instead (e.g. "${s.replace(/^PT?/i, '').toLowerCase()}" style: "30d", "12h"), or an absolute ISO 8601 expiry timestamp.`,
     );
   }
-
-  // Relative duration shorthand → now + duration.
-  const dur = s.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?)$/i);
-  if (dur) {
-    const n = parseInt(dur[1], 10);
-    const unit = dur[2].toLowerCase();
-    const ms =
-      unit.startsWith('s') ? n * 1000 :
-      unit.startsWith('m') ? n * 60 * 1000 :
-      unit.startsWith('h') ? n * 60 * 60 * 1000 :
-      n * 24 * 60 * 60 * 1000;
-    return new Date(Date.now() + ms);
-  }
-
-  // Absolute ISO 8601 date or datetime.
-  const iso = Date.parse(s);
-  if (Number.isFinite(iso)) return new Date(iso);
-
   throw verbError(
     'invalid_params',
-    `Cannot parse ttl "${s}".`,
+    `Cannot parse ttl "${parsed.input}".`,
     'Pass a duration like "30d" or "12h", or an absolute ISO 8601 timestamp like "2026-07-12T00:00:00Z". Omit ttl for a fact that never expires.',
   );
 }

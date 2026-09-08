@@ -26,6 +26,7 @@ follows is `BOOTSTRAP_FOR_AGENTS.md` at the repo root, fetched at the
 | Per-turn persistence | Stop hook → debounced, detached scan-gated push (per workspace; 5 min default, every turn in cloud sandboxes) | after each assistant turn; `GBRAIN_STOP_PUSH=0` disables; `GBRAIN_STOP_PUSH_DEBOUNCE_MIN` / config `hooks.stop_push_debounce_min` tune it |
 | Session persistence | SessionEnd hook → scan-gated commit+push | at session end (note: the harness never fires SessionEnd on `/exit` — the per-turn push is what covers that) |
 | Compaction checkpoints | PreCompact hook → secret-scanned boundary segment banked to the corpus dir; a live serve harvests it into facts + `brain://` links (see `docs/guides/checkpoint-compaction.md`) | at each Claude Code compaction; links render as `## Compaction checkpoints` on the post-compaction session start |
+| Ambient-writeback instruction blocks (OFF by default — only when `memory.auto_writeback` is enabled, and installed by HARNESS mode, not the workspace install) | managed `<!-- gbrain:ambient-writeback -->` blocks in user-scope `CLAUDE.md` (Claude Code) + `$CODEX_HOME/AGENTS.md` (Codex); the Stop-hook backstop banks gated user turns for serve-side extraction (see `docs/guides/ambient-writeback.md`) | while enabled; re-run `bootstrap harness` after config changes; off-mode re-runs remove the blocks |
 | Push-failure visibility | next turn's context + a user-visible notice; re-announces every 30 min while failing | whenever a background push fails |
 | Optional background job (consent-gated) | git post-commit auto-push + launchd/cron 30-min pull (pull job skipped honestly on hosts without a scheduler) | while logged in |
 | Private GitHub repo | your account, created by `bootstrap repo` (or an empty repo you made yourself, adopted) | privacy verified via API |
@@ -162,10 +163,11 @@ you'd apply to any journal: write what you'd be comfortable persisting.
 | opencode (no wired hooks; scope INVERTED: user-global by default) | pull protocol (opencode reads AGENTS.md natively) + MCP tools; project scope available as an explicit opt-in | per-turn push (opencode ships a plugin/event system, but gbrain does not wire it yet). The project-scope default is deliberately NOT offered: opencode spawns project-config servers with no trust prompt, so a committed entry would auto-execute on every collaborator machine |
 | Bootstrap at all (plugin-only install) | MCP tools (`starter` surface, `--source-guard`) + the curated skill set via the codex/claude plugin (docs/mcp/CODEX.md) | identity files, hooks/push protocol, the private-repo body — the plugin is the lightweight lane; bootstrap is the full agent |
 | Memorable relay (declined or never disclosed) | everything — the integration is additive and off by default | replayable cross-session procedures via the third-party Memorable service (`docs/memorable-agents.md`) |
+| Ambient memory writeback (left off — the default) | everything — the feature is additive; agents still save when explicitly asked (`remember`) | unprompted capture of directly-stated user facts (instructions section, harness blocks, Stop-hook backstop — `docs/guides/ambient-writeback.md`). On Codex specifically, enabling it still has NO per-turn hook: real-time saves ride the instruction blocks; the SessionEnd→sweep lane is the delayed backstop |
 | Second simultaneous session | first session unaffected | second session's brain tools fail politely (one live serve per brain — v1 contract) |
-| Postgres brain (incl. harness mode) | MCP tools every session + pull protocol | per-turn hook injection (`no_pglite_path`: the hook IPC socket is PGLite-only today; hooks stay pre-wired and light up when the engine-uniform listener lands). Preferring Postgres — e.g. via `gbrain init --prefer-postgres` — deliberately trades the per-turn hook lane for MCP-every-session plus the pull protocol until that listener lands; a documented tradeoff, not an oversight |
+| Postgres brain (incl. harness mode) | MCP tools every session + pull protocol; per-turn hooks whenever a `gbrain serve` for this brain is running (the engine-uniform IPC listener keys its socket off the connection URL) | per-turn hook injection between serves (hooks heartbeat `no_pglite_path`/`no_serve` until one is up — the pre-wired hooks light up when a serve runs; MCP-every-session plus the pull protocol carry the load meanwhile). Preferring Postgres — e.g. via `gbrain init --prefer-postgres` — keeps the hook lane; it just needs a live serve, same as PGLite |
 
-## Local harness mode (`gbrain bootstrap harness`, #4043)
+## Local harness mode (`gbrain bootstrap harness`)
 
 The workspace install above is built for a human's laptop. A box run by an
 agent framework (your OpenClaw, or anything that shells out to `claude -p` /
@@ -209,8 +211,8 @@ mode wires them in one command, with no `agent.json` and no interview:
   comment-preserving editor the workspace lane uses — the `{env:…}`
   interpolation the `connect` path prefers would resolve empty under a
   framework-spawned opencode for the same no-shell-profile reason.
-  Note: downgrading gbrain below the release that introduced opencode support
-  after wiring it leaves the opencode entry in place for manual removal —
+  Note: downgrading to a gbrain binary without opencode support after wiring
+  it leaves the opencode entry in place for manual removal —
   edit the opencode config by hand, or re-upgrade and run
   `gbrain bootstrap harness --remove`.
 - Honesty on Postgres brains: per-turn injection is degraded (the matrix row
@@ -251,8 +253,8 @@ revoked by `--remove` or rotation (it is not the harness's to revoke) —
 retire it yourself with `gbrain auth revoke` when you're done with it.
 
 Binary-downgrade note: token scoping is data-only (no migration), so a gbrain
-binary OLDER than the release that shipped it verifies every scoped token as
-FULL-ACCESS — the old verify path never reads the scopes column. If you
+binary without token scoping verifies every scoped token as FULL-ACCESS (its
+verify path never reads the scopes column). If you
 downgrade after a harness install, revoke the scoped tokens first
 (`gbrain auth revoke` with the id flag) and re-mint once you upgrade again.
 

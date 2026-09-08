@@ -412,7 +412,7 @@ export async function checkUndeclaredDbOnlyPages(engine: BrainEngine): Promise<C
       for (const { slug, source_path: sourcePath } of rows) {
         if (dbOnlyDirs.some(dir => slug.startsWith(dir))) continue;
         if (sourcePath) {
-          const filePath = resolveSourceLocalFilePath(src.local_path!, sourcePath);
+          const filePath = resolveSourceLocalFilePath(src.local_path!, sourcePath, slug);
           if (filePath && existsSync(filePath)) continue;
         } else {
           backedWithoutSourcePath ??= collectMarkdownSlugs(src.local_path!);
@@ -509,11 +509,17 @@ type ExtractAtomsBacklogCounter = (engine: BrainEngine, sourceId?: string) => Pr
 async function countExtractAtomsBacklogBySource(
   engine: BrainEngine,
   countBacklog: ExtractAtomsBacklogCounter,
+  sourceIds?: string[],
 ): Promise<Array<{ source_id: string; backlog: number }> | null> {
   try {
-    const sources = await engine.executeRaw<{ source_id: string }>(
-      `SELECT DISTINCT source_id FROM pages WHERE deleted_at IS NULL ORDER BY source_id`,
-    );
+    // Source isolation: a scoped caller (remote run_doctor with a source
+    // grant) only ever sees its own ids — the brain-wide roster is for the
+    // unscoped local/host path.
+    const sources = sourceIds
+      ? [...sourceIds].sort().map((source_id) => ({ source_id }))
+      : await engine.executeRaw<{ source_id: string }>(
+        `SELECT DISTINCT source_id FROM pages WHERE deleted_at IS NULL ORDER BY source_id`,
+      );
     const rows: Array<{ source_id: string; backlog: number }> = [];
     for (const src of sources) {
       const backlog = await countBacklog(engine, src.source_id);
@@ -526,18 +532,112 @@ async function countExtractAtomsBacklogBySource(
   }
 }
 
+/** Total backlog: brain-wide when unscoped, else the sum over the granted ids. */
+async function countExtractAtomsBacklogScoped(
+  engine: BrainEngine,
+  countBacklog: ExtractAtomsBacklogCounter,
+  sourceIds?: string[],
+): Promise<number | null> {
+  if (!sourceIds) return countBacklog(engine);
+  let total = 0;
+  for (const id of sourceIds) {
+    const n = await countBacklog(engine, id);
+    if (n === null) return null;
+    total += n;
+  }
+  return total;
+}
+
+function buildExtractAtomsDrainCommand(
+  bySource: Array<{ source_id: string; backlog: number }> | null,
+): string {
+  if (!bySource || bySource.length === 0) {
+    return `gbrain dream --phase extract_atoms --drain --source <source-id> --window 120`;
+  }
+  if (bySource.length === 1) {
+    return `gbrain dream --phase extract_atoms --drain --source ${bySource[0]!.source_id} --window 120`;
+  }
+  const sources = bySource.map((row) => row.source_id).join(', ');
+  return `gbrain dream --phase extract_atoms --drain --source ${bySource[0]!.source_id} --window 120 (repeat for backlog source(s): ${sources})`;
+}
+
 function buildExtractAtomsBacklogFixHint(
   bySource: Array<{ source_id: string; backlog: number }> | null,
 ): string {
-  const suffix = '(or declare extract_atoms in your active schema pack)';
-  if (!bySource || bySource.length === 0) {
-    return `gbrain dream --phase extract_atoms --drain --source <source-id> --window 120 ${suffix}`;
+  const drain = buildExtractAtomsDrainCommand(bySource);
+  if (bySource && bySource.length > 1) {
+    // Multi-source form already ends in a parenthetical — fold the
+    // declare-suggestion into it.
+    return drain.replace(/\)$/, '; or declare extract_atoms in your active schema pack)');
   }
-  if (bySource.length === 1) {
-    return `gbrain dream --phase extract_atoms --drain --source ${bySource[0]!.source_id} --window 120 ${suffix}`;
+  return `${drain} (or declare extract_atoms in your active schema pack)`;
+}
+
+/**
+ * #4576 — evidence that a full routine cycle actually completes on this host.
+ * Reads the most recent `last_full_cycle_at` across local_path sources — the
+ * canonical "this whole cycle completed" stamp runCycle's exit hook writes
+ * and `cycle_freshness` reads. Freshness window is the same
+ * GBRAIN_CYCLE_FRESHNESS_WARN_HOURS knob (default 6h) cycle_freshness warns
+ * at. `unknown` (sources unreadable) is fail-open: callers must not warn on it.
+ */
+type FullCycleEvidence =
+  | { state: 'fresh' | 'stale'; latestIso: string; ageHours: number; warnHours: number }
+  | { state: 'never'; latestIso: null; warnHours: number }
+  | { state: 'unknown' };
+
+async function latestFullCycleEvidence(
+  engine: BrainEngine,
+  nowMs = Date.now(),
+): Promise<FullCycleEvidence> {
+  const warnHours = _resolveSyncFreshnessHours('GBRAIN_CYCLE_FRESHNESS_WARN_HOURS', 6);
+  try {
+    const sources = await engine.listAllSources({ localPathOnly: true });
+    let latest = Number.NEGATIVE_INFINITY;
+    let latestIso: string | null = null;
+    for (const src of sources) {
+      const raw = src.config?.last_full_cycle_at;
+      if (typeof raw !== 'string') continue;
+      const t = new Date(raw).getTime();
+      if (Number.isFinite(t) && t > latest) {
+        latest = t;
+        latestIso = raw;
+      }
+    }
+    if (latestIso === null) return { state: 'never', latestIso: null, warnHours };
+    const ageHours = Math.max(0, Math.floor((nowMs - latest) / 3_600_000));
+    // Future timestamps (clock skew) count as fresh — cycle_freshness owns
+    // the clock-skew signal; this check only needs "does anything run?".
+    const state = nowMs - latest <= warnHours * 3_600_000 ? 'fresh' : 'stale';
+    return { state, latestIso, ageHours, warnHours };
+  } catch {
+    return { state: 'unknown' };
   }
-  const sources = bySource.map((row) => row.source_id).join(', ');
-  return `gbrain dream --phase extract_atoms --drain --source ${bySource[0]!.source_id} --window 120 (repeat for backlog source(s): ${sources}; or declare extract_atoms in your active schema pack)`;
+}
+
+/**
+ * #4576 review fix: can this brain's shape produce per-source
+ * last_full_cycle_at stamps at all? Two lanes write them:
+ *   - the per-source cycle (autopilot fanout / dream --source / dream --dir
+ *     matching a registered local_path) stamps that local_path source;
+ *   - the #4700 implicit-default lane stamps the resolved implicit default.
+ * A brain with ZERO local_path sources and NO implicit default (the legacy
+ * unscoped-dream shape — everything in 'default', dir via sync.repo_path)
+ * has neither lane, so evidence state 'never' is a property of the SHAPE,
+ * not evidence that nothing runs. Fail-open: a probe error reads as
+ * cannot-verify (false), keeping the pre-#4576 ok-with-reassurance.
+ */
+async function brainShapeCanCarryCycleStamps(engine: BrainEngine): Promise<boolean> {
+  try {
+    const sources = await engine.listAllSources({ localPathOnly: true });
+    if (sources.length > 0) return true;
+    const { resolveImplicitDefaultSourceId } = await import('../../../core/source-resolver.ts');
+    const implicitDefault = await resolveImplicitDefaultSourceId(engine);
+    // dream only runs the stamping implicit lane for a NON-'default' target.
+    return implicitDefault !== null && implicitDefault !== 'default';
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -557,12 +657,15 @@ function buildExtractAtomsBacklogFixHint(
  */
 export async function computeExtractAtomsBacklogCheck(
   engine: BrainEngine,
+  opts: { sourceIds?: string[] } = {},
 ): Promise<Check> {
   const name = 'extract_atoms_backlog';
   const approx = 'page backlog only; transcript corpus not counted';
   try {
     const { countExtractAtomsBacklog } = await import('../../../core/cycle/extract-atoms.ts');
-    const backlog = await countExtractAtomsBacklog(engine); // brain-wide
+    // undefined = brain-wide (local doctor); an array = the remote caller's
+    // source grant — counts, roster and drain hints all stay inside it.
+    const backlog = await countExtractAtomsBacklogScoped(engine, countExtractAtomsBacklog, opts.sourceIds);
     if (backlog === null) {
       return { name, status: 'warn', message: 'backlog query failed (could not count eligible pages)' };
     }
@@ -582,7 +685,7 @@ export async function computeExtractAtomsBacklogCheck(
     // The incident: pack does NOT run the phase but a real backlog exists →
     // it will grow forever without a signal. WARN with the drain command.
     if (!declared && backlog > 10) {
-      const backlogBySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog);
+      const backlogBySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog, opts.sourceIds);
       const fix = buildExtractAtomsBacklogFixHint(backlogBySource);
       return {
         name, status: 'warn',
@@ -592,7 +695,50 @@ export async function computeExtractAtomsBacklogCheck(
     }
 
     if (declared) {
-      // Pack runs it; the routine cycle drains in bounded batches. Informational.
+      // #4576: "the pack runs it each cycle" is only reassurance when
+      // something actually RUNS the cycle. Gate the OK on evidence — on a
+      // host with no autopilot/cron install nothing runs the phase, the
+      // backlog grows forever, and this branch used to report ok the whole
+      // time (the same silent-backlog failure mode #1678 closed for the
+      // !declared branch, reopened through a different door).
+      const evidence = backlog > 10 ? await latestFullCycleEvidence(engine) : null;
+      // #4576 review fix: 'never' only indicts the scheduler when the brain
+      // shape can actually produce stamps. On the legacy unscoped-dream shape
+      // (no local_path sources, no implicit default) no lane ever writes
+      // last_full_cycle_at, so 'never' would be a permanent false warn —
+      // keep the old ok-with-reassurance there instead.
+      if (evidence && evidence.state === 'never' && !(await brainShapeCanCarryCycleStamps(engine))) {
+        return {
+          name, status: 'ok',
+          message: `${backlog} page(s) pending; active pack runs extract_atoms each cycle`,
+          details: { backlog, pack_declares_phase: true, cycle_evidence: 'unavailable', known_approximation: approx },
+        };
+      }
+      if (evidence && (evidence.state === 'never' || evidence.state === 'stale')) {
+        const backlogBySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog, opts.sourceIds);
+        const drain = buildExtractAtomsDrainCommand(backlogBySource);
+        const since = evidence.state === 'never'
+          ? 'no full cycle has ever completed'
+          : `no full cycle has completed in ${evidence.ageHours}h (warn window ${evidence.warnHours}h)`;
+        return {
+          name, status: 'warn',
+          message:
+            `${backlog} page(s) pending and the active pack declares extract_atoms, but ${since} — ` +
+            `nothing appears to run the cycle. Install the scheduler: gbrain autopilot --install. ` +
+            `Or drain now: ${drain}`,
+          details: {
+            backlog,
+            backlog_by_source: backlogBySource ?? undefined,
+            pack_declares_phase: true,
+            cycle_evidence: evidence.state,
+            last_full_cycle_at: evidence.latestIso ?? undefined,
+            fix_hint: drain,
+            known_approximation: approx,
+          },
+        };
+      }
+      // Pack runs it AND a cycle completed recently (or the backlog is small,
+      // or evidence is unreadable — fail-open). Informational.
       return {
         name, status: 'ok',
         message: `${backlog} page(s) pending; active pack runs extract_atoms each cycle`,
@@ -608,6 +754,178 @@ export async function computeExtractAtomsBacklogCheck(
     };
   } catch (err) {
     return { name, status: 'warn', message: `extract_atoms_backlog check failed: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * atom_provenance_drift doctor check (#4566).
+ *
+ * The mirror of extract_atoms_backlog. That check counts pages waiting to be
+ * extracted; this one counts atoms whose provenance no longer resolves.
+ *
+ * Scope: PAGE-BOUND atoms only (those stamped with a `source_slug`). The page
+ * lane of extract_atoms stamps `frontmatter.source_hash` with the first 16
+ * chars of the source page's content_hash, and discovery skips a page while an
+ * atom with the matching hash exists. Editing the page moves its content_hash,
+ * so the atom is left pointing at a hash no live page carries. The transcript
+ * lane binds atoms to a FILE instead (`source_path`, no `source_slug`) and
+ * stamps sha256(raw file)[:16] — a different function over different input
+ * that can never equal a page's content_hash — so those atoms are counted
+ * separately as `slug_unbound` and excluded from the drift population (#4799
+ * named the bucket, #4806 took it out of the ratio). Nothing reclaims drifted
+ * atoms: re-extraction mints under a deterministic slug built from the atom
+ * TITLE, so it only upserts in place when the new pass happens to produce the
+ * same title. A reworded claim lands on a new slug and the old atom stays,
+ * unreferenced.
+ *
+ * Why this needs a signal: a drifted atom is still returned by search, still
+ * carries a `source_quote`, and still reads as sourced — but its quote can no
+ * longer be located in any current page. It is the one class of derived page
+ * that silently diverges from the corpus it claims to summarize.
+ *
+ * Measured on a 17-source brain (30.7k pages, 4.0k atoms) before shipping this:
+ * 1,001 of 3,999 atoms (25.0%) had drifted; 932 still had a live source page
+ * that had merely been edited, 69 had lost the source page entirely. The
+ * youngest drifted atom was 6.0 days old and the mean was 16.5 days, i.e. the
+ * population is NOT extraction lag working itself out — it accumulates.
+ *
+ * Diagnostic only. It reports and hints; it never deletes. `source_gone` and
+ * `source_changed` are split because they warrant different handling and the
+ * second is by far the larger group — a naive GC keyed on drift alone would
+ * delete mostly-recoverable knowledge. The third bucket, `slug_unbound`, holds
+ * atoms with no `source_slug` at all (transcript-origin atoms bind by
+ * `source_path`, pre-binding-era atoms by neither); their page liveness cannot
+ * be resolved by slug, so they are reported as their own informational count
+ * and never as drift, gone, or part of the WARN ratio.
+ */
+export async function computeAtomProvenanceDriftCheck(
+  engine: BrainEngine,
+): Promise<Check> {
+  const name = 'atom_provenance_drift';
+  // Both must trip: the ratio alone flaps on brains with a handful of atoms,
+  // and the count alone fires on large healthy brains mid-cycle.
+  const MIN_DRIFTED = 25;
+  const WARN_RATIO = 0.1;
+  try {
+    const rows = await engine.executeRaw<{
+      total: string | number; slug_unbound: string | number; drifted: string | number;
+      source_changed: string | number; source_gone: string | number;
+      oldest_ext: string | null;
+    }>(
+      // extracted_at stays TEXT end to end (review fix): an unguarded
+      // ::timestamptz cast let ONE malformed frontmatter value (hand edit,
+      // truncation) abort the whole aggregate and permanently degrade this
+      // check to a spurious "check failed" warn. The ISO-shape regex drops
+      // garbage from the min(); the age math happens in TS where Date
+      // parsing can never throw (semantically-invalid dates become NaN →
+      // metric omitted, verdict untouched).
+      `WITH atom AS (
+         SELECT a.source_id,
+                a.frontmatter->>'source_hash' AS sh,
+                -- NULL = slug-unbound: transcript-minted (source_path only) or
+                -- pre-binding-era. \`ss IS NULL\` is THE predicate for that
+                -- population everywhere below (#4799 / #4806).
+                NULLIF(a.frontmatter->>'source_slug', '') AS ss,
+                CASE WHEN a.frontmatter->>'extracted_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                     THEN a.frontmatter->>'extracted_at' END AS ext
+           FROM pages a
+          WHERE a.type = 'atom'
+            AND a.deleted_at IS NULL
+            AND a.frontmatter->>'source_hash' IS NOT NULL
+            -- in-flight marker written before the extraction commits
+            AND a.frontmatter->>'source_hash' NOT LIKE 'pending:%'
+       -- Lookup sets are built ONCE and joined (#4937). A correlated EXISTS in
+       -- the SELECT list is not rewritten to a semi-join — Postgres re-runs it
+       -- per atom over substring(content_hash), which no index serves, so the
+       -- check went O(atoms x same-source pages) and blew health-check budgets.
+       -- DISTINCT is load-bearing: duplicate live content_hash values are a
+       -- real state and would otherwise fan one atom out into several rows.
+       ), live_hashes AS MATERIALIZED (
+         SELECT DISTINCT source_id, substring(content_hash from 1 for 16) AS sh
+           FROM pages WHERE deleted_at IS NULL AND content_hash IS NOT NULL
+       ), live_slugs AS MATERIALIZED (
+         SELECT DISTINCT source_id, slug FROM pages WHERE deleted_at IS NULL
+       ), drift AS (
+         SELECT atom.*,
+                -- a slug-unbound atom is never drift: its hash is over a file,
+                -- not a page, so the page probe is meaningless (#4806)
+                (atom.ss IS NOT NULL AND h.sh IS NULL) AS drifted,
+                (s.slug IS NOT NULL) AS src_alive
+           FROM atom
+           LEFT JOIN live_hashes h ON h.source_id = atom.source_id AND h.sh = atom.sh
+           LEFT JOIN live_slugs  s ON s.source_id = atom.source_id AND s.slug = atom.ss
+       )
+       SELECT count(*) FILTER (WHERE ss IS NOT NULL) AS total,
+              count(*) FILTER (WHERE ss IS NULL) AS slug_unbound,
+              count(*) FILTER (WHERE drifted) AS drifted,
+              count(*) FILTER (WHERE drifted AND src_alive) AS source_changed,
+              -- drifted implies a slug binding, so "gone" is always a binding
+              -- that failed to resolve — never a slug-unbound atom (#4799)
+              count(*) FILTER (WHERE drifted AND NOT src_alive) AS source_gone,
+              -- lexicographic min of ISO-shaped strings ≈ chronological min
+              -- (oldest); informational only, never verdict-bearing
+              min(ext) FILTER (WHERE drifted) AS oldest_ext
+         FROM drift`,
+      [],
+    );
+    const r = rows?.[0];
+    if (!r) return { name, status: 'warn', message: 'atom provenance query returned no rows' };
+
+    const num = (v: string | number | null | undefined) => (v == null ? 0 : Number(v));
+    const total = num(r.total);
+    const slugUnbound = num(r.slug_unbound);
+    const drifted = num(r.drifted);
+    const sourceChanged = num(r.source_changed);
+    const sourceGone = num(r.source_gone);
+    const oldestExtMs = r.oldest_ext ? new Date(String(r.oldest_ext)).getTime() : NaN;
+    const oldestDays = Number.isFinite(oldestExtMs)
+      ? Math.round(((Date.now() - oldestExtMs) / 86_400_000) * 10) / 10
+      : null;
+    const ratio = total > 0 ? drifted / total : 0;
+    const details = {
+      total_atoms: total,
+      slug_unbound: slugUnbound,
+      drifted,
+      source_changed: sourceChanged,
+      source_gone: sourceGone,
+      drift_pct: total > 0 ? Math.round(ratio * 1000) / 10 : 0,
+      oldest_drifted_days: oldestDays ?? undefined,
+    };
+
+    // Slug-unbound atoms cannot be page-checked; say so instead of hiding them.
+    const su = slugUnbound > 0
+      ? `; ${slugUnbound} slug-unbound atom(s) (no source_slug: transcript-minted source_path-only, or pre-binding-era) are file-bound and not page-checked`
+      : '';
+    if (total === 0) {
+      return { name, status: 'ok', message: (slugUnbound > 0 ? 'no page-bound atoms to check' : 'no atoms to check') + su, details };
+    }
+    if (drifted === 0) return { name, status: 'ok', message: `${total} atom(s), all provenance-resolved${su}`, details };
+
+    if (drifted >= MIN_DRIFTED && ratio > WARN_RATIO) {
+      const fix =
+        "review before acting — most drift is an edited source, not a dead one. " +
+        "List them with: SELECT slug, frontmatter->>'source_slug' FROM pages a WHERE a.type='atom' " +
+        "AND a.deleted_at IS NULL AND NULLIF(a.frontmatter->>'source_slug','') IS NOT NULL " +
+        "AND NOT EXISTS (SELECT 1 FROM pages p WHERE p.source_id=a.source_id " +
+        "AND p.deleted_at IS NULL AND substring(p.content_hash from 1 for 16)=a.frontmatter->>'source_hash')";
+      return {
+        name, status: 'warn',
+        message:
+          `${drifted}/${total} atom(s) (${details.drift_pct}%) reference a source_hash no live page carries ` +
+          `— ${sourceChanged} whose source page still exists (edited), ${sourceGone} whose source page is gone` +
+          (oldestDays != null ? `; oldest ${oldestDays}d` : '') + su +
+          `. These still surface in search with a source_quote that no current page contains. Fix: ${fix}`,
+        details,
+      };
+    }
+
+    return {
+      name, status: 'ok',
+      message: `${drifted}/${total} atom(s) drifted (below warn threshold)${su}`,
+      details,
+    };
+  } catch (err) {
+    return { name, status: 'warn', message: `atom_provenance_drift check failed: ${(err as Error).message}` };
   }
 }
 

@@ -25,14 +25,15 @@ import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { OAuthTokenRevocationRequestSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, opAllowedForBoundClient } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
-import { GBRAIN_MCP_INSTRUCTIONS } from '../mcp/instructions.ts';
+import { resolveMcpInstructions } from '../mcp/instructions.ts';
+import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import {
   GBrainOAuthProvider,
   validateTokenEndpointAuthMethod,
@@ -1274,7 +1275,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // parameter, so MCP clients couldn't begin the OAuth flow from a fresh
   // 401 — they would silently fail to connect with a generic "couldn't
   // reach the MCP server" error.
-  const resourceMetadataUrl = `${issuerUrl.toString().replace(/\/$/, '')}/.well-known/oauth-protected-resource`;
+  // RFC 9728 / MCP auth spec: the protected-resource metadata describes the
+  // resource the client connects to (/mcp), not the authorization-server root.
+  // Without resourceServerUrl the SDK falls back to issuerUrl, advertising
+  // `resource: "https://host/"` and 404ing the path-based PRM URL
+  // (/.well-known/oauth-protected-resource/mcp) that clients derive from the
+  // connector URL (#4893). The 401 challenge's resource_metadata URL is
+  // derived from the same value so the two can never drift apart.
+  const mcpResourceUrl = new URL('/mcp', issuerUrl);
+  const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(mcpResourceUrl);
 
   // F9: cookie `secure` flag honors both the request's TLS state (req.secure
   // is set when express trust-proxy lands an X-Forwarded-Proto: https) AND
@@ -1299,6 +1308,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // ['read','write','admin'] list left those new scopes invisible.
     scopesSupported: [...ALLOWED_SCOPES_LIST],
     resourceName: 'GBrain MCP Server',
+    // Advertise /mcp as the protected resource (see mcpResourceUrl above).
+    resourceServerUrl: mcpResourceUrl,
   };
 
   // F12: DCR disable lives on the provider's constructor option above. The
@@ -1331,6 +1342,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return origJson(body);
       };
     }
+    next();
+  });
+
+  // Back-compat alias: with resourceServerUrl set the SDK mounts the PRM only
+  // at the path-based URL, so clients that still probe the bare root (what
+  // gbrain advertised before) would 404 mid-flight. Rewrite the root onto the
+  // SDK's own handler — one document, same cors()/allowedMethods, no copy.
+  const legacyPrmPath = '/.well-known/oauth-protected-resource';
+  app.all(legacyPrmPath, (req: Request, _res: Response, next: NextFunction) => {
+    req.url = new URL(resourceMetadataUrl).pathname;
     next();
   });
 
@@ -2335,15 +2356,50 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // WP4 (D2): per-request effective surface + fail-closed allow-set,
     // recomputed per request (amendment 20) so rescopes/request_tools
     // persists take effect on the next request with zero restart.
-    const { ceiling: surfaceCeiling, effective: surface } = await resolveEffectiveSurface(authInfo);
+    // Ambient writeback (opt-in, default off) resolves CONCURRENTLY with the
+    // surface read (performance review, this wave — the two independent DB
+    // waits must not serialize; an initialize-only resolve is NOT possible
+    // here because /mcp has no JSON middleware, so req.body is undefined
+    // until the SDK transport reads the stream — verified by the OAuth
+    // lifecycle test, which caught exactly that regression). Restart-free
+    // like the publish gates, fail-closed with a per-engine last-known-good
+    // bundle so a transient config blip serves the previous bundle instead
+    // of silently dropping the section mid-session. OV-A5: a token without
+    // write scope never receives the section (`remember` would be
+    // uncallable — instructions must not order impossible calls); OV2-14:
+    // extract_facts is advertised only when this token's ACTUAL visible set
+    // can call it (surface + scope + bound-client fence — the same
+    // predicates tools/list applies).
+    const canWrite = hasScope(authInfo.scopes, 'write');
+    const [{ ceiling: surfaceCeiling, effective: surface }, writeback] = await Promise.all([
+      resolveEffectiveSurface(authInfo),
+      canWrite ? resolveWritebackConfig(engine, config) : Promise.resolve(null),
+    ]);
     const mcpOperations = filterOpsForSurface(mcpOperationsBase, surface);
     const surfaceAllowedOps: ReadonlySet<string> | undefined =
       surface === 'full' ? undefined : new Set(mcpOperations.map(o => o.name));
 
-    // Create a fresh MCP server per request (stateless)
+    // Create a fresh MCP server per request (stateless).
+    let writebackOpts: ReturnType<typeof ambientOptsFrom> = null;
+    if (writeback) {
+      // Both availability probes apply the SAME predicates tools/list does
+      // (surface filter + bound-client fence): a slug-bound client whose
+      // fence denies `remember` receives NO ambient section at all —
+      // instructions must never order calls dispatch will deny.
+      const rememberOp = mcpOperations.find(o => o.name === 'remember');
+      const extractFactsOp = mcpOperations.find(o => o.name === 'extract_facts');
+      writebackOpts = ambientOptsFrom(writeback, {
+        remember: rememberOp !== undefined && opAllowedForBoundClient(authInfo, rememberOp),
+        extractFacts: extractFactsOp !== undefined && opAllowedForBoundClient(authInfo, extractFactsOp),
+      });
+    }
     const server = new Server(
       { name: 'gbrain', version: VERSION },
-      { capabilities: { tools: {} }, instructions: GBRAIN_MCP_INSTRUCTIONS },
+      {
+        capabilities: { tools: {} },
+        // #4748: contract (+ opt-in writeback section) + deployment identity.
+        instructions: resolveMcpInstructions(config, process.env, { writeback: writebackOpts }),
+      },
     );
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       // WP1 honest catalog: the advertised list is exactly what THIS token

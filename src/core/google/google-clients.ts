@@ -4,7 +4,14 @@
  * Hand-rolled (no googleapis dep, house style — see github-source.ts):
  *  - auth via GoogleTokenProvider (vault-backed, auto-refreshing)
  *  - 401 → forceRefresh() + single retry
- *  - 403/429 → Retry-After honored (delta-seconds AND http-date)
+ *  - 403/429 → Retry-After honored (delta-seconds AND http-date). A
+ *    rate-limit-class response (403 rateLimitExceeded/userRateLimitExceeded,
+ *    403 quota, or 429) gets a MUCH more patient retry budget than other
+ *    retryable failures — DEFAULT_RATE_LIMIT_RETRIES, exponential backoff
+ *    with jitter capped at 60s — because Gmail's per-user rate limiting
+ *    under backfill burst load is common and self-clearing; giving up after
+ *    two tries used to poison threads that would have succeeded a few
+ *    seconds later.
  *  - 403 accessNotConfigured → CredentialError 'api_not_enabled' with the
  *    exact enable deep link (project number extracted from the client id)
  *  - uniform pageToken pagination with a safety cap
@@ -17,6 +24,7 @@ import { apiEnableLink } from '../creds/providers/google.ts';
 import { parseRetryAfterMs } from '../github-source.ts';
 import {
   bareAddress,
+  DEFAULT_CALENDAR_ID,
   splitAddressList,
   type CalendarEventData,
   type ContactData,
@@ -32,6 +40,34 @@ const CALENDAR_BASE = 'https://www.googleapis.com/calendar/v3';
 const PEOPLE_BASE = 'https://people.googleapis.com/v1';
 
 const PAGINATION_CAP = 500;
+
+/** Retry budget for a 401 needing a token refresh-and-retry. */
+const DEFAULT_RETRIES = 2;
+
+/**
+ * Retry budget for a rate-limit-class response (403 rateLimitExceeded /
+ * userRateLimitExceeded / quota, or 429) — deliberately much larger than
+ * DEFAULT_RETRIES. Gmail's per-user rate limiting under backfill burst load
+ * clears on its own within seconds to low minutes; two tries (~6s total)
+ * gave up before it cleared and poisoned threads that would otherwise have
+ * succeeded.
+ */
+const DEFAULT_RATE_LIMIT_RETRIES = 6;
+
+/** Backoff ceiling for a rate-limit retry with no Retry-After header. */
+const RATE_LIMIT_BACKOFF_CAP_MS = 60_000;
+
+/**
+ * Exponential backoff with EQUAL jitter (half fixed, half random), capped at
+ * RATE_LIMIT_BACKOFF_CAP_MS. Only used when Google didn't send Retry-After —
+ * jitter avoids many gbrain processes hitting the same per-user/per-project
+ * quota resynchronizing their retries in lockstep.
+ */
+export function rateLimitBackoffMs(attempt: number): number {
+  const base = Math.min(RATE_LIMIT_BACKOFF_CAP_MS, 2 ** attempt * 2_000);
+  const half = base / 2;
+  return Math.round(half + Math.random() * half);
+}
 
 interface GoogleErrorBody {
   error?: {
@@ -57,10 +93,16 @@ export class GoogleApiClient {
   async fetchJSON<T>(
     url: string,
     apiHint: ApiHint,
-    opts: { signal?: AbortSignal; retries?: number } = {},
+    opts: { signal?: AbortSignal; retries?: number; rateLimitRetries?: number } = {},
   ): Promise<T> {
-    const retries = opts.retries ?? 2;
-    for (let attempt = 0; attempt <= retries; attempt++) {
+    const retries = opts.retries ?? DEFAULT_RETRIES;
+    // Rate-limit-class failures get their OWN (larger) retry budget — see
+    // the class doc comment. The shared `attempt` counter is bounded by
+    // whichever budget is larger; each branch below still checks its own
+    // budget, so a plain 401 exhausts at `retries` exactly as before.
+    const rateLimitRetries = opts.rateLimitRetries ?? DEFAULT_RATE_LIMIT_RETRIES;
+    const maxAttempt = Math.max(retries, rateLimitRetries);
+    for (let attempt = 0; attempt <= maxAttempt; attempt++) {
       const token = await this.tokens.getAccessToken();
       const res = await this.fetchImpl(url, {
         headers: { authorization: `Bearer ${token}` },
@@ -87,9 +129,12 @@ export class GoogleApiClient {
         }
       }
       if (res.status === 403 || res.status === 429) {
-        const waitMs = parseRetryAfterMs(res.headers.get('retry-after')) ?? Math.min(60_000, 2 ** attempt * 2_000);
-        if (attempt < retries) {
-          this.log(`[google] HTTP ${res.status}; retrying in ${Math.round(waitMs / 1000)}s`);
+        const waitMs = parseRetryAfterMs(res.headers.get('retry-after')) ?? rateLimitBackoffMs(attempt);
+        if (attempt < rateLimitRetries) {
+          this.log(
+            `[google] HTTP ${res.status}; retrying in ${Math.round(waitMs / 1000)}s ` +
+              `(rate limit, attempt ${attempt + 1}/${rateLimitRetries})`,
+          );
           await new Promise<void>((resolve) => {
             const t = setTimeout(resolve, waitMs);
             opts.signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
@@ -155,7 +200,12 @@ interface RawGmailHeader {
 }
 
 interface RawGmailPart {
+  /** BARE media type ('text/calendar') — Gmail strips the Content-Type
+   *  parameters from this field; they live on `headers[]` (format=full). */
   mimeType?: string;
+  filename?: string;
+  /** Per-part MIME headers (Content-Type with its params, Content-Disposition, …). */
+  headers?: RawGmailHeader[];
   body?: { data?: string; size?: number };
   parts?: RawGmailPart[];
 }
@@ -165,7 +215,7 @@ interface RawGmailMessage {
   threadId: string;
   labelIds?: string[];
   internalDate?: string;
-  payload?: RawGmailPart & { headers?: RawGmailHeader[] };
+  payload?: RawGmailPart;
 }
 
 interface RawGmailThread {
@@ -174,10 +224,17 @@ interface RawGmailThread {
   messages?: RawGmailMessage[];
 }
 
-function header(msg: RawGmailMessage, name: string): string {
-  const h = msg.payload?.headers?.find((x) => x.name.toLowerCase() === name.toLowerCase());
+function partHeader(part: RawGmailPart | undefined, name: string): string {
+  const h = part?.headers?.find((x) => x.name.toLowerCase() === name.toLowerCase());
   return h?.value ?? '';
 }
+
+function header(msg: RawGmailMessage, name: string): string {
+  return partHeader(msg.payload, name);
+}
+
+/** iCalendar METHOD parameter of a Content-Type value (quoted or bare). */
+const CALENDAR_METHOD_RE = /method\s*=\s*"?([a-z]+)"?/i;
 
 function decodeB64Url(data: string): string {
   try {
@@ -206,6 +263,49 @@ export function extractBody(part: RawGmailPart | undefined): { text: string; isH
   // Single-part messages sometimes carry data at the top level with no mimeType match.
   if (part.body?.data) return { text: decodeB64Url(part.body.data), isHtml: false };
   return { text: '', isHtml: false };
+}
+
+/**
+ * iCalendar method for a message: the METHOD of its `text/calendar` /
+ * `application/ics` MIME part ('' when the part carries no parsable method),
+ * or null when the message has no calendar MIME part at all — including the
+ * bare-.ics-filename-attachment shape, which is a human forwarding an invite
+ * file, not Calendar system mail.
+ *
+ * Structural, not textual: Google Calendar attaches a `text/calendar` part
+ * (`method=REQUEST|REPLY|CANCEL`) to every invitation, update, response and
+ * cancellation, so this identifies calendar system mail without matching on
+ * subject wording or sender address — both of which are wrong signals, since
+ * the mail arrives FROM the colleague's real address. Only a NON-EMPTY method
+ * classifies as system mail (isCalendarSystemMail); '' and null both fall to
+ * the anchored subject-prefix fallback.
+ */
+export function extractCalendarMethod(part: RawGmailPart | undefined): string | null {
+  if (!part) return null;
+  const stack: RawGmailPart[] = [part];
+  while (stack.length > 0) {
+    const p = stack.shift()!;
+    const mime = (p.mimeType ?? '').toLowerCase();
+    if (mime.startsWith('text/calendar') || mime === 'application/ics') {
+      // Gmail's MessagePart.mimeType is the BARE media type; the `method=`
+      // parameter lives in the part's own Content-Type header (format=full
+      // carries headers on nested parts). Read that first — a parser that
+      // only looked at mimeType read '' for every real invite, which silently
+      // downgraded the structural signal to the subject-prefix fallback. A
+      // mimeType that still carries the params (other providers / fixtures)
+      // remains the fallback parse.
+      const contentType = partHeader(p, 'Content-Type');
+      const m = CALENDAR_METHOD_RE.exec(contentType) ?? CALENDAR_METHOD_RE.exec(p.mimeType ?? '');
+      return (m?.[1] ?? '').toUpperCase();
+    }
+    // A bare `.ics` FILENAME with a non-calendar MIME type claims nothing:
+    // that shape is a human attaching an invite file, not Calendar system
+    // mail, and short-circuiting '' here used to suppress the whole message
+    // from loop detection. Keep scanning — a real text/calendar part
+    // elsewhere in the tree still wins.
+    if (p.parts) stack.push(...p.parts);
+  }
+  return null;
 }
 
 export class GmailClient extends GoogleApiClient {
@@ -298,6 +398,7 @@ export class GmailClient extends GoogleApiClient {
         internalDateMs,
         labelIds: m.labelIds ?? [],
         listUnsubscribe: header(m, 'List-Unsubscribe') !== '',
+        calendarMethod: extractCalendarMethod(m.payload),
         bodyText,
       };
     });
@@ -335,10 +436,15 @@ export class CalendarClient extends GoogleApiClient {
       timeMinIso?: string;
       timeMaxIso?: string;
       signal?: AbortSignal;
+      /** Calendar to sweep. Defaults to DEFAULT_CALENDAR_ID. A secondary calendar id is
+       *  an address like `...@group.calendar.google.com`; each calendar gets
+       *  its OWN gbrain source so their sync tokens never collide. */
+      calendarId?: string;
     },
   ): Promise<{ events: CalendarEventData[]; nextSyncToken: string | null }> {
     let nextSyncToken: string | null = null;
-    const base = `${CALENDAR_BASE}/calendars/primary/events?maxResults=250&singleEvents=true`;
+    const calId = encodeURIComponent(opts.calendarId?.trim() || DEFAULT_CALENDAR_ID);
+    const base = `${CALENDAR_BASE}/calendars/${calId}/events?maxResults=250&singleEvents=true`;
     const raw = await this.drainPages<RawCalendarEvent>(
       (t) => {
         const params = new URLSearchParams();
@@ -382,6 +488,39 @@ export class CalendarClient extends GoogleApiClient {
       account,
     }));
     return { events, nextSyncToken };
+  }
+
+  /**
+   * Enumerate every calendar the account can read (calendarList). Discovery
+   * only — the sweep still reads ONE calendar per source, so this exists to
+   * find the id you pass to `sources add --calendar-id`.
+   */
+  async listCalendars(opts: { signal?: AbortSignal } = {}): Promise<
+    Array<{ id: string; summary: string; primary: boolean; accessRole: string }>
+  > {
+    const base = `${CALENDAR_BASE}/users/me/calendarList?maxResults=250`;
+    const raw = await this.drainPages<{
+      id?: string;
+      summary?: string;
+      primary?: boolean;
+      accessRole?: string;
+    }>(
+      (t) => (t ? `${base}&pageToken=${encodeURIComponent(t)}` : base),
+      (body) => ({
+        items: (body.items as Array<Record<string, unknown>> | undefined) ?? [],
+        nextPageToken: (body.nextPageToken as string | undefined) ?? null,
+      }),
+      'calendar-json',
+      opts,
+    );
+    return raw
+      .filter((c) => typeof c.id === 'string' && c.id.length > 0)
+      .map((c) => ({
+        id: c.id as string,
+        summary: c.summary ?? '(no name)',
+        primary: Boolean(c.primary),
+        accessRole: c.accessRole ?? 'unknown',
+      }));
   }
 }
 

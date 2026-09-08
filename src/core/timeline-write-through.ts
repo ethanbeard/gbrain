@@ -1,3 +1,4 @@
+import { bodyWriteChunkVersion } from './search/safe-chunks.ts';
 /**
  * #1856 — write-through for manual timeline entries.
  *
@@ -232,8 +233,9 @@ const CONTINUATION_RE = /^\s{2,}\S/;
  * Placement mirrors `spliceTimelineBlock`'s date-ordering, but is
  * BULLET-BOUNDED: when no bullet should follow the new entry, it lands right
  * after the last bullet (plus its continuation lines), NOT at the end of the
- * region — the region can carry later sections (e.g. a `## Facts` fence,
- * which upsertFactRow appends at EOF) that a naive tail-append would corrupt.
+ * region — the region can carry later sections (e.g. a legacy `## Facts`
+ * fence written below the sentinel by pre-#4756 upsertFactRow EOF appends)
+ * that a naive tail-append would corrupt.
  */
 export function spliceTimelineIntoFileText(fileText: string, date: string, block: string): string {
   const lines = fileText.split('\n');
@@ -405,7 +407,7 @@ export async function writeTimelineEntryThrough(
           spliceTimelineBlock(page.timeline ?? '', entry.date, rendered.block),
         );
         await engine.executeRaw(
-          `UPDATE pages SET timeline = $1, updated_at = now()
+          `UPDATE pages SET timeline = $1, chunker_version = ${bodyWriteChunkVersion('pages.compiled_truth', '$1')}, updated_at = now()
             WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL`,
           [newTimeline, slug, sourceId],
         );

@@ -96,6 +96,14 @@ export interface Page {
   created_at: Date;
   updated_at: Date;
   /**
+   * `updated_at` at the column's microsecond precision, as an ISO string
+   * (`2026-08-10T12:00:00.000123Z`). Projected by `listPages` so keyset
+   * callers can resume from the exact row (`updatedAfterKeyset.updatedAt`);
+   * a JS Date holds milliseconds only and would re-select every row in the
+   * last row's millisecond. Absent on paths that do not project it.
+   */
+  updated_at_iso?: string;
+  /**
    * v0.26.5: when present, the page is soft-deleted. Hidden from search and
    * from `getPage` / `listPages` by default; surface via `include_deleted: true`.
    * The autopilot purge phase hard-deletes rows where `deleted_at < now() - 72h`.
@@ -305,9 +313,12 @@ export interface PageFilters {
    * v0.45.7 — keyset cursor for deterministic pagination through pages sharing
    * one `updated_at`. `WHERE p.updated_at > ts OR (p.updated_at = ts AND
    * p.slug > slug)`. Supersedes `updated_after` when set; pair with
-   * `sort: 'updated_asc'` (total order). Used by the `delta` verb's session
+   * `sort: 'updated_asc'` (a total order: updated_at, slug, source_id, id —
+   * slug alone is unique only per source). Used by the `delta` verb's session
    * cursor so a >limit same-timestamp cluster pages cleanly instead of
-   * livelocking. `slug` empty ⇒ start of the `ts` bucket.
+   * livelocking. `slug` empty ⇒ start of the `ts` bucket. `updatedAt` should
+   * be the row's `updated_at_iso` (column precision); a millisecond-rounded
+   * value re-selects same-millisecond rows.
    */
   updatedAfterKeyset?: { updatedAt: string; slug: string };
   /**
@@ -361,7 +372,21 @@ export interface PageFilters {
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
-export interface GetPageOpts {
+export interface PageReadScope {
+  sourceId?: string;
+  sourceIds?: string[];
+  /** Resolved by the trusted operation layer, never from MCP parameters. */
+  excludePrivate?: boolean;
+  /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
+  requireSafeChunks?: boolean;
+}
+
+export interface PageReadPolicy extends PageReadScope {
+  /** Undefined is unrestricted; an empty list permits no holders. */
+  takesHoldersAllowList?: string[];
+}
+
+export interface GetPageOpts extends PageReadScope {
   /** Filter to a specific source. When omitted, getPage returns the first slug match across sources (pre-existing semantics). */
   sourceId?: string;
   /**
@@ -382,9 +407,16 @@ export const PAGE_SORT_SQL: Record<NonNullable<PageFilters['sort']>, string> = {
   // cluster of pages sharing one updated_at (bulk syncs stamp identical
   // now() across a transaction). Without the tiebreaker, rows at the same
   // timestamp order arbitrarily and a >limit tie cluster is unpageable.
-  updated_asc:  'p.updated_at ASC, p.slug ASC',
+  // The cursor must carry the column's microsecond precision to be exact:
+  // resume from `Page.updated_at_iso`, never from a JS Date. Slug is unique
+  // only per source, so a federated listing needs source_id + id behind it to
+  // stay a total order (same tiebreakers as `slug` below).
+  updated_asc:  'p.updated_at ASC, p.slug ASC, p.source_id ASC, p.id ASC',
   created_desc: 'p.created_at DESC',
-  slug:         'p.slug ASC',
+  // Slug uniqueness is per (source_id, slug), so a federated listing can hold
+  // the same slug from several sources; source_id + id make slug+offset paging
+  // a TOTAL order (same class as the updated_asc tiebreaker above).
+  slug:         'p.slug ASC, p.source_id ASC, p.id ASC',
 };
 
 /**
@@ -446,7 +478,7 @@ export interface DomainBankRow {
   representative_chunk_id: number | null;
 }
 
-export interface SalienceOpts {
+export interface SalienceOpts extends PageReadPolicy {
   /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
   sourceId?: string;
   /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
@@ -550,7 +582,7 @@ export const ENRICH_ORDER_SQL: Record<EnrichCandidatesOpts['order'], string> = {
  * the number of distinct pages touched on `since`. A cohort is anomalous when its
  * current count exceeds `mean + sigma * stddev`. Year cohort deferred to v0.30.
  */
-export interface AnomaliesOpts {
+export interface AnomaliesOpts extends PageReadScope {
   /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
   sourceId?: string;
   /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
@@ -773,6 +805,22 @@ export interface SearchResult {
    */
   content_flag?: { reason: string; detail: string };
   /**
+   * 2026-09 fix wave (#3617 follow-up): true when this row came from the
+   * keyword/title arm's AND→OR zero-strict-recall fallback rather than a
+   * strict websearch match. Stamped by the ENGINES inside the fallback
+   * branch (both engines, keyword + title arms — parity-pinned). hybridSearch
+   * reads it at fusion time: relaxed rows only vote in RRF when EVERY vector
+   * list is empty (the fallback's designed rescue case — keyword-only /
+   * keyless / degraded paths). When the vector arm is healthy, relaxed rows
+   * are dropped pre-fusion: OR-of-common-terms matches carry noise-shaped
+   * rank evidence, and letting them vote at full RRF weight demonstrably
+   * outvotes correct semantic results (LongMemEval receipt: hybrid
+   * recall_all@5 51.3% with them voting vs vector-only 93.8%; disabling the
+   * fallback restored gold to ranks 0-2 on probed questions). Absent on
+   * strict-match rows.
+   */
+  keyword_relaxed?: boolean;
+  /**
    * Extraction quarantine lane (issue #160): true when the result's page is
    * an unverified auto-extracted entity stub (frontmatter
    * `provenance: 'auto-extracted'` + `status: 'unverified'`). Such pages are
@@ -853,6 +901,13 @@ export interface SearchResult {
   relational_hop?: number;
   /** Shortest connecting slug path seed→…→result (for "how I know this"). */
   relational_path?: string[];
+  /**
+   * Ranker wave — set when `pinRelationalRows` (relational-rerank-pin.ts)
+   * re-pinned this relational-arm row above the reranked text rows. Autocut
+   * preserves stamped rows and excludes them from its cliff computation (they
+   * carry low cross-encoder scores by construction). Absent otherwise.
+   */
+  relational_pinned?: boolean;
   /**
    * v0.40.4 full attribution (D12=A) — per-stage score deltas for the
    * `gbrain search --explain` formatter. Every boost stage stamps its
@@ -1039,7 +1094,7 @@ export interface ResolvedColumn {
   embeddingModel: string;
 }
 
-export interface SearchOpts {
+export interface SearchOpts extends PageReadPolicy {
   limit?: number;
   offset?: number;
   /**
@@ -1310,6 +1365,16 @@ export interface SearchOpts {
    */
   relationalRetrieval?: boolean;
   relationalRetrievalDepth?: number;
+  /**
+   * Ranker wave — per-call override for `search.relational_rerank_pin`
+   * (relational-arm rows re-pinned above reranked text rows; `0` disables).
+   * Per-call wins over config wins over the mode bundle; out-of-range values
+   * (negative, > 10, fractional, NaN) are treated as unset through the ONE
+   * range contract `normalizeRelationalRerankPin` (relational-rerank-pin.ts),
+   * in BOTH the inner search and the cache resolver (knobs hash reflects it).
+   * Eval A/B gates drive it here.
+   */
+  relationalRerankPin?: number;
 }
 
 /**
@@ -1424,7 +1489,9 @@ export interface RelationalFanoutRow {
 }
 
 /** Options for BrainEngine.relationalFanout. */
-export interface RelationalFanoutOpts {
+export interface RelationalFanoutOpts extends PageReadPolicy {
+  /** Resolved seed identities; separate from the read grant for edge origins. */
+  seedRefs?: Array<{ source_id: string; slug: string }>;
   /** Edge types to traverse; null/empty = type-agnostic. */
   linkTypes?: string[] | null;
   /** Direction from each seed. Default 'both'. */
@@ -1459,7 +1526,7 @@ export interface TimelineInput {
   detail?: string;
 }
 
-export interface TimelineOpts {
+export interface TimelineOpts extends PageReadScope {
   limit?: number;
   after?: string;
   before?: string;
@@ -1495,7 +1562,7 @@ export interface ChronicleTimelineRow {
   kind: string | null;        // event.kind from the event page frontmatter
 }
 
-export interface ChronicleTimelineOpts {
+export interface ChronicleTimelineOpts extends PageReadScope {
   /** getTimelineForDate: expand to the ISO week (Mon–Sun) containing `date`. */
   week?: boolean;
   /** getSince: filter event projections by `event.kind`. */
@@ -1556,7 +1623,12 @@ export interface OntologyConflict {
   dimension: string;
   values: { value: string; source: string | null; confidence: number; fact_id: number }[];
 }
-export interface OntologyReadOpts {
+// excludePrivate (from PageReadScope) drops observations whose provenance page
+// is `visibility: private` BEFORE per-dimension resolution, so an untrusted
+// caller resolves the newest value they may see — never a private one, never
+// a hole where one was. Set by the op layer (readPolicyOpts); engines never
+// decide trust.
+export interface OntologyReadOpts extends PageReadScope {
   asof?: string;
   minConfidence?: number;
   includeQuarantined?: boolean;
@@ -1790,6 +1862,23 @@ export interface EvalCaptureFailure {
  *                        it was the primary recall arm (vector unavailable)
  *   cache_prestamp     — served from a cache row written before the
  *                        degradation stamp existed; cleanliness unprovable
+ *   reranker_skipped   — the mode enables the reranker but it did not run:
+ *                        reason `no_key` (provider key absent) or
+ *                        `sunset_short_circuit` (provider dead past its
+ *                        announced date); results are in RRF order
+ *   rerank_passthrough — the reranker was enabled and the provider answered
+ *                        SUCCESSFULLY but with an empty/malformed result set,
+ *                        so results passed through in raw RRF order with no
+ *                        rerank_score (#4648 — distinguishes "reranker off"
+ *                        from "reranker died silently")
+ *   keyword_relaxed_carried — OR-relaxed lexical rows VOTED in fusion because
+ *                        every text vector list came back empty on a
+ *                        vector-enabled run (e.g. mid embed-backfill). The
+ *                        result set leans on noise-shaped rank evidence, so
+ *                        the cache write takes the degraded (short) TTL —
+ *                        otherwise a transitional relaxed-carried row would
+ *                        shadow the recovered pipeline for the full TTL
+ *                        under the same knobs hash (2026-09 red-team).
  */
 export const DEGRADED_STAGES = [
   'embed_unavailable',
@@ -1802,6 +1891,9 @@ export const DEGRADED_STAGES = [
   'budget_truncated',
   'keyword_zero',
   'cache_prestamp',
+  'reranker_skipped',
+  'rerank_passthrough',
+  'keyword_relaxed_carried',
 ] as const;
 export type DegradedStage = (typeof DEGRADED_STAGES)[number];
 
@@ -1818,12 +1910,40 @@ export const DEGRADED_REASONS = [
   'variant_embed_failed',
   'original_embed_failed',
   'first_result_truncated',
+  'no_key',
+  'sunset_short_circuit',
+  // #4648 — rerank_passthrough reasons (mirror RerankPassThroughReason).
+  'empty_result_set',
+  'malformed_shape',
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
 export interface DegradedStageEntry {
   stage: DegradedStage;
   reason?: DegradedReason;
+}
+
+/**
+ * Stages that change RANKING but never RECALL: the result set is complete,
+ * only its order is not what the mode promised. Consumers that reason about
+ * "was recall impaired?" (empty-result copy, the short degraded cache TTL)
+ * skip these; consumers that report "what did not run" keep them.
+ *
+ * Membership is a deliberate list, not "anything reranker-shaped":
+ *   - `reranker_skipped` IS ranking-only: it is a CONFIG state (no key / dead
+ *     provider) that a short TTL cannot fix, so the cache keeps the full TTL.
+ *   - `rerank_passthrough` (#4648) is NOT listed on purpose: the provider
+ *     answered 200 with an empty/malformed set — a TRANSIENT fault where the
+ *     short degraded TTL lets the next query recover a reranked result set
+ *     (master's v0.48.1.0 behavior, kept at the merge). It never reaches the
+ *     empty-result copy because a pass-through implies a non-empty batch.
+ *   - `keyword_relaxed_carried` is recall-shaped by definition (see above).
+ * Pinned by test/degraded-stages-recall.test.ts; a new fail-open stage must be
+ * classified here in the same commit that adds it.
+ */
+export const RANKING_ONLY_DEGRADED_STAGES: ReadonlySet<DegradedStage> = new Set<DegradedStage>(['reranker_skipped']);
+export function affectsRecall(d: { stage?: string; reason?: string } | undefined | null): boolean {
+  return !!d?.stage && !RANKING_ONLY_DEGRADED_STAGES.has(d.stage as DegradedStage);
 }
 
 /**
@@ -1874,6 +1994,37 @@ export interface HybridSearchMeta {
    */
   relational_evidence_slot?: import('./search/relational-recall.ts').RelationalEvidenceSlotDecision;
   /**
+   * Ranker wave — relational rerank pin decision (knob, relational pages in
+   * the pool, the pinned rows with from/to/fused ranks, how many moved).
+   * Present only when the reranker reordered the pool AND at least one
+   * relational-arm row was pinned; omitted for non-relational queries, pin 0,
+   * and every reranker fail-open path. Surfaced for `gbrain search --explain`.
+   */
+  relational_rerank_pin?: import('./search/relational-rerank-pin.ts').RelationalRerankPinDecision;
+  /**
+   * Ranker wave (Phase E2, Cat 13) — keyword-arm confidence decision:
+   * `margin_ratio` (scale-free `top / (top + second)` over the keyword arm's
+   * fused rows; 1 single row; 0 empty), the raw `top_score` (diagnostics),
+   * and `downweighted` (did the keyword + title lists fuse at weight 0.5).
+   * Present on every main RRF-path result — INCLUDING with the floor off
+   * (`downweighted: false`) — so an operator can calibrate
+   * `search.keyword_arm_confidence_floor` from per-probe margins. Omitted on
+   * the keyword-only fallback paths (no vector arm → no decision).
+   */
+  keyword_arm_confidence?: import('./search/arm-confidence.ts').KeywordArmConfidenceDecision;
+  /**
+   * Ranker wave (Phase E3, Cat 13) — metadata boost gate decision: the
+   * resolved `gate` (`always` | `lexical`), `lexical_voted` (did a strict
+   * keyword, title-arm or relational row reach fusion), `boosts_applied` (did
+   * the backlink / salience / recency / graph-signal / alias-resolved stages
+   * run) and the `reason`. Present on every main RRF-path result — INCLUDING
+   * under `always` (`boosts_applied: true`) — so an operator can count
+   * vector-only-voter queries before flipping `search.metadata_boost_gate`.
+   * Omitted on the keyword-only fallback paths (the lexical arms are the
+   * recall there; the gate is never consulted).
+   */
+  metadata_boost_gate?: import('./search/metadata-boost-gate.ts').MetadataBoostGateDecision;
+  /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite
    * consumers).
@@ -1898,6 +2049,17 @@ export interface HybridSearchMeta {
    * existed (surfaced as `cache_prestamp` at hit time).
    */
   degraded?: DegradedStageEntry[];
+  /**
+   * 2026-09 fix wave (#3617 follow-up): count of OR-relaxed lexical rows
+   * fetched but EXCLUDED from RRF fusion because the text vector arm was
+   * healthy (the designed demotion). NOT a degraded stage — muting relaxed
+   * noise on a healthy run is normal operation and common (any query with
+   * zero strict lexical matches), so it must not shorten the cache TTL —
+   * but without this field `_meta` implies the lexical arms voted when they
+   * contributed nothing, hiding the demotion from an operator debugging a
+   * miss. Omitted when zero.
+   */
+  relaxed_dropped?: number;
   /**
    * WP2/T3 — pre-budget hit count: how many results retrieval produced for
    * this page BEFORE token-budget enforcement. Lets a consumer distinguish

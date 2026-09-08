@@ -5,7 +5,7 @@ is the HTTP wrapper that ships with llama.cpp. With `--reranking`, it
 exposes an OpenAI-style `POST /v1/rerank` endpoint that returns
 `{results: [{index, relevance_score}]}` — exactly the wire shape gbrain
 already drives for ZeroEntropy's hosted reranker. The
-`llama-server-reranker` recipe (added in v0.40.6.1) routes
+`llama-server-reranker` recipe routes
 `gateway.rerank()` at your local llama.cpp instance instead of ZE.
 
 Two flavors of "local" this recipe covers:
@@ -149,6 +149,20 @@ gbrain config set search.reranker.timeout_ms 60000
 
 Per-call overrides in `SearchOpts.reranker_timeout_ms` still win for
 any single call.
+
+## Document size
+
+Every document handed to the reranker is capped before the call: about 1,400
+estimated tokens (a 6,000-character cut first, then a shrink by measured
+token ratio), always on a UTF-8-safe boundary so a lone surrogate never turns
+a 500 into a 400. Prose chunks (~300 words) pass through untouched; code or
+CJK chunks at the chunker ceiling lose part of their tail before scoring, the
+same trade the embed side already makes. The cap exists because a
+chunker-ceiling chunk plus the query plus the server-side reranker template
+does not fit llama-server's default 2048 ubatch, and a pooled self-hosted
+reranker answered that overflow with a 500 that `applyReranker` fails open
+on, silently serving raw RRF order. It applies to every provider, hosted
+included, and has no config knob.
 
 ## Budget caps + local rerank
 

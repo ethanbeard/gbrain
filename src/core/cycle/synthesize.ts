@@ -66,6 +66,7 @@ import { waitForCompletionRenewing, TimeoutError } from '../minions/wait-for-com
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
 import { runSubagentsInline, runDrainRenewalTick, percentile, INLINE_LOCK_MS } from './inline-drain.ts';
 import { buildManifestContext, buildLinkManifest, type ManifestContext } from './link-manifest.ts';
+import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
@@ -320,6 +321,8 @@ export interface SynthesizePhaseOpts {
   date?: string;
   from?: string;
   to?: string;
+  /** #4348: clock seam for deterministic cycle-date bucketing (tests). */
+  now?: () => Date;
   /** #4168 sibling: absolute wall-clock deadline (epoch ms) of the enclosing
    *  minion job. When set, child-subagent timeout_ms/wait are clamped via the
    *  clampSubagentBudgets template so a child submitted late in the cycle
@@ -391,6 +394,12 @@ async function runPhaseSynthesizeInner(
   try {
     throwIfAborted(opts.signal, '[dream] synthesize');
     const config = await loadSynthConfig(engine);
+    // #4348: the calendar day that owns this run — explicit --date >
+    // cycle.timezone config > host IANA timezone > UTC. Sampled ONCE at
+    // phase start so a run that crosses midnight stays in one bucket.
+    // Pre-fix this was UTC toISOString().slice(0,10), so a run after local
+    // midnight but before UTC midnight rewrote the previous day's summary.
+    const summaryDate = await resolveCycleDate(engine, { explicitDate: opts.date, now: opts.now });
 
     // #4168 sibling: clamp the child-subagent budgets to the REAL remaining
     // job time (patterns.ts clampSubagentBudgets template). Pre-fix,
@@ -625,10 +634,8 @@ async function runPhaseSynthesizeInner(
     const skipReports: Array<{ filePath: string; reason: string }> = [];
 
     const maxCharsPerChunk = computeChunkCharBudget(config.model, config.maxPromptTokens);
-    const successfulLegacyKeys = await loadSuccessfulLegacySynthesisKeys(
-      engine,
-      cycleSourceId,
-    );
+    const successfulLegacyKeys = await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth:');
+    const successfulV2Keys = await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth-v2:');
 
     // Per-source daily submission cap (D2D: default 0 = disabled; opt-in
     // backstop via dream.synthesize.max_submissions_per_source_per_day).
@@ -690,6 +697,25 @@ async function runPhaseSynthesizeInner(
           reason: legacyCompletion === 'chunked'
             ? 'already_synthesized_legacy_chunked'
             : 'already_synthesized_legacy_single_chunk',
+        });
+        continue;
+      }
+
+      // Same rule for the synth-v2 key family. Without it a transcript whose
+      // children already COMPLETED coalesced onto them via queue.add's
+      // idempotency key — free for the daily cap, but only AFTER the link
+      // manifest (up to 20 searches) was built — and the coalesced children
+      // re-entered writtenRefs, so their old pages were quote-repaired,
+      // restamped and re-embedded every night with nothing new written.
+      const v2Completion = findSynthV2Completion(
+        successfulV2Keys, t.filePath, hash16, opts.sourceId ?? 'default',
+      );
+      if (v2Completion) {
+        skipReports.push({
+          filePath: t.filePath,
+          reason: v2Completion === 'chunked'
+            ? 'already_synthesized_v2_chunked'
+            : 'already_synthesized_v2_single_chunk',
         });
         continue;
       }
@@ -786,6 +812,7 @@ async function runPhaseSynthesizeInner(
             // #4117: validated per-lane namespaces.
             config.reflectionsPrefix,
             config.originalsPrefix,
+            config.mode,
           ),
           model: subagentModel,
           max_turns: config.maxTurns,
@@ -1039,8 +1066,6 @@ async function runPhaseSynthesizeInner(
         process.stderr.write(`[dream] quote verify pass failed open: ${e instanceof Error ? e.message : String(e)}\n`);
       }
     }
-
-    const summaryDate = opts.date ?? today();
 
     // #2569: persist the dream-output identity marker into the DB frontmatter
     // of every child-written page BEFORE reverse-rendering, so generated pages
@@ -1765,12 +1790,15 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
         messages,
         maxTokens: params.max_tokens,
         // DeepSeek v4 thinks by default and bills reasoning as OUTPUT tokens
-        // against max_tokens (recipe thinking_by_default, #4172). The judge
-        // wants only the small JSON verdict, so pin thinking off per-call —
-        // the openai-compatible adapter spreads providerOptions[recipe.id]
-        // into the wire body, where `thinking` is DeepSeek's documented knob.
+        // against max_tokens (recipe thinking_by_default, #4172) — same for
+        // OpenRouter's DeepSeek hosts (#4758). The judge wants only the small
+        // JSON verdict, so pin thinking off per-call — the openai-compatible
+        // adapter spreads providerOptions[recipe.id] into the wire body,
+        // where `thinking` is DeepSeek's documented knob.
         ...(v.parsed.providerId === 'deepseek'
-          ? { providerOptions: { deepseek: { thinking: { type: 'disabled' } } } }
+          || (v.parsed.providerId === 'openrouter'
+            && v.parsed.modelId.trim().toLowerCase().startsWith('deepseek/'))
+          ? { providerOptions: { [v.parsed.providerId]: { thinking: { type: 'disabled' } } } }
           : {}),
         // #4077: a cancelled cycle tears down the in-flight judge call too.
         abortSignal: options?.signal,
@@ -2603,8 +2631,11 @@ function buildSynthesisPrompt(
   // config-resolved values.
   reflectionsPrefix = `${outputRoot}/personal/reflections`,
   originalsPrefix = `${outputRoot}/originals/ideas`,
+  mode: 'agentic' | 'oneshot' = 'agentic',
 ): string {
-  const dateHint = t.inferredDate ?? today();
+  // #4348: UTC projection retained here on purpose — this is a slug-name
+  // hint for undated sources, not calendar provenance.
+  const dateHint = t.inferredDate ?? utcDate();
   const baseSlugSegment = sanitizeForSlug(t.basename) || `session-${dateHint}`;
   const isChunked = chunkTotal > 1;
   const hashSuffix = isChunked
@@ -2617,12 +2648,18 @@ function buildSynthesisPrompt(
     ? `${t.filePath} (chunk ${chunkIdx + 1}/${chunkTotal})`
     : t.filePath;
   // #4216 rule-2 wording: with a manifest present, the model is pointed at the
-  // pre-resolved candidates FIRST (the search tool stays available on the
-  // agentic path; the oneshot path has no tools, and this same prompt must be
-  // byte-identical across a oneshot attempt and its agentic fallback).
-  const crossRefRule = linkManifestBlock
-    ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Pick targets from the LINK CANDIDATES above (or another page you write in this response); use the search tool, if available, only when no candidate fits.'
-    : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Use the search tool to find existing pages first.';
+  // pre-resolved candidates FIRST. The agentic prompt keeps its search-tool
+  // guidance; oneshot has no tools, so it may use only pre-resolved candidates
+  // or pages in the same JSON batch. (A oneshot child's prompt is stored as
+  // data.prompt and reused verbatim by its in-job agentic fallback, which
+  // keeps its tools in the schema and merely loses the search hint.)
+  const crossRefRule = mode === 'agentic'
+    ? (linkManifestBlock
+      ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Pick targets from the LINK CANDIDATES above (or another page you write in this response); use the search tool, if available, only when no candidate fits.'
+      : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Use the search tool to find existing pages first.')
+    : (linkManifestBlock
+      ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`). Pick its target from the LINK CANDIDATES above or another page in this response.'
+      : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to another page in this response.');
   // OV-7: the write allow-list must live in the PROMPT, not only in the
   // put_page tool schema — the oneshot path never sees a tool schema.
   const allowedPathsBlock = allowedSlugPrefixes.length > 0
@@ -2638,7 +2675,7 @@ CONTEXT
 OUTPUT POLICY (ALL of these are required)
 1. Quote the user verbatim. Quotation marks are ONLY for spans reproducible EXACTLY from the transcript below — if you cannot reproduce a span exactly, paraphrase it WITHOUT quotation marks. Do not paraphrase memorable phrasings you can quote exactly.
 2. ${crossRefRule}
-3. Do NOT write to any path outside the ALLOWED WRITE PATHS above${allowedSlugPrefixes.length > 0 ? '' : ' (shown in the put_page schema)'}.
+3. Do NOT write to any path outside the ALLOWED WRITE PATHS above${allowedSlugPrefixes.length > 0 ? '' : mode === 'agentic' ? ' (shown in the put_page schema)' : '; if none are listed, return the Task D skip response'}.
 4. Slug discipline: lowercase alphanumeric and hyphens only, slash-separated segments. NO underscores, NO file extensions.
 5. Self-contained opening: begin every new page's body with a 2-3 sentence summary that a reader unfamiliar with this transcript could understand on its own, before any quotes or detail. Do not assume the reader has the source conversation for context.
 6. Preserve concrete facts: carry the specific numbers, dates, dollar amounts, names, and who-decided-what OF the salient content you write about, exactly as the transcript states them. Do not add routine logistics for their own sake.
@@ -2651,16 +2688,18 @@ A. Reflections (self-knowledge, pattern recognition, emotional processing):
 B. Originals (new ideas, frames, theses, mental models):
    slug: \`${originalsPrefix}/${dateHint}-<idea-slug>-${hashSuffix}\`
 
-C. People mentions: ${linkManifestBlock ? 'check LINK CANDIDATES (and the search tool, when available) first' : 'search first, when a search tool is available'}; never write over an existing person page (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
+C. People mentions: ${mode === 'agentic'
+    ? (linkManifestBlock ? 'check LINK CANDIDATES (and the search tool, when available) first' : 'search first, when a search tool is available')
+    : (linkManifestBlock ? 'check LINK CANDIDATES first' : 'do not create or modify person pages')}; never write over an existing person page (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
 
 D. If nothing in this transcript meets the bar (significance filter already passed but the content is still routine), return without writing anything.
 
 TRANSCRIPT (${transcriptHeader})
 ---
 ${chunkText}
----
-
-When done, briefly list the slugs you wrote in your final message so the orchestrator can audit.`;
+---${mode === 'agentic'
+    ? '\n\nWhen done, briefly list the slugs you wrote in your final message so the orchestrator can audit.'
+    : ''}`;
 }
 
 function sanitizeForSlug(s: string): string {
@@ -2740,12 +2779,15 @@ async function collectChildPutPageSlugs(
 }
 
 /**
- * D8: load every `completed` legacy job key in the pre-v2 path-based
- * family `dream:synth:<filePath>:<hash16>[:c<i>of<n>]`. Used at fan-out
- * time to detect transcripts already synthesized under an old key shape;
- * those should NOT be re-submitted under v2 keys. (v2 keys start with
- * `dream:synth-v2:` and don't match the LIKE prefix — the queue's own
- * idempotency dedupe already covers them.)
+ * Load every `completed` subagent job key in one synthesis key family for
+ * one source. Called once per phase per family so the submit loop can skip
+ * transcripts already synthesized BEFORE building their link manifest:
+ *  - D8 legacy `dream:synth:<filePath>:<hash16>[:c<i>of<n>]` (pre-v2 shape;
+ *    must not be re-submitted under v2 keys);
+ *  - current `dream:synth-v2:<source>:filename:<basename>:<hash16>[:c<i>of<n>]`
+ *    (the queue's idempotency dedupe would coalesce these too, but only after
+ *    the manifest build, and the coalesced children would re-enter writtenRefs).
+ * `dream:synth:%` does not match `dream:synth-v2:` keys.
  *
  * Plain `status = 'completed'` deliberately mirrors the queue-level
  * idempotency semantics the legacy keys relied on: a completed job blocks
@@ -2757,9 +2799,10 @@ async function collectChildPutPageSlugs(
  * Loads source-scoped completions once per phase; no schema additions
  * and no repeated history scan for each transcript.
  */
-async function loadSuccessfulLegacySynthesisKeys(
+async function loadSuccessfulSynthesisKeys(
   engine: BrainEngine,
   sourceId: string,
+  keyPrefix: 'dream:synth:' | 'dream:synth-v2:',
 ): Promise<string[]> {
   const rows = await engine.executeRaw<{ idempotency_key: string }>(
     `SELECT idempotency_key
@@ -2767,10 +2810,44 @@ async function loadSuccessfulLegacySynthesisKeys(
       WHERE name = 'subagent'
         AND status = 'completed'
         AND COALESCE(NULLIF(data->>'source_id', ''), 'default') = $1
-        AND idempotency_key LIKE 'dream:synth:%'`,
-    [sourceId],
+        AND idempotency_key LIKE $2`,
+    [sourceId, `${keyPrefix}%`],
   );
   return rows.map(row => row.idempotency_key);
+}
+
+/**
+ * Mirror of findLegacyCompletion for the synth-v2 key family (grammar as
+ * produced by the submit loop / parsed by `parseSynthV2Key`): `'single'` when
+ * the unchunked key completed, `'chunked'` when a FULL `:c0of<n>`..`:c<n-1>of<n>`
+ * set completed, null otherwise (a cancelled row never counts).
+ */
+function findSynthV2Completion(
+  successfulKeys: string[],
+  filePath: string,
+  hash16: string,
+  sourceId: string,
+): 'single' | 'chunked' | null {
+  const prefix =
+    `dream:synth-v2:${encodeURIComponent(sourceId)}` +
+    `:filename:${encodeURIComponent(basename(filePath))}:${hash16}`;
+  const chunkSets = new Map<number, Set<number>>();
+  for (const key of successfulKeys) {
+    if (key === prefix) return 'single';
+    if (!key.startsWith(prefix + ':c')) continue;
+    const chunk = /:c(\d+)of(\d+)$/.exec(key);
+    if (!chunk) continue;
+    const i = Number(chunk[1]);
+    const n = Number(chunk[2]);
+    if (n < 1 || i < 0 || i >= n) continue;
+    let seen = chunkSets.get(n);
+    if (!seen) chunkSets.set(n, seen = new Set());
+    seen.add(i);
+  }
+  for (const [n, seen] of chunkSets) {
+    if (seen.size === n) return 'chunked';
+  }
+  return null;
 }
 
 /**
@@ -2819,10 +2896,16 @@ function findLegacyCompletion(
  * couldn't enumerate generated pages and a later put_page write-through
  * (which re-renders from the DB row) silently erased the marker.
  *
- * Plain UPDATE through executeRawJsonb (raw object bound to $3::jsonb —
+ * Plain UPDATE through executeRawJsonb (raw object bound to $4::jsonb —
  * never JSON.stringify into a ::jsonb cast; engine-parity safe, no new
  * engine method). Best-effort per row: a stamp failure never kills the
  * phase (the render-time override still covers the file).
+ *
+ * #4337: reruns preserve the FIRST dream cycle date. `dream_cycle_date`
+ * stays the stable back-compat query key and `dream_created_cycle_date`
+ * is its explicit immutable mirror — an existing value of either (created
+ * mirror wins) beats this run's cycleDate, so a re-synthesis pass can't
+ * rewrite a page's provenance to the maintenance run's date.
  */
 async function stampDreamProvenance(
   engine: BrainEngine,
@@ -2840,15 +2923,21 @@ async function stampDreamProvenance(
       await executeRawJsonb(
         engine,
         `UPDATE pages
-            SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $3::jsonb
+            SET frontmatter = COALESCE(frontmatter, '{}'::jsonb)
+                              || $4::jsonb
+                              || jsonb_build_object(
+                                   'dream_cycle_date',
+                                   COALESCE(NULLIF(frontmatter->>'dream_created_cycle_date', ''), NULLIF(frontmatter->>'dream_cycle_date', ''), $3),
+                                   'dream_created_cycle_date',
+                                   COALESCE(NULLIF(frontmatter->>'dream_created_cycle_date', ''), NULLIF(frontmatter->>'dream_cycle_date', ''), $3)
+                                 )
           WHERE slug = $1 AND source_id = $2`,
-        [slug, source_id],
+        [slug, source_id, cycleDate],
         // #1978 raw-source persistence: record the transcript path the
         // synthesis was derived from, so `gbrain doctor` (raw_provenance
         // check) can verify every generated page carries a raw trace.
         [{
           dream_generated: true,
-          dream_cycle_date: cycleDate,
           ...(raw_source ? { raw_source } : {}),
         }],
       );
@@ -2915,15 +3004,37 @@ export function renderPageToMarkdown(page: Page, tags: string[]): string {
   // serializePageToMarkdown helper in markdown.ts; this wrapper passes
   // the dream-specific overrides. Future markdown-shape changes happen
   // in one place.
+  //
+  // #4337: preserve the DB-stamped first cycle date (stampDreamProvenance
+  // runs before the reverse-write). Falling back to utcDate() is only for
+  // legacy callers rendering an unstamped page for the first time — the
+  // pre-fix today() default rewrote every rerendered page's provenance to
+  // the maintenance run's date.
+  const createdCycleDate = page.frontmatter?.dream_created_cycle_date;
+  const legacyCycleDate = page.frontmatter?.dream_cycle_date;
+  const stableCycleDate = typeof createdCycleDate === 'string' && createdCycleDate
+    ? createdCycleDate
+    : typeof legacyCycleDate === 'string' && legacyCycleDate
+      ? legacyCycleDate
+      : utcDate();
   return serializePageToMarkdown(page, tags, {
     frontmatterOverrides: {
       dream_generated: true,
-      dream_cycle_date: today(),
+      dream_cycle_date: stableCycleDate,
+      dream_created_cycle_date: stableCycleDate,
     },
   });
 }
 
 // ── Summary index page ───────────────────────────────────────────────
+
+/**
+ * #4337: cap the summary's wikilink list. An unbounded list turned the
+ * summary into a graph hub (thousands of edges on a large cycle) and an
+ * oversized file, even though every child already carries queryable
+ * provenance (`dream_generated` + `dream_cycle_date` frontmatter).
+ */
+const SUMMARY_LINK_SAMPLE_LIMIT = 20;
 
 async function writeSummaryPage(
   engine: BrainEngine,
@@ -2946,12 +3057,29 @@ async function writeSummaryPage(
   lines.push(`**Pages written:** ${writtenSlugs.length}.`);
   lines.push('');
   if (writtenSlugs.length > 0) {
-    lines.push('## Pages');
-    lines.push('');
-    for (const s of writtenSlugs) {
-      lines.push(`- [[${s}]]`);
+    // #4337: deterministic, lexicographically sorted sample — small cycles
+    // stay fully linked; large cycles list exactly SUMMARY_LINK_SAMPLE_LIMIT
+    // links while keeping exact totals above. The full child set stays
+    // recoverable via per-page provenance frontmatter (pointer below).
+    const sampledSlugs = [...writtenSlugs].sort().slice(0, SUMMARY_LINK_SAMPLE_LIMIT);
+    lines.push(
+      writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT
+        ? `## Page sample (${sampledSlugs.length} of ${writtenSlugs.length})`
+        : '## Pages',
+      '',
+      ...sampledSlugs.map(slug => `- [[${slug}]]`),
+      '',
+    );
+    if (writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT) {
+      lines.push(
+        '## Full output provenance',
+        '',
+        `The complete ${writtenSlugs.length}-page set is recoverable in this source by querying page frontmatter for ` +
+          `\`dream_generated: true\` and \`dream_cycle_date: ${summaryDate}\`, excluding \`${summarySlug}\`. ` +
+          'Every child page carries those provenance fields; this summary intentionally links only the deterministic sample above.',
+        '',
+      );
     }
-    lines.push('');
   }
 
   const body = lines.join('\n');
@@ -2962,6 +3090,10 @@ async function writeSummaryPage(
     {
       dream_generated: true,
       dream_cycle_date: summaryDate,
+      // #4337: immutable mirror — reruns preserve the first cycle date via
+      // stampDreamProvenance/renderPageToMarkdown; the summary is per-date so
+      // both keys are simply the summary's own date.
+      dream_created_cycle_date: summaryDate,
       // #1978: deterministic index page — no source document of its own;
       // raw traces live on the listed pages. Explicit exemption keeps the
       // doctor raw_provenance check quiet.
@@ -3036,10 +3168,6 @@ function loadAdHocTranscript(
   const { readSingleTranscript } = require('./transcript-discovery.ts') as typeof import('./transcript-discovery.ts');
   const t = readSingleTranscript(filePath, { minChars, excludePatterns, bypassGuard });
   return t ? [t] : [];
-}
-
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
 }
 
 function ok(summary: string, details: Record<string, unknown> = {}): PhaseResult {

@@ -28,6 +28,7 @@ import {
   resumeFilter,
 } from '../core/import-checkpoint.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
+import { slog } from '../core/console-prefix.ts';
 
 /** Return a refusal when an import target lies outside every admitted root. */
 export function configuredRootImportError(dir: string, configuredRoots: string[]): string | null {
@@ -213,9 +214,13 @@ export async function runImport(
   // always writes to stderr. Stdout stays clean for data output (--json
   // payloads)"). Pre-fix, `import --json` prefixed the payload with
   // "Found N markdown files", so JSON.parse of stdout failed outright.
+  // The human branch goes through slog() so an in-process caller running in
+  // its own --json mode (`sync --json` → performFullSync → runImport, wrapped
+  // in withHumanLogsToStderr) keeps its stdout clean too; outside any wrap
+  // slog IS console.log.
   const info = (msg: string): void => {
     if (jsonOutput) console.error(msg);
-    else console.log(msg);
+    else slog(msg);
   };
 
   // T7 (D9): refuse cleanly when init persisted the deferred-setup sentinel,
@@ -273,17 +278,47 @@ export async function runImport(
   // callers (performFullSync, future Step 6 paths) can route to a named
   // source.
   //
-  // v0.37.7.0 #1167+#1222: the CLI surface now also accepts a
-  // `--source-id <id>` flag (named to avoid colliding with `--source`
-  // which other commands use for different axes). Pre-fix, users
-  // passing `gbrain import --source dept-x ...` silently fell back to
-  // default because the parser ignored the flag. Now an explicit
-  // `--source-id <id>` opt-in routes the import to that source.
-  // Programmatic callers continue passing `opts.sourceId` directly;
-  // CLI callers' flag wins over opts when both are set.
+  // #1167: the CLI flag shipped as `--source-id <id>`. #4862: `--source <id>`
+  // is an alias — it is what every sibling command and the resolver's own
+  // nudge tell users to pass, import has no competing --source axis, and the
+  // flag registry already accepted it, so pre-alias it was silently IGNORED
+  // (pages landed in default). Both spellings with different values abort.
+  // Programmatic callers continue passing `opts.sourceId` directly; CLI
+  // flags win over opts when both are set. Both the `--source value` and
+  // `--source=value` spellings are accepted (same for --source-id); a missing
+  // value (or a value that is itself a flag) is refused the way sync-delegate
+  // refuses it, never read as "no scope".
   const sourceIdIdx = args.indexOf('--source-id');
-  const flagSourceId = sourceIdIdx !== -1 ? args[sourceIdIdx + 1] : null;
-  let sourceId: string | undefined = flagSourceId ?? opts.sourceId;
+  const sourceIdx = args.indexOf('--source');
+  const readSourceFlag = (flag: string, idx: number): string | null => {
+    const eq = args.find((a) => a.startsWith(`${flag}=`));
+    const v = eq !== undefined ? eq.slice(flag.length + 1) : idx !== -1 ? args[idx + 1] : null;
+    if (v === null) return null;
+    if (v === undefined || v === '' || v.startsWith('--')) {
+      console.error(`${flag} (missing value)`);
+      throw new ImportAbortError(`${flag} (missing value)`);
+    }
+    return v;
+  };
+  const viaSourceId = readSourceFlag('--source-id', sourceIdIdx);
+  const viaSource = readSourceFlag('--source', sourceIdx);
+  if (viaSourceId && viaSource && viaSourceId !== viaSource) {
+    console.error('Pass either --source or --source-id, not both.');
+    throw new ImportAbortError('conflicting source flags');
+  }
+  const flagSourceId = viaSourceId ?? viaSource;
+  let sourceId: string | undefined = opts.sourceId;
+  if (flagSourceId) {
+    // Validate + assert existence through the shared resolver (tier 1), so an
+    // invalid or unregistered id fails once with the same SourceTargetError
+    // sync gives — not once per file on the pages.source_id foreign key.
+    const { resolveSourceWithTier, ALL_SOURCES } = await import('../core/source-resolver.ts');
+    if (flagSourceId === ALL_SOURCES) {
+      console.error(`import writes to one source; \`${ALL_SOURCES}\` is not a write target.`);
+      throw new ImportAbortError('__all__ is not an import target');
+    }
+    sourceId = (await resolveSourceWithTier(engine, flagSourceId)).source_id;
+  }
 
   // v0.41.13 (#1434): when no explicit source / env / opts.sourceId is set,
   // fall through to the resolver so the new sole_non_default tier (5.5) can
@@ -299,7 +334,13 @@ export async function runImport(
     const { resolveSourceId } = await import('../core/source-resolver.ts');
     sourceId = await resolveSourceId(engine, null);
   } else if (!sourceId) {
-    const { resolveSourceWithTier, formatSoleNonDefaultNudge } = await import('../core/source-resolver.ts');
+    const {
+      resolveSourceWithTier,
+      formatSoleNonDefaultNudge,
+      defaultWriteAllowedByEnv,
+      assessDefaultWriteGuardOnce,
+      formatDefaultWriteWarning,
+    } = await import('../core/source-resolver.ts');
     const resolved = await resolveSourceWithTier(engine, null);
     // Only adopt the resolution when it improves on the seed_default
     // fallback — that preserves the v0.30.x "default-only when unset"
@@ -309,6 +350,28 @@ export async function runImport(
       sourceId = resolved.source_id;
       const nudge = formatSoleNonDefaultNudge(sourceId);
       if (nudge) process.stderr.write(nudge + '\n');
+    } else if (!defaultWriteAllowedByEnv()) {
+      // #4583 (fixes #4564's misrouted-write symptom): an unscoped import that
+      // would silently land in 'default' on a bulk-non-default brain gets a
+      // loud warning. Keyed on the REAL destination, not the tier: only the
+      // sole_non_default adoption above changes where this run writes, so for
+      // EVERY other tier — seed_default, but also dotfile / local_path /
+      // brain_default, whose resolutions runImport deliberately does not
+      // adopt — `sourceId` stays undefined and the write lands in 'default'.
+      // (Warning only on seed_default let exactly those non-adopted tiers
+      // land in 'default' silently while the user believed the dotfile or
+      // sources.default had scoped the import.) Advisory only — refusing here
+      // would change behaviour for callers that never asked about source
+      // routing, and runImport also runs in-process (sync_brain MCP op,
+      // autopilot daemon, minion sync), where aborting takes the host down
+      // mid-call. The CLI escape is the source-id flag; scripted pipelines
+      // set GBRAIN_ALLOW_DEFAULT_WRITE=1. The assessment (an unindexed
+      // full-`pages` aggregate) is memoized per engine for the process — the
+      // in-process callers above run runImport many times on one engine.
+      const assessment = await assessDefaultWriteGuardOnce(engine);
+      if (assessment.shouldGuard) {
+        console.error(formatDefaultWriteWarning(assessment, '--source-id'));
+      }
     }
   }
   const workersIdx = args.indexOf('--workers');
@@ -316,7 +379,11 @@ export async function runImport(
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
   // (--workers 0, -3, "foo") with a loud error instead of silently falling
   // through to 1. Mirrors sync.ts's flag handling.
-  const { parseWorkers } = await import('../core/sync-concurrency.ts');
+  const {
+    clampWorkersForConnectionBudget,
+    parseWorkers,
+    resolveMaxConnections,
+  } = await import('../core/sync-concurrency.ts');
   let workerCount: number;
   try {
     workerCount = parseWorkers(workersArg ?? undefined) ?? 1;
@@ -328,10 +395,11 @@ export async function runImport(
   const flagValues = new Set<number>();
   if (workersIdx !== -1) flagValues.add(workersIdx + 1);
   if (sourceIdIdx !== -1) flagValues.add(sourceIdIdx + 1);
+  if (sourceIdx !== -1) flagValues.add(sourceIdx + 1);
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--allow-noncanonical-root] [--json]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source <id> | --source-id <id>] [--include-gitignored] [--allow-noncanonical-root] [--json]');
     throw new ImportAbortError('no import directory given');
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
@@ -440,8 +508,35 @@ export async function runImport(
   }
   const files = resumeFilter(allFiles, dir, completed);
 
-  // Determine actual worker count
-  const actualWorkers = workerCount > 1 ? workerCount : 1;
+  // Determine actual worker count. Import owns the same per-worker Postgres
+  // pools as sync, so it must honor the shared opt-in connection budget too
+  // (GBRAIN_MAX_CONNECTIONS, same clamp sync.ts applies before its fan-out).
+  // Resolve this before choosing the parallel branch: a budget that cannot
+  // fit even one child worker falls through to the provided parent engine.
+  let actualWorkers = workerCount > 1 ? workerCount : 1;
+  if (actualWorkers > 1 && engine.kind !== 'pglite') {
+    const maxConnections = resolveMaxConnections();
+    if (maxConnections !== undefined) {
+      const { resolvePoolSize } = await import('../core/db.ts');
+      const parentPool = resolvePoolSize();
+      const perWorkerPool = Math.min(2, resolvePoolSize(2));
+      const clampResult = clampWorkersForConnectionBudget(actualWorkers, {
+        maxConnections,
+        parentPool,
+        perWorkerPool,
+      });
+      if (clampResult.clamped) {
+        const budgetDetail = clampResult.workers === 1
+          ? `(serial parent engine; parent pool ${parentPool}).`
+          : `(parent ${parentPool} + ${clampResult.workers}x${perWorkerPool} per-worker).`;
+        console.error(
+          `  [import] GBRAIN_MAX_CONNECTIONS=${maxConnections}: clamped workers ` +
+          `${actualWorkers} -> ${clampResult.workers} ${budgetDetail}`,
+        );
+      }
+      actualWorkers = clampResult.workers;
+    }
+  }
   if (actualWorkers > 1) {
     info(`Using ${actualWorkers} parallel workers`);
   }
@@ -597,9 +692,9 @@ export async function runImport(
     } else {
       const { PostgresEngine } = await import('../core/postgres-engine.ts');
       const { resolvePoolSize } = await import('../core/db.ts');
-      // Default per-worker pool is 2 (small, parallel import case). Users on
-      // constrained poolers (e.g. Supabase port 6543) can cap below this via
-      // GBRAIN_POOL_SIZE=1.
+      // Each child keeps the established two-connection pool. GBRAIN_POOL_SIZE
+      // controls the parent pool; GBRAIN_MAX_CONNECTIONS clamps the child
+      // count above so the combined footprint stays within the operator's cap.
       const workerPoolSize = Math.min(2, resolvePoolSize(2));
       const databaseUrl = config.database_url;
 
@@ -689,16 +784,26 @@ export async function runImport(
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
   if (jsonOutput) {
+    // `skipped` includes every per-file failure importFile RETURNS (invalid
+    // frontmatter, oversize, symlink, slug mismatch) as well as content-hash
+    // no-ops, and `errors` counts only the thrown ones — so a caller cannot
+    // tell "unchanged" from "failed" by counts alone. The failure ledger is
+    // written only for git-repo dirs (see the gitHead gate below), so a caller
+    // importing a scratch directory has no other channel. Emit the per-file
+    // list so state can be gated per file.
     console.log(JSON.stringify({
       status: 'success', duration_s: parseFloat(totalTime),
       imported, skipped, errors, chunks: chunksCreated,
       total_files: allFiles.length,
+      unchanged: skipped - failures.length - malformedFileSkips,
+      malformed_skipped: malformedFileSkips,
+      failures,
     }));
   } else {
-    console.log(`\nImport complete (${totalTime}s):`);
-    console.log(`  ${imported} pages imported`);
-    console.log(`  ${skipped} pages skipped (${skipped - errors} unchanged, ${errors} errors)`);
-    console.log(`  ${chunksCreated} chunks created`);
+    slog(`\nImport complete (${totalTime}s):`);
+    slog(`  ${imported} pages imported`);
+    slog(`  ${skipped} pages skipped (${skipped - errors} unchanged, ${errors} errors)`);
+    slog(`  ${chunksCreated} chunks created`);
   }
 
   // v0.39 T7 — end-of-run schema mismatch warn. Fires ONCE per import,
@@ -845,7 +950,80 @@ export async function runImport(
     // this import's to move (its sync anchors live on the `sources` row).
   }
 
+  // #1691: a named source registered with `local_path` but fed only via
+  // `gbrain import` (never `gbrain sync`) never got `sources.last_sync_at`
+  // touched, so doctor's `sync_freshness` read it as permanently
+  // "never synced". Stamp it on a clean run only (mirrors the bookmark
+  // gate above). `!opts.managedBookmark` excludes performFullSync's call —
+  // that path stamps its own, more-authoritative `last_sync_at` via
+  // writeSyncAnchor AFTER its full gate (applySyncFailureGate) decides the
+  // sync actually advanced; stamping here too would race ahead of that
+  // decision. remote_url sources are excluded too: autopilot's freshness
+  // dispatcher (autopilot.ts) reads last_sync_at to decide when to queue a
+  // real `git pull` for those, and a plain import never pulls. A git-tracked
+  // local_path is excluded too (scoped to #1691's actual "non-git local
+  // source" case): `gbrain import` never advances the source's own
+  // `last_commit`, so stamping last_sync_at for a git checkout would mask
+  // real commit-level staleness that `gbrain sync` (not `import`) is the
+  // correct pipeline to detect. Detection reuses sync's own
+  // `discoverGitRoot` (rev-parse --show-toplevel, walks UP) rather than a
+  // bare `.git`-at-local_path probe, so a source anchored at a SUBDIR of a
+  // git checkout (the #753/#774 monorepo shape) is excluded too — that is
+  // exactly the shape sync's git-root slug anchoring exists for.
+  // Malformed-filename exclusions/skips (tallied into `totalMalformed`
+  // below, NOT into `failures`) count toward the clean-run gate too — a run
+  // that silently dropped files isn't "clean" for freshness purposes even
+  // with zero recorded failures.
   const totalMalformed = malformedExcluded.length + malformedFileSkips;
+  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark) {
+    try {
+      const [row] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+        `SELECT local_path, config FROM sources WHERE id = $1`,
+        [sourceId],
+      );
+      const { sourceConfigHasRemoteUrl, parseSourceConfig } = await import('../core/sources-load.ts');
+      // Connector-managed sources (config.kind: github/google, v0.47 API-backed
+      // shapes) own their last_sync_at via the connector's sync path — a google
+      // source has a non-git local_path and no remote_url, so without this
+      // check a stray `import --source-id` would mask connector staleness
+      // (and flip `gbrain waiting`'s google-freshness gate). parseSourceConfig,
+      // not a bare JSON.parse: nested-string / historical-array configs are
+      // real shapes (#2829) and must not slip past the kind check.
+      const cfg = parseSourceConfig(row?.config);
+      const isConnectorManaged = typeof cfg.kind === 'string' && cfg.kind.length > 0;
+      // Freshness is a claim about the WHOLE registered root. Configured-root
+      // enforcement is default-off, so an import of an unrelated directory —
+      // or of a mere subdirectory of the root — can complete cleanly with
+      // --source-id; neither says anything about the rest of the root, so
+      // only an import whose canonical target IS the registered local_path
+      // may stamp. `dir` is already the canonical realpath (#1728).
+      let coversRegisteredRoot = false;
+      if (row?.local_path) {
+        try {
+          const { realpathSync } = await import('fs');
+          coversRegisteredRoot = realpathSync(row.local_path) === dir;
+        } catch {
+          coversRegisteredRoot = false;
+        }
+      }
+      let isGitTracked = false;
+      if (row?.local_path) {
+        try {
+          const { discoverGitRoot } = await import('../core/sync-git.ts');
+          discoverGitRoot(row.local_path);
+          isGitTracked = true;
+        } catch {
+          isGitTracked = false;
+        }
+      }
+      if (row?.local_path && coversRegisteredRoot && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked && !isConnectorManaged) {
+        await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
+      }
+    } catch {
+      // best-effort — a freshness nicety never fails the import (see above).
+    }
+  }
+
   return {
     imported, skipped, errors, chunksCreated, failures,
     ...(totalMalformed > 0 ? { malformedSkipped: totalMalformed } : {}),

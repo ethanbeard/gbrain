@@ -42,16 +42,20 @@ import {
   type HarnessDeps,
   type HarnessFlags,
 } from '../src/core/bootstrap/harness.ts';
-import { readHarnessReceiptState, harnessReceiptPath } from '../src/core/bootstrap/format.ts';
+import { readHarnessReceiptState, harnessReceiptPath, type HarnessTarget } from '../src/core/bootstrap/format.ts';
 import {
   CLAUDE_HOOK_EVENTS,
   CODEX_TOML_BLOCK_BEGIN,
   CODEX_TOML_BLOCK_END,
   GBRAIN_HARNESS_MARKER_VALUE,
 } from '../src/core/bootstrap/host-specs.ts';
+import { AMBIENT_WRITEBACK_BLOCK_BEGIN } from '../src/core/bootstrap/instructions-block.ts';
 import type { ExecRunner } from '../src/core/bootstrap/repo.ts';
 import type { ConnectProbeResult } from '../src/core/connect-probe.ts';
+import type { GBrainConfig } from '../src/core/config.ts';
 import { VERSION } from '../src/version.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { SourceTargetError } from '../src/core/source-resolver.ts';
 
 const TOKEN_A = `gbrain_${'a'.repeat(64)}`;
 const TOKEN_B = `gbrain_${'b'.repeat(64)}`;
@@ -79,6 +83,12 @@ function makeFake(opts: {
   probeOk?: boolean;
   mintQueue?: Array<{ token: string; id: string }>;
   pgliteLive?: boolean;
+  /** What the brain's ambient resolution (no --source) lands on (absent = the seeded default). */
+  implicitSource?: string;
+  /** The federated read set the ambient resolution carries (default: [implicitSource]). */
+  implicitGrant?: string[];
+  /** Make the hook-source lookup throw (a typo'd --source, or an unopenable engine). */
+  hookSourceError?: Error;
 } = {}): Fake {
   const dir = mkdtempSync(join(tmpdir(), 'gb-harness-'));
   const home = join(dir, '.gbrain');
@@ -139,6 +149,12 @@ function makeFake(opts: {
       return true;
     },
     pgliteLiveServe: () => opts.pgliteLive ?? false,
+    resolveHookSource: async (explicit) => {
+      if (opts.hookSourceError) throw opts.hookSourceError;
+      if (explicit) return { source_id: explicit, grant: [explicit] };
+      const id = opts.implicitSource ?? 'default';
+      return { source_id: id, grant: opts.implicitGrant ?? [id] };
+    },
     detectClaude: () => true,
     detectCodex: () => true,
     detectOpencode: () => true,
@@ -169,6 +185,10 @@ describe('parseHarnessArgs', () => {
     expect(parseHarnessArgs(['--harness', 'cursor']).error).toMatch(/unknown --harness/);
     expect(parseHarnessArgs(['--port', 'nope']).error).toMatch(/invalid --port/);
     expect(parseHarnessArgs(['--name', 'My Server']).error).toMatch(/invalid --name/);
+    // --source was the one flag that skipped validation (wave review).
+    expect(parseHarnessArgs(['--source', 'Not Valid']).error).toMatch(/invalid --source/);
+    expect(parseHarnessArgs(['--source', '__all__']).error).toMatch(/invalid --source/);
+    expect(parseHarnessArgs(['--source', 'wiki']).source).toBe('wiki');
   });
   test('--project is repeatable and resolved', () => {
     const f = parseHarnessArgs(['--project', '/a', '--project', '/b']);
@@ -524,6 +544,130 @@ describe('outside-voice hardening (X-batch)', () => {
     const f2 = makeFake();
     expect(await applyHarness(flags(['--harness', 'codex']), f2.deps)).toBe(0);
     expect(f2.mintCalls[0].sourceGrant).toBeUndefined();
+  });
+
+  test('#4897 no --source: hooks, receipt and token bind to the serve\'s implicit default source', async () => {
+    // A brain whose only populated source is 'workspace' (default = 0 pages):
+    // the serve binds its resolve-IPC listener to 'workspace' via the same
+    // resolver, so a hook claiming 'default' is source_mismatch on every turn.
+    const f = makeFake({ implicitSource: 'workspace' });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).toContain('GBRAIN_SOURCE=workspace');
+    expect(cmd).not.toContain('GBRAIN_SOURCE=default');
+    const state = readHarnessReceiptState(f.home) as { receipt: { source_id: string } };
+    expect(state.receipt.source_id).toBe('workspace');
+    // The token gets the same scalar grant `--source workspace` produces —
+    // the federated-default mint cannot read a non-federated sole source.
+    expect(f.mintCalls[0].sourceGrant).toEqual(['workspace']);
+    expect(f.out.join('\n')).toContain("source 'workspace'");
+
+    // Explicit --source still wins over the implicit default.
+    const f2 = makeFake({ implicitSource: 'workspace' });
+    expect(await applyHarness(flags(['--harness', 'claude-code', '--source', 'wiki']), f2.deps)).toBe(0);
+    const hooks2 = readJson(f2.userSettings).hooks as Record<string, unknown[]>;
+    const cmd2 = ((hooks2.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd2).toContain('GBRAIN_SOURCE=wiki');
+    expect(f2.mintCalls[0].sourceGrant).toEqual(['wiki']);
+    expect((readHarnessReceiptState(f2.home) as { receipt: { source_id: string } }).receipt.source_id).toBe('wiki');
+  });
+
+  test("#4897 implicit 'default' is the federated floor, not a scalar grant (wave review)", async () => {
+    // `sources.default = default` is a valid config value: the resolver echoes
+    // it back, but it means "the seeded default" — the same thing the absent
+    // case means. Binding the token to a scalar ['default'] grant would hide
+    // every federated source from the hook lane (allowedSources set → no span).
+    const f = makeFake({ implicitSource: 'default' });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    expect(f.mintCalls[0].sourceGrant).toBeUndefined();
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).toContain('GBRAIN_SOURCE=default');
+    expect((readHarnessReceiptState(f.home) as { receipt: { source_id: string } }).receipt.source_id).toBe('default');
+    expect(f.out.join('\n')).not.toContain('binding hooks + token');
+  });
+
+  // Wave review: the hook lane binds through the SAME resolver the serve
+  // runs, an ambient non-default source carries its federated read set, and
+  // a failed lookup is never papered over with 'default'.
+  test("a typo'd --source fails loudly before any mint or receipt (wave review)", async () => {
+    const f = makeFake({
+      hookSourceError: new SourceTargetError('Source "wikk" not found or is archived. Available active sources: run `gbrain sources list`.'),
+    });
+    await expect(applyHarness(flags(['--harness', 'codex', '--source', 'wikk']), f.deps)).rejects.toThrow(/wikk/);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('no --source and the lookup fails: refuse with "pass --source" instead of binding default (wave review)', async () => {
+    const f = makeFake({ hookSourceError: new Error('PGLite data dir is held by a live serve') });
+    await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.toThrow(/pass --source/);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('explicit --source with an unopenable engine binds unverified, with a warning (the --token + live-serve path)', async () => {
+    const f = makeFake({ hookSourceError: new Error('PGLite data dir is held by a live serve') });
+    expect(await applyHarness(flags(['--harness', 'codex', '--source', 'wiki']), f.deps)).toBe(0);
+    expect(f.mintCalls[0].sourceGrant).toEqual(['wiki']);
+    expect(f.err.join('\n')).toContain("could not verify --source 'wiki'");
+  });
+
+  // CI e2e (bootstrap-harness-lifecycle): under a LIVE PGLite serve the
+  // documented --token lane must keep working without --source, and the
+  // no-token case must surface the mint's two escape hatches, not a
+  // source-resolution error for what is a lock problem.
+  test('live PGLite serve + no token + no --source: the LIVE_SERVE refusal with both escape hatches, before any mint', async () => {
+    const f = makeFake({
+      pgliteLive: true,
+      hookSourceError: new Error("GBrain's local database is already open through `gbrain serve` (MCP, PID 4242)."),
+    });
+    await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.toThrow(/pre-mint.*--token|stop the serve/);
+    await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.not.toThrow(/pass --source/);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('live PGLite serve + --token + no --source: wires unpinned with a warning (the documented PGLite lane)', async () => {
+    const f = makeFake({
+      pgliteLive: true,
+      hookSourceError: new Error("GBrain's local database is already open through `gbrain serve` (MCP, PID 4242)."),
+    });
+    expect(await applyHarness(flags(['--harness', 'claude-code', '--token', TOKEN_A]), f.deps)).toBe(0);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(f.err.join('\n')).toMatch(/could not read which source it serves/);
+    expect(f.err.join('\n')).toMatch(/--source <id>/);
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).not.toContain('GBRAIN_SOURCE=');
+    const receipt = (readHarnessReceiptState(f.home) as { receipt: { source_id: string; source_pinned?: boolean } }).receipt;
+    expect(receipt.source_id).toBe('default');
+    expect(receipt.source_pinned).toBe(false);
+  });
+
+  test('a pinned install records no source_pinned flag (absent = pinned to source_id)', async () => {
+    const f = makeFake({ implicitSource: 'workspace', implicitGrant: ['default', 'workspace'] });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    const receipt = (readHarnessReceiptState(f.home) as { receipt: { source_id: string; source_pinned?: boolean } }).receipt;
+    expect(receipt.source_id).toBe('workspace');
+    expect(receipt.source_pinned).toBeUndefined();
+  });
+
+  test('--token with a NON-live-serve lookup failure still refuses with "pass --source" (fail-closed stays for real errors)', async () => {
+    const f = makeFake({ hookSourceError: new Error('connection refused: postgres is down') });
+    await expect(applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A]), f.deps)).rejects.toThrow(/pass --source/);
+    expect(f.mintCalls).toHaveLength(0);
+  });
+
+  test('implicit non-default source: the token grant is its federated read set, not a scalar (wave review)', async () => {
+    const f = makeFake({ implicitSource: 'workspace', implicitGrant: ['default', 'workspace'] });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    expect(f.mintCalls[0].sourceGrant).toEqual(['default', 'workspace']);
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).toContain('GBRAIN_SOURCE=workspace');
+    expect((readHarnessReceiptState(f.home) as { receipt: { source_id: string } }).receipt.source_id).toBe('workspace');
   });
 
   test('[X3] --no-capture RE-RUN unwires the capture events it previously wired', async () => {
@@ -1069,5 +1213,186 @@ describe('opencode harness target (managed JSONC entry)', () => {
     expect(g.out.join('\n')).toMatch(/does not match this receipt's url .* skipping/);
     const kept = JSON.parse(readFileSync(g.opencodeConfig, 'utf8')) as { mcp: Record<string, unknown> };
     expect(kept.mcp.gbrain).toBeDefined(); // never delete what is not provably ours
+  });
+});
+
+describe('ambient-writeback instruction blocks (kind: instructions, WP3)', () => {
+  // Engine-free file-plane fake: memory.auto_writeback=salient enables the lane.
+  const WB_ON = (): GBrainConfig => ({ engine: 'pglite', memory: { auto_writeback: 'salient' } });
+  // resolveDeps derives the instruction-file paths from the INJECTED settings/
+  // config paths' directory (production: the host-specs defaults), so both
+  // land inside the fake's temp dir.
+  const memoryPath = (f: Fake) => join(dirname(f.userSettings), 'CLAUDE.md');
+  const agentsPath = (f: Fake) => join(dirname(f.codexConfig), 'AGENTS.md');
+  const overridePath = (f: Fake) => join(dirname(f.codexConfig), 'AGENTS.override.md');
+  const instrTargets = (home: string): HarnessTarget[] => {
+    const state = readHarnessReceiptState(home);
+    return state.state === 'ok' ? state.receipt.targets.filter((t) => t.kind === 'instructions') : [];
+  };
+
+  test('enabled config plans + confirms BOTH instructions targets; blocks carry sentinel + mode + serve url; consent names the files', async () => {
+    const f = makeFake();
+    const deps: HarnessDeps = { ...f.deps, loadFileConfig: WB_ON };
+    expect(await applyHarness(flags(), deps)).toBe(0);
+    for (const path of [memoryPath(f), agentsPath(f)]) {
+      const text = readFileSync(path, 'utf8');
+      expect(text).toContain(AMBIENT_WRITEBACK_BLOCK_BEGIN);
+      expect(text).toContain('mode: salient');
+      expect(text).toContain(`serve: ${URL}`); // [OV-A3] the header names the endpoint
+    }
+    const targets = instrTargets(f.home);
+    expect(targets.map((t) => [t.host, t.state, t.mechanism]).sort()).toEqual([
+      ['claude-code', 'confirmed', 'managed-block'],
+      ['codex', 'confirmed', 'managed-block'],
+    ]);
+    // Consent names the writes before they happen [X7 parity].
+    expect(f.out.join('\n')).toMatch(/Ambient memory writeback is ENABLED/);
+    expect(f.out.join('\n')).toContain(memoryPath(f));
+    expect(f.out.join('\n')).toContain(agentsPath(f));
+  });
+
+  test('a failed MCP registration blocks THAT host\'s instruction install; the other host proceeds (codex re-review)', async () => {
+    const f = makeFake({ mcpAddCode: 1 }); // claude `mcp add` fails; codex toml write succeeds
+    const deps: HarnessDeps = { ...f.deps, loadFileConfig: WB_ON };
+    const code = await applyHarness(flags(), deps);
+    expect(code).toBe(1);
+    // No block may direct ambient saves through a registration that never
+    // landed — the claude lane skips; codex (whose registration landed)
+    // still converges normally.
+    expect(existsSync(memoryPath(f))).toBe(false);
+    const targets = instrTargets(f.home);
+    const claude = targets.find((t) => t.host === 'claude-code');
+    expect(claude?.state).toBe('failed');
+    expect(String(claude?.error)).toContain('did not land');
+  });
+
+  test('a failed smoke rolls the instruction blocks back too — no block outlives its unverified registration (codex re-review)', async () => {
+    const f = makeFake({ probeOk: false }); // apply succeeds, final smoke fails (auth)
+    const deps: HarnessDeps = { ...f.deps, loadFileConfig: WB_ON };
+    const code = await applyHarness(flags(), deps);
+    expect(code).toBe(1);
+    for (const path of [memoryPath(f), agentsPath(f)]) {
+      if (!existsSync(path)) continue; // stripped block may leave an empty-of-ours file
+      expect(readFileSync(path, 'utf8')).not.toContain(AMBIENT_WRITEBACK_BLOCK_BEGIN);
+    }
+    for (const t of instrTargets(f.home)) {
+      expect(t.state).toBe('failed');
+      expect(String(t.error)).toContain('failed smoke');
+    }
+  });
+
+  test('registrar mode (non-loopback --url): NO instruction blocks even with local writeback on — the remote brain never opted in (adversarial review)', async () => {
+    const f = makeFake();
+    const deps: HarnessDeps = { ...f.deps, loadFileConfig: WB_ON };
+    const code = await applyHarness(
+      flags(['--url', 'http://192.168.1.50:3131/mcp', '--token', TOKEN_A, '--harness', 'codex']),
+      deps,
+    );
+    expect(code).toBe(0);
+    // The MCP registration lands; the block does NOT (the local file mirror
+    // speaks for the LOCAL brain — a block here would order agents to save
+    // into the remote brain without its brain-scoped opt-in).
+    expect(readFileSync(f.codexConfig, 'utf8')).toContain('http://192.168.1.50:3131/mcp');
+    expect(existsSync(agentsPath(f))).toBe(false);
+    expect(instrTargets(f.home)).toEqual([]);
+    expect(f.out.join('\n')).toContain('registrar mode: ambient-writeback instruction blocks are NOT installed');
+  });
+
+  test('re-apply is idempotent: both instruction files byte-identical', async () => {
+    const f = makeFake();
+    const deps: HarnessDeps = { ...f.deps, loadFileConfig: WB_ON };
+    expect(await applyHarness(flags(), deps)).toBe(0);
+    const claudeOnce = readFileSync(memoryPath(f), 'utf8');
+    const agentsOnce = readFileSync(agentsPath(f), 'utf8');
+    expect(await applyHarness(flags(), deps)).toBe(0);
+    expect(readFileSync(memoryPath(f), 'utf8')).toBe(claudeOnce);
+    expect(readFileSync(agentsPath(f), 'utf8')).toBe(agentsOnce);
+  });
+
+  test('[OV-A4] AGENTS.override.md present → codex target FAILS with the actionable error; claude target still succeeds', async () => {
+    const f = makeFake();
+    writeFileSync(overridePath(f), '# my override\n');
+    const deps: HarnessDeps = { ...f.deps, loadFileConfig: WB_ON };
+    expect(await applyHarness(flags(), deps)).toBe(1);
+    const targets = instrTargets(f.home);
+    const codex = targets.find((t) => t.host === 'codex');
+    expect(codex?.state).toBe('failed');
+    expect(codex?.error).toMatch(/AGENTS\.override\.md/);
+    expect(codex?.error).toMatch(/ignores/);
+    // Never a dead integration: AGENTS.md was NOT written.
+    expect(existsSync(agentsPath(f))).toBe(false);
+    // The claude lane is unaffected.
+    expect(targets.find((t) => t.host === 'claude-code')?.state).toBe('confirmed');
+    expect(readFileSync(memoryPath(f), 'utf8')).toContain(AMBIENT_WRITEBACK_BLOCK_BEGIN);
+  });
+
+  test('[OV-A2/OV2-2] config back OFF converges: blocks stripped (files kept), receipt cleared, advisory printed', async () => {
+    const f = makeFake();
+    writeFileSync(memoryPath(f), '# mine\n');
+    writeFileSync(agentsPath(f), '# agents\n');
+    expect(await applyHarness(flags(), { ...f.deps, loadFileConfig: WB_ON })).toBe(0);
+    expect(readFileSync(memoryPath(f), 'utf8')).toContain(AMBIENT_WRITEBACK_BLOCK_BEGIN);
+    // Second apply with the DEFAULT off config (makeFake injects none; the
+    // preload-pinned GBRAIN_HOME scratch has no config.json → off).
+    expect(await applyHarness(flags(), f.deps)).toBe(0);
+    // Non-block content restored EXACTLY; the files are never deleted.
+    expect(readFileSync(memoryPath(f), 'utf8')).toBe('# mine\n');
+    expect(readFileSync(agentsPath(f), 'utf8')).toBe('# agents\n');
+    expect(instrTargets(f.home)).toEqual([]);
+    expect(f.out.join('\n')).toMatch(
+      /ambient writeback off — enable with `gbrain config set memory\.auto_writeback salient` and re-run\./,
+    );
+  });
+
+  test('--remove strips the blocks and leaves the files in place', async () => {
+    const f = makeFake();
+    writeFileSync(memoryPath(f), '# keep\n');
+    expect(await applyHarness(flags(), { ...f.deps, loadFileConfig: WB_ON })).toBe(0);
+    expect(await removeHarness(parseHarnessArgs(['--remove', '--yes']), f.deps)).toBe(0);
+    expect(readFileSync(memoryPath(f), 'utf8')).toBe('# keep\n');
+    // The codex agents file was created by the apply (block only) — emptied, NEVER deleted.
+    expect(existsSync(agentsPath(f))).toBe(true);
+    expect(readFileSync(agentsPath(f), 'utf8')).not.toContain(AMBIENT_WRITEBACK_BLOCK_BEGIN);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('--status probes sentinel presence: installed → missing → override-blocked (exit reflects it)', async () => {
+    const f = makeFake();
+    const deps: HarnessDeps = { ...f.deps, loadFileConfig: WB_ON };
+    expect(await applyHarness(flags(), deps)).toBe(0);
+    expect(await statusHarness(parseHarnessArgs(['--status']), deps)).toBe(0);
+    expect(f.out.join('\n')).toMatch(/ambient-writeback block \(claude-code\): installed/);
+    expect(f.out.join('\n')).toMatch(/ambient-writeback block \(codex\): installed/);
+    // Hand-emptied AGENTS.md → missing, exit 1.
+    writeFileSync(agentsPath(f), '# emptied\n');
+    f.out.length = 0;
+    expect(await statusHarness(parseHarnessArgs(['--status']), deps)).toBe(1);
+    expect(f.out.join('\n')).toMatch(/ambient-writeback block \(codex\): missing/);
+    // Override file appears → override-blocked (checked in status too), exit 1.
+    writeFileSync(overridePath(f), '# override\n');
+    f.out.length = 0;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), deps)).toBe(1);
+    const payload = JSON.parse(f.out[f.out.length - 1]) as {
+      instructions_blocks: Array<{ host: string; probe: string }>;
+    };
+    expect(payload.instructions_blocks.find((p) => p.host === 'codex')?.probe).toBe('override-blocked');
+    expect(payload.instructions_blocks.find((p) => p.host === 'claude-code')?.probe).toBe('installed');
+  });
+
+  test('default file-plane read honors GBRAIN_HOME: config.json with salient enables the target without an injected loader', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'gb-wb-home-'));
+    mkdirSync(join(parent, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(parent, '.gbrain', 'config.json'),
+      JSON.stringify({ engine: 'pglite', memory: { auto_writeback: 'salient' } }),
+    );
+    const f = makeFake();
+    await withEnv({ GBRAIN_HOME: parent }, async () => {
+      expect(await applyHarness(flags(['--harness', 'claude-code', '--no-hooks']), f.deps)).toBe(0);
+    });
+    expect(readFileSync(memoryPath(f), 'utf8')).toContain(AMBIENT_WRITEBACK_BLOCK_BEGIN);
+    // claude-only run: no codex target, no codex agents-file write.
+    expect(existsSync(agentsPath(f))).toBe(false);
+    expect(instrTargets(f.home).map((t) => t.host)).toEqual(['claude-code']);
   });
 });

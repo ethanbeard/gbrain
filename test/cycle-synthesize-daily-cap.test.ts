@@ -135,7 +135,10 @@ interface CapDetails {
   skips: Array<{ filePath: string; reason: string }>;
 }
 
-async function runPhase(rig: Rig, opts: { date?: string; excludeQueue?: string } = {}): Promise<CapDetails> {
+async function runPhase(
+  rig: Rig,
+  opts: { date?: string; excludeQueue?: string; now?: () => Date } = {},
+): Promise<CapDetails> {
   // No key + isolated GBRAIN_HOME: every seeded verdict is a cache hit, so no
   // judge call happens; the env isolation is belt-and-suspenders against a
   // dev machine whose config file carries a real key.
@@ -159,6 +162,25 @@ async function runPhase(rig: Rig, opts: { date?: string; excludeQueue?: string }
     try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* */ }
   }
 }
+
+describe('cycle summary date (#4348)', () => {
+  test('the phase buckets a UTC-evening run into the configured local day', async () => {
+    const rig = await setupRig();
+    try {
+      await rig.engine.setConfig('cycle.timezone', 'Asia/Kolkata');
+      await seedPassingFile(rig, '2026-08-19-boundary.txt');
+
+      await runPhase(rig, {
+        now: () => new Date('2026-08-19T21:30:00.000Z'),
+      });
+
+      expect(await rig.engine.getPage('dream-cycle-summaries/2026-08-20')).not.toBeNull();
+      expect(await rig.engine.getPage('dream-cycle-summaries/2026-08-19')).toBeNull();
+    } finally {
+      await rig.cleanup();
+    }
+  }, 60_000);
+});
 
 describe('daily cap — default off (D2D)', () => {
   test('unset cap: every passing file submits, zero daily_cap skips', async () => {
@@ -187,6 +209,65 @@ describe('daily cap — engaged', () => {
       const capSkips = details.skips.filter(s => s.reason.startsWith('daily_cap_reached'));
       expect(capSkips).toHaveLength(1);
       expect(capSkips[0].reason).toMatch(/daily_cap_reached: 1\/1/);
+    } finally {
+      await rig.cleanup();
+    }
+  }, 60_000);
+
+  test('a transcript whose synth-v2 child already completed is skipped before any work; a cancelled row does not count', async () => {
+    const rig = await setupRig();
+    try {
+      const done = await seedPassingFile(rig, '2026-08-05-done.txt');
+      const redo = await seedPassingFile(rig, '2026-08-06-redo.txt');
+      const key = (name: string) => {
+        const content = `conversation in ${name}\n`.repeat(200);
+        const hash16 = createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16);
+        return `dream:synth-v2:default:filename:${name}:${hash16}`;
+      };
+      await rig.engine.executeRaw(
+        `INSERT INTO minion_jobs (name, queue, status, data, idempotency_key, created_at, finished_at)
+         VALUES ('subagent', 'dream-inline-old-run', 'completed', '{"source_id":"default"}'::jsonb, $1, now() - interval '2 days', now() - interval '2 days'),
+                ('subagent', 'dream-inline-old-run', 'cancelled', '{"source_id":"default"}'::jsonb, $2, now() - interval '2 days', now() - interval '2 days')`,
+        [key('2026-08-05-done.txt'), key('2026-08-06-redo.txt')],
+      );
+      const details = await runPhase(rig);
+      const doneSkip = details.skips.find(s => s.filePath === done);
+      expect(doneSkip?.reason).toBe('already_synthesized_v2_single_chunk');
+      expect(details.skips.find(s => s.filePath === redo)).toBeUndefined();
+      expect(details.children_submitted).toBe(1);
+    } finally {
+      await rig.cleanup();
+    }
+  }, 60_000);
+
+  test('a transcript whose synth-v2 CHUNKED set fully completed is skipped; a partial chunk set is resubmitted', async () => {
+    const rig = await setupRig();
+    try {
+      const full = await seedPassingFile(rig, '2026-08-07-chunked-full.txt');
+      const partial = await seedPassingFile(rig, '2026-08-08-chunked-partial.txt');
+      const chunkKey = (name: string, i: number, n: number) => {
+        const content = `conversation in ${name}\n`.repeat(200);
+        const hash16 = createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16);
+        return `dream:synth-v2:default:filename:${name}:${hash16}:c${i}of${n}`;
+      };
+      // full: c0of2 + c1of2 completed (a whole set). partial: only c0of3 —
+      // the transcript would ship with holes, so it must be re-synthesized.
+      await rig.engine.executeRaw(
+        `INSERT INTO minion_jobs (name, queue, status, data, idempotency_key, created_at, finished_at)
+         VALUES ('subagent', 'dream-inline-old-run', 'completed', '{"source_id":"default"}'::jsonb, $1, now() - interval '2 days', now() - interval '2 days'),
+                ('subagent', 'dream-inline-old-run', 'completed', '{"source_id":"default"}'::jsonb, $2, now() - interval '2 days', now() - interval '2 days'),
+                ('subagent', 'dream-inline-old-run', 'completed', '{"source_id":"default"}'::jsonb, $3, now() - interval '2 days', now() - interval '2 days')`,
+        [
+          chunkKey('2026-08-07-chunked-full.txt', 0, 2),
+          chunkKey('2026-08-07-chunked-full.txt', 1, 2),
+          chunkKey('2026-08-08-chunked-partial.txt', 0, 3),
+        ],
+      );
+      const details = await runPhase(rig);
+      expect(details.skips.find(s => s.filePath === full)?.reason).toBe('already_synthesized_v2_chunked');
+      expect(details.skips.find(s => s.filePath === partial)).toBeUndefined();
+      // Only the partial transcript submits (small fixture → one chunk).
+      expect(details.children_submitted).toBe(1);
     } finally {
       await rig.cleanup();
     }
@@ -253,11 +334,18 @@ describe('daily cap — engaged', () => {
     const rig = await setupRig();
     try {
       await rig.engine.setConfig('dream.synthesize.max_submissions_per_source_per_day', '1');
+      await rig.engine.setConfig('cycle.timezone', 'America/Los_Angeles');
       await seedSubmissionRow(rig, { ageHours: 1, tag: 'recent.txt' }); // cap exhausted
       await seedPassingFile(rig, '2026-08-07-g.txt');
-      const details = await runPhase(rig, { date: '2026-08-07' });
+      const details = await runPhase(rig, {
+        date: '2026-08-07',
+        now: () => new Date('2040-01-02T12:00:00.000Z'),
+      });
       expect(details.children_submitted).toBe(1);
       expect(details.skips.filter(s => s.reason.startsWith('daily_cap'))).toHaveLength(0);
+      // #4348: explicit --date beats both the clock and the configured zone.
+      expect(await rig.engine.getPage('dream-cycle-summaries/2026-08-07')).not.toBeNull();
+      expect(await rig.engine.getPage('dream-cycle-summaries/2040-01-02')).toBeNull();
     } finally {
       await rig.cleanup();
     }

@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -79,11 +79,11 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `find_anomalies` | Returns statistical anomalies in recent page activity, grouped by cohort (tag or type). | read | yes |  |
-| `find_contradictions` | v0.32.6 — return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. | read |  |  |
+| `find_contradictions` | Stored contradiction reports are temporarily available only to trusted local callers without a source filter. | read |  |  |
 | `find_experts` | Answers 'who in my brain knows about <topic>'. | read |  |  |
 | `find_trajectory` | v0.35.4 — return the chronological claim trajectory for an entity (typed metric values over time, plus auto-detected regressions and narrative drift). | read |  |  |
 | `get_calibration_profile` | Read the active calibration profile for a holder. | read |  |  |
-| `get_recent_salience` | Returns pages recently touched and ranked by emotional + activity salience (deterministic 0..1 emotional_weight + take density + recency decay). | read | yes |  |
+| `get_recent_salience` | Returns readable pages recently touched and ranked by activity salience and recency. | read | yes |  |
 | `volunteer_context` | Push-based context: volunteer brain pages relevant to a rolling conversation window WITHOUT being asked. | read |  |  |
 
 ## jobs
@@ -122,6 +122,7 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 |---|---|---|---|---|
 | `loops_close` | Close an open loop by id: status 'done' (handled) or 'dropped' (not going to). | write |  |  |
 | `loops_mute` | Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback primitive behind "never track this sender". | write |  |  |
+| `loops_unmute` | Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for it again. | write |  |  |
 | `open_loops` | The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. | read |  |  |
 
 ## memory
@@ -192,7 +193,7 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 | `query` | Hybrid search with vector + keyword + multi-query expansion. | read | yes |  |
 | `search` | Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. | read | yes |  |
 | `search_by_image` | v0.36 cross-modal Phase 2: image-as-query retrieval. | read |  |  |
-| `search_modes` | Read-only search-mode dashboard: active mode, per-knob resolved value with attribution (mode default vs config override), and the three frozen bundles. | read |  |  |
+| `search_modes` | Read-only search-mode dashboard: active mode, EVERY mode-bundle knob resolved with attribution (mode default vs config override), the three frozen bundles, and a reranker_readiness verdict (whether the resolved reranker will actually run; remote callers get the verdict without the host key inventory). | read |  |  |
 | `search_stats` | Search observability over a window: cache hit rate, intent/mode mix, budget drops, rank-1 score drift, graph-signals failure counts. | admin |  |  |
 | `search_tune` | Read-only tuning recommendations derived from the last 7 days of search telemetry: what should change, why, and the paste-ready config command per recommendation — relay them to the user. | admin |  |  |
 

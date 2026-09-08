@@ -226,7 +226,11 @@ export function writeReceipt(gbrainHomeDir: string, receipt: InstallReceipt): vo
 // completes. A crash at any step leaves a receipt --remove can consume.
 // ---------------------------------------------------------------------------
 
-export type HarnessTargetKind = 'mcp' | 'permission' | 'hooks';
+// 'instructions' (the ambient-writeback managed block) is ADDITIVE under
+// harness_receipt_version 1 — a version bump would make older binaries refuse
+// the whole receipt (bricking --remove of EVERY target), so instead older
+// binaries simply won't unwire this kind on --remove: a documented limitation.
+export type HarnessTargetKind = 'mcp' | 'permission' | 'hooks' | 'instructions';
 export type HarnessTargetState = 'pending' | 'confirmed' | 'failed';
 
 export interface HarnessTarget {
@@ -260,6 +264,10 @@ export interface HarnessReceipt {
   /** Serve version at apply time — --status re-checks for skew [F7]. */
   serve_version?: string;
   source_id: string;
+  /** False when the hooks carry NO `GBRAIN_SOURCE` pin (a live PGLite serve hid
+   * which source it resolves, the --token lane proceeded unpinned and `source_id`
+   * records the federated floor `default`). Absent = pinned to `source_id`. */
+  source_pinned?: false;
   token: {
     name: string;
     /** Row id — the only safe revocation key. */

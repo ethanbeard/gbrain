@@ -19,7 +19,8 @@ import { ALL_SOURCES, isValidSourceId } from '../source-id.ts';
 import { isSearchMode } from '../search/mode.ts';
 import { stampEvidence } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
-import type { SearchResult, HybridSearchMeta } from '../types.ts';
+import type { SearchResult, HybridSearchMeta, PageReadScope, PageReadPolicy } from '../types.ts';
+import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 
 // --- Upload validators (Fix 1 / B5 / H5 / M4) ---
 
@@ -460,6 +461,24 @@ export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sou
   return {};
 }
 
+/** Holder permissions are independent of the operator's page-visibility opt-out. */
+export function readHolders(ctx: OperationContext): string[] | undefined {
+  return ctx.remote === false ? ctx.takesHoldersAllowList : ctx.takesHoldersAllowList ?? ['world'];
+}
+
+/** Resolve policy once at the operation boundary; callers may supply a canonical per-call scope. */
+export async function readPolicyOpts(
+  ctx: OperationContext,
+  scope: PageReadScope = sourceScopeOpts(ctx),
+): Promise<PageReadPolicy> {
+  return {
+    ...scope,
+    excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote),
+    requireSafeChunks: ctx.remote !== false,
+    takesHoldersAllowList: readHolders(ctx),
+  };
+}
+
 /** Map the operation-layer scope names onto runThink's public options. */
 export function thinkSourceScopeOpts(ctx: OperationContext): {
   sourceId?: string;
@@ -617,6 +636,41 @@ export function federatedSearchScope(
     return { sourceIds: ctx.localFederatedSourceIds };
   }
   return scope;
+}
+
+/**
+ * #4620 — the #1712 rule on the op path: an EXPLICIT per-call `source_id`
+ * that names no live (unarchived) source fails loudly instead of silently
+ * scoping the read to a source with no rows (page_not_found with a
+ * soft-delete hint, or an empty list). Reachable because a federated_read
+ * grant / `.gbrain-source` dotfile has no FK and outlives `sources remove`.
+ * Call it AFTER `federatedSearchScope` so the grant check has already run —
+ * it can only name a source the caller was granted, never a cross-grant
+ * existence oracle. `__all__` and an omitted param skip it (nothing explicit
+ * to verify). Async on purpose: `resolveRequestedScope` stays sync for its
+ * ~10 engine-free call sites.
+ */
+export async function assertExplicitSourceLive(
+  ctx: OperationContext,
+  sourceIdParam: string | undefined,
+): Promise<void> {
+  if (sourceIdParam === undefined || sourceIdParam === ALL_SOURCES) return;
+  // Point lookup, not listAllSources (wave review): this runs on every
+  // search/query/get_page/list_pages call that names a source, and the full
+  // enumeration hauled every row's config JSONB across the wire each time.
+  // Same liveness predicate as listAllSources' default filter.
+  const live = await ctx.engine.executeRaw<{ ok: number }>(
+    `SELECT 1 AS ok FROM sources WHERE id = $1 AND archived IS NOT TRUE LIMIT 1`,
+    [sourceIdParam],
+  );
+  if (live.length > 0) return;
+  throw new OperationError(
+    'unknown_source',
+    `source '${sourceIdParam}' does not exist (removed or archived)`,
+    'Omit source_id to read within your grant, or pick an id from sources_list. ' +
+      'If a .gbrain-source dotfile or a federated_read grant still names it, update them ' +
+      '(gbrain auth rescope-client <client_id>; gbrain doctor lists dangling grants).',
+  );
 }
 
 /**

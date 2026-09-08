@@ -968,11 +968,13 @@ describe('#3583 review: orphan-sentinel self-heal probe/clear race', () => {
     // after the first orphan probe returned "no active row". The second
     // probe must see it and keep the sentinel open — a single-probe sweep
     // cleared it while the duplicate existed.
-    const origExecuteRaw = engine.executeRaw.bind(engine);
+    // Preserve the dynamic receiver: import transaction clones inherit this
+    // interceptor and must query their own transaction, including after restore.
+    const origExecuteRaw = engine.executeRaw;
     let probeCalls = 0;
     (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
-      (async (sql: string, params?: unknown[]) => {
-        const res = await origExecuteRaw(sql, params);
+      (async function (this: PGLiteEngine, sql: string, params?: unknown[]) {
+        const res = await origExecuteRaw.call(this, sql, params);
         if (sql.includes('source_path = ANY')) {
           probeCalls++;
           if (probeCalls === 1) {
@@ -980,7 +982,7 @@ describe('#3583 review: orphan-sentinel self-heal probe/clear race', () => {
               type: 'person', title: 'Dana (revenant)',
               compiled_truth: 'materialized between probe and clear',
             }, { sourceId: 'default' });
-            await origExecuteRaw(
+            await origExecuteRaw.call(this,
               `UPDATE pages SET source_path = 'people/dana-old.md'
                WHERE source_id = 'default' AND slug = 'people/dana-old-revenant'`,
             );
@@ -1298,11 +1300,11 @@ describe('#3583 review: a writer landing AFTER the second probe gets its sentine
     // the second probe returned, i.e. after the double-probe verdict is
     // final and the clear is committed. The post-clear verify probe must
     // detect the row and RESTORE the sentinel.
-    const origExecuteRaw = engine.executeRaw.bind(engine);
+    const origExecuteRaw = engine.executeRaw;
     let probeCalls = 0;
     (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
-      (async (sql: string, params?: unknown[]) => {
-        const res = await origExecuteRaw(sql, params);
+      (async function (this: PGLiteEngine, sql: string, params?: unknown[]) {
+        const res = await origExecuteRaw.call(this, sql, params);
         if (sql.includes('source_path = ANY')) {
           probeCalls++;
           if (probeCalls === 2) {
@@ -1310,7 +1312,7 @@ describe('#3583 review: a writer landing AFTER the second probe gets its sentine
               type: 'person', title: 'Dana (late writer)',
               compiled_truth: 'materialized after the second probe',
             }, { sourceId: 'default' });
-            await origExecuteRaw(
+            await origExecuteRaw.call(this,
               `UPDATE pages SET source_path = 'people/dana-old.md'
                WHERE source_id = 'default' AND slug = 'people/dana-old-late-writer'`,
             );
@@ -1370,11 +1372,11 @@ describe('#3583 review: the failure-gate clear paths also verify-and-restore', (
     writeFileSync(join(repo, 'people/newfile.md'), personMd('New', 'New person.'));
     execSync('git add -A && git commit -m "unrelated addition"', { cwd: repo, stdio: 'pipe' });
 
-    const origExecuteRaw = engine.executeRaw.bind(engine);
+    const origExecuteRaw = engine.executeRaw;
     let probeCalls = 0;
     (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
-      (async (sql: string, params?: unknown[]) => {
-        const res = await origExecuteRaw(sql, params);
+      (async function (this: PGLiteEngine, sql: string, params?: unknown[]) {
+        const res = await origExecuteRaw.call(this, sql, params);
         if (sql.includes('source_path = ANY')) {
           probeCalls++;
           if (probeCalls === 2) {
@@ -1383,7 +1385,7 @@ describe('#3583 review: the failure-gate clear paths also verify-and-restore', (
               type: 'person', title: 'Dana (gate writer)',
               compiled_truth: 'materialized between the gate verdict and the clear',
             }, { sourceId: 'default' });
-            await origExecuteRaw(
+            await origExecuteRaw.call(this,
               `UPDATE pages SET source_path = 'people/dana-old.md'
                WHERE source_id = 'default' AND slug = 'people/dana-old-gate-writer'`,
             );
@@ -1425,15 +1427,15 @@ describe('#3583 review: the failure-gate clear paths also verify-and-restore', (
     // Both orphan probes succeed (empty) → clear commits; the post-clear
     // VERIFY probe (third matching SELECT) throws. Fail-closed means every
     // cleared sentinel comes back.
-    const origExecuteRaw = engine.executeRaw.bind(engine);
+    const origExecuteRaw = engine.executeRaw;
     let probeCalls = 0;
     (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
-      (async (sql: string, params?: unknown[]) => {
+      (async function (this: PGLiteEngine, sql: string, params?: unknown[]) {
         if (sql.includes('source_path = ANY')) {
           probeCalls++;
           if (probeCalls === 3) throw new Error('injected verify-probe outage');
         }
-        return origExecuteRaw(sql, params);
+        return origExecuteRaw.call(this, sql, params);
       }) as typeof engine.executeRaw;
     try {
       const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
@@ -1515,13 +1517,13 @@ describe('#3583 review: a throwing bookmark advance can no longer lose a sentine
     writeFileSync(join(repo, 'people/newfile.md'), personMd('New', 'New person.'));
     execSync('git add -A && git commit -m "unrelated addition"', { cwd: repo, stdio: 'pipe' });
 
-    const origExecuteRaw = engine.executeRaw.bind(engine);
+    const origExecuteRaw = engine.executeRaw;
     (engine as unknown as { executeRaw: typeof engine.executeRaw }).executeRaw =
-      (async (sql: string, params?: unknown[]) => {
+      (async function (this: PGLiteEngine, sql: string, params?: unknown[]) {
         if (sql.includes('UPDATE sources SET last_commit')) {
           throw new Error('injected advance outage');
         }
-        return origExecuteRaw(sql, params);
+        return origExecuteRaw.call(this, sql, params);
       }) as typeof engine.executeRaw;
     let threw = false;
     try {
@@ -2548,5 +2550,192 @@ describe('rename destination import: an errored skip must not checkpoint the ren
     const third = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(third.status).toBe('synced');
     expect((await engine.getPage('people/beta'))?.compiled_truth).toBe('Alpha is a person, fixed.');
+  });
+});
+
+describe('the no-sourceId rename lane must stay source-scoped', () => {
+  test('e2e: a same-path row in a different source must not license a rename of an unrelated default-source page', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const NO_SOURCE_ID_OPTS = { noPull: true, noEmbed: true, noExtract: true } as const;
+
+    // Two unrelated pages in the 'default' source, synced from one repo.
+    const repo = mkRepo({
+      'notes/shared.md': personMd('Shared', 'default body'),
+      'people/victim.md': personMd('Victim', 'victim body'),
+    });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+    expect(await engine.getPage('notes/shared', { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.getPage('people/victim', { sourceId: 'default' })).not.toBeNull();
+
+    // A DIFFERENT source ('acme') happens to have a row whose source_path is
+    // the exact file about to be renamed, but whose OWN slug coincides with
+    // the unrelated victim page's slug in 'default'. 'acme' sorts before
+    // 'default', so a from-path resolve that isn't scoped to the caller's
+    // own source would surface this foreign slug instead of the real page's
+    // own ('notes/shared') — the rename lane's updateSlug call is always
+    // default-scoped (renameOpts is undefined for the no-sourceId lane), so
+    // reading a foreign slug here would repoint an unrelated default-source
+    // row rather than the file's own page.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
+      ['acme'],
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (source_id, slug, source_path, type, title, compiled_truth, timeline, frontmatter)
+       VALUES ('acme', 'people/victim', 'notes/shared.md', 'note', 'people/victim', 'foreign body', '', '{}'::jsonb)`,
+    );
+
+    // Rename ONLY notes/shared.md. Content stays byte-identical to keep
+    // git's similarity-based rename detection above its threshold.
+    execSync('git mv notes/shared.md notes/renamed.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "rename shared"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+
+    // The rename must land at its own new slug in 'default'...
+    expect((await engine.getPage('notes/renamed', { sourceId: 'default' }))?.compiled_truth)
+      .toBe('default body');
+    // ...the old slug is gone (a real rename, not a permanent orphan)...
+    expect(await engine.getPage('notes/shared', { sourceId: 'default' })).toBeNull();
+    // ...and the unrelated victim page — which merely shares a slug VALUE
+    // with the foreign 'acme' row, never the file being renamed — must
+    // never have been touched. A from-path resolve that ignored source
+    // scope would return the 'acme' row's slug ('people/victim'), and the
+    // default-scoped updateSlug would match and repoint THIS page instead.
+    const victim = await engine.getPage('people/victim', { sourceId: 'default' });
+    expect(victim).not.toBeNull();
+    expect(victim?.compiled_truth).toBe('victim body');
+    // ...and the foreign 'acme' row itself was never written to — this is a
+    // read-only resolve, so the seeded row must survive byte-identical.
+    const acmeRow = await engine.executeRaw<{ slug: string; source_path: string | null; compiled_truth: string }>(
+      `SELECT slug, source_path, compiled_truth FROM pages WHERE source_id = 'acme'`,
+    );
+    expect(acmeRow).toEqual([
+      { slug: 'people/victim', source_path: 'notes/shared.md', compiled_truth: 'foreign body' },
+    ]);
+  });
+});
+
+describe('#3942: the rename lane must not repoint a foreign-origin page', () => {
+  test('e2e (sourceId set, batched lane): renaming a legacy trailing-hyphen path must not corrupt a different, live page', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+
+    // Sync 1: only the legacy trailing-hyphen file exists. slugifyPath strips
+    // the trailing hyphen, so it imports AT the clean slug.
+    const repo = mkRepo({
+      'extracts/propose-/round-single.md': personMd('Legacy', 'legacy body'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      .not.toBeNull();
+
+    // Sync 2: the clean file lands at the SAME derived slug with DIFFERENT
+    // content. The reimport re-records source_path to the clean file, so the
+    // page now has a FOREIGN origin relative to the legacy trailing-hyphen
+    // path (whose own file is untouched and still on disk).
+    mkdirSync(join(repo, 'extracts/propose'), { recursive: true });
+    writeFileSync(join(repo, 'extracts/propose/round-single.md'), personMd('Clean', 'clean body'));
+    execSync('git add -A && git commit -m "add clean variant"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect((await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      ?.compiled_truth).toBe('clean body');
+
+    // Sync 3: rename ONLY the legacy trailing-hyphen file (never the clean
+    // page's own file). Content stays byte-identical so git's similarity
+    // detection reports a RENAME. An unguarded batched pre-resolve's exact
+    // source_path lookup misses here (the legacy path is not any page's
+    // recorded origin anymore) and falls back to an unverified re-slugified
+    // fallback — the SAME slug as the clean page — cheap-renaming that
+    // unrelated, live, foreign-origin page.
+    mkdirSync(join(repo, 'notes'), { recursive: true });
+    execSync('git mv "extracts/propose-/round-single.md" notes/renamed.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "rename legacy trailing-hyphen file"', {
+      cwd: repo, stdio: 'pipe',
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    // The clean page — a different file's page — must survive untouched.
+    const cleanPage = await engine.getPage('extracts/propose/round-single', { sourceId: 'default' });
+    expect(cleanPage).not.toBeNull();
+    expect(cleanPage?.compiled_truth).toBe('clean body');
+    // The renamed destination lands as its own page, carrying the legacy
+    // file's (unchanged) content.
+    expect((await engine.getPage('notes/renamed', { sourceId: 'default' }))?.compiled_truth)
+      .toBe('legacy body');
+  });
+
+  test('e2e (no sourceId, per-path lane): the same collision is guarded on the legacy no-sourceId lane too', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const NO_SOURCE_ID_OPTS = { noPull: true, noEmbed: true, noExtract: true } as const;
+
+    const repo = mkRepo({
+      'extracts/propose-/round-single.md': personMd('Legacy', 'legacy body'),
+    });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+    expect(await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      .not.toBeNull();
+
+    mkdirSync(join(repo, 'extracts/propose'), { recursive: true });
+    writeFileSync(join(repo, 'extracts/propose/round-single.md'), personMd('Clean', 'clean body'));
+    execSync('git add -A && git commit -m "add clean variant"', { cwd: repo, stdio: 'pipe' });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+    expect((await engine.getPage('extracts/propose/round-single', { sourceId: 'default' }))
+      ?.compiled_truth).toBe('clean body');
+
+    mkdirSync(join(repo, 'notes'), { recursive: true });
+    execSync('git mv "extracts/propose-/round-single.md" notes/renamed.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git add -A && git commit -m "rename legacy trailing-hyphen file"', {
+      cwd: repo, stdio: 'pipe',
+    });
+    await performSync(engine, { repoPath: repo, ...NO_SOURCE_ID_OPTS });
+
+    const cleanPage = await engine.getPage('extracts/propose/round-single', { sourceId: 'default' });
+    expect(cleanPage).not.toBeNull();
+    expect(cleanPage?.compiled_truth).toBe('clean body');
+    expect((await engine.getPage('notes/renamed', { sourceId: 'default' }))?.compiled_truth)
+      .toBe('legacy body');
+  });
+});
+
+describe('#4597: a fallback rename\'s own stale duplicate converges under incremental sync', () => {
+  // Negative control lives above: "the anchor tree is enumerated on its own
+  // paths" (from=people/alpha.md, anchor proof at the emoji path) pins that
+  // anchor proof from a DIFFERENT path than the reconciled rename's from
+  // still spares the row. This case is the self-referential sub-case only.
+  test('the anchor blob at the rename\'s own from-path is not liveness proof: the pre-rename row is removed and the next run is quiet', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      '\u{1F389}.md': exoticMd,
+      'people/alpha.md': personMd('Alpha', 'Alpha is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('party-notes')).not.toBeNull();
+
+    // Occupied destination forces the fallback lane (updateSlug throws).
+    await engine.putPage('notes/party', {
+      type: 'person', title: 'Occupant', compiled_truth: 'occupies the destination slug',
+    }, { sourceId: 'default' });
+
+    // The exotic file moves to an ORDINARY path and drops its slug: line
+    // (identical body, so `diff -M` reports a rename, not delete + add).
+    // The destination derives its slug from the path now; the only state
+    // still naming `party-notes` is the anchor blob at the rename's own
+    // from-path — the pre-rename content of the file just re-imported.
+    mkdirSync(join(repo, 'notes'), { recursive: true });
+    execSync('git mv "\u{1F389}.md" notes/party.md', { cwd: repo, stdio: 'pipe' });
+    writeFileSync(join(repo, 'notes/party.md'), exoticMd.replace('slug: Party-Notes\n', ''));
+    execSync('git add -A && git commit -m "move party notes to an ordinary path"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    const dest = await engine.getPage('notes/party');
+    expect(dest).not.toBeNull();
+    expect(dest!.compiled_truth).toContain('Party notes live here.');
+    // The stale half of the rename is gone (soft-deleted, 72h recoverable)...
+    expect(await engine.getPage('party-notes')).toBeNull();
+
+    // ...and the incremental path is converged: no sentinel, no wedge.
+    const quiet = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(quiet.status).toBe('up_to_date');
+    expect(await engine.getPage('party-notes')).toBeNull();
   });
 });
