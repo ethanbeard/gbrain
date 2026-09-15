@@ -21,7 +21,7 @@
  *     rotation (via configureGateway()) invalidates stale entries.
  */
 
-import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema } from 'ai';
+import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema, type JSONSchema7, type Output } from 'ai';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { listRecipes } from './recipes/index.ts';
@@ -58,13 +58,16 @@ import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
-import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
+import { AIConfigError, AITransientError, isStructuredOutputRejection, normalizeAIError } from './errors.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
 import type { GBrainConfig } from '../config.ts';
 import { mergedProviderEnv } from './provider-env.ts';
 import { buildGatewayConfig, foldNativeBaseUrlsFromFilePlane } from './build-gateway-config.ts';
+import { invokeAI, sdkInvocationUsage, responseInvocationUsage, hasAIInvocationGuard, isAIInvocationPolicyError } from './invocation-guard.ts';
+import { createGuardedGeneration, chatInvocation } from './guarded-generation.ts';
+const guardedGeneration = createGuardedGeneration(() => DEFAULT_MAX_OUTPUT_TOKENS);
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -2162,7 +2165,11 @@ async function embedSubBatch(
   opts?: EmbedOpts,
 ): Promise<Float32Array[]> {
   try {
-    const callTransport = () => _embedTransport({
+    const callTransport = () => invokeAI({ operation: 'gateway.embed', kind: 'embedding', model: `${recipe.id}:${modelId}`,
+      maxInputTokens: recipe.touchpoints.embedding?.max_batch_tokens
+        ?? (recipe.touchpoints.embedding?.max_input_tokens?.[modelId] !== undefined
+          ? recipe.touchpoints.embedding.max_input_tokens[modelId]! * texts.length : undefined),
+      maxOutputTokens: 0 }, () => _embedTransport({
       model,
       values: texts,
       providerOptions: providerOpts,
@@ -2171,8 +2178,8 @@ async function embedSubBatch(
       // per-SDK-call scope). Composes with a caller signal (Fix 3's 6s query
       // deadline) — shorter wins.
       abortSignal: withDefaultTimeout(opts?.abortSignal, AI_EMBED_TIMEOUT_MS),
-      ...(opts?.maxRetries !== undefined && { maxRetries: opts.maxRetries }),
-    });
+      ...(hasAIInvocationGuard() ? { maxRetries: 0 } : opts?.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
+    }), sdkInvocationUsage);
     // Carry the threaded input_type across the SDK boundary via
     // __embedInputTypeStore (the adapter strips it from providerOptions —
     // see the store's doc comment). Populated only when dimsProviderOptions
@@ -2202,6 +2209,7 @@ async function embedSubBatch(
     recordSubBatchSuccess(recipe);
     return result.embeddings.map((e: number[]) => new Float32Array(e));
   } catch (err) {
+    if (isAIInvocationPolicyError(err)) throw err;
     // On token-limit error, tighten the recipe's effective safety factor
     // (so the next embed() pre-splits smaller) and recursively halve THIS
     // batch to make forward progress without dropping work.
@@ -2375,7 +2383,7 @@ export async function embedMultimodal(
 
     let res: Response;
     try {
-      res = await fetch(`${baseUrl}/multimodalembeddings`, {
+      res = await invokeAI({ operation: 'gateway.multimodal', kind: 'multimodal', model: `${recipe.id}:${parsed.modelId}` }, () => fetch(`${baseUrl}/multimodalembeddings`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2385,8 +2393,9 @@ export async function embedMultimodal(
         // v0.42.20.0 (codex #4) — per-request multimodal timeout (direct fetch
         // bypasses the SDK abortSignal).
         signal: AbortSignal.timeout(AI_MULTIMODAL_TIMEOUT_MS),
-      });
+      }), responseInvocationUsage);
     } catch (err) {
+      if (isAIInvocationPolicyError(err)) throw err;
       throw normalizeAIError(err, `embedMultimodal(${recipe.id}:${parsed.modelId})`);
     }
 
@@ -2521,7 +2530,7 @@ async function embedMultimodalOpenAICompat(
 
     let res: Response;
     try {
-      res = await fetch(`${baseUrl}/embeddings`, {
+      res = await invokeAI({ operation: 'gateway.multimodal', kind: 'multimodal', model: `${recipe.id}:${modelId}` }, () => fetch(`${baseUrl}/embeddings`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2530,8 +2539,9 @@ async function embedMultimodalOpenAICompat(
         body: JSON.stringify(body),
         // v0.42.20.0 (codex #4) — per-request multimodal timeout (direct fetch).
         signal: AbortSignal.timeout(AI_MULTIMODAL_TIMEOUT_MS),
-      });
+      }), responseInvocationUsage);
     } catch (err) {
+      if (isAIInvocationPolicyError(err)) throw err;
       throw normalizeAIError(err, `embedMultimodal(${recipe.id}:${modelId})`);
     }
 
@@ -2683,6 +2693,7 @@ export async function embedMultimodalSafe(
       }
       return;
     } catch (err) {
+      if (isAIInvocationPolicyError(err)) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));
       // AIConfigError = permanent misconfig. Retrying smaller won't help.
       if (lastError instanceof AIConfigError) {
@@ -2905,12 +2916,13 @@ export async function expand(query: string): Promise<string[]> {
     const viaText = async (): Promise<string[]> => {
       let textResult: Awaited<ReturnType<GenerateTextFn>>;
       try {
-        textResult = await _generateTextTransport({
+        textResult = await guardedGeneration(modelLabel, _generateTextTransport, {
           model,
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
         });
       } catch (err) {
+        if (isAIInvocationPolicyError(err)) throw err;
         recordExpansionFailure(modelLabel, err); // failed call still billed upstream
         throw err; // outer catch degrades to [query]
       }
@@ -2943,9 +2955,9 @@ export async function expand(query: string): Promise<string[]> {
       // structured output natively — unchanged path.
       // (Typed structurally: ReturnType<GenerateObjectFn> erases the schema
       // generic, so `object` would be `{}`.)
-      let result: { object?: { queries?: string[] }; usage?: unknown };
+      let result: { object?: unknown; usage?: unknown };
       try {
-        result = await _generateObjectTransport({
+        result = await guardedGeneration(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Name the schema. On the native-anthropic path the SDK turns the schema
@@ -2967,17 +2979,19 @@ export async function expand(query: string): Promise<string[]> {
           prompt: expansionPrompt,
         });
       } catch (err) {
+        if (isAIInvocationPolicyError(err)) throw err;
         recordExpansionFailure(modelLabel, err);
         throw err; // outer catch degrades to [query]
       }
       recordExpansionUsage(modelLabel, result.usage);
-      expansions = result.object?.queries ?? [];
+      const parsed = ExpansionSchema.safeParse(result.object);
+      expansions = parsed.success ? parsed.data.queries : [];
     } else if (recipeSupportsStructuredOutputs(recipe) && !_structuredOutputRejectedRecipes.has(recipe.id)) {
       // openai-compatible backend that honors strict json_schema: request the
       // schema (strict validation), and fall back to the text path if it is
       // rejected at call time so a mis-declared capability never drops expansion.
       try {
-        const result = await _generateObjectTransport({
+        const result = await guardedGeneration(modelLabel, _generateObjectTransport, {
           model,
           schema: ExpansionSchema,
           // Same schema name+description as the native branch above: an
@@ -2990,8 +3004,10 @@ export async function expand(query: string): Promise<string[]> {
           prompt: expansionPrompt,
         });
         recordExpansionUsage(modelLabel, result.usage);
-        expansions = result.object?.queries ?? [];
+        const parsed = ExpansionSchema.safeParse(result.object);
+        expansions = parsed.success ? parsed.data.queries : [];
       } catch (err) {
+        if (isAIInvocationPolicyError(err)) throw err;
         // The rejected structured attempt billed real tokens — record it
         // before the fallback bills its own call (two records, both true).
         recordExpansionFailure(modelLabel, err);
@@ -3016,6 +3032,7 @@ export async function expand(query: string): Promise<string[]> {
     });
     return all;
   } catch (err) {
+    if (isAIInvocationPolicyError(err)) throw err;
     // Expansion is best-effort: on failure, fall back to the original query alone.
     const normalized = normalizeAIError(err, 'expand');
     if (normalized instanceof AIConfigError) {
@@ -3072,7 +3089,7 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
     recordSpendOnTracker(tracker, ocrModelId, label, tokens);
   let result: Awaited<ReturnType<GenerateTextFn>>;
   try {
-    result = await _generateTextTransport({
+    result = await guardedGeneration(ocrModelId, _generateTextTransport, {
       model,
       // v0.42.20.0 (codex) — OCR is a 5th unbounded generateText entry point.
       abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
@@ -3094,6 +3111,7 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
       ],
     });
   } catch (err) {
+    if (isAIInvocationPolicyError(err)) throw err;
     recordOcr('gateway.ocr.failed', _extractUsageFromError(err, {
       inputTokens: estimatedOcrInputTokens,
       outputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -3492,6 +3510,42 @@ export interface ChatOpts {
    * request body — the AI SDK routes provider options by provider key.
    */
   cacheSystem?: boolean;
+  /**
+   * JSON Schema the reply must conform to (#4863). Honored ONLY on
+   * openai-compatible recipes that declare `supports_structured_outputs` —
+   * backends that enforce `response_format: json_schema` server-side
+   * (Ollama's grammar-constrained decoding). Every other lane ignores the
+   * field, so native / claude-cli calls are byte-identical with or without
+   * it, and the reply still arrives as `text`: callers keep parsing and
+   * validating it themselves (see `jsonSchemaOutput`).
+   */
+  responseSchema?: { name: string; description?: string; schema: Record<string, unknown> };
+}
+
+/**
+ * Tolerant AI SDK `Output` spec for `ChatOpts.responseSchema` (#4863). NOT
+ * `Output.object`: generateText parses `output` eagerly when finishReason is
+ * 'stop', and Output.object throws NoObjectGeneratedError on unparseable
+ * text — that would turn a recoverable malformed reply into a thrown
+ * provider_error and skip the caller's own parse + retry lane. This spec only
+ * carries the responseFormat (what the openai-compatible provider turns into
+ * `response_format: json_schema`) and hands the raw text back, so
+ * result.text / stopReason / usage / the facts #2113 truncation retry all run
+ * unchanged. The streaming members are inert (chat() never streams).
+ */
+function jsonSchemaOutput(spec: NonNullable<ChatOpts['responseSchema']>): Output.Output<string, string, never> {
+  return {
+    name: 'json_schema',
+    responseFormat: Promise.resolve({
+      type: 'json' as const,
+      schema: spec.schema as JSONSchema7,
+      name: spec.name,
+      ...(spec.description ? { description: spec.description } : {}),
+    }),
+    parseCompleteOutput: async ({ text }) => text,
+    parsePartialOutput: async () => undefined,
+    createElementStreamTransform: () => undefined,
+  };
 }
 
 /**
@@ -3873,7 +3927,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     let res: ChatResult | null = null;
     let threw: unknown = null;
     try {
-      res = await _chatTransport(opts);
+      res = await invokeAI(chatInvocation('gateway.chat', modelStrEarly, maxOutputTokens), () => _chatTransport!(opts), sdkInvocationUsage);
       // #4218 success boundary (test-transport lane): same accounting call as
       // the production path below so transport-driven tests exercise it.
       recordChatUsage({
@@ -3888,6 +3942,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       });
       return res;
     } catch (err) {
+      if (isAIInvocationPolicyError(err)) throw err;
       threw = err;
       throw err;
     } finally {
@@ -4041,20 +4096,52 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       }
     : opts.system;
 
+  // #4863: schema-constrained decoding for openai-compatible backends that
+  // honor json_schema. Gated on the recipe declaration so a backend that
+  // would reject the schema is never sent one; a declared backend that
+  // ignores it just returns unconstrained text, which the caller's parse
+  // lane already handles. Native + claude-cli lanes never see the field.
+  // A declared backend that REJECTS it at call time (older Ollama build,
+  // strict proxy) gets one schemaless retry below and is remembered in
+  // `_structuredOutputRejectedRecipes` — the same process-lifetime memory
+  // expand() keeps — so the caller's own retry lanes don't re-pay the
+  // rejection and turn every call into a permanent provider_error.
+  const output = opts.responseSchema
+    && recipe.implementation === 'openai-compatible'
+    && recipeSupportsStructuredOutputs(recipe)
+    && !_structuredOutputRejectedRecipes.has(recipe.id)
+    ? jsonSchemaOutput(opts.responseSchema)
+    : undefined;
+
+  const generate = (out: typeof output) => guardedGeneration(modelStr, _generateTextTransport, {
+    model,
+    system: systemParam,
+    messages: toModelMessages(repairToolPairing(opts.messages)) as any,
+    tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
+    maxOutputTokens: opts.maxTokens ?? defaultMaxOutputTokens(modelStr),
+    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    output: out,
+    // v0.42.20.0 — default a chat timeout (composes with the caller's signal,
+    // shorter wins). Covers native-anthropic (the default provider + facts Haiku).
+    // Fresh signal per attempt so the schemaless retry gets its own timeout.
+    abortSignal: withDefaultTimeout(opts.abortSignal, AI_CHAT_TIMEOUT_MS),
+    providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
+    ...(requestHeaders ? { headers: requestHeaders } : {}),
+  });
+
   try {
-    const result = await _generateTextTransport({
-      model,
-      system: systemParam,
-      messages: toModelMessages(repairToolPairing(opts.messages)) as any,
-      tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
-      maxOutputTokens: opts.maxTokens ?? defaultMaxOutputTokens(modelStr),
-      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
-      // v0.42.20.0 — default a chat timeout (composes with the caller's signal,
-      // shorter wins). Covers native-anthropic (the default provider + facts Haiku).
-      abortSignal: withDefaultTimeout(opts.abortSignal, AI_CHAT_TIMEOUT_MS),
-      providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
-      ...(requestHeaders ? { headers: requestHeaders } : {}),
-    });
+    let result: Awaited<ReturnType<GenerateTextFn>>;
+    try {
+      result = await generate(output);
+    } catch (err) {
+      if (!output || isAIInvocationPolicyError(err) || !isStructuredOutputRejection(err)) throw err;
+      _structuredOutputRejectedRecipes.add(recipe.id);
+      console.warn(
+        `[ai.gateway] ${recipe.id} rejected response_format json_schema; retrying without a schema ` +
+        `and skipping it for the rest of this process: ${(err as Error)?.message ?? String(err)}`,
+      );
+      result = await generate(undefined);
+    }
 
     // Normalize blocks. Vercel SDK gives us `result.content` (an array of typed
     // parts) for v6+; fall back to text + toolCalls for older shapes.
@@ -4133,6 +4220,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       providerMetadata,
     };
   } catch (err) {
+    if (isAIInvocationPolicyError(err)) throw err;
     // Pessimistic fallback (A3 amended): when err.usage isn't there, charge
     // the worst-case ceiling — better to overcount on failure than under.
     const fallback = _extractUsageFromError(err, {
@@ -4347,6 +4435,7 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
         cacheSystem: opts.cacheSystem,
       });
     } catch (err) {
+      if (isAIInvocationPolicyError(err)) throw err;
       opts.onHeartbeat?.('llm_call_failed', {
         turn_idx: turnIdx,
         error: err instanceof Error ? err.message : String(err),
@@ -4486,6 +4575,7 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
         });
         opts.onHeartbeat?.('tool_result', { turn_idx: turnIdx, tool_name: call.toolName });
       } catch (err) {
+        if (isAIInvocationPolicyError(err)) throw err;
         const errMsg = err instanceof Error ? err.message : String(err);
         await opts.onToolCallFailed?.(gbrainToolUseId, errMsg);
         toolResultBlocks.push({
@@ -4748,12 +4838,12 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   };
   try {
     const transport: RerankTransport = _rerankTransport ?? ((u, init) => fetch(u, init));
-    const resp = await transport(url, {
+    const resp = await invokeAI({ operation: 'gateway.rerank', kind: 'rerank', model: modelStr }, () => transport(url, {
       method: 'POST',
       headers,
       body,
       signal: ctrl.signal,
-    });
+    }), responseInvocationUsage);
     if (!resp.ok) {
       let msg = `rerank HTTP ${resp.status}`;
       try {
@@ -4793,6 +4883,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
     _rerankRecord();
     return mapped;
   } catch (err) {
+    if (isAIInvocationPolicyError(err)) throw err;
     _rerankRecord();
     if (err instanceof RerankError) throw err;
     // AbortError on timeout — classify cleanly.

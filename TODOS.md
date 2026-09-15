@@ -1,12 +1,37 @@
 # TODOS
 
+## Community fix wave follow-ups (filed 2026-09-09)
+
+- [ ] **P3 — new v0.49/v0.50 tests assume `os.tmpdir()` is already a realpath (macOS `/var` vs `/private/var`).**
+  **What:** `test/agent-install.test.ts`, `test/harness-install-ownership.test.ts`, `test/harness-onboarding.test.ts`, `test/init-mcp-only.test.ts`, `test/minions-submission-authority.test.ts`, `test/harness-access.serial.test.ts` and `test/harness-delivery-recovery.serial.test.ts` fail on macOS with "Refusing a symlink in managed path: /var" / "Source file escapes registered root" while the same files pass on Linux CI — the fixtures build paths under `os.tmpdir()` (a symlink on macOS) and the managed-path / registered-root guards compare against realpaths. **Why:** every local and Mac-mini run of the suite now carries 19 red tests that are not defects, which hides real regressions (the v0.50.1.0 ship had to classify them by re-running on a clean master checkout). **Fix:** `realpathSync(os.tmpdir())` in those fixtures (the `upgrade-bun-link-arc` e2e has the same gap). **Effort:** S. **Priority:** P3.
+- [ ] **P2 — `delta`: fetch facts oldest-first with an overflow flag instead of a newest-first `limit: 50` window.**
+  **What:** `src/core/context/turn-context.ts` fetches delta facts with `listFactsSince(..., { limit: 50 })` ordered `created_at DESC` and never sets `has_more` for facts, so more than 50 new facts since the cursor silently drop the OLDEST ones as the page cursor advances past them. **Why:** the v0.50.1.0 pre-landing review found it while simplifying the delta cursor; the fix is an ascending keyset fetch plus `has_more` when the window is full (an engine-options change, so it was left out of the wave). **Effort:** M. **Priority:** P2.
+- [ ] **P2 — `session_context_state` cursor upsert: GREATEST, not COALESCE.**
+  **What:** `src/core/context/session-state.ts` upserts `last_wake_at = COALESCE(EXCLUDED.last_wake_at, …)` (last-writer-wins) while its own doc and `src/mcp/context-pack-handler.ts` assume a monotonic GREATEST, so a `context_pack` push after a `delta` wake can move the shared cursor forward past items the delta never delivered. **Why:** pre-existing, surfaced by the v0.50.1.0 review; fix the SQL to GREATEST and pin it. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — `schema lint --with-db` has no test.**
+  **What:** the v0.50.1.0 wave re-plumbed `gbrain schema lint --with-db` inside `withConnectedEngine` (tier-4 `schema_pack` read + `process.exit(1)` on a missing pack) and nothing in `test/` drives it. **Why:** a regression there would ship green. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — recompute_emotional_weight: pin `pages_recomputed` semantics and the lock-steal path.**
+  **What:** `pages_recomputed` now counts evaluated rows (`details.pages_updated` counts writes) and feeds `totals.pages_emotional_weight_recomputed`; the phase moved under `racedTimePhase` with no lock-steal test, and its Postgres SQL twin runs only in the nightly e2e lane. **Why:** the coverage audit flagged both as unpinned behavior changes. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — minion `put_page` type pin: round-trip fidelity test + delegated-lane wording.**
+  **What:** `pinUndeclaredType` re-serializes the whole page when an undeclared explicit `type:` is rewritten to `note`; no test carries a `timeline` block, extra frontmatter or a pre-existing `legacy_type`, and its docblock says "trusted-workspace subagents" although master's delegated jobs also set `allowedSlugPrefixes`. **Why:** flagged by the v0.50.1.0 review; the behavior is fine, the pins are missing. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — stdio idle sweep: pin the no-dotfile / no `GBRAIN_SOURCE` lane.**
+  **What:** `gbrain serve`'s idle maintenance sweep now resolves its source through the stdio ladder (#4679); only the `.gbrain-source` dotfile lane is tested, so the `local_path` / `sources.default` rungs the sweep now follows for a plain serve are unpinned. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — inline extract: inbound links to `_`-prefixed and hidden-directory pages still fail to resolve.**
+  **What:** the wave restored the legacy `slug + '.md'` fallback for the FROM side of the per-slug extractors (#4967 follow-up), but `allSlugs` at `src/commands/extract.ts` is still walk-only, so links INTO admitted `_note.md` / `.github/*.md` pages are dropped as unresolved — as on master before the wave. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — link-extractor watermark bumps cannot demote already-typed edges.**
+  **What:** re-extraction writes via `addLinksBatch … ON CONFLICT DO NOTHING` and never prunes, so the 2026-09-09 `LINK_EXTRACTOR_VERSION_TS` bump adds `mentions` rows beside prior-typed `works_at`/`advises` edges from machine-written list sections instead of demoting them. A doctor `--fix` that deletes prior-typed markdown edges whose anchor sits in a suppressed range is the cleanup; needs the maintainer's call on evidence. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — brainstorm `--resume` from a pre-0.50.1.0 checkpoint still mints a fresh idea slug.**
+  **What:** checkpoints written before the wave carry no `idea_slug`, so one legacy resume can still create a second idea page (the bug #4766's follow-up fixed for new checkpoints). A one-line stderr note or a slug back-derivation would close it. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — hermes-door: pin the installer bootstrapper by upstream commit instead of sha-pinning the served `install.sh`.**
+  **What:** `.github/workflows/heavy-tests.yml` pins `HERMES_INSTALL_SHA256` against the bytes served at the vendor's stable install URL, which upstream edits often: the pin has needed four refreshes in four weeks (latest #4991, fixes #4990) and one was stale within hours of being observed, so every upstream edit is a red nightly until someone re-reviews the upstream diff and re-pins the two homes (the workflow constant + `docs/mcp/HERMES-CLI-PIN.md`). The door also stays red at its Preconditions step until the `ANTHROPIC_API_KEY` repo secret is set; the re-pin restores digest + payload + version verification, not a green job. **How (maintainer design call):** fetch the bootstrapper from the upstream repo at a reviewed commit (the door already commit-pins the PAYLOAD via `HERMES_GIT_COMMIT`, so a commit-pinned bootstrapper is consistent; the served-URL door was kept deliberately as the real user install path — weigh that against a roughly weekly re-pin chore), or keep the served-URL pin and accept the chore. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `extract_facts`: heal an attribute-only fence edit in place instead of wipe+reinsert.**
+  **What:** since #4870 the reconcile treats a `visibility` / `notability` cell edit as drift and re-syncs the page through the same atomic wipe+reinsert the other drift classes use. That transports the edit but re-embeds every row on the page (a paid call when an embedding key is configured; NULL embeddings until re-embedded when it is not) and rotates the rows' ids. **Why:** the v0.50.1.0 ship found the keyless case through `test/e2e/phantom-redirect.test.ts` round 12 (the seed disagreed with its fence, so the reconcile wiped the migrated row); the test seed was fixed, the reconcile was not. An attribute-only drift with matching content key, row number and struck-state can be a per-row `UPDATE facts SET visibility, notability` under the same page lock. **Effort:** S. **Priority:** P3.
+
+
 ## Community fix wave follow-ups (filed 2026-09-07, search-eval train)
 
 - [ ] **P2 — bump MARKDOWN_CHUNKER_VERSION to 5 so already-indexed CJK-dominant pages pick up the CJK overlap fix.**
   **What:** #4871 (wave adoption) made `extractTrailingContext` count chars for CJK-dominant chunks (the unit `countCJKAwareWords` uses) instead of whitespace tokens, so CJK pages get a real, bounded overlap instead of none / a near-total duplicate; the L4 char-slice fallback also stopped halving astral pairs. Both change chunk boundaries for CJK-dominant text only and apply to pages chunked from now on — pages already in the index keep their old boundaries until the chunker version moves. **How:** `export const MARKDOWN_CHUNKER_VERSION = 5;` in `src/core/chunkers/recursive.ts`, DECOUPLED from `SAFE_FENCE_CHUNKER_VERSION` (stays 4 as the safe-chunks provenance floor; `safeChunksFilter` is `>= 4`, so 5 passes); update the `MARKDOWN_CHUNKER_VERSION is 4` pin in `test/chunkers/recursive.test.ts`. **Cost (why this is a maintainer decision, not a fix-wave change):** the post-upgrade sweep re-chunks AND re-embeds every markdown page in every brain (markdown import has no embedding reuse) — the same full-brain re-embed shape as the v4 bump in 0.48.3.0, for a boundary change that only affects CJK-dominant pages. Coalescing it with the next planned chunker bump spares a standalone sweep. English output is byte-identical (pinned by `test/chunkers/recursive-cjk-overlap.test.ts`). **Effort:** S.
-## Community fix wave follow-ups (filed 2026-09-07, sync-import train)
-- [ ] **P3 — `gbrain import` human summary labels returned per-file failures as "unchanged".**
-  **What:** the non-`--json` summary line in `src/commands/import.ts` prints `${skipped - errors} unchanged`, but `skipped` also counts the failures `importFile` RETURNS (invalid frontmatter, oversize, symlink, slug mismatch) while `errors` counts only the thrown ones, so a returned failure reads as an unchanged no-op. The `--json` payload was fixed in #4803 (`unchanged` / `malformed_skipped` / `failures`); the human line was deliberately left alone in that wave. **How:** reuse the same `skipped - failures.length - malformedFileSkips` arithmetic and print the returned-failure count as its own term. **Effort:** S. **Priority:** P3.
 ## Community fix wave follow-ups (filed 2026-09-07, minions-autopilot train)
 - [ ] **P3 — pglite-lock `readProcessArgs` has the same win32 gap as #4563, failing the other way.** **What:** `src/core/pglite-lock.ts` `readProcessArgs` probes `ps` then `/proc` with no Windows branch; on win32 it returns null, which that caller treats as "unknowable => alive", so a recycled-pid PGLite lock is never reaped and `acquire` waits out its timeout instead of stealing. Distinct symptom from the autopilot classifier (which now has the CIM branch in `src/core/autopilot-lock.ts` `readProcessCommand`). **How:** route `readProcessArgs` through the shared `readProcessCommand(pid)` (already handles /proc, ps, and win32 CIM) and delete the duplicate probe. **Effort:** S. **Priority:** P3.
 
@@ -192,10 +217,7 @@
   retrieval-gate path were deferred. Triage records (verdict, evidence, fix
   sketch, key files per issue) live in the wave workspace
   `.context/wave/triage/issue/` + `.context/wave/refute/issue/` (gitignored
-  wave working state, not repo content). Deferred: #4381 #4558 #4576 #4578
-  #4586 #4588 #4600 #4603 #4605 #4613 #4616 #4622 #4649 #4653 #4670 #4684
-  #4741 #4761 #4766 #4772 #4795 #4797 #4852 #4879 #4910 #4921, plus #4359
-  (S, but it lives in `search/hybrid.ts` and needs an eval-replay receipt).
+  wave working state, not repo content). Deferred: #4381 #4576 #4578 #4603 #4616 #4622 #4649 #4772 #4921 (of the 0.48.5.0 wave's 26 deferrals, 17 shipped in 0.48.6.0: #4558 #4586 #4588 #4600 #4605 #4613 #4653 #4670 #4684 #4741 #4761 #4766 #4795 #4797 #4852 #4879 #4910).
   Of the 0.48.1.0 wave's 27 deferrals, ten shipped in 0.48.5.0 (#4744 via
   #4933, #4729 via #4865, #4728, #4696, #4652, #4620, #4606, #4597, #4589,
   #4563), five were re-classified on verification (#4738 and #4732
@@ -232,6 +254,18 @@
   sources (order is now total; the cursor is not). (11) `bootstrap harness`
   resolves the implicit source from its own cwd while the serve resolves from
   its cwd at boot; the shared ladder narrows but does not close the gap.
+- [ ] **P2 — Corrective-release follow-ups (0.48.5.1): two INVESTIGATE items
+  from the adversarial passes on the release-notes fix.** (a) The CLI flag
+  validator accepts `gbrain sync --force` although `sync` never reads it:
+  `scripts/generate-flag-registry.ts` harvests `--[a-z0-9-]*` tokens from
+  source text, and a comment in `src/commands/sync.ts` (`(--force skips …)`)
+  puts `--force` on the sync row. Either harvest from the parsed argv sites
+  only, or strip comments before scanning; then add a registry test that a
+  comment-only token does not register. (b) `scripts/check-privacy.sh
+  --staged` takes filenames from the index but greps their WORKING copies,
+  so a banned name staged for commit and then removed from the working copy
+  (without staging the removal) passes the pre-commit guard. Read the staged
+  blob (`git show :path`) in that mode. **Effort:** S each. **P2.**
 - [ ] **P3 — Simplification advisories from the wave review (structure, not
   defects).** One `mirrorFenceBodyToDb` helper for the three pasted fence-mirror
   recipes (fence-write.ts, forget.ts x2); static import of
@@ -606,9 +640,12 @@ deferred M-effort issues above are NOT repeated here.
   contract constant references get_page/put_page/list_skills/get_skill, which
   don't exist on `--surface verbs`; serve the verb-appropriate contract per
   surface.
-- [ ] **P3 — per-source sync.exclude scoping.** **What:** #4667's persisted
-  exclude scope is global (union-only widening across every source); a
-  per-source key was the author's own follow-up note.
+- [ ] **P3 — per-source sync.exclude / sync.include_hidden scoping.** **What:**
+  #4667's persisted exclude scope and #5003's persisted dot-directory waiver
+  are both brain-global (one list reaches every source on `sync --all`); a
+  per-source key was the author's own follow-up note. Admission
+  (`sync.include_hidden`) is the riskier direction — a `.github/` waiver meant
+  for one repo admits that directory in every source — so scope it first.
 - [ ] **P3 — skills-doc note on capture-time vs retroactive backlink dating.**
   **What:** #4552/#4595 made backlink REPAIR insert undated "Referenced by"
   rows (retroactive dating is forgery), while live capture keeps dated
@@ -1434,11 +1471,12 @@ deferred M-effort issues above are NOT repeated here.
   by ON CONFLICT DO NOTHING, the tool still executes, and the settle UPDATE
   then matches 0 rows — the outcome is silently unrecorded and a non-idempotent
   tool can re-execute on replay. Add a rowcount check + job-log warn (needs a
-  logging seam in the persist helpers). (b) extract-atoms tombstones cover
-  pages only: `recordPageFailureCount` returns null for `kind !== 'page'`, so
-  a transcript that deterministically yields malformed output re-spends LLM
-  budget every cycle forever — extend #4148's failure-count machinery to
-  transcript items. (c) getHealth coverage numerators are not liveness-
+  logging seam in the persist helpers). (b) DONE in v0.48.5.0 (#4916):
+  extract-atoms now keeps per-transcript strike counts and tombstones
+  (`extract_atoms_transcript_state`, migration v146), so a transcript that
+  deterministically yields malformed output stops re-spending LLM budget;
+  the item as filed (`recordPageFailureCount` returning null for
+  `kind !== 'page'`) is closed by that table. (c) getHealth coverage numerators are not liveness-
   filtered while islanded now is (#4153): a page whose only inbound link is
   from a soft-deleted page counts as covered AND orphaned simultaneously;
   align the coverage EXISTS subqueries with the islanded liveness JOINs in
@@ -1473,18 +1511,6 @@ deferred M-effort issues above are NOT repeated here.
   base-phase.ts. **Effort:** S each. **P3.**
 ## Multi-agent wave follow-ups (cathedral-6, `gbrain agent register`)
 
-- [ ] **P2 — archived sources keep previously-granted federated reads until
-  re-registration.** **What:** grants are validated at mint time only — a
-  client whose `federated_read` names a source that is archived AFTER
-  registration keeps reading it; there is no per-request archived-source
-  filtering and no grant invalidation on archive. **How:** this is a
-  platform-wide read-path decision affecting every federated op (recall,
-  search, entity, boundary verbs), not just recall — either fold an
-  `archived = false` join into the shared source-scope resolution or sweep
-  grants on `sources archive`; decide once, apply everywhere. **Where:**
-  `src/core/ops/context.ts` (sourceScopeOpts consumers), engine read paths,
-  `src/core/destructive-guard.ts` (archive lifecycle). **Effort:** M.
-  **Priority:** P2.
 - [ ] **P2 — federate the remaining read verbs across allowedSources.**
   **What:** `recall` now honors a federated grant (every fact arm fans out
   across `ctx.auth.allowedSources` and merges per-arm — see the `factSources`
@@ -7127,6 +7153,31 @@ keeping both skills' triggers intact for chaining.
 **Found:** 2026-04-24 during v0.19.0 production-readiness review.
 
 ## Completed
+
+### ~~Report returned import failures accurately in the human summary~~
+**Completed:** v0.50.0.0 (2026-09-10)
+
+The human and JSON summaries distinguish unchanged files, malformed files, and
+returned or thrown failures. Imports report errors with a nonzero exit and
+preserve retry checkpoints; queued imports also fail when documents are rejected.
+Covered by the import stdout/checkpoint and queued-import error regressions.
+
+- [x] **P2 — archived sources keep previously-granted federated reads until
+  re-registration.** **What:** grants are validated at mint time only — a
+  client whose `federated_read` names a source that is archived AFTER
+  registration keeps reading it; there is no per-request archived-source
+  filtering and no grant invalidation on archive. **How:** this is a
+  platform-wide read-path decision affecting every federated op (recall,
+  search, entity, boundary verbs), not just recall — either fold an
+  `archived = false` join into the shared source-scope resolution or sweep
+  grants on `sources archive`; decide once, apply everywhere. **Where:**
+  `src/core/ops/context.ts` (sourceScopeOpts consumers), engine read paths,
+  `src/core/destructive-guard.ts` (archive lifecycle). **Effort:** M.
+  **Priority:** P2.
+  **Completed:** v0.49.0.0 (2026-09-10). OAuth clients, including legacy NULL
+  operation snapshots, now recheck active sources on every authenticated
+  request. The scalar archived source also clears effective scopes.
+
 
 ### ~~(v0.42.20.0 follow-up) Decouple the op-dispatch force-exit timer~~
 **Completed:** v0.42.39.0 (2026-06-10)

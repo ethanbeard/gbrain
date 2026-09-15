@@ -89,6 +89,11 @@ interface ExistingPageFact {
   // drifted and re-heals through the wipe+reinsert fallback.
   superseded_by: number | string | null;
   expired_at: Date | string | null;
+  // #4870 — fence cells the reconcile must honor. Both columns are NOT NULL
+  // enums whose CHECK matches the fence's validated values, so a plain
+  // equality compare cannot churn on case/format/NULL.
+  visibility: string;
+  notability: string;
 }
 
 function factContentKey(fact: string, source: string | null | undefined): string {
@@ -208,16 +213,9 @@ async function underPageLock<T>(
  * wipe every cycle) nor mask a fence row from insertion. Mirrors the
  * preserveExpiredLegacy filter deleteFactsForPage applies on the wipe.
  *
- * Deliberate consequence: if the fence still carries the same
- * (claim, source) as an expired legacy row, the reconcile inserts it
- * as a fresh ACTIVE fence-owned row. That is the fence-is-canonical
- * contract working as documented — legacy DB-only forgets "DO NOT
- * survive rebuild" (see forget.ts header); suppressing the insert
- * would instead create silent fence↔DB divergence, the exact failure
- * mode the empty-fence guard exists to prevent. To durably forget
- * such a claim, forget the fence-owned row (forget_fact now takes the
- * fence path, which strikes the row through in markdown). The expired
- * legacy row survives alongside as the record of the earlier forget.
+ * An ordinary expired legacy row does not suppress a fresh canonical fence
+ * row. Explicit forget is different: its durable withdrawal record is
+ * enforced by the facts trigger and import overlay, even after index rebuild.
  */
 async function listExistingFactsForPage(
   engine: BrainEngine,
@@ -225,7 +223,7 @@ async function listExistingFactsForPage(
   sourceId: string,
 ): Promise<ExistingPageFact[]> {
   return engine.executeRaw<ExistingPageFact>(
-    `SELECT id, fact, source, row_num, superseded_by, expired_at
+    `SELECT id, fact, source, row_num, superseded_by, expired_at, visibility, notability
        FROM facts
       WHERE source_id = $1
         AND source_markdown_slug = $2
@@ -709,13 +707,26 @@ export async function runExtractFacts(
       const dbTargetId = f.superseded_by == null ? null : Number(f.superseded_by);
       return resolvedTargetId !== dbTargetId;
     });
+    // #4870 — a visibility / notability edit on an existing row leaves the
+    // content key, row_num and struck-state untouched, so none of the terms
+    // above fire and the edit was a silent no-op. Compare the two fence
+    // cells the parser already validates; the wipe+reinsert transports them.
+    // ponytail: confidence is skipped — it is a REAL column, so an equality
+    // compare would need the fence formatter to avoid float-noise churn;
+    // route it through formatConfidence if a confidence-edit report lands.
+    const hasAttributeDrift = existing.some(f => {
+      const desired = desiredByKey.get(factContentKey(f.fact, f.source));
+      return desired !== undefined
+        && (desired.visibility !== f.visibility || desired.notability !== f.notability);
+    });
 
     if (
       existing.length === extracted.length &&
       !hasStaleExisting &&
       !hasDuplicateExisting &&
       !hasRowNumDrift &&
-      !hasSupersessionDrift
+      !hasSupersessionDrift &&
+      !hasAttributeDrift
     ) {
       continue;
     }
@@ -731,7 +742,7 @@ export async function runExtractFacts(
     // conversation facts (#1928), and soft-expired legacy rows (#2646)
     // survive.
     let deleteForPageFirst: { slug: string; excludeSourcePrefixes: string[]; preserveExpiredLegacy: boolean } | undefined;
-    if (hasStaleExisting || hasDuplicateExisting || hasRowNumDrift || hasSupersessionDrift) {
+    if (hasStaleExisting || hasDuplicateExisting || hasRowNumDrift || hasSupersessionDrift || hasAttributeDrift) {
       deleteForPageFirst = { slug, excludeSourcePrefixes: ['cli:'], preserveExpiredLegacy: true };
       toInsert = extracted;
     }

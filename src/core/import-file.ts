@@ -1,3 +1,4 @@
+import { readSourceFileSync } from './minions/source-filesystem.ts';
 import { readFileSync, statSync, lstatSync } from 'fs';
 import { basename, extname } from 'path';
 import { createHash } from 'crypto';
@@ -274,6 +275,31 @@ function invalidYamlFrontmatterError(parsed: ReturnType<typeof parseMarkdown>): 
   if (!yamlError) return null;
   const detail = yamlError.message.replace(/^YAML parse failed:\s*/, '').trim();
   return `Invalid YAML frontmatter: ${detail}. Quote scalar values that contain ": " or fix the frontmatter block.`;
+}
+
+/**
+ * #4588: refresh `pages.source_path` on the import SKIP path. A row whose slug
+ * moved before the sync rename repair (GATE13) existed still names the OLD
+ * file; write-through prefers source_path, so every later write recreates the
+ * old directory, and the full-sync reconcile reads the stale path as "file
+ * removed" and soft-deletes the live page. The changed-content path already
+ * heals this via putPage's `COALESCE(EXCLUDED.source_path, …)`; the
+ * unchanged-content skip is the natural heal moment and used to discard the
+ * real path importFile handed in. `current` is the path getPage already read:
+ * equal → no statement at all (an unchanged 20k-file tree must not issue 20k
+ * zero-row UPDATEs, each firing the generation-clock trigger); undefined
+ * (projection-less engine) falls through and `IS DISTINCT FROM` keeps the
+ * UPDATE zero-row. brainstorm passes `${slug}.md`, the value putPage writes on
+ * its own path. Bookkeeping only — never fails the import.
+ */
+async function refreshSourcePath(engine: BrainEngine, slug: string, sourceId: string | undefined, sourcePath: string | undefined, current: string | null | undefined): Promise<void> {
+  if (!sourcePath || current === sourcePath) return;
+  try {
+    await engine.executeRaw(
+      'UPDATE pages SET source_path = $1 WHERE source_id = $2 AND slug = $3 AND deleted_at IS NULL AND source_path IS DISTINCT FROM $1',
+      [sourcePath, sourceId ?? 'default', slug],
+    );
+  } catch { /* bookkeeping only — never fail the import over it */ }
 }
 
 /**
@@ -670,6 +696,9 @@ export async function importFromContent(
     parsed.compiled_truth = mergeHiddenFactRowsIntoBody(slug, parsed.compiled_truth, existing.compiled_truth);
     parsed.timeline = mergeHiddenFactRowsIntoBody(slug, parsed.timeline, existing.timeline);
   }
+  const { preserveWithdrawnFenceRows } = await import('./facts/withdrawal.ts');
+  parsed.compiled_truth = await preserveWithdrawnFenceRows(engine, sourceId ?? 'default', parsed.compiled_truth);
+  parsed.timeline = await preserveWithdrawnFenceRows(engine, sourceId ?? 'default', parsed.timeline);
 
   // #1035: absence of an explicit frontmatter `type:` on an EXISTING page
   // means "preserve the stored type", not "re-infer". Pre-fix, a round-trip
@@ -725,6 +754,7 @@ export async function importFromContent(
   };
 
   if (existing?.content_hash === hash && !opts.forceRechunk) {
+    await refreshSourcePath(engine, slug, sourceId, opts.sourcePath, existing?.source_path);
     return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
   }
 
@@ -749,6 +779,7 @@ export async function importFromContent(
         parsed.timeline || '',
         hash,
       );
+      await refreshSourcePath(engine, slug, sourceId, opts.sourcePath, existing?.source_path);
       return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
     }
   }
@@ -1252,7 +1283,7 @@ export async function importFromFile(
     return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)` };
   }
 
-  let content = readFileSync(filePath, 'utf-8').replace(/^\uFEFF/, ''); // #4798: a BOM is encoding noise, not content
+  let content = readSourceFileSync(filePath, 'utf-8').replace(/^\uFEFF/, ''); // #4798: a BOM is encoding noise, not content
 
   // Defense-in-depth for callers that bypass the sync/import classifiers
   // (direct importFromFile, reindex, capture paths): a malformed filename is
@@ -1469,7 +1500,7 @@ export async function importCodeFile(
   });
 
   // Hash for idempotency. CHUNKER_VERSION is folded in so chunker shape
-  // changes across releases force clean re-chunks without sync --force.
+  // changes across releases force clean re-chunks without a forced re-import.
   const hash = createHash('sha256')
     .update(JSON.stringify({ title, type: 'code', content, lang, chunker_version: CHUNKER_VERSION }))
     .digest('hex');
@@ -2099,7 +2130,7 @@ export async function importImageFile(
   const linkOpts = opts.sourceId
     ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
     : undefined;
-  const buf = readFileSync(filePath);
+  const buf = readSourceFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
   const existing = await engine.getPage(imageSlug, sourceOpts);

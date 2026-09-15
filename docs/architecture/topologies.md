@@ -138,9 +138,12 @@ gbrain auth register-client neuromancer-dept \
 ```
 
 The `register-client` command prints a `client_id` and `client_secret`.
-Note both. **Scope must include `admin`** — `submit_job` (used by
-`gbrain remote ping`) and `run_doctor` (used by `gbrain remote doctor`)
-both require it.
+Note both. **Scope must include `admin`** for `run_doctor` (used by
+`gbrain remote doctor`) and generic background jobs. `submit_job` accepts
+only `sync`, `import`, `lint`, and `lint-fix` with the authenticated source's
+registered root. `gbrain remote ping` no longer submits an autopilot cycle;
+run maintenance on the brain host. See the
+[authorization upgrade guide](../guides/authorization-upgrade.md#generic-remote-background-jobs).
 
 **Step 2 — On the thin client (neuromancer):**
 
@@ -290,13 +293,13 @@ other config field):
 
 ```bash
 gbrain reinit-pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
-gbrain reindex --code --yes
+gbrain reindex-code --yes
 ```
 
 (`gbrain config set embedding_model` is refused because the schema column
 has to resize alongside the config.)
 
-`gbrain reindex --code` prints a recommendation when the configured
+`gbrain reindex-code` prints a recommendation when the configured
 embedding model isn't code-tuned. Suppress with
 `GBRAIN_NO_CODE_MODEL_NUDGE=1` if you've intentionally chosen another
 provider (single-vendor procurement, compliance, no Voyage key).

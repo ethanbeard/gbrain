@@ -20,6 +20,9 @@ import {
 } from '../src/core/minions/tools/brain-allowlist.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 import type { ToolCtx } from '../src/core/minions/types.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { loadActivePackForWriteVocabulary } from '../src/core/schema-pack/write-vocabulary.ts';
+import { classifyStoredType } from '../src/core/schema-pack/type-usage.ts';
 
 let engine: PGLiteEngine;
 const config: GBrainConfig = { engine: 'pglite' } as GBrainConfig;
@@ -45,7 +48,7 @@ describe('BRAIN_TOOL_ALLOWLIST', () => {
     expect(missing).toEqual([]);
   });
 
-  test('contains the v0.15 read-only 10 + put_page + v0.29 salience pair + v114 list_link_sources', () => {
+  test('contains delegated page tools and excludes local-only attachments', () => {
     // v0.29 added get_recent_salience + find_anomalies (read-only).
     // get_recent_transcripts is deliberately excluded — subagent calls always
     // have ctx.remote=true, and the v0.29 trust gate rejects remote callers.
@@ -53,7 +56,9 @@ describe('BRAIN_TOOL_ALLOWLIST', () => {
     // the edge-WRITE ops add_link/remove_link stay out (separate trust call).
     // #2778 added add_timeline_entry (write, fenced like put_page via
     // operations.ts:enforceSubagentSlugFence).
-    expect(BRAIN_TOOL_ALLOWLIST.size).toBe(15);
+    expect(BRAIN_TOOL_ALLOWLIST.size).toBe(13);
+    expect(BRAIN_TOOL_ALLOWLIST.has('file_list')).toBe(false);
+    expect(BRAIN_TOOL_ALLOWLIST.has('file_url')).toBe(false);
     expect(BRAIN_TOOL_ALLOWLIST.has('add_timeline_entry')).toBe(true);
     expect(BRAIN_TOOL_ALLOWLIST.has('query')).toBe(true);
     expect(BRAIN_TOOL_ALLOWLIST.has('search')).toBe(true);
@@ -254,5 +259,80 @@ describe('sanitizeToolName', () => {
 
   test('replaces non-conforming chars with _', () => {
     expect(__testing.sanitizeToolName('foo.bar')).toBe('brain_foo_bar');
+  });
+});
+
+// #4852: trusted-workspace subagents (dream synth agentic lane, patterns,
+// delegated jobs) author page content model-side and mint types no bundled
+// pack declares (`reflection` / `original` / `pattern`); the reverse-write puts
+// that type on disk as explicit frontmatter and every `gbrain sync` warns.
+// The oneshot lane already pins its output to 'note' (F5); the seam extends
+// that rule: an EXPLICIT undeclared type rewrites to 'note' + legacy_type.
+describe('brain_put_page pins undeclared model-authored types (#4852)', () => {
+  const PREFIXES = ['wiki/personal/patterns/*'];
+
+  async function putUnderPack(slug: string, content: string, allowedSlugPrefixes?: readonly string[]) {
+    const ctx: ToolCtx = { engine, jobId: 1, remote: true };
+    await withEnv({ GBRAIN_SCHEMA_PACK: 'gbrain-base-v2' }, async () => {
+      const tools = buildBrainTools({ subagentId: 42, engine, config, allowedSlugPrefixes });
+      const putPage = tools.find(t => t.name === 'brain_put_page');
+      await putPage!.execute({ slug, content }, ctx);
+    });
+    return (await engine.getPage(slug, { sourceId: 'default' }))!;
+  }
+
+  test('explicit undeclared type under a slug allow-list → note + frontmatter.legacy_type', async () => {
+    const page = await putUnderPack(
+      'wiki/personal/patterns/recurring-theme',
+      '---\ntype: pattern\ntitle: Recurring theme\n---\n\nBody [[wiki/personal/reflections/x]]',
+      PREFIXES,
+    );
+    expect(page.type).toBe('note');
+    expect(page.frontmatter.legacy_type).toBe('pattern');
+    expect(page.title).toBe('Recurring theme');
+    expect(page.compiled_truth).toContain('Body [[wiki/personal/reflections/x]]');
+    // The sync type-warning path has nothing to say about the stored type.
+    const pack = await withEnv({ GBRAIN_SCHEMA_PACK: 'gbrain-base-v2' }, () =>
+      loadActivePackForWriteVocabulary({ engine, remote: true }));
+    expect(classifyStoredType(page.type, pack!.manifest).kind).toBe('canonical');
+  });
+
+  test('declared type is stored untouched (no legacy_type)', async () => {
+    const page = await putUnderPack(
+      'wiki/personal/patterns/declared',
+      '---\ntype: note\ntitle: Declared\n---\n\nBody',
+      PREFIXES,
+    );
+    expect(page.type).toBe('note');
+    expect(page.frontmatter.legacy_type).toBeUndefined();
+  });
+
+  test('declared alias is stored literally (alias_of stays a sync warning, not a rewrite)', async () => {
+    const page = await putUnderPack(
+      'wiki/personal/patterns/aliased',
+      '---\ntype: insight\ntitle: Aliased\n---\n\nBody',
+      PREFIXES,
+    );
+    expect(page.type).toBe('insight');
+    expect(page.frontmatter.legacy_type).toBeUndefined();
+  });
+
+  test('no explicit type → pack inference untouched', async () => {
+    const page = await putUnderPack(
+      'wiki/personal/patterns/inferred',
+      '---\ntitle: Inferred\n---\n\nBody',
+      PREFIXES,
+    );
+    expect(page.type).toBe('concept');
+    expect(page.frontmatter.legacy_type).toBeUndefined();
+  });
+
+  test('same write WITHOUT a slug allow-list (legacy agents namespace) stores the literal type', async () => {
+    const page = await putUnderPack(
+      'wiki/agents/42/pattern-literal',
+      '---\ntype: pattern\ntitle: Literal\n---\n\nBody',
+    );
+    expect(page.type).toBe('pattern');
+    expect(page.frontmatter.legacy_type).toBeUndefined();
   });
 });

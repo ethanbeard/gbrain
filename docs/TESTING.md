@@ -47,10 +47,12 @@ Measured effect: ~3.5x per PGLite-booting file (a cold boot replays every
 migration, ~3.1s each on a CI shard). Properties:
 
 - **Idempotent.** A hash short-circuit exits in ~40ms when the snapshot is
-  fresh, and REBUILDS a stale one. The hash covers `PGLITE_SCHEMA_SQL`, every
-  migration's `sql` + `sqlFor.pglite`, AND each migration `handler`'s function
-  source (`Function.prototype.toString`) — 19+ migrations carry executable
-  handler code with empty `sql` that a sql-only hash cannot see.
+  fresh, and REBUILDS a stale one. The hash covers the raw file bytes of
+  `migrate.ts`, `pglite-schema.ts`, and their schema/migration helpers,
+  including grant constraints and withdrawal triggers. Imported SQL and
+  handler changes invalidate the fixture; coverage instrumentation does not
+  change the hash. Keep the dependency list in `computeSnapshotSchemaHash`
+  and the CI cache keys aligned when adding another schema helper.
 - **Concurrency-safe.** Parallel shard runners / sibling workspaces serialize
   on an atomic `mkdir` lock (`test/fixtures/.pglite-snapshot.lock`) with
   staleness-verified takeover of a crashed builder; the tar is written first
@@ -69,7 +71,7 @@ migration, ~3.1s each on a CI shard). Properties:
   the migration-replay canary tests clear the env themselves regardless.
 
 Pinned by `test/snapshot-shape-guard.test.ts` (hash + shape refusal matrix,
-handler-source hash sensitivity).
+imported SQL/handler dependency hash sensitivity).
 
 ### Guard registry and self-test
 
@@ -616,6 +618,7 @@ Unit tests and what they cover:
 - `test/sync-failures.test.ts` — `classifyErrorCode` regex coverage for all 12 codes against literal production message strings from `markdown.ts` and `import-file.ts`; `summarizeFailuresByCode` sort + pre-classified-honor; `recordSyncFailures` code-field persistence; `acknowledgeSyncFailures` `AcknowledgeResult` shape + backfill on legacy entries.
 - `test/sync-soft-delete.serial.test.ts` — removed-file recovery arc: a `git rm` drained by sync SOFT-deletes the page (`deleted_at` set; row recoverable, not gone), an already-soft-deleted row isn't re-flipped (purge clock preserved), batch delete failures decompose to per-file batches and the run banks instead of aborting, delete → re-add inside the window revives via upsert (content updated, chunks replaced, no duplicate), soft-deleted pages stay invisible to search/getLinks/getBacklinks, the rename lane converges against an out-of-band soft delete, and full-sync reconcile + the unsyncable lane are SOFT with the purge window honored end-to-end.
 - `test/sync-exclude-config.test.ts` — persisted `sync.exclude` reach: honored with no flag on incremental AND first-sync full-walk paths, trailing-slash covers directory contents, a per-call flag narrows without re-opening the persisted scope, mixed comma+newline multi-pattern values, conservative posture (pages imported before the exclusion stay live, incl. full-sync reconcile), and a throwing/unreadable config read degrades to no-persisted-scope instead of breaking the sync.
+- `test/sync-include-hidden-config.test.ts` — persisted `sync.include_hidden` reach (the dot-directory waiver's twin to `sync.exclude`): baseline control (no config, no flag → dot-directory pruned), honored with no flag on incremental AND first-sync full-walk paths, trailing-slash covers nested files (lowercased slug), an unnamed dot-directory stays pruned, a per-call `includeHidden` unions with the persisted waiver, and a throwing config read degrades to no-waiver instead of breaking the sync.
 - `test/doctor.test.ts` — doctor command; assertions that `jsonb_integrity` scans the four JSONB write sites and `markdown_body_completeness` is present.
 - `test/utils.test.ts` — shared SQL utilities + `tryParseEmbedding` null-return and single-warn semantics.
 - `test/build-llms.test.ts` — `llms.txt`/`llms-full.txt` generator: path resolution, idempotence, spec shape, regen-drift guard, content contract, AGENTS.md install-path mirror, size-budget enforcement.
@@ -799,3 +802,34 @@ permission to run them — see the "run without asking" rule above.
 
 Never leave `gbrain-test-pg` running. If you find a stale one from a previous run,
 stop and remove it before starting a new one.
+
+## Authorization regression gates
+
+`test/data-frontmatter.test.ts` and `test/frontmatter-security.test.ts` pin inert
+frontmatter parsing, opaque serialization, scalar compatibility, and import
+errors. `test/authorization-boundaries.test.ts` covers scalar source grants,
+foreign/private facts, and delegated tool exclusions.
+
+`test/oauth-consent-security.test.ts` covers pending consent, CSRF, policy
+changes, duplicate decisions, and uncertain completion. Production HTTP flows
+live in `test/e2e/serve-http-consent.test.ts`; client-lock races and grant rollback
+on Postgres live in `test/e2e/oauth-grant-transactions.test.ts`.
+
+`test/minions-submission-authority.test.ts` covers submission schemas, durable
+policy, lifecycle operations, legacy approval snapshots, file confinement, and
+both workers. `test/e2e/minions-authority-parity.test.ts` exercises real Postgres
+JSONB and authorization behavior. Filesystem write concurrency is pinned by the
+existing fence and timeline suites.
+
+`test/guarded-http.test.ts` and `test/guarded-http-tls.serial.test.ts` cover DNS,
+TLS identity and ports, redirects, deadlines, body limits, and cleanup. CI runs
+these boundaries on Bun 1.3.11 and 1.3.13, audits root and admin dependencies, and
+executes `scripts/test-gitleaks-config.sh` to prove fixture exceptions still
+report an unrelated secret in the same file. `scripts/scan-worktree-secrets.sh`
+scans tracked files plus new files eligible for commit; tracked ignored files
+remain included. Full-history scans use `gitleaks git . --log-opts=--all` from a
+complete clone and reports must remain private.
+
+The Docker gate sets `GBRAIN_CI_DISABLE_TEST_ENV_FILE=1` so a bind-mounted
+developer `.env.testing` cannot add credentials or change the isolated test
+database. Explicit local provider E2E runs can continue using that file.

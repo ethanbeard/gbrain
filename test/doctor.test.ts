@@ -376,6 +376,8 @@ describe('doctor command', () => {
     const source = doctorSource();
     expect(source).toContain('jsonb_integrity');
     expect(source).toContain('markdown_body_completeness');
+    // 0.48.5.1: the truncated-page hint must not name a flag `gbrain sync` does not have.
+    expect(source).not.toContain('gbrain sync --force');
     expect(source).toContain('gbrain repair-jsonb');
   });
 
@@ -418,7 +420,7 @@ describe('doctor command', () => {
       // the pre-#2375 damage class) and one LEGITIMATE string scalar
       // (persistToolExec binds pre-serialized string payloads as-is).
       await engine.executeRaw(
-        `INSERT INTO minion_jobs (id, name, data, status) VALUES (990001, 'doctor-jsonb-test', '{}'::jsonb, 'completed')`,
+        `INSERT INTO minion_jobs (submission_authority, id, name, data, status) VALUES ('{"version":1,"kind":"application"}'::jsonb, 990001, 'doctor-jsonb-test', '{}'::jsonb, 'completed')`,
       );
       await engine.executeRaw(
         `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)

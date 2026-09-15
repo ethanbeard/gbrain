@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **Starter** marks membership in the ~27-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **Starter** marks membership in the ~26-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -90,7 +90,7 @@ Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `cancel_job` | Cancel a waiting, active, or delayed job. | admin |  |  |
+| `cancel_job` | Cancel a waiting, active, or delayed job. | admin | yes |  |
 | `get_agent_job` | Poll an agent job submitted via submit_agent. | agent | yes |  |
 | `get_job` | Get job status and details by ID. | admin |  |  |
 | `get_job_progress` | Get structured progress for a running job. | admin |  |  |
@@ -102,7 +102,7 @@ Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **S
 | `retry_job` | Re-queue a failed or dead job for retry | admin |  |  |
 | `send_job_message` | Send a sidechannel message to a running job's inbox | admin |  |  |
 | `submit_agent` | Submit an LLM agent job that the worker dispatches via the gateway-native tool loop. | agent | yes |  |
-| `submit_job` | Submit a background job to the Minions queue. | admin |  |  |
+| `submit_job` | Submit a background job. | admin |  |  |
 
 ## links
 
@@ -130,7 +130,7 @@ Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `extract_facts` | v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. | write |  |  |
-| `forget_fact` | v0.32.2: forget a fact. | write |  |  |
+| `forget_fact` | Forget a fact by recording a durable withdrawal in its source and visibility. | write |  |  |
 
 ## memory-verbs
 
@@ -158,7 +158,7 @@ Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `capture` | Capture a quick note into the brain — the "just remember this" write. | write | yes |  |
-| `delete_page` | Soft-delete a page. | write |  |  |
+| `delete_page` | Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). | write |  |  |
 | `fetch` | Fetch the full text of one search result by its `id` (OpenAI deep-research contract: the search/fetch pair). | read |  |  |
 | `get_chunks` | Get content chunks for a page | read |  |  |
 | `get_page` | Read a page by slug (supports optional fuzzy matching). | read | yes |  |
@@ -168,7 +168,7 @@ Every non-localOnly operation on the MCP surface: 122 tools across 23 areas. **S
 | `put_page` | Write or replace a page (markdown with frontmatter). | write | yes |  |
 | `put_raw_data` | Store raw API response data for a page | write |  |  |
 | `resolve_slugs` | Fuzzy-resolve a partial slug to matching page slugs | read | yes |  |
-| `restore_page` | v0.26.5 — restore a soft-deleted page (clear deleted_at). | write |  |  |
+| `restore_page` | v0.26.5 — restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). | write |  |  |
 | `revert_version` | Revert page to a previous version | write |  |  |
 
 ## schema
