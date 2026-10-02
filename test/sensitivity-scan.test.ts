@@ -12,6 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
+  formatSensitivityDrop,
   loadSensitivityConfig,
   scanSensitive,
   SensitivityScanConfigError,
@@ -256,5 +257,50 @@ describe('PII refactor regression — scrubPii bytes + findPii semantics', () =>
 
   test('findPii on empty input returns []', () => {
     expect(findPii('')).toEqual([]);
+  });
+});
+
+describe('secret-scan owns the jwt/bearer shapes — no double report with the PII pass', () => {
+  // Runtime-joined synthetic values (never committed as one literal).
+  const JWT = [
+    'eyJhbGciOiJIUzI1NiJ9',
+    'eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaWF0IjoxNzAwMDAwMDAwfQ',
+    'c2lnbmF0dXJlLXBsYWNlaG9sZGVyLTAwMDA',
+  ].join('.');
+  const OPAQUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
+
+  test('one JWT → exactly one finding, attributed to the secret scanner', () => {
+    const findings = scanSensitive(`service role ${JWT} here`, makeConfig(ws()));
+    expect(findings.map((f) => f.family)).toEqual(['secret:jwt']);
+  });
+
+  test('one opaque Bearer header → exactly one finding (secret:bearer), not pii:bearer as well', () => {
+    const findings = scanSensitive(`Authorization: Bearer ${OPAQUE}`, makeConfig(ws()));
+    expect(findings.map((f) => f.family)).toEqual(['secret:bearer']);
+  });
+
+  test('Bearer <vendor key> → one vendor finding only', () => {
+    const findings = scanSensitive(`Bearer ${ANTHROPIC}`, makeConfig(ws()));
+    expect(findings.map((f) => f.family)).toEqual(['secret:anthropic']);
+  });
+
+  test('a short bearer token (below the secret-scan floor) still reaches pii:bearer — coverage is not lost', () => {
+    const findings = scanSensitive('Bearer abcdef1234', makeConfig(ws()));
+    expect(findings.map((f) => f.family)).toEqual(['pii:bearer']);
+  });
+});
+
+describe('DX-7: a dropped entry gets one content-free diagnostic line', () => {
+  test('names reason, pattern, fingerprint and the allowlist recovery, never the value', () => {
+    const token = ['gh', 'p_'].join('') + 'Q7'.repeat(18);
+    const [finding] = scanSensitive(`notes ${token} end`, loadSensitivityConfig({ blocklist: '' }));
+    const line = formatSensitivityDrop({ slug: 'concepts/leaky', ...finding! }, '/work/space');
+    expect(line).toContain('concepts/leaky');
+    expect(line).toContain('reason: sensitivity_scan');
+    expect(line).toContain('pattern: secret:github_token');
+    expect(line).toContain(`fingerprint: ${finding!.fingerprint}`);
+    expect(line).toContain(`add the line "${finding!.fingerprint}" to ${join('/work/space', SCAN_ALLOW_FILENAME)}`);
+    expect(line).not.toContain(token);
+    expect(line).not.toContain('\n');
   });
 });

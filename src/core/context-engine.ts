@@ -62,6 +62,7 @@ export interface ContextEngine {
     citationsMode?: string;
     model?: string;
     prompt?: string;
+    runtimeContext?: { transcriptStorage?: { kind: string } };
   }): Promise<AssembleResult>;
   compact(params: {
     sessionId: string;
@@ -980,14 +981,14 @@ export function createGBrainContextEngine(ctx: {
     try {
       const hb = await import('./context/hook-heartbeat.ts');
       if (!deadlineHit() && (await hb.memorableGateAllowed(cfg)).allowed) {
-        // Entropy parity with the hook lane [red-team]: the segment file was
-        // vendor-scanned only — its rendering feeds the Cathedral-5 ledger
-        // hash and cannot change — but the relay child derives its egress
-        // task line from that text. Re-scan with highEntropy and REFUSE the
-        // relay when it finds anything the vendor pass missed (fail-closed;
-        // the next compaction window re-evaluates).
+        // Entropy parity with the hook lane [red-team]: the segment file was vendor-scanned
+        // only (its rendering feeds the Cathedral-5 ledger hash), but the relay child derives
+        // its egress task line from that text. Re-scan with highEntropy and REFUSE the relay on
+        // any hit, logged content-free (fail-closed; the next compaction window re-evaluates).
         const scan = await import('./secret-scan.ts');
-        if (scan.redactFindings(rendered.text, { highEntropy: true }).redactions.length > 0) {
+        const [hit] = scan.redactFindings(rendered.text, { highEntropy: true }).redactions;
+        if (hit) {
+          await hb.writeHeartbeat(hb.relayRefusalHeartbeat(hit), { trim: false });
           throw new Error('entropy_hit'); // caught below — receipt+relay skipped, checkpoint unaffected
         }
         // Same span rule as the hook lane: windowTurns is a suffix of
@@ -1055,8 +1056,8 @@ export function createGBrainContextEngine(ctx: {
       if (ingested(fullPath + sweep.CORPUS_INGESTED_SUFFIX)) {
         return { status: 'banked', reason: 'already_ingested' };
       }
-      const { detectCapabilities } = await import('./capability.ts');
-      if (!detectCapabilities().extraction.available) return { status: 'banked', reason: 'keyless' };
+      const { extractionAvailableForEngine } = await import('./facts/extraction-availability.ts');
+      if (!(await extractionAvailableForEngine(pg))) return { status: 'banked', reason: 'keyless' };
       const { isFactsExtractionEnabled } = await import('./facts/extract.ts');
       if (!(await isFactsExtractionEnabled(pg))) return { status: 'banked', reason: 'extraction_disabled' };
       const { resolveSourceId } = await import('./source-resolver.ts');
@@ -1156,7 +1157,7 @@ export function createGBrainContextEngine(ctx: {
       return { ingested: true };
     },
 
-    async assemble({ sessionId, sessionKey, messages, tokenBudget, availableTools, citationsMode, prompt }) {
+    async assemble({ sessionId, sessionKey, messages, tokenBudget, availableTools, citationsMode, prompt, runtimeContext }) {
       // Lazy SDK load on first method call (was top-level await pre-L0-B).
       await ensureSdkLoaded();
 
@@ -1165,15 +1166,14 @@ export function createGBrainContextEngine(ctx: {
       // take down the whole context pipeline.
       const msgs = Array.isArray(messages) ? messages : [];
 
-      // Some OpenClaw runtimes (e.g. the codex-app-server in 2026.7.x) deliver
-      // the current user turn via `prompt` with an empty `messages` array.
-      // Synthesize a single user turn so the Retrieval Reflex still sees the
-      // text (the deterministic live-context/pass-through path is unaffected).
-      const effectiveMessages = msgs.length > 0
-        ? msgs
-        : (typeof prompt === 'string' && prompt.trim()
-            ? ([{ role: 'user', content: prompt }] as typeof msgs)
-            : msgs);
+      const hasCurrentPrompt = typeof prompt === 'string' && prompt.trim().length > 0;
+      const lastMessage = msgs.at(-1);
+      const includesCurrentPrompt = runtimeContext?.transcriptStorage?.kind !== 'sqlite'
+        && lastMessage?.role === 'user'
+        && messageText(lastMessage.content) === prompt;
+      const effectiveMessages = hasCurrentPrompt && !includesCurrentPrompt
+        ? [...msgs, { role: 'user', content: prompt }]
+        : msgs;
 
       // 1. Generate deterministic context (<5ms, zero LLM calls)
       const liveCtx = generateLiveContext(workspaceDir);

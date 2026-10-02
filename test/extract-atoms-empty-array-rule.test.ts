@@ -6,7 +6,7 @@
  * and smaller models responded by inventing 1-3 atoms or by explaining in
  * prose; prose parses as `no JSON array in response`, which is a counted
  * deterministic failure, so the page burned every retry and was tombstoned
- * for no reason. The prompt now tells the model to output exactly `[]` for a
+ * for no reason. The prompt tells the model to output exactly `{"atoms":[]}` for a
  * content-free transcript, which the parser already treats as an honest
  * zero-yield (ok: true, atoms: []).
  *
@@ -16,7 +16,8 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { runPhaseExtractAtoms, parseAtomsOutcome } from '../src/core/cycle/extract-atoms.ts';
+import { parseAtomsOutcome } from '../src/core/cycle/extract-atoms.ts';
+import { runPhaseWithStoredPageFixtures as runPhaseExtractAtoms } from './helpers/extract-atoms-page-fixtures.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChatResult, ChatOpts } from '../src/core/ai/gateway.ts';
 
@@ -48,7 +49,7 @@ function okChatResult(text: string): ChatResult {
 }
 
 describe('extract_atoms prompt — content-free transcript rule', () => {
-  test('the system prompt tells the model to output exactly [] when nothing is extractable', async () => {
+  test('the system prompt requests an empty atoms envelope when nothing is extractable', async () => {
     let capturedSystem = '';
     await runPhaseExtractAtoms(engine, {
       sourceId: 'default',
@@ -62,12 +63,13 @@ describe('extract_atoms prompt — content-free transcript rule', () => {
     expect(capturedSystem.length).toBeGreaterThan(0); // the seam was hit
     // The rule names the zero-yield shape AND forbids the two failure modes
     // (invented atoms, prose).
-    expect(capturedSystem).toMatch(/no extractable idea[\s\S]*output exactly \[\]/);
+    expect(capturedSystem).toMatch(/no extractable idea[\s\S]*output exactly \{"atoms":\[\]\}/);
     expect(capturedSystem).toMatch(/never invent an atom/);
     expect(capturedSystem).toMatch(/never explain in prose/);
   });
 
   test('[] is an honest zero-yield, not a parse failure (the path the rule steers into)', () => {
+    expect(parseAtomsOutcome('{"atoms":[]}')).toEqual({ ok: true, atoms: [] });
     expect(parseAtomsOutcome('[]')).toEqual({ ok: true, atoms: [] });
     // The rule must survive a bracketed preamble too: a model that echoes a
     // `[Source: …]` citation before obeying still yields an honest `[]`.

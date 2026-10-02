@@ -43,6 +43,7 @@ const KEEP_EXACT = new Set([
   'GBRAIN_DATABASE_URL', // e2e DB target; database-url-guard-preload (registered first) already vetoed un-opted runs
   'GBRAIN_MODEL_DISCOVERY', // operator override provider-keys-preload deliberately respects
   'GBRAIN_PGLITE_SNAPSHOT', // schema-snapshot fast path exported by every unit runner (scripts/lib/test-env.sh)
+  'GBRAIN_NO_SNAPSHOT', // cold-path opt-out must survive this preload and reach CLI children
   'GBRAIN_PGBOUNCER_URL', // explicit pooled test target supplied by ci-local
   'GBRAIN_PGBOUNCER_DIRECT_URL', // admin connection used to create the isolated pooler test DB
   'GBRAIN_COMPILED_BIN', // heavy-lane compile-once binary (agent-harness.ts ensureCompiledGbrain)
@@ -53,6 +54,8 @@ const KEEP_EXACT = new Set([
   // header — the scrub was silently no-op'ing the paid live layer (any
   // GBRAIN_* opt-in read by a test file needs a row here or a KEEP_PREFIX).
   'GBRAIN_TRIAGE_CALIBRATION_LIVE',
+  // Opt-in keyed System One wire test (test/live/decide-typesafe.live.test.ts).
+  'GBRAIN_LIVE_TYPESAFE',
 ]);
 
 // GBRAIN_TEST_*: test-control opt-ins (ALLOW_DATABASE_URL, KEEP_PROVIDER_KEYS,
@@ -78,4 +81,9 @@ if (process.env.GBRAIN_TEST_KEEP_AMBIENT_ENV !== '1') {
       `[operator-env-preload] cleared ${removed.length}: ${removed.sort().join(', ')}`,
     );
   }
+}
+
+if (process.env.GBRAIN_NO_SNAPSHOT === '1') {
+  delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+  delete process.env.GBRAIN_TEST_DEFAULT_SNAPSHOT;
 }

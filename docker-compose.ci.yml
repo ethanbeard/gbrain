@@ -5,7 +5,7 @@
 # `bun run ci:local:diff` (see scripts/ci-local.sh).
 #
 # All services are pulled as `image:` (no build) so `docker compose pull`
-# refreshes everything. #4479: the bun tag is PINNED (default 1.3.13, matching
+# refreshes everything. #4479: the bun tag is PINNED (default 1.4.2, matching
 # the CI/build bun) instead of floating with `oven/bun:1` — a floating tag
 # resolved to a newer bun than the host and produced container-only behavior
 # skew during release gates. Override per-run with GBRAIN_CI_BUN_TAG (e.g.
@@ -94,7 +94,7 @@ services:
   # pooled :6543) behind three consecutive pooler-teardown waves
   # (#1972 → #2015 → #2084) that CI could never reproduce.
   # test/e2e/pgbouncer-teardown.test.ts uses a DEDICATED database
-  # (gbrain_pgbouncer) on postgres-1 so it never races shard 1's
+  # (gbrain_pgbouncer_test) on postgres-1 so it never races shard 1's
   # TRUNCATE-based fixtures; pgbouncer's wildcard [databases] section
   # forwards any dbname to DB_HOST.
   pgbouncer:
@@ -125,7 +125,7 @@ services:
 
   runner:
     # #4479: pinned to the host bun version by default (see header comment).
-    image: oven/bun:${GBRAIN_CI_BUN_TAG:-1.3.13}
+    image: oven/bun:${GBRAIN_CI_BUN_TAG:-1.4.2}
     working_dir: /app
     environment:
       # The bind-mounted checkout may contain private developer test keys.
@@ -154,6 +154,8 @@ services:
       # Without this, container `bun install` stomps host node_modules and
       # subsequent `bun test` on host fails with binary-incompat errors.
       - gbrain-ci-node-modules:/app/node_modules
+      - gbrain-ci-admin-node-modules:/app/admin/node_modules
+      - gbrain-ci-admin-dist:/app/admin/dist
       # Warm install cache across runs.
       - gbrain-ci-bun-cache:/root/.bun/install/cache
 
@@ -163,4 +165,6 @@ volumes:
   gbrain-ci-pg-data-3:
   gbrain-ci-pg-data-4:
   gbrain-ci-node-modules:
+  gbrain-ci-admin-node-modules:
+  gbrain-ci-admin-dist:
   gbrain-ci-bun-cache:

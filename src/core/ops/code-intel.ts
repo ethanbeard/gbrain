@@ -10,7 +10,7 @@
 
 import type { Operation, OperationContext } from './contract.ts';
 import { OperationError } from './contract.ts';
-import { routeCodeIntelScope } from './context.ts';
+import { routeCodeIntelScope, readPolicyOpts } from './context.ts';
 import type { WalkResult } from '../code-intel/recursive-walk.ts';
 import {
   CODE_CALLERS_DESCRIPTION,
@@ -35,6 +35,7 @@ import {
 
 const code_callers: Operation = {
   name: 'code_callers',
+  outputRedaction: 'retrieval',
   description: CODE_CALLERS_DESCRIPTION,
   params: {
     symbol: { type: 'string', required: true, description: 'Symbol to find callers of (bare or qualified name).' },
@@ -74,6 +75,7 @@ const code_callers: Operation = {
 
 const code_callees: Operation = {
   name: 'code_callees',
+  outputRedaction: 'retrieval',
   description: CODE_CALLEES_DESCRIPTION,
   params: {
     symbol: { type: 'string', required: true, description: 'Symbol to find callees of (bare or qualified name).' },
@@ -111,6 +113,7 @@ const code_callees: Operation = {
 
 const code_def: Operation = {
   name: 'code_def',
+  outputRedaction: 'retrieval',
   description: CODE_DEF_DESCRIPTION,
   params: {
     symbol: { type: 'string', required: true, description: 'Symbol name (bare token; e.g., parseMarkdown, BrainEngine).' },
@@ -120,20 +123,22 @@ const code_def: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { findCodeDef } = await import('../../commands/code-def.ts');
+    const policy = await readPolicyOpts(ctx, ctx.remote === false ? {} : undefined);
     const defs = await findCodeDef(ctx.engine, p.symbol as string, {
+      ...policy,
       limit: (p.limit as number) ?? 20,
       language: (p.lang as string) || undefined,
     });
-    // code_def is brain-wide (not source-scoped); readiness is 'symbol' grain.
-    const { resolveCodeReadiness } = await import('../code-graph-readiness.ts');
-    const readiness = await resolveCodeReadiness(ctx.engine, { kind: 'symbol', count: defs.length });
-    return { symbol: p.symbol as string, count: defs.length, status: readiness.status, ready: readiness.ready, defs };
+    const { resolveCodeReadiness, readinessHint } = await import('../code-graph-readiness.ts');
+    const readiness = await resolveCodeReadiness(ctx.engine, { ...policy, remote: ctx.remote, kind: 'symbol', count: defs.length });
+    return { symbol: p.symbol as string, count: defs.length, status: readiness.status, ready: readiness.ready, hint: readinessHint(readiness), defs };
   },
   cliHints: { name: 'code_def', hidden: true },
 };
 
 const code_refs: Operation = {
   name: 'code_refs',
+  outputRedaction: 'retrieval',
   description: CODE_REFS_DESCRIPTION,
   params: {
     symbol: { type: 'string', required: true, description: 'Symbol to find references to.' },
@@ -143,14 +148,15 @@ const code_refs: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { findCodeRefs } = await import('../../commands/code-refs.ts');
+    const policy = await readPolicyOpts(ctx, ctx.remote === false ? {} : undefined);
     const refs = await findCodeRefs(ctx.engine, p.symbol as string, {
+      ...policy,
       limit: (p.limit as number) ?? 50,
       language: (p.lang as string) || undefined,
     });
-    // code_refs is brain-wide (not source-scoped); readiness is 'symbol' grain.
-    const { resolveCodeReadiness } = await import('../code-graph-readiness.ts');
-    const readiness = await resolveCodeReadiness(ctx.engine, { kind: 'symbol', count: refs.length });
-    return { symbol: p.symbol as string, count: refs.length, status: readiness.status, ready: readiness.ready, refs };
+    const { resolveCodeReadiness, readinessHint } = await import('../code-graph-readiness.ts');
+    const readiness = await resolveCodeReadiness(ctx.engine, { ...policy, remote: ctx.remote, kind: 'symbol', count: refs.length });
+    return { symbol: p.symbol as string, count: refs.length, status: readiness.status, ready: readiness.ready, hint: readinessHint(readiness), refs };
   },
   cliHints: { name: 'code_refs', hidden: true },
 };
@@ -187,6 +193,7 @@ async function attachWalkReadiness(ctx: OperationContext, walk: WalkResult, sour
 
 const code_blast: Operation = {
   name: 'code_blast',
+  outputRedaction: 'retrieval',
   description: 'BEFORE editing any function, run code_blast with the symbol name to surface every transitive caller grouped by depth (direct → 2-hop → 3-hop). Use this during plan-mode to size the change. Returns up to 200 nodes. Trust an empty/not_found result only when ready=true; ready=false means impact is unknown and requires a safe fallback. Returns: {result, status, ready, depth_groups?, truncation?, cycles_detected?, did_you_mean?, candidates?}. Example ok: {result:"ok", status:"ready", ready:true, depth_groups:[{depth:1, nodes:[{symbol,chunk_id}], confidence:0.77}], truncation:"none"}.',
   params: {
     symbol: { type: 'string', required: true, description: 'Bare or qualified symbol name (e.g. "performSync" or "src/foo::performSync")' },
@@ -198,7 +205,6 @@ const code_blast: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { runRecursiveWalk } = await import('../code-intel/recursive-walk.ts');
-    const { getCachedOrCompute } = await import('../code-intel/traversal-cache.ts');
     const symbol = p.symbol as string;
     const depth = Math.min((p.depth as number) ?? 5, 8);
     const max_nodes = Math.min((p.max_nodes as number) ?? 200, 200);
@@ -209,17 +215,13 @@ const code_blast: Operation = {
     // exactly preserving pre-fix local behavior.
     const { sourceId: scopedSourceId } = await routeCodeIntelScope(ctx, typeof p.source_id === 'string' ? p.source_id : undefined);
     const sourceId = scopedSourceId ?? ctx.sourceId;
-    const walk = await getCachedOrCompute(
-      ctx.engine,
-      { symbol_qualified: symbol, depth, source_id: sourceId },
-      () => runRecursiveWalk(ctx.engine, symbol, {
+    const walk = await runRecursiveWalk(ctx.engine, symbol, {
         direction: 'callers',
         depth,
         maxNodes: max_nodes,
         sourceId,
         exact,
-      }),
-    );
+      });
     return attachWalkReadiness(ctx, walk, sourceId);
   },
   cliHints: { name: 'code_blast', hidden: true },
@@ -227,6 +229,7 @@ const code_blast: Operation = {
 
 const code_flow: Operation = {
   name: 'code_flow',
+  outputRedaction: 'retrieval',
   description: 'When tracing how a request flows through the codebase from entry point to side effect (DB write, HTTP call, file I/O), run code_flow from the entry point. Returns ordered execution chain with terminal-node tags. Returns: same envelope as code_blast plus terminal_nodes: [{symbol, sink_kind}] where sink_kind ∈ "db_call"|"http_call"|"file_io"|"process_exec"|"unknown".',
   params: {
     entry_point: { type: 'string', required: true, description: 'Entry-point symbol name (bare or qualified)' },
@@ -238,7 +241,6 @@ const code_flow: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { runRecursiveWalk } = await import('../code-intel/recursive-walk.ts');
-    const { getCachedOrCompute } = await import('../code-intel/traversal-cache.ts');
     const symbol = p.entry_point as string;
     const depth = Math.min((p.depth as number) ?? 8, 12);
     const max_nodes = Math.min((p.max_nodes as number) ?? 200, 200);
@@ -246,17 +248,13 @@ const code_flow: Operation = {
     // Single trust+grant resolver (see code_blast).
     const { sourceId: scopedSourceId } = await routeCodeIntelScope(ctx, typeof p.source_id === 'string' ? p.source_id : undefined);
     const sourceId = scopedSourceId ?? ctx.sourceId;
-    const walk = await getCachedOrCompute(
-      ctx.engine,
-      { symbol_qualified: symbol + ':flow', depth, source_id: sourceId },
-      () => runRecursiveWalk(ctx.engine, symbol, {
+    const walk = await runRecursiveWalk(ctx.engine, symbol, {
         direction: 'callees',
         depth,
         maxNodes: max_nodes,
         sourceId,
         exact,
-      }),
-    );
+      });
     return attachWalkReadiness(ctx, walk, sourceId);
   },
   cliHints: { name: 'code_flow', hidden: true },
@@ -266,6 +264,7 @@ const code_flow: Operation = {
 
 const code_traversal_cache_clear: Operation = {
   name: 'code_traversal_cache_clear',
+  outputRedaction: 'no_stored_text',
   description: 'Clear cached code_blast / code_flow traversal results. Source-scoped by default; pass all_sources=true to wipe everything (D8 destructive-guard).',
   params: {
     source_id: { type: 'string', description: 'Source to clear. Required unless all_sources=true.' },

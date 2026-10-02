@@ -1,6 +1,6 @@
 # Connect GBrain to Claude Code
 
-For an existing agent, start with the [memory-only walkthrough](../tutorials/connect-coding-agent.md); a personal-agent identity and private repository are optional. For an existing hosted brain, use [private handoff and profiles](../guides/hosted-harness-access.md).
+For an existing agent, start with the [memory-only walkthrough](../tutorials/connect-coding-agent.md); a personal-agent identity and private repository are optional. For an existing hosted brain, choose [native OAuth or a private machine handoff](../guides/hosted-harness-access.md). Owner login and client management use [MCP administration](ADMIN.md), independently of the harness's OAuth scopes.
 
 > New to this? The [Give your coding agent a memory](../tutorials/connect-coding-agent.md)
 > tutorial walks both paths (local-from-nothing and connect-to-an-existing-brain)
@@ -82,16 +82,31 @@ the default and what existing installs already run.
 
 ## Option 2: Remote, one command (fastest from a bearer token)
 
-If GBrain is running somewhere as an HTTP server (`gbrain serve --http`, see the
-[ngrok-tunnel recipe](../../recipes/ngrok-tunnel.md)) and you have a bearer token,
-let `gbrain connect` generate the wire-up for you.
+If GBrain is running somewhere as an HTTP server and you have a bearer token,
+let `gbrain connect` generate the wire-up for you using that configured endpoint.
+If the brain still needs publishing, on the brain host,
+`gbrain mcp expose` publishes the server on your Tailscale tailnet and prints
+`https://your-machine.your-tailnet.ts.net/mcp` (tailnet-only is enough for
+your own laptops; [remote MCP guide](../guides/remote-mcp.md)). ngrok stays an
+alternative ([ngrok-tunnel recipe](../../recipes/ngrok-tunnel.md)) — substitute
+its URL below.
 
-On the host (or anywhere `gbrain` is installed), mint a token and print the block:
+**Say to your agent:** *"use my brain over mcp"* — *"put my brain on tailscale"*.
+
+Mint the token on the brain host. Run `gbrain connect` in the intended client
+environment to print its setup block:
 
 ```bash
 gbrain auth create "claude-code"
-gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --token gbrain_xxx
+gbrain connect https://your-machine.your-tailnet.ts.net/mcp --token gbrain_xxx
 ```
+
+> **PGLite brains:** `gbrain auth create` opens the database, which fails with
+> `live_serve` while the expose-managed service holds it. Mint the token
+> **before** the service runs (ahead of `gbrain mcp expose`, or while the service
+> is stopped briefly), or provision through the running server instead —
+> `gbrain mcp grant … --admin-token-file ~/.gbrain/serve/admin-token` or the
+> `/admin` dashboard. Postgres brains mint fine while the server runs.
 
 `gbrain connect` prints a short, copy-paste block. Paste it into Claude Code — it
 runs the `claude mcp add` for you and tells the agent to call `get_brain_identity`
@@ -101,7 +116,7 @@ Already on the machine you want to wire up? Skip the copy-paste and let `connect
 do it directly, with a built-in token smoke-test:
 
 ```bash
-gbrain connect https://YOUR-DOMAIN.ngrok.app --token gbrain_xxx --install
+gbrain connect https://your-machine.your-tailnet.ts.net --token gbrain_xxx --install
 ```
 
 (`--install` runs `claude mcp add`, then verifies the token by calling
@@ -112,7 +127,7 @@ appended; pass an explicit `https://` scheme.)
 Pipe-friendly machine output (token redacted unless `--show-token`):
 
 ```bash
-gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --token gbrain_xxx --json
+gbrain connect https://your-machine.your-tailnet.ts.net/mcp --token gbrain_xxx --json
 ```
 
 ## Option 3: Remote, manual `claude mcp add`
@@ -121,12 +136,12 @@ Equivalent to what `gbrain connect` generates, if you'd rather run it yourself:
 
 ```bash
 claude mcp add gbrain -t http \
-  https://YOUR-DOMAIN.ngrok.app/mcp \
+  https://your-machine.your-tailnet.ts.net/mcp \
   -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-Replace `YOUR-DOMAIN` with your ngrok domain and `YOUR_TOKEN` with a token from
-`gbrain auth create "claude-code"`.
+Replace the host with your MagicDNS name (or your ngrok domain) and
+`YOUR_TOKEN` with a token from `gbrain auth create "claude-code"`.
 
 > A `gbrain auth create` token is a long-lived, full-access secret. Keep it
 > private (it lands in `~/.claude.json`), and prefer a scoped/short-lived token
@@ -152,7 +167,7 @@ You should see results from your GBrain knowledge base.
 > full surfaces (prefer it for quick notes — auto-slug + dedupe; `put_page` for
 > full-control writes); if your tool list doesn't carry it, use `put_page`, or
 > `remember` on the verbs surface.
-> Why brains differ on the default: [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-serve-over-http).
+> Why brains differ on the default: [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-grant-memory-access).
 
 ## Ambient recall at session boundaries
 
@@ -165,7 +180,10 @@ sub-second, world-visibility by default, and available on `--surface verbs`.
   installer wires `SessionStart` (injects a warm pack; also fires on
   post-compaction re-entry, `source=compact`) and `PreCompact` (banks the
   window's standing entities so that rehydration pack is warm) into
-  `.claude/settings.local.json`. Nothing to call; `GBRAIN_HOOKS=0` disables.
+  `.claude/settings.local.json`. Nothing to call; `GBRAIN_HOOKS=0` disables
+  every hook event, including capture. Session start never shows another
+  session's activity: the `Last session activity` line older releases printed
+  was removed in v0.60.28.0 (#5558), with deliberately no opt-in to restore it.
 - **Manual (any brain, incl. remote/Postgres):** call the verbs yourself at
   boundaries — `context_pack(entities, budget_tokens)` at session start /
   after compaction, `delta(session_id, budget_tokens)` on wakes. See

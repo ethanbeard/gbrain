@@ -44,10 +44,11 @@ export function resolveWhoknowsFixturePath(
   env: NodeJS.ProcessEnv = process.env,
   moduleUrl: string = import.meta.url,
 ): string | null {
-  if (env.GBRAIN_WHOKNOWS_FIXTURE_PATH) {
-    return isAbsolute(env.GBRAIN_WHOKNOWS_FIXTURE_PATH)
-      ? env.GBRAIN_WHOKNOWS_FIXTURE_PATH
-      : resolvePath(process.cwd(), env.GBRAIN_WHOKNOWS_FIXTURE_PATH);
+  // cwd-dotenv-ok: doctor test-fixture path override; the check only READS that jsonl, never loads or executes it.
+  const override = env.GBRAIN_WHOKNOWS_FIXTURE_PATH;
+  if (override) {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- override is the operator-set GBRAIN_WHOKNOWS_FIXTURE_PATH doctor test-fixture path (the check only READS that jsonl, never loads or executes it); absolutizing the operator's own relative path against the process cwd is the intent, unchanged from the pre-hoist form
+    return isAbsolute(override) ? override : resolvePath(process.cwd(), override);
   }
 
   try {

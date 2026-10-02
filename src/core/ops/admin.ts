@@ -1,3 +1,5 @@
+import { pageMutationSource, submitPageMutation } from '../persistence/page-mutations.ts';
+import { PAGE_MUTATION_PARAMS } from '../persistence/params.ts';
 import { readPolicyOpts } from './context.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 /**
@@ -30,6 +32,7 @@ function diagnosticScope(ctx: OperationContext): { sourceId?: string; sourceIds?
 
 const get_stats: Operation = {
   name: 'get_stats',
+  outputRedaction: 'no_stored_text',
   description: 'Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant.',
   params: {},
   handler: async (ctx) => {
@@ -41,6 +44,7 @@ const get_stats: Operation = {
 
 const get_health: Operation = {
   name: 'get_health',
+  outputRedaction: 'no_stored_text',
   description: 'Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host.',
   params: {},
   handler: async (ctx) => {
@@ -83,6 +87,7 @@ const get_health: Operation = {
  */
 const get_brain_identity: Operation = {
   name: 'get_brain_identity',
+  outputRedaction: 'no_stored_text',
   description: 'Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, and page/chunk counts. Read-scope.',
   params: {},
   handler: async (ctx) => {
@@ -139,6 +144,7 @@ const get_brain_identity: Operation = {
  */
 const run_doctor: Operation = {
   name: 'run_doctor',
+  outputRedaction: 'no_stored_text',
   description: 'Run brain health checks and return a structured DoctorReport (thin-client doctor surface).',
   params: {},
   handler: async (ctx) => {
@@ -151,7 +157,7 @@ const run_doctor: Operation = {
     // unscoped ctx = brain-wide.
     const scope = sourceScopeOpts(ctx);
     const sourceIds = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : undefined);
-    return doctorReportRemote(ctx.engine, { sourceIds });
+    return doctorReportRemote(ctx.engine, { sourceIds, remote: ctx.remote });
   },
   scope: 'admin',
   localOnly: false,
@@ -159,6 +165,7 @@ const run_doctor: Operation = {
 
 const get_versions: Operation = {
   name: 'get_versions',
+  outputRedaction: { exempt: 'full page version snapshots by slug; a page read governed by visibility like get_page (CEO-17)' },
   description: 'Page version history',
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose version history to list.' },
@@ -166,7 +173,8 @@ const get_versions: Operation = {
   handler: async (ctx, p) => {
     const versions = await ctx.engine.getVersions(p.slug as string, await readPolicyOpts(ctx));
     if (ctx.remote === false) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth) }));
+    return versions.map(v => ({ ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth),
+      ...(typeof v.timeline === 'string' ? { timeline: sanitizeRemoteBody(v.timeline) } : {}) }));
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },
@@ -174,23 +182,20 @@ const get_versions: Operation = {
 
 const revert_version: Operation = {
   name: 'revert_version',
+  outputRedaction: 'no_stored_text',
   description: 'Revert page to a previous version',
   params: {
+    ...PAGE_MUTATION_PARAMS,
     slug: { type: 'string', required: true, description: 'Slug of the page to revert.' },
     version_id: { type: 'number', required: true, description: 'Numeric version id to revert to, as returned by get_versions. Not a version NUMBER offset — pass the id field.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    pageMutationSource(ctx, p, 'revert_version');
     enforceClientSlugFence(ctx, p.slug as string, 'revert_version');
     if (ctx.dryRun) return { dry_run: true, action: 'revert_version', slug: p.slug, version_id: p.version_id };
-    // v0.31.8 (D7): thread ctx.sourceId so multi-source brains revert the
-    // intended page row instead of whichever same-slug row Postgres returns
-    // first.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.createVersion(p.slug as string, sourceOpts);
-    await ctx.engine.revertToVersion(p.slug as string, p.version_id as number, sourceOpts);
-    return { status: 'reverted' };
+    return submitPageMutation(ctx, { operation: 'revert_version', params: p });
   },
   cliHints: { name: 'revert', positional: ['slug', 'version_id'] },
 };
@@ -206,6 +211,7 @@ const revert_version: Operation = {
  */
 const quarantine_list: Operation = {
   name: 'quarantine_list',
+  outputRedaction: 'retrieval',
   description:
     'List quarantined (hidden) and optionally content-flagged pages by scanning page ' +
     'frontmatter, newest-updated first. When truncated is true, count is a LOWER BOUND — ' +

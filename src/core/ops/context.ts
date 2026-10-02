@@ -16,6 +16,7 @@ import { OperationError } from './contract.ts';
 import type { AuthInfo, Operation, OperationContext } from './contract.ts';
 import { CJK_SLUG_CHARS, SLUG_WORD_CHARS } from '../cjk.ts';
 import { ALL_SOURCES, isValidSourceId } from '../source-id.ts';
+import { encodeDeepResearchId } from '../deep-research-id.ts';
 import { isSearchMode } from '../search/mode.ts';
 import { stampEvidence } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
@@ -78,8 +79,11 @@ export function validateUploadPath(filePath: string, root: string, strict = true
 }
 
 /**
- * Op-boundary page-slug segment (#4665): cjk.ts's PAGE_SLUG_SEG shape widened
- * LOCALLY so `.` and `_` are allowed as segment-CONTINUATION characters. The
+ * Op-boundary page-slug segment (#4665/#5032): cjk.ts's PAGE_SLUG_SEG shape
+ * widened LOCALLY so `.` and `_` are allowed as part-CONTINUATION characters.
+ * Colon separates individually valid parts inside a path segment, preserving
+ * existing integration slugs such as `calendar:event-id` without admitting
+ * empty or dot-led parts (`calendar:../x` remains invalid). The
  * sync slugifier deliberately preserves both (`notes/v1.0.0`,
  * `people/my_file_name` — see slugifySegment in src/core/sync.ts), so the
  * put_page boundary must round-trip every slug sync can produce. The lead
@@ -94,13 +98,14 @@ export function validateUploadPath(filePath: string, root: string, strict = true
 // underscores (`_index.md` → `_index`, the Hugo convention), so rejecting
 // them recreates the un-updatable-synced-page class this widen closes.
 // Dot stays continuation-only — `..` traversal remains impossible.
-const OP_PAGE_SLUG_SEG = `[${SLUG_WORD_CHARS}_][${SLUG_WORD_CHARS}._\\-]*`;
+const OP_PAGE_SLUG_PART = `[${SLUG_WORD_CHARS}_][${SLUG_WORD_CHARS}._\\-]*`;
+const OP_PAGE_SLUG_SEG = `${OP_PAGE_SLUG_PART}(?::${OP_PAGE_SLUG_PART})*`;
 
 /**
  * Allowlist validator for page slugs. Rejects URL-encoded traversal, backslashes,
  * control chars, RTL overrides, Unicode lookalikes — anything outside the allowlist.
- * Format: lowercase alphanumeric segments (dot/underscore/hyphen continuation
- * allowed) separated by single forward slashes.
+ * Format: alphanumeric parts (dot/underscore/hyphen continuation allowed),
+ * optionally colon-separated within segments; segments use single forward slashes.
  */
 export function validatePageSlug(slug: string): void {
   if (typeof slug !== 'string' || slug.length === 0) {
@@ -113,7 +118,7 @@ export function validatePageSlug(slug: string): void {
   // for the \p{...} classes in OP_PAGE_SLUG_SEG). Shape rules (word-char lead,
   // dot/underscore/hyphen continuation) preserved.
   if (!new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu').test(slug)) {
-    throw new OperationError('invalid_params', `Invalid page_slug: ${slug} (allowed: letters/numbers in any script, with '.', '_', '-' after the first character of a segment, forward-slash separated segments)`);
+    throw new OperationError('invalid_params', `Invalid page_slug: ${slug} (allowed: letters/numbers in any script, with '.', '_', '-' after the first character of a part, optional colon-separated namespace parts, and forward-slash separated segments)`);
   }
 }
 
@@ -316,7 +321,11 @@ export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
   // enforceClientSlugFence themselves (their markdown mirror writes the
   // page file under the slug), the same guarantee as add_tag/add_timeline_entry.
   'capture',
+  // Own-principal receipt controls recheck original/current source + slug
+  // authority. They are not meta-op exemptions: degraded fences still deny.
+  'get_write_request', 'list_write_requests', 'cancel_write_request',
   'takes_add', 'takes_update', 'takes_resolve', 'takes_supersede',
+  'put_skill', 'delete_skill',
 ]);
 
 /**
@@ -330,7 +339,7 @@ export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
  * tools/list filter and the dispatch fence consume the identical carve-out
  * (ENG-3 drift-proofing).
  */
-export const BOUND_CLIENT_META_OPS: ReadonlySet<string> = new Set(['request_tools']);
+export const BOUND_CLIENT_META_OPS: ReadonlySet<string> = new Set(['request_tools', 'join_brain', 'sync_brain_skills', 'leave_brain']);
 
 /**
  * Single source of truth for "may a slug-bound client use this op" (ENG-3).
@@ -360,7 +369,7 @@ export function opAllowedForBoundClient(
   if (!degraded && !auth?.boundSlugPrefixes) return true;
   const isRead = op.scope === 'read' && op.mutating !== true;
   if (isRead) return true;
-  if (BOUND_CLIENT_META_OPS.has(op.name)) return true;
+  if (BOUND_CLIENT_META_OPS.has(op.name)) return op.name === 'request_tools' || !degraded;
   if (degraded) return false;
   return CLIENT_FENCED_WRITE_OPS.has(op.name);
 }
@@ -473,6 +482,56 @@ export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sou
   return {};
 }
 
+/**
+ * Confine an explicitly named source id to the caller's resolved READ scope
+ * (#4433 wave-L posture; used by sources_status — the destructive
+ * sources_remove keys on `assertSourceInCallerWriteScope` below instead):
+ * EVERY untrusted caller (anything not strictly `remote === false`) may only
+ * name a source inside the canonical `sourceScopeOpts` ladder — federated
+ * grant > scalar bound source. An out-of-scope id answers `not_found`, exactly
+ * like a nonexistent source (anti-enumeration). The trusted local CLI passes
+ * unconditionally (full operator view). Returns void; throws otherwise.
+ */
+export function assertSourceInCallerScope(ctx: OperationContext, id: string): void {
+  if (ctx.remote === false) return;
+  const scope = sourceScopeOpts(ctx);
+  const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : null);
+  if (allowed && !allowed.includes(id)) {
+    throw new OperationError('not_found', `Unknown source: ${id}`);
+  }
+}
+
+/**
+ * WRITE-authority twin of `assertSourceInCallerScope`, for the DESTRUCTIVE
+ * source ops (`sources_remove`). Federation (`ctx.auth.allowedSources`) is READ
+ * authority by contract (contract.ts: "source ids this OAuth client may READ
+ * from") and confers no removal right, so this helper deliberately does NOT
+ * consult the `sourceScopeOpts` ladder — a client bound to write `alpha` with
+ * `federated_read: [alpha, beta]` may read `beta` but never cascade-delete it.
+ *
+ * Rules, in order:
+ *  - trusted local CLI (`remote === false`) passes unconditionally;
+ *  - an untrusted caller that is BOUND — carries a write source
+ *    (`ctx.auth.sourceId`, falling back to `ctx.sourceId`; the same notion as
+ *    delete_page/restore_page's write gate) and/or a federated grant — may
+ *    name ONLY its write source; a bound caller with no write source (or the
+ *    `__all__` sentinel as its source) may name nothing;
+ *  - an UNBOUND untrusted caller (neither axis set — an operator-registered
+ *    client with no source binding) keeps full authority, unchanged.
+ * Out-of-authority ids answer `not_found`, byte-identical to a nonexistent
+ * id (anti-enumeration; the same shape the read helper uses, so a caller
+ * cannot tell "hidden" from "absent"). Returns void; throws otherwise.
+ */
+export function assertSourceInCallerWriteScope(ctx: OperationContext, id: string): void {
+  if (ctx.remote === false) return;
+  const writeSource = ctx.auth?.sourceId ?? ctx.sourceId;
+  const bound = writeSource !== undefined || ctx.auth?.allowedSources !== undefined;
+  if (!bound) return;
+  if (writeSource === undefined || writeSource === ALL_SOURCES || id !== writeSource) {
+    throw new OperationError('not_found', `Unknown source: ${id}`);
+  }
+}
+
 /** Holder permissions are independent of the operator's page-visibility opt-out. */
 export function readHolders(ctx: OperationContext): string[] | undefined {
   return ctx.remote === false ? ctx.takesHoldersAllowList : ctx.takesHoldersAllowList ?? ['world'];
@@ -517,10 +576,14 @@ export function thinkSourceScopeOpts(ctx: OperationContext): {
  * and have a foreign far/origin slug disclosed. So for remote callers we promote a
  * scalar scope to a single-element `sourceIds:[id]`, routing them through the
  * all-endpoint branch. Trusted local CLI (`ctx.remote === false`) keeps the scalar
- * cross-source view, and a federated array passes through unchanged.
+ * cross-source view, and a federated array passes through unchanged. `scope`
+ * defaults to the ambient ladder; the link ops pass their resolved per-call
+ * scope (`federatedSearchScope`) so the same promotion applies to it.
  */
-export function linkReadScopeOpts(ctx: OperationContext): { sourceId?: string; sourceIds?: string[] } {
-  const scope = sourceScopeOpts(ctx);
+export function linkReadScopeOpts(
+  ctx: OperationContext,
+  scope: { sourceId?: string; sourceIds?: string[] } = sourceScopeOpts(ctx),
+): { sourceId?: string; sourceIds?: string[] } {
   if (ctx.remote !== false && scope.sourceId && !scope.sourceIds) {
     return { sourceIds: [scope.sourceId] };
   }
@@ -542,9 +605,15 @@ export function linkReadScopeOpts(ctx: OperationContext): { sourceId?: string; s
  *       trusted local (remote === false) → `{}` (spans the whole brain)
  *       remote                           → the caller's grant (sourceScopeOpts)
  *   - explicit `source_id`:
- *       remote + federated grant that doesn't include it → permission_denied
+ *       remote, outside the caller's grant or scalar scope, and outside
+ *       `explicitReads` (when passed)                     → permission_denied
  *       otherwise                                        → `{ sourceId }`
  *   - neither → the caller's grant (sourceScopeOpts).
+ *
+ * `explicitReads` (#5081) is the explicit-read admission set; only
+ * `federatedSearchScope` passes it. The other callers (image, loops,
+ * code-intel) pass nothing and keep denying every id outside the scope, with
+ * the original hint.
  *
  * `code_traversal_cache_clear` is intentionally NOT a caller — it is localOnly
  * and carries its own destructive D8 all_sources guard.
@@ -553,6 +622,7 @@ export function resolveRequestedScope(
   ctx: OperationContext,
   sourceIdParam: string | undefined,
   allSourcesParam = false,
+  explicitReads?: readonly string[],
 ): { sourceId?: string; sourceIds?: string[] } {
   const wantsAll = allSourcesParam || sourceIdParam === ALL_SOURCES;
   if (wantsAll) {
@@ -563,16 +633,66 @@ export function resolveRequestedScope(
     const granted = scope.sourceIds !== undefined
       ? scope.sourceIds.includes(sourceIdParam)
       : scope.sourceId === sourceIdParam;
-    if (ctx.remote !== false && !granted) {
+    if (ctx.remote !== false && !granted && !explicitReads?.includes(sourceIdParam)) {
       throw new OperationError(
         'permission_denied',
         'Requested source is outside your granted sources',
-        'Request access to this source, or omit source_id to search within your grant.',
+        explicitReads === undefined
+          ? 'Request access to this source, or omit source_id to search within your grant.'
+          : explicitReadDeniedHint(ctx, sourceIdParam),
+        explicitReads === undefined ? undefined : EXPLICIT_READ_DOCS,
       );
     }
     return { sourceId: sourceIdParam };
   }
   return sourceScopeOpts(ctx);
+}
+
+const EXPLICIT_READ_DOCS = 'docs/guides/multi-source-brains.md#explicit-reads-from-a-bound-agent-connection';
+
+/**
+ * #5081 / DX-O6(c): why an explicit read was refused, with the exact command
+ * that would admit it. A granted token is told about its grant; a connection
+ * bound by GBRAIN_SOURCE or a .gbrain-source pin is told about the binding
+ * (its own opt-out, the target's opt-out, or a target that was never
+ * federated); an unbound connection is told the target is not federated.
+ */
+function explicitReadDeniedHint(ctx: OperationContext, id: string): string {
+  const auth = ctx.auth;
+  if (auth !== undefined && (auth.allowedSources !== undefined || auth.hasSourceGrant !== false)) {
+    const granted = auth.allowedSources ?? (auth.sourceId !== undefined ? [auth.sourceId] : []);
+    return auth.principal?.kind === 'oauth_client'
+      ? `Your token is not granted ${id}; ask the brain owner to grant it ` +
+        `(gbrain auth rescope-client ${auth.principal.id} --federated-read ${[...granted, id].join(',')}).`
+      : `Your token is not granted ${id}; ask the brain owner to grant it.`;
+  }
+  const binding = ctx.explicitReadBinding;
+  if (binding === undefined) {
+    return `${id} is not federated; the brain owner can run \`gbrain sources federate ${id}\` on the brain host, ` +
+      'or omit source_id to read within this connection\'s sources.';
+  }
+  const bound = `This connection is bound to source ${binding.sourceId} (${binding.via}).`;
+  const unbind = binding.via === 'GBRAIN_SOURCE'
+    ? 'start this connection without GBRAIN_SOURCE'
+    : 'start this connection outside the directory pinned by .gbrain-source';
+  if (binding.optedOut.includes(binding.sourceId)) {
+    return `${bound} ${binding.sourceId} opted out of federation (federated: false), so it reads no other source; ` +
+      `the brain owner can run \`gbrain sources federate ${binding.sourceId}\` on the brain host, or ${unbind}.`;
+  }
+  const reason = binding.optedOut.includes(id) ? 'opted out of federation (federated: false)' : 'is not federated';
+  return `${bound} ${id} ${reason}; the brain owner can run \`gbrain sources federate ${id}\` on the brain host, or ${unbind}.`;
+}
+
+/**
+ * #5081: the sources an explicit `source_id` read may name beyond the scope.
+ * A grant (`ctx.auth.allowedSources`) governs alone. Otherwise a bound stdio
+ * connection uses its binding's set, and an unbound connection uses the set
+ * its unqualified reads already span (`localFederatedSourceIds`), so an
+ * explicit read there is never wider than an unqualified one.
+ */
+function explicitReadAdmission(ctx: OperationContext): readonly string[] {
+  if (ctx.auth?.allowedSources !== undefined) return [];
+  return ctx.explicitReadBinding?.sourceIds ?? ctx.localFederatedSourceIds ?? [];
 }
 
 /**
@@ -620,6 +740,10 @@ export function parseSourceIdParam(
  * unqualified reads (#3242 — pages ingested into a `federated: true` source
  * were invisible to get_page/search/list_pages while resolve_slugs leaked them).
  *
+ * An explicit per-call `source_id` is admitted inside the explicit-read set
+ * (#5081, `explicitReadAdmission`): the binding's set for a connection bound
+ * by GBRAIN_SOURCE or a .gbrain-source pin, otherwise the federated set.
+ *
  * The expansion NEVER applies when:
  *   - a concrete per-call `source_id` was passed (explicit wins);
  *   - the resolver already produced a federated array (OAuth grant governs);
@@ -639,7 +763,7 @@ export function federatedSearchScope(
   ctx: OperationContext,
   sourceIdParam?: string,
 ): { sourceId?: string; sourceIds?: string[] } {
-  const scope = resolveRequestedScope(ctx, sourceIdParam);
+  const scope = resolveRequestedScope(ctx, sourceIdParam, false, explicitReadAdmission(ctx));
   if (
     (sourceIdParam === undefined || sourceIdParam === ALL_SOURCES) &&
     ctx.auth?.allowedSources === undefined &&
@@ -722,7 +846,7 @@ export async function requireWritablePage(
     includeDeleted: true,
   });
   if (writable) {
-    if (ctx.viaSubagent === true && ctx.auth && isPrivatePage(writable.frontmatter)
+    if (ctx.viaSubagent === true && ctx.auth && isPrivatePage(writable)
       && await resolveExcludePrivatePages(ctx.engine, ctx.remote)) {
       throw new OperationError('permission_denied', `${operation}: this page is outside your write visibility.`);
     }
@@ -885,14 +1009,8 @@ export function stampEvidenceSafe(results: SearchResult[]): void {
   try { stampEvidence(results); } catch { /* non-fatal */ }
 }
 
-/**
- * #4039 — OpenAI deep-research contract: search results must carry an `id`
- * that the paired `fetch` tool round-trips. id = slug (what `fetch` — the
- * thin get_page adapter in ops/pages.ts — resolves). Additive stamp; every
- * other consumer of SearchResult ignores it.
- */
 export function stampDeepResearchIds(results: SearchResult[]): void {
-  for (const r of results) (r as SearchResult & { id?: string }).id = r.slug;
+  for (const r of results) (r as SearchResult & { id?: string }).id = encodeDeepResearchId(r.source_id, r.slug);
 }
 
 /** T4 — shared eval-capture for the `search` op (keyword-only + cheap-hybrid paths). */

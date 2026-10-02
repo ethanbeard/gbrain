@@ -12,6 +12,7 @@ export { MEMORY_VERBS_VERSION };
 // operations.ts is unchanged.
 
 import type { Operation } from './ops/contract.ts';
+import { withOutputRedaction } from './search/output-redaction.ts';
 
 // Re-exports: the full previously-exported foundation surface of this module.
 // The formerly file-private helpers (enforceSubagentSlugFence, slugUnderSubagentFence,
@@ -54,6 +55,7 @@ export {
 // contractual — docs/TOOL_CATALOG.md is generated from it).
 
 import { pagesOperations } from './ops/pages.ts';
+import { persistenceOperations } from './ops/persistence.ts';
 import { searchOperations } from './ops/search.ts';
 import { takesOperations } from './ops/takes.ts';
 import { tagsOperations } from './ops/tags.ts';
@@ -76,6 +78,7 @@ export { MANAGED_LINK_SOURCES } from './ops/links.ts';
 
 import { adminOperations } from './ops/admin.ts';
 import { skillsCatalogOperations } from './ops/skills-catalog.ts';
+import { brainMembershipOperations } from './ops/brain-membership.ts';
 import { syncStatusOperations } from './ops/sync-status.ts';
 import { rawDataOperations } from './ops/raw-data.ts';
 import { chunksOperations } from './ops/chunks.ts';
@@ -130,6 +133,7 @@ export const operations: Operation[] = [
   // Page CRUD (get_page, put_page, delete_page, list_pages + the v0.26.5
   // destructive-guard ops restore_page, purge_deleted_pages) — ops/pages.ts
   ...pagesOperations,
+  ...persistenceOperations,
   // Search (search, query) — ops/search.ts
   ...searchOperations,
   // v0.36 Phase 2: image-as-query (search_by_image) — ops/image.ts
@@ -147,6 +151,7 @@ export const operations: Operation[] = [
   // PR1: skill catalog over MCP (list_skills, get_skill, list_brain_skillpack,
   // advisor) + v0.41.19.0 get_status_snapshot — ops/skills-catalog.ts
   ...skillsCatalogOperations,
+  ...brainMembershipOperations,
   // Sync (sync_brain) — ops/sync-status.ts
   ...syncStatusOperations,
   // Raw data (put_raw_data, get_raw_data) — ops/raw-data.ts
@@ -240,7 +245,7 @@ const OP_AREAS: Record<string, string> = {
   put_raw_data: 'pages', get_raw_data: 'pages',
   fetch: 'pages', // #4039 deep-research read adapter (search/fetch pair)
   // search
-  search: 'search', query: 'search', search_by_image: 'search',
+  search: 'search', query: 'search', search_by_image: 'search', assemble_evidence: 'search',
   // tags
   add_tag: 'tags', remove_tag: 'tags', get_tags: 'tags',
   // links + graph
@@ -264,6 +269,10 @@ const OP_AREAS: Record<string, string> = {
   whoami: 'identity', get_brain_identity: 'identity',
   // skills
   list_skills: 'skills', get_skill: 'skills', list_brain_skillpack: 'skills',
+  get_skill_asset: 'skills', put_skill: 'skills', delete_skill: 'skills',
+  get_skill_policy: 'skills', set_skill_policy: 'skills', import_skill_proposal: 'skills',
+  get_skill_retention: 'skills', prune_skill_revisions: 'skills', retain_skill_revision: 'skills',
+  join_brain: 'skills', sync_brain_skills: 'skills', leave_brain: 'skills',
   // advisor
   advisor: 'advisor',
   // sources
@@ -314,6 +323,7 @@ for (const op of operations) {
   if (op.area === undefined && OP_AREAS[op.name] !== undefined) {
     op.area = OP_AREAS[op.name];
   }
+  op.handler = withOutputRedaction(op);
 }
 
 export const operationsByName = Object.fromEntries(

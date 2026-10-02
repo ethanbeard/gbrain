@@ -17,7 +17,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { hasDatabase, setupDB, teardownDB, getEngine } from './helpers.ts';
+import { hasDatabase, setupLegacyEmbeddingDB, teardownDB, getEngine } from './helpers.ts';
 import { withEnv } from '../helpers/with-env.ts';
 import { runExtractFacts } from '../../src/core/cycle/extract-facts.ts';
 // v0.40: per-source lock id replaces the legacy bare SYNC_LOCK_ID constant.
@@ -28,7 +28,7 @@ const describeMaybe = SKIP ? describe.skip : describe;
 
 beforeAll(async () => {
   if (SKIP) return;
-  await setupDB();
+  await setupLegacyEmbeddingDB();
 });
 
 afterAll(async () => {

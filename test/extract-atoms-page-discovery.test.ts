@@ -18,9 +18,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
-  runPhaseExtractAtoms,
   discoverExtractablePages,
 } from '../src/core/cycle/extract-atoms.ts';
+import { runPhaseWithStoredPageFixtures as runPhaseExtractAtoms } from './helpers/extract-atoms-page-fixtures.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChatOpts, ChatResult } from '../src/core/ai/gateway.ts';
 
@@ -547,12 +547,12 @@ describe('#2144: zero-yield tombstone', () => {
     expect(result.details?.pages_processed).toBe(1);
     expect(result.details?.atoms_extracted).toBe(0);
 
-    // Stamp landed: atoms_scan_hash = first 16 chars of the page's content_hash.
     const rows = await engine.executeRaw<{ scan: string; ch: string }>(
-      `SELECT frontmatter->>'atoms_scan_hash' AS scan, content_hash AS ch
-         FROM pages WHERE slug = 'article/zero-yield'`,
+      `SELECT scan.content_hash AS scan, p.content_hash AS ch
+         FROM pages p JOIN extract_atoms_page_state scan ON scan.page_id=p.id
+         WHERE p.slug = 'article/zero-yield' AND scan.tombstoned`,
     );
-    expect(rows[0].scan).toBe(rows[0].ch.slice(0, 16));
+    expect(rows[0].scan).toBe(rows[0].ch);
 
     // No longer rediscovered.
     const discovered = await discoverExtractablePages(engine, 'default');
@@ -578,7 +578,8 @@ describe('#2144: zero-yield tombstone', () => {
     const failingChat = async (_o: ChatOpts): Promise<ChatResult> => { throw new Error('rate limit'); };
     await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: failingChat as never });
     const rows = await engine.executeRaw<{ scan: string | null }>(
-      `SELECT frontmatter->>'atoms_scan_hash' AS scan FROM pages WHERE slug = 'article/transient-failure'`,
+      `SELECT scan.content_hash AS scan FROM pages p LEFT JOIN extract_atoms_page_state scan ON scan.page_id=p.id
+        WHERE p.slug = 'article/transient-failure'`,
     );
     expect(rows[0].scan).toBeNull();
     const discovered = await discoverExtractablePages(engine, 'default');
@@ -620,9 +621,9 @@ describe('local extract-atoms config knobs', () => {
     // Discovery honored the configured budget: 2 eligible pages, 1 processed.
     expect(result.details.pages_processed).toBe(1);
     expect(captured.length).toBe(1);
-    // Payload after the "Source: ...\n\n---\n\n" preamble is sliced to the
+    // Payload inside the <transcript> wrapper is sliced to the
     // configured max_source_chars (default would have been 50_000 → 2000 z's).
-    const body = captured[0].split('\n\n---\n\n')[1] ?? '';
+    const body = /<transcript>\n([\s\S]*)\n<\/transcript>/.exec(captured[0])?.[1] ?? '';
     expect(body).toBe('z'.repeat(600));
   }, 30_000);
 });
@@ -643,7 +644,7 @@ describe('local extract-atoms config knobs — invalid-value fallbacks', () => {
       sql: string,
       params?: unknown[],
     ) {
-      if (sql.includes('atoms_scan_hash') && sql.includes('LIMIT $4')) {
+      if (sql.includes('extract_atoms_page_state') && sql.includes('LIMIT $4')) {
         limitParam = Number((params ?? [])[3]);
       }
       return realExecute.call(this, sql as never, params as never);
@@ -694,7 +695,7 @@ describe('local extract-atoms config knobs — invalid-value fallbacks', () => {
     const captured: string[] = [];
     await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: capturingChat(captured) as never });
     expect(captured.length).toBe(1);
-    const body = captured[0].split('\n\n---\n\n')[1] ?? '';
+    const body = /<transcript>\n([\s\S]*)\n<\/transcript>/.exec(captured[0])?.[1] ?? '';
     expect(body).toBe('z'.repeat(2000)); // default 50_000 → no truncation
   }, 30_000);
 
@@ -704,7 +705,7 @@ describe('local extract-atoms config knobs — invalid-value fallbacks', () => {
     const captured: string[] = [];
     await runPhaseExtractAtoms(engine, { _transcripts: [], _chat: capturingChat(captured) as never });
     expect(captured.length).toBe(1);
-    const body = captured[0].split('\n\n---\n\n')[1] ?? '';
+    const body = /<transcript>\n([\s\S]*)\n<\/transcript>/.exec(captured[0])?.[1] ?? '';
     expect(body).toBe('z'.repeat(500));
   }, 30_000);
 });

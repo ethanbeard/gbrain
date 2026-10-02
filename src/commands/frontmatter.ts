@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
 /**
  * gbrain frontmatter — Frontmatter validation, audit, and auto-repair.
  *
@@ -206,6 +207,7 @@ async function runValidate(rest: string[]): Promise<void> {
 
   const brainRoot = findBrainRoot(resolved);
   const files = collectFiles(resolved);
+  if (flags.fix && !flags.dryRun) for (const file of files) assertManagedFilesystemWrite(file);
   const results: FileValidation[] = [];
   const backupRunId = makeFrontmatterBackupRunId();
 
@@ -214,7 +216,8 @@ async function runValidate(rest: string[]): Promise<void> {
     const rel = relative(brainRoot, file);
     // Files above/outside the brain root fall back to basename rather than
     // emitting a "../"-prefixed slug for non-brain files.
-    const expectedSlug = slugifyPath(rel && !rel.startsWith('..') ? rel : basename(file));
+    const slugPath = rel && !rel.startsWith('..') ? rel : basename(file);
+    const expectedSlug = slugifyPath(slugPath);
     const parsed = parseMarkdown(content, file, { validate: true, expectedSlug });
     const errs = parsed.errors ?? [];
     const result: FileValidation = {
@@ -223,9 +226,12 @@ async function runValidate(rest: string[]): Promise<void> {
     };
 
     if (flags.fix && errs.length > 0) {
-      const { content: fixed, fixes } = autoFixFrontmatter(content, { filePath: file });
+      // #5053: the fixer derives the slug from the same path validate used;
+      // the absolute path re-keyed every declared slug as a mismatch.
+      const { content: fixed, fixes } = autoFixFrontmatter(content, { filePath: slugPath });
       result.fixesApplied = fixes;
       if (fixes.length > 0 && !flags.dryRun) {
+        assertManagedFilesystemWrite(file);
         result.backupPath = createFrontmatterBackup(file, { sourcePath: resolved, runId: backupRunId });
         writeFileSync(file, fixed, 'utf8');
       }
@@ -506,6 +512,7 @@ async function runGenerate(args: string[]): Promise<void> {
       const newContent = fm + '\n' + content;
       // Safety: write a centralized backup first.
       createFrontmatterBackup(absPath, { sourcePath: brainRoot, runId: backupRunId });
+      assertManagedFilesystemWrite(absPath);
       writeFileSync(absPath, newContent, 'utf-8');
       written++;
     }

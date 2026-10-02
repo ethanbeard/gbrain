@@ -13,7 +13,15 @@
  */
 
 import { VERSION } from '../version.ts';
+import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig } from '../core/config.ts';
+import { PgliteBusyError } from '../core/pglite-lock.ts';
+import {
+  acquireMigrationOrchestrationLock,
+  MIGRATIONS_RUNNING_EXIT_CODE,
+  MigrationsRunningError,
+  type MigrationOrchestrationLock,
+} from '../core/migration-orchestration-lock.ts';
 import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
 import {
@@ -25,6 +33,8 @@ import {
 interface ApplyMigrationsArgs {
   list: boolean;
   dryRun: boolean;
+  json: boolean;
+  dbOnlyExport?: OrchestratorOpts['dbOnlyExport'];
   yes: boolean;
   nonInteractive: boolean;
   mode?: 'always' | 'pain_triggered' | 'off';
@@ -56,6 +66,11 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
     return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
   };
   const mode = val('--mode') as ApplyMigrationsArgs['mode'];
+  const exporting = has('--export-db-only');
+  if (exporting && !val('--content-root') || has('--backup-confirmed') && has('--acknowledge-no-backup')) {
+    console.error('DB-only export requires --content-root and exactly one explicit backup choice for a non-dry run.');
+    process.exit(2);
+  }
   if (mode && !['always', 'pain_triggered', 'off'].includes(mode)) {
     console.error(`Invalid --mode "${mode}". Allowed: always, pain_triggered, off.`);
     process.exit(2);
@@ -63,12 +78,16 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
   return {
     list: has('--list'),
     dryRun: has('--dry-run'),
+    json: has('--json'),
+    dbOnlyExport: exporting ? { root: val('--content-root')!, sourceId: val('--export-source') ?? 'default',
+      confirmQuiesced: has('--confirm-quiesced'),
+      backup: has('--backup-confirmed') ? 'operator_verified' : has('--acknowledge-no-backup') ? 'acknowledged_unprotected' : undefined } : undefined,
     yes: has('--yes'),
     nonInteractive: has('--non-interactive'),
     mode,
     specificMigration: val('--migration'),
     hostDir: val('--host-dir'),
-    noAutopilotInstall: has('--no-autopilot-install'),
+    noAutopilotInstall: has('--no-autopilot-install') || process.env.GBRAIN_NO_AUTOPILOT_INSTALL === '1',
     forceRetry: val('--force-retry'),
     forceOrchestrator: has('--force-orchestrator'),
     forceSchema: has('--force-schema'),
@@ -86,6 +105,14 @@ Usage:
   gbrain apply-migrations                Run all pending migrations interactively.
   gbrain apply-migrations --yes          Non-interactive; uses default mode (pain_triggered).
   gbrain apply-migrations --dry-run      Print the plan; take no action.
+  gbrain apply-migrations --dry-run --json
+                                        Include read-only content inventories and conflicts.
+  gbrain apply-migrations --migration 0.53.0 --export-db-only --content-root <path>
+    [--export-source <id>] --dry-run --json
+                                        Preview a lossless host-side DB-only content export.
+    --confirm-quiesced                   Attest old writers and skill servers are stopped.
+    --backup-confirmed                   Attest an operational backup was verified by you.
+    --acknowledge-no-backup               Explicitly proceed without a verified backup.
   gbrain apply-migrations --list         Show applied + pending migrations.
   gbrain apply-migrations --migration vX.Y.Z
                                          Force-run a specific migration by version.
@@ -112,6 +139,7 @@ Flags:
   --host-dir <path>                      Include this directory in host-file walk
                                          (default scope: \$HOME/.claude + \$HOME/.openclaw).
   --no-autopilot-install                 Skip the Phase F autopilot install step.
+                                         Also: GBRAIN_NO_AUTOPILOT_INSTALL=1.
   --non-interactive                      Equivalent to --yes; never prompt.
 
 Exit codes:
@@ -297,6 +325,7 @@ function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
     dryRun: cli.dryRun,
     hostDir: cli.hostDir,
     noAutopilotInstall: cli.noAutopilotInstall,
+    dbOnlyExport: cli.dbOnlyExport,
   };
 }
 
@@ -314,12 +343,74 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // before the user has run `gbrain init`). No config = no brain = nothing
   // to migrate. Exit silently for --yes / --non-interactive so postinstall
   // stays quiet; mention the init step when invoked interactively.
-  if (!loadConfig()) {
-    if (cli.list) console.log('No brain configured. Run `gbrain init` to set one up.');
+  const config = loadConfig();
+  if (!config) {
+    if (cli.dryRun && cli.json) console.log(JSON.stringify({ status: 'unconfigured', previews: [] }));
+    else if (cli.list) console.log('No brain configured. Run `gbrain init` to set one up.');
     else if (cli.dryRun) console.log('No brain configured (run `gbrain init` first). Nothing to migrate.');
     return;
   }
 
+  if (cli.dryRun && (cli.forceRetry || cli.forceOrchestrator || cli.forceSchema || cli.forceAll)) {
+    if (cli.forceRetry) {
+      if (!migrations.some(m => m.version === cli.forceRetry)) {
+        console.error(`No migration registered with version "${cli.forceRetry}". Run \`gbrain apply-migrations --list\`.`);
+        process.exit(2);
+      }
+      console.log(`[dry-run] Would write a 'retry' marker for v${cli.forceRetry}. No ledger or database changes made.`);
+      return;
+    }
+    if (cli.forceOrchestrator || cli.forceAll) {
+      console.log("[dry-run] Would write 'retry' markers for wedged orchestrator migrations. No ledger changes made.");
+      if (!cli.forceAll) return;
+    }
+    if (cli.forceSchema || cli.forceAll) {
+      console.log('[dry-run] Would run schema migrations from current config.version. Database not opened; no schema changes made.');
+    }
+    return;
+  }
+
+  // #5693: one runner orchestrates at a time. --list and --dry-run are
+  // read-only and never take the lock.
+  const held: { lock: MigrationOrchestrationLock | null } = { lock: null };
+  const holdLock = async (): Promise<void> => {
+    if (cli.list || cli.dryRun) return;
+    if (held.lock) { await held.lock.assertHeld(); return; }
+    held.lock = await acquireMigrationOrchestrationLock(config);
+  };
+  let exitCode: number | undefined;
+  try {
+    await holdLock();
+    exitCode = await runLockedMigrations(cli, installed, holdLock, () => held.lock !== null);
+  } catch (error) {
+    if (!(error instanceof MigrationsRunningError)) throw error;
+    console.error(`apply-migrations refused: ${error.message}`);
+    exitCode = MIGRATIONS_RUNNING_EXIT_CODE;
+  } finally {
+    await held.lock?.release();
+  }
+  if (exitCode !== undefined) process.exit(exitCode);
+}
+
+/**
+ * Everything that mutates the ledger or the database runs here, under the
+ * orchestration lock. Returns the process exit status instead of exiting so
+ * the caller releases the lock first.
+ */
+async function runLockedMigrations(
+  cli: ReturnType<typeof parseArgs>,
+  installed: string,
+  holdLock: () => Promise<void>,
+  hasLock: () => boolean,
+): Promise<number | undefined> {
+  // Without the orchestration lease (a schema too old for it), schema work goes
+  // through initSchema(), which serializes on the schema lock.
+  const migrateSchema = async (eng: BrainEngine, from: number): Promise<{ applied: number; current: number }> => {
+    if (hasLock()) { const { runMigrations } = await import('../core/migrate.ts'); return runMigrations(eng); }
+    await eng.initSchema();
+    const current = parseInt(await eng.getConfig('version') || String(from), 10);
+    return { applied: Math.max(0, current - from), current };
+  };
   // Bug 3 — --force-retry: write an explicit reset marker for a wedged
   // migration, then return. User re-runs `gbrain apply-migrations --yes`
   // to actually re-attempt.
@@ -327,7 +418,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     const target = migrations.find(m => m.version === cli.forceRetry);
     if (!target) {
       console.error(`No migration registered with version "${cli.forceRetry}". Run \`gbrain apply-migrations --list\`.`);
-      process.exit(2);
+      return 2;
     }
     appendCompletedMigration({ version: cli.forceRetry, status: 'retry' });
     console.log(`Wrote 'retry' marker for v${cli.forceRetry}. Run \`gbrain apply-migrations --yes\` to re-attempt.`);
@@ -363,23 +454,22 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // recovery path.
   if (cli.forceSchema || cli.forceAll) {
     try {
-      const { runMigrations } = await import('../core/migrate.ts');
       const { loadConfig: lc, toEngineConfig } = await import('../core/config.ts');
       const { createEngine } = await import('../core/engine-factory.ts');
       const cfg = lc();
       if (!cfg) {
         console.error('No brain configured for --force-schema.');
-        process.exit(2);
+        return 2;
       }
       const eng = await createEngine(toEngineConfig(cfg));
       await eng.connect(toEngineConfig(cfg));
       console.log('Running schema migrations from current config.version...');
-      const result = await runMigrations(eng);
+      const result = await migrateSchema(eng, parseInt(await eng.getConfig('version') || '1', 10));
       console.log(`Applied ${result.applied} schema migration(s); now at v${result.current}.`);
       await eng.disconnect();
     } catch (err) {
       console.error(`--force-schema failed: ${(err as Error).message}`);
-      process.exit(1);
+      return 1;
     }
     if (cli.forceSchema && !cli.forceAll) return;
     if (cli.forceAll) return; // both surfaces flushed
@@ -415,14 +505,13 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
         const verStr = await eng.getConfig('version');
         const schemaVer = parseInt(verStr || '1', 10);
         dbProbe = { status: 'connected', schemaVer, latest: LATEST_VERSION };
-        const { runMigrations } = await import('../core/migrate.ts');
         schemaBehind = await resolveSchemaBehind({
           schemaVer,
           latest: LATEST_VERSION,
           // --list and --dry-run are read-only surfaces: never mutate schema
           // even when combined with --yes/--non-interactive.
           autoApply: (cli.yes || cli.nonInteractive) && !cli.dryRun && !cli.list,
-          run: () => runMigrations(eng),
+          run: () => migrateSchema(eng, schemaVer),
         });
         await eng.disconnect();
       }
@@ -459,31 +548,52 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 
   if (cli.specificMigration && plan.applied.length + plan.partial.length + plan.pending.length + plan.skippedFuture.length === 0) {
     console.error(`No migration registered with version "${cli.specificMigration}". Run \`gbrain apply-migrations --list\` to see registered versions.`);
-    process.exit(2);
+    return 2;
   }
 
   // #4364: --require-db turns an unreachable DB into a hard failure instead
   // of a filesystem-only plan that renders identically to a clean database.
   const listExit = cli.requireDb && dbProbe.status === 'unreachable' ? 1 : 0;
-  if (cli.list) { printList(plan, installed, dbProbe); process.exit(listExit); }
-  if (cli.dryRun) { printDryRun(plan, installed, dbProbe); process.exit(listExit); }
+  if (cli.list) { printList(plan, installed, dbProbe); return listExit; }
+  if (cli.dryRun) {
+    const previews: Array<{ version: string; preview?: unknown; error?: string }> = [];
+    for (const migration of [...plan.applied, ...plan.partial, ...plan.pending, ...plan.wedged]) {
+      if (!migration.preview) continue;
+      try { previews.push({ version: migration.version, preview: await migration.preview(orchestratorOptsFrom(cli)) }); }
+      catch (error) { previews.push({ version: migration.version, error: error instanceof Error ? error.message : 'Inventory unavailable.' }); }
+    }
+    if (cli.json) console.log(JSON.stringify({ installed, database: dbProbe, plan: Object.fromEntries(Object.entries(plan).map(([state, entries]) => [state, entries.map((migration: Migration) => migration.version)])), previews }));
+    else {
+      printDryRun(plan, installed, dbProbe);
+      for (const preview of previews) console.log(JSON.stringify(preview));
+    }
+    return listExit || (previews.some(preview => preview.error) ? 1 : 0);
+  }
   if (cli.requireDb && dbProbe.status === 'unreachable') {
     console.error(formatDbProbeLine(dbProbe));
     console.error('--require-db: database is unreachable; aborting before orchestrators run.');
-    process.exit(1);
+    return 1;
   }
 
-  const toRun: Migration[] = [...plan.partial, ...plan.pending];
+  // A Postgres schema without gbrain_cycle_locks had no lease yet; the
+  // preflight above created the table, so take the lease before orchestrating.
+  await holdLock();
+
+  const toRun: Migration[] = [...plan.partial, ...plan.pending, ...plan.applied.filter(migration => migration.reconcile)]
+    .sort((left, right) => compareVersions(left.version, right.version));
   if (toRun.length === 0) {
     if (schemaBehind) {
       console.error(
         'Orchestrator migrations are up to date, but schema migrations are behind. ' +
         'Run `gbrain apply-migrations --yes` (or `--force-schema`) to apply them.',
       );
-      process.exit(1);
+      return 1;
     }
     console.log('All migrations up to date.');
-    process.exit(0);
+    return 0;
+  }
+  if (!schemaBehind && plan.pending.length === 0 && plan.partial.length === 0) {
+    console.log('All migrations up to date. This covers orchestrator checkpoints only; host publication and client activation are being rechecked.');
   }
 
   // Run each orchestrator in registry order. An orchestrator failure aborts
@@ -496,11 +606,16 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // ledger drop was the root cause of the original infinite-retry symptom).
   let failed = false;
   for (const m of toRun) {
+    // A lease lost while an earlier orchestrator ran stops the chain here.
+    await holdLock();
+    const recordCheckpoint = !m.reconcile || !plan.applied.includes(m);
     console.log(`\n=== Applying migration v${m.version}: ${m.featurePitch.headline} ===`);
     try {
       const result = await m.orchestrator(orchestratorOptsFrom(cli));
-      if (result.status === 'failed') {
-        console.error(`Migration v${m.version} reported status=failed.`);
+      if (result.status === 'failed' || result.phases.some(p => p.status === 'failed')) {
+        console.error(result.status === 'failed'
+          ? `Migration v${m.version} reported status=failed.`
+          : `Migration v${m.version} has failed phases (reported status=${result.status}); recording as partial.`);
         // Surface each failed phase's detail — the ledger records it, but
         // the operator needs it on stderr to act (#921).
         for (const p of result.phases) {
@@ -511,7 +626,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
         // Record the attempt as 'partial' (not 'complete') so the cap counts
         // it. Don't let a failed orchestrator look like it never ran.
         try {
-          appendCompletedMigration({
+          if (recordCheckpoint) appendCompletedMigration({
             version: m.version,
             status: 'partial',
             phases: result.phases,
@@ -531,7 +646,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       // the last entry for this version is already 'complete' (idempotency
       // guard), so repeated clean runs don't spam the ledger.
       try {
-        appendCompletedMigration({
+        if (recordCheckpoint) appendCompletedMigration({
           version: m.version,
           status: result.status, // 'complete' | 'partial'
           phases: result.phases,
@@ -549,22 +664,25 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 
       if (result.status === 'partial') {
         console.log(`Migration v${m.version} finished as PARTIAL. Re-run \`gbrain apply-migrations --yes\` after resolving any pending host-work items.`);
+      } else if (m.reconcile && result.pending_host_work) {
+        console.log(`Migration v${m.version} mechanical checks complete; host publication or client actions remain pending.`);
       } else {
         console.log(`Migration v${m.version} complete.`);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`Migration v${m.version} threw: ${msg}`);
+      if (e instanceof PgliteBusyError) throw e;
       // Same partial-on-throw treatment so the cap counts runaway failures.
       try {
-        appendCompletedMigration({ version: m.version, status: 'partial' });
+        if (recordCheckpoint) appendCompletedMigration({ version: m.version, status: 'partial' });
       } catch { /* swallow ledger-write failure on throw path */ }
       failed = true;
       break;
     }
   }
 
-  if (failed) process.exit(1);
+  return failed ? 1 : undefined;
 }
 
 /** Exported for unit tests only. Do not use from production code. */

@@ -1,8 +1,9 @@
 /**
  * Atomic file write for brain-repo markdown writers.
  *
- * Write path: unique tmp sibling → write → fsync → close → (optional verify
- * of the on-disk bytes) → chmod to the original mode → rename over the target.
+ * Write path: unique tmp sibling opened with the requested (or the target's
+ * original) mode and fchmod-ed to it → write → fsync → close → (optional
+ * verify of the on-disk bytes) → rename over the target.
  * The rename is atomic on POSIX filesystems, so readers never observe a torn
  * file; a crash mid-write leaves only a tmp sibling, never a corrupt target.
  *
@@ -17,10 +18,14 @@
  */
 
 import {
-  chmodSync,
   closeSync,
+  constants,
   existsSync,
+  fchmodSync,
   fsyncSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
@@ -28,10 +33,17 @@ import {
   unlinkSync,
   writeSync,
 } from 'fs';
-import { randomBytes } from 'crypto';
-import { dirname } from 'path';
+import { randomBytes, randomUUID } from 'crypto';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'path';
+import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
 
 export interface AtomicWriteOpts {
+  /** Preallocated by a durable recovery journal before any filesystem sink. */
+  stagingPath?: string;
+  /** Synchronous boundary after the staging file is flushed and closed. */
+  afterStagingFlush?: () => void;
+  /** Required by journaled publication: real directory durability errors propagate. */
+  durable?: boolean;
   /**
    * Called with the bytes read back from the tmp file BEFORE the rename.
    * Throw to abort the write — the tmp file is removed and the target is
@@ -39,13 +51,78 @@ export interface AtomicWriteOpts {
    * still parses (backlinks uses parseMarkdown here).
    */
   verify?: (onDisk: string) => void;
+  /**
+   * Exact permission bits for the written file. The stage is opened with this
+   * mode and then fchmod-ed on its descriptor past the umask before any byte is
+   * written, so content never sits in a looser file; a rewrite reasserts it over
+   * the existing target's mode. Omitted: preserve the existing target's mode,
+   * else 0644 & ~umask.
+   */
+  mode?: number;
 }
 
-export function atomicWriteFileSync(filePath: string, content: string, opts?: AtomicWriteOpts): void {
-  const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+function createPrivateDir(dir: string): void {
+  try {
+    mkdirSync(dir, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return;
+    throw error;
+  }
+  if (process.platform === 'win32') return;
+  const fd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fchmodSync(fd, 0o700); } finally { closeSync(fd); }
+}
+
+/**
+ * Create `dir` for gbrain-private files. A missing `root` is created with
+ * default-permission ancestors and only `root` itself made exactly 0700 (past
+ * the umask); each missing directory between `root` and `dir` is gbrain's own
+ * layout and is created 0700 too. A directory that already exists, which may
+ * be one the user chose, is never chmod-ed.
+ */
+export function mkdirPrivate(dir: string, root: string = dir): void {
+  if (existsSync(dir)) return;
+  const below = relative(root, dir);
+  if (below === '..' || below.startsWith(`..${sep}`) || isAbsolute(below)) throw new Error(`mkdirPrivate: ${dir} is outside ${root}`);
+  if (!existsSync(root)) {
+    mkdirSync(dirname(root), { recursive: true });
+    createPrivateDir(root);
+  }
+  let current = root;
+  for (const part of below ? below.split(sep) : []) {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `below` is relative(root, dir), rejected above when it escapes root; parts walk only between root and dir.
+    current = join(current, part);
+    createPrivateDir(current);
+  }
+}
+
+export function atomicStagingPath(filePath: string): string {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- internal name allocation only; coordinator checks owner-root containment before staging and publication.
+  return `${resolve(filePath)}.tmp.${randomUUID()}`;
+}
+
+export function validateAtomicStagingPath(filePath: string, stagingPath: string): void {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- normalization for the exact sibling check below; callers authorize and confine the target before filesystem use.
+  const target = resolve(filePath);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- normalized only to reject non-sibling stages below; recovery also checks symlink-aware root containment before file access.
+  const staged = resolve(stagingPath);
+  if (dirname(target) !== dirname(staged) || !staged.startsWith(`${target}.tmp.`)
+    || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(staged.slice(target.length + 5))) {
+    throw new Error('atomic-write: invalid journaled staging path');
+  }
+}
+
+export function atomicWriteFileSync(filePath: string, content: string | Uint8Array, opts?: AtomicWriteOpts): void {
+  assertManagedFilesystemWrite(filePath);
+  if (opts?.stagingPath) validateAtomicStagingPath(filePath, opts.stagingPath);
+  const tmpPath = opts?.stagingPath ?? `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+  const buf = typeof content === 'string' ? Buffer.from(content, 'utf-8') : Buffer.from(content);
+  let created: ReturnType<typeof fstatSync> | undefined;
 
   // Preserve the target's mode across the rename (a fresh tmp file gets the
-  // process umask, which can silently drop e.g. group-write bits).
+  // process umask, which can silently drop e.g. group-write bits). open(2)'s
+  // mode argument is masked by the umask, so the descriptor is fchmod-ed to
+  // the exact mode; a path chmod could follow a swapped stage.
   let mode: number | null = null;
   try {
     if (existsSync(filePath)) mode = statSync(filePath).mode & 0o7777;
@@ -53,14 +130,16 @@ export function atomicWriteFileSync(filePath: string, content: string, opts?: At
     /* stat raced a delete — fall through with default mode */
   }
 
+  const finalMode = opts?.mode ?? mode;
   try {
-    const fd = openSync(tmpPath, 'w', mode ?? 0o644);
+    const fd = openSync(tmpPath, 'wx', finalMode ?? 0o644);
     try {
+      if (finalMode !== null) fchmodSync(fd, finalMode);
+      created = fstatSync(fd);
       // Loop until every byte lands: writeSync may legally return a short
       // count under disk pressure/quotas, and a silent short write that
       // truncates AFTER valid frontmatter would pass a frontmatter-only
       // verifier and atomically install truncated content.
-      const buf = Buffer.from(content, 'utf-8');
       let off = 0;
       while (off < buf.length) {
         const n = writeSync(fd, buf, off, buf.length - off);
@@ -71,11 +150,7 @@ export function atomicWriteFileSync(filePath: string, content: string, opts?: At
     } finally {
       closeSync(fd);
     }
-    // open(2)'s mode argument is masked by the process umask (0664 & ~022 →
-    // 0644), so an explicit chmod is required to actually PRESERVE the
-    // target's mode across the rename — the pre-wave in-place write kept the
-    // inode's mode exactly; this keeps that property.
-    if (mode !== null) chmodSync(tmpPath, mode);
+    opts?.afterStagingFlush?.();
     if (opts?.verify) {
       opts.verify(readFileSync(tmpPath, 'utf-8'));
     }
@@ -87,12 +162,20 @@ export function atomicWriteFileSync(filePath: string, content: string, opts?: At
     try {
       const dfd = openSync(dirname(filePath), 'r');
       try { fsyncSync(dfd); } finally { closeSync(dfd); }
-    } catch {
-      /* best-effort */
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (opts?.durable && !(process.platform === 'win32' && ['EISDIR', 'EPERM', 'EINVAL', 'ENOTSUP'].includes(code ?? ''))) throw error;
     }
   } catch (err) {
     try {
-      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+      // A failed exclusive create owns nothing. A callback or another process
+      // may also have replaced/changed our stage; never remove those bytes.
+      const current = created ? lstatSync(tmpPath) : undefined;
+      if (created && current?.isFile() && current.dev === created.dev && current.ino === created.ino
+        && current.birthtimeMs === created.birthtimeMs && current.size <= buf.length) {
+        const attempted = readFileSync(tmpPath);
+        if (attempted.equals(buf.subarray(0, attempted.length))) unlinkSync(tmpPath);
+      }
     } catch {
       /* best-effort cleanup */
     }

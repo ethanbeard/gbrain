@@ -16,11 +16,11 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
-  runPhaseExtractAtoms,
   discoverExtractablePages,
   parseAtomsOutcome,
   MAX_DETERMINISTIC_FAILURES,
 } from '../src/core/cycle/extract-atoms.ts';
+import { runPhaseWithStoredPageFixtures as runPhaseExtractAtoms } from './helpers/extract-atoms-page-fixtures.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChatResult, ChatOpts } from '../src/core/ai/gateway.ts';
 
@@ -74,6 +74,14 @@ async function frontmatterOf(slug: string): Promise<Record<string, unknown>> {
   return typeof fm === 'string' ? JSON.parse(fm) : fm;
 }
 
+async function stateOf(slug: string) {
+  const [row] = await engine.executeRaw<{ fail_count: number; content_hash: string; tombstoned: boolean }>(
+    `SELECT scan.* FROM extract_atoms_page_state scan JOIN pages p ON p.id=scan.page_id
+      JOIN sources s ON s.id=p.source_id AND s.incarnation=scan.source_incarnation
+      WHERE p.source_id='default' AND p.slug=$1 AND scan.content_hash=p.content_hash`, [slug]);
+  return row;
+}
+
 describe('parseAtomsOutcome — typed parse (gbrain#4148)', () => {
   test('malformed shapes are ok:false, never an empty success', () => {
     expect(parseAtomsOutcome('sorry, I cannot help with that')).toEqual({ ok: false, reason: 'no JSON array in response' });
@@ -112,7 +120,7 @@ describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
     // and the trailing prose from the sent prompt entirely.
     expect(capturedPrompt).not.toContain('trailing prose');
     expect(capturedPrompt).toContain('a'.repeat(49_999));
-    expect(capturedPrompt.length).toBe(`Source: note/surrogate-boundary\n\n---\n\n${'a'.repeat(49_999)}`.length);
+    expect(/<transcript>\n([\s\S]*)\n<\/transcript>/.exec(capturedPrompt)?.[1]).toBe('a'.repeat(49_999));
   });
 
   test('malformed output is a counted failure, NOT a zero-yield tombstone', async () => {
@@ -128,8 +136,11 @@ describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
     expect(result.details.pages_processed).toBe(0);
     const fm = await frontmatterOf('note/m1');
     expect(fm.atoms_scan_hash).toBeUndefined(); // the pre-fix bug: this was stamped
-    expect(Number(fm.atoms_fail_count)).toBe(1);
-    expect(fm.atoms_fail_hash).toBe(HASH_A);
+    expect(fm.atoms_fail_count).toBeUndefined();
+    expect(fm.atoms_fail_hash).toBeUndefined();
+    expect((await stateOf('note/m1'))?.fail_count).toBe(1);
+    expect((await stateOf('note/m1'))?.content_hash).toBe(HASH_A);
+    expect((await stateOf('note/m1'))?.tombstoned).toBe(false);
   });
 
   test(`tombstones only after ${MAX_DETERMINISTIC_FAILURES} consecutive same-content malformed failures`, async () => {
@@ -144,14 +155,18 @@ describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
       const r = await runPhaseExtractAtoms(engine, opts);
       expect(r.details.tombstoned_for_failures).toEqual([]);
       const fm = await frontmatterOf('note/m2');
-      expect(Number(fm.atoms_fail_count)).toBe(i);
+      expect((await stateOf('note/m2'))?.fail_count).toBe(i);
+      expect((await stateOf('note/m2'))?.tombstoned).toBe(false);
+      expect(fm.atoms_fail_count).toBeUndefined();
       expect(fm.atoms_scan_hash).toBeUndefined();
     }
     const final = await runPhaseExtractAtoms(engine, opts);
     expect(final.details.tombstoned_for_failures).toEqual(['note/m2']);
     const fm = await frontmatterOf('note/m2');
-    expect(Number(fm.atoms_fail_count)).toBe(MAX_DETERMINISTIC_FAILURES);
-    expect(fm.atoms_scan_hash).toBe(HASH_A); // backlog floor clears
+    expect((await stateOf('note/m2'))?.fail_count).toBe(MAX_DETERMINISTIC_FAILURES);
+    expect((await stateOf('note/m2'))?.content_hash).toBe(HASH_A);
+    expect((await stateOf('note/m2'))?.tombstoned).toBe(true);
+    expect(fm.atoms_scan_hash).toBeUndefined();
   });
 
   test('a content edit resets the failure streak (count is hash-keyed)', async () => {
@@ -164,11 +179,13 @@ describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
     });
     await runPhaseExtractAtoms(engine, mk(HASH_A));
     await runPhaseExtractAtoms(engine, mk(HASH_A));
-    expect(Number((await frontmatterOf('note/m3')).atoms_fail_count)).toBe(2);
+    expect((await stateOf('note/m3'))?.fail_count).toBe(2);
     await runPhaseExtractAtoms(engine, mk('b'.repeat(16))); // edited content
     const fm = await frontmatterOf('note/m3');
-    expect(Number(fm.atoms_fail_count)).toBe(1);
-    expect(fm.atoms_fail_hash).toBe('b'.repeat(16));
+    expect((await stateOf('note/m3'))?.fail_count).toBe(1);
+    expect((await stateOf('note/m3'))?.content_hash).toBe('b'.repeat(16));
+    expect(fm.atoms_fail_count).toBeUndefined();
+    expect(fm.atoms_fail_hash).toBeUndefined();
   });
 
   test('transient provider errors are retryable: no count, no tombstone', async () => {
@@ -184,6 +201,7 @@ describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
     const fm = await frontmatterOf('note/t1');
     expect(fm.atoms_fail_count).toBeUndefined();
     expect(fm.atoms_scan_hash).toBeUndefined();
+    expect(await stateOf('note/t1')).toBeUndefined();
   });
 });
 
@@ -220,6 +238,7 @@ describe('runPhaseExtractAtoms — global-error halt (#3044)', () => {
       const fm = await frontmatterOf(slug);
       expect(fm.atoms_fail_count).toBeUndefined();
       expect(fm.atoms_scan_hash).toBeUndefined();
+      expect(await stateOf(slug)).toBeUndefined();
     }
   });
 
@@ -242,6 +261,7 @@ describe('runPhaseExtractAtoms — global-error halt (#3044)', () => {
     expect(failures[2].error).toContain('3 consecutive rate_limit errors');
     for (const slug of ['note/r1', 'note/r2', 'note/r3', 'note/r4']) {
       expect((await frontmatterOf(slug)).atoms_fail_count).toBeUndefined();
+      expect(await stateOf(slug)).toBeUndefined();
     }
   });
 
@@ -377,7 +397,9 @@ describe('runPhaseExtractAtoms — completion receipt (gbrain#4148)', () => {
     const afm = typeof atoms[0].frontmatter === 'string' ? JSON.parse(atoms[0].frontmatter) : atoms[0].frontmatter;
     expect(afm.source_hash).toBe(HASH_A); // flipped, not pending:
     expect(String(afm.source_hash)).not.toContain('pending');
-    expect((await frontmatterOf('note/ok1')).atoms_scan_hash).toBe(HASH_A);
+    expect((await stateOf('note/ok1'))?.content_hash).toBe(HASH_A);
+    expect((await stateOf('note/ok1'))?.tombstoned).toBe(true);
+    expect((await frontmatterOf('note/ok1')).atoms_scan_hash).toBeUndefined();
   });
 
   test('a pending (partial-persist) atom row does NOT mark the source page done for discovery', async () => {
@@ -412,5 +434,78 @@ describe('runPhaseExtractAtoms — completion receipt (gbrain#4148)', () => {
     );
     const done = await discoverExtractablePages(engine, 'default');
     expect(done.map(p => p.slug)).not.toContain('meetings/2026-04-03');
+  });
+});
+
+// #5809 / #5832: the drain's hard signal (job timeout/cancel, cycle-lock lease
+// loss, job deadline) reaches the in-flight model call and stops the run
+// before the next commit; the interrupted page takes no strike and nothing is
+// written after the stop (no atoms, no scan state, no rollup row). The soft
+// signal (drain window) lets the page in flight finish and commit, then stops
+// before the next page, booked as an expected limit.
+describe('runPhaseExtractAtoms — hard and soft stops (#5809)', () => {
+  const mkPages = (slugs: string[]) =>
+    slugs.map((slug, i) => ({ slug, content: 'prose', contentHash: String(i + 1).repeat(16) }));
+  const atomPages = async () =>
+    Number((await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM pages WHERE type = 'atom'`))[0].n);
+  const rollup = async () => (await engine.executeRaw<{ round_completed_count: number; expected_limit_count: number; halt_count: number }>(
+    `SELECT round_completed_count, expected_limit_count, halt_count FROM extract_rollup_7d WHERE kind = 'atoms' AND source_id = 'default'`,
+  ))[0];
+
+  test.each([
+    { callOutcome: 'throws', pacingMs: null },
+    { callOutcome: 'still answers', pacingMs: null },
+    { callOutcome: 'still answers under per-item pacing', pacingMs: '60000' },
+  ])('a hard abort while the model call $callOutcome commits nothing and strikes nothing', async ({ callOutcome, pacingMs }) => {
+    if (pacingMs) await engine.setConfig('cycle.extract_atoms.pacing_ms', pacingMs);
+    await seedPage('note/ab1');
+    await seedPage('note/ab2');
+    const controller = new AbortController();
+    const callSignals: Array<AbortSignal | undefined> = [];
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default',
+      _transcripts: [],
+      _pages: mkPages(['note/ab1', 'note/ab2']),
+      signal: controller.signal,
+      _chat: async (o: ChatOpts) => {
+        callSignals.push(o.abortSignal);
+        controller.abort(new Error('timeout'));
+        if (callOutcome === 'throws') throw new Error('claude-cli adapter aborted');
+        return okChatResult(ATOM_JSON);
+      },
+    }).finally(() => engine.unsetConfig('cycle.extract_atoms.pacing_ms'));
+    expect(callSignals).toEqual([controller.signal]);
+    expect(result.details.failures).toEqual([]);
+    expect(result.details.pages_processed).toBe(0);
+    expect(await atomPages()).toBe(0);
+    expect(await stateOf('note/ab1')).toBeUndefined();
+    expect(await stateOf('note/ab2')).toBeUndefined();
+    expect(await rollup()).toBeUndefined();
+  }, 20_000);
+
+  test('a soft stop during a page lets that page commit, then stops before the next one', async () => {
+    await seedPage('note/sf1');
+    await seedPage('note/sf2');
+    const hard = new AbortController();
+    const soft = new AbortController();
+    const calls: Array<boolean | undefined> = [];
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default',
+      _transcripts: [],
+      _pages: mkPages(['note/sf1', 'note/sf2']),
+      signal: hard.signal,
+      stopSignal: soft.signal,
+      _chat: async (o: ChatOpts) => {
+        soft.abort(new Error('window'));
+        calls.push(o.abortSignal?.aborted);
+        return okChatResult(ATOM_JSON);
+      },
+    });
+    expect(calls).toEqual([false]);
+    expect(result.details.pages_processed).toBe(1);
+    expect(result.details.atoms_extracted).toBe(1);
+    expect((await stateOf('note/sf1'))?.tombstoned).toBe(true);
+    expect(await stateOf('note/sf2')).toBeUndefined();
+    expect(await rollup()).toMatchObject({ round_completed_count: 0, expected_limit_count: 1, halt_count: 0 });
   });
 });

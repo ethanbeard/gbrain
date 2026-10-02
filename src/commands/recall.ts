@@ -34,9 +34,9 @@ import type { BrainEngine, FactRow, FactKind } from '../core/engine.ts';
 import { effectiveConfidence } from '../core/facts/decay.ts';
 import { resolveEntitySlug } from '../core/entities/resolve.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
-import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
+import { callRemoteTool, RemoteMcpError, unpackToolResult } from '../core/mcp-client.ts';
 import { readCursor, writeCursor } from '../core/recall-cursor-state.ts';
-import { resolveSourceId } from '../core/source-resolver.ts';
+import { resolveSourceId, resolveSourceIdEngineFree, SourceTargetError } from '../core/source-resolver.ts';
 
 // Same kebab-case shape gate the source-resolver applies. v0.32: applied
 // locally on thin-client where the canonical resolver's assertSourceExists
@@ -71,6 +71,8 @@ interface ParsedFlags {
   // (this hand-rolled CLI otherwise ignores unknown flags silently).
   query: string | null;
   budgetTokens: number | null;
+  budgetPolicy: string | null;
+  sourceExplicit: boolean;
   // v0.32
   sinceLastRun: boolean;
   pending: boolean;
@@ -101,12 +103,15 @@ function parseFlags(args: string[]): ParsedFlags {
     limit: 50,
     query: null,
     budgetTokens: null,
+    budgetPolicy: null,
+    sourceExplicit: false,
     sinceLastRun: false,
     pending: false,
     rollup: false,
     watchSeconds: null,
   };
   let positional = '';
+  let rawBudget: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--since') { out.since = parseSinceParam(args[++i] ?? ''); continue; }
@@ -117,10 +122,19 @@ function parseFlags(args: string[]): ParsedFlags {
     if (a === '--include-expired') { out.includeExpired = true; continue; }
     if (a === '--as-context') { out.asContext = true; continue; }
     if (a === '--json') { out.json = true; continue; }
-    if (a === '--source') { out.source = args[++i] ?? 'default'; continue; }
+    if (a === '--source') { out.source = args[++i] ?? 'default'; out.sourceExplicit = true; continue; }
+    if (a === '--source-id') { out.source = args[++i] ?? ''; out.sourceExplicit = true; continue; }
+    if (a.startsWith('--source-id=')) { out.source = a.slice('--source-id='.length); out.sourceExplicit = true; continue; }
     if (a === '--limit') { out.limit = parseInt(args[++i] ?? '50', 10) || 50; continue; }
     if (a === '--query') { out.query = args[++i] ?? null; continue; }
-    if (a === '--budget-tokens') { out.budgetTokens = parseInt(args[++i] ?? '', 10) || null; continue; }
+    if (a === '--budget-tokens') { rawBudget = args[++i]; continue; }
+    if (a === '--budget-policy') {
+      const next = args[i + 1];
+      out.budgetPolicy = next === undefined || next.startsWith('--') ? '' : next;
+      if (next !== undefined && !next.startsWith('--')) i++;
+      continue;
+    }
+    if (a.startsWith('--budget-policy=')) { out.budgetPolicy = a.slice('--budget-policy='.length); continue; }
     if (a === '--since-last-run') { out.sinceLastRun = true; continue; }
     if (a === '--pending') { out.pending = true; continue; }
     if (a === '--rollup') { out.rollup = true; continue; }
@@ -138,12 +152,19 @@ function parseFlags(args: string[]): ParsedFlags {
     if (!positional) positional = a;
   }
   if (positional) out.entity = positional;
+  out.budgetTokens = (out.budgetPolicy === 'query_first' && out.query?.trim()
+    ? Number(rawBudget)
+    : parseInt(rawBudget ?? '', 10)) || null;
   if (out.today && !out.since) {
     const start = new Date();
     start.setHours(0, 0, 0, 0);
     out.since = start;
   }
   return out;
+}
+
+export function hasRecallBudgetPolicy(args: string[]): boolean {
+  return parseFlags(args).budgetPolicy !== null;
 }
 
 function parseSinceParam(raw: string): Date | null {
@@ -192,9 +213,17 @@ async function resolveSourceForRecall(
   engine: BrainEngine,
   flagValue: string,
   thinClient: boolean,
+  // #5535: whether --source/--source-id was actually PASSED. parseFlags
+  // defaults flags.source to the literal 'default', so the value alone
+  // cannot distinguish "user asked for the default source" from "user
+  // passed no source flag".
+  sourceExplicit: boolean,
 ): Promise<string> {
   if (thinClient) {
-    if (flagValue !== 'default') return flagValue;
+    // #5535: an explicit `--source default` is a real selector, not an
+    // omitted flag — return the literal id instead of falling through to
+    // GBRAIN_SOURCE / the server's own default.
+    if (sourceExplicit || flagValue !== 'default') return flagValue;
     const env = process.env.GBRAIN_SOURCE;
     if (env && env.length > 0 && SOURCE_ID_RE.test(env)) return env;
     return 'default';
@@ -207,7 +236,10 @@ async function resolveSourceForRecall(
   // empty" behavior so existing tests + scripts keep working while
   // recall still benefits from the env/dotfile resolution chain.
   try {
-    return await resolveSourceId(engine, flagValue !== 'default' ? flagValue : null);
+    // #5535: pass the flag's literal value (including 'default') when it
+    // was explicit so tier 1 of the resolver wins; null only when the flag
+    // was omitted, which keeps the env/dotfile/config-default chain.
+    return await resolveSourceId(engine, sourceExplicit || flagValue !== 'default' ? flagValue : null);
   } catch (e) {
     process.stderr.write(
       `[recall] source not registered: ${flagValue}. Falling back to literal value.\n`,
@@ -218,8 +250,45 @@ async function resolveSourceForRecall(
 
 export async function runRecall(engine: BrainEngine, args: string[]): Promise<void> {
   const flags = parseFlags(args);
-  validateAndNormalizeFlags(flags);
+  if (flags.budgetPolicy !== null) {
+    const { MEMORY_VERBS_VERSION, operationsByName, verbError } = await import('../core/operations.ts');
+    const { validateParams } = await import('../mcp/validate-params.ts');
+    const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
+    try {
+      const error = validateParams(operationsByName.recall, { budget_policy: flags.budgetPolicy })
+        ?? (flags.watchSeconds !== null || flags.sinceLastRun || flags.rollup || flags.asContext
+          ? '--budget-policy cannot be combined with --watch, --since-last-run, --rollup, or --as-context.' : null);
+      if (error) throw verbError('invalid_params', error,
+        'Use --budget-policy facts_first or query_first on a one-shot recall, or omit the policy for CLI-only behavior.');
+      const selector = flags.sourceExplicit ? flags.source : process.env.GBRAIN_SOURCE || undefined;
+      if (selector !== undefined && !SOURCE_ID_RE.test(selector)) {
+        throw verbError('invalid_params', 'recall requires a concrete source id matching [a-z0-9-]{1,32}.',
+          'Choose a registered source id, or omit the source selector to use your existing scope.', 'source_id');
+      }
+      const thinClient = isThinClient(loadConfig());
+      const sourceId = resolveSourceIdEngineFree(flags.sourceExplicit ? flags.source : null)
+        ?? (thinClient ? undefined : await resolveSourceId(engine, null));
+      await runRecallVerb(engine, flags, sourceId);
+    } catch (error) {
+      if (error instanceof RemoteMcpError) {
+        const { setCliExitVerdict, writeStdoutFinal } = await import('../core/cli-force-exit.ts');
+        const detail = { protocol_version: MEMORY_VERBS_VERSION, ...error.toJSON() };
+        if (flags.json) await writeStdoutFinal(JSON.stringify(detail, null, 2) + '\n');
+        console.error(`Error [${detail.error}]: ${detail.message}`);
+        if (detail.suggestion) console.error(`Fix: ${detail.suggestion}`);
+        setCliExitVerdict(1);
+        return;
+      }
+      if (error instanceof SourceTargetError) {
+        error = verbError('not_found', error.message,
+          'Choose an active source with the source selector, or repair your local source configuration.', 'unknown_source');
+      }
+      if (!await reportPersistenceCliError(error, flags.json)) throw error;
+    }
+    return;
+  }
 
+  validateAndNormalizeFlags(flags);
   const cfg = loadConfig();
   const thinClient = isThinClient(cfg);
 
@@ -230,7 +299,7 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
     );
   }
 
-  const sourceId = await resolveSourceForRecall(engine, flags.source, thinClient);
+  const sourceId = await resolveSourceForRecall(engine, flags.source, thinClient, flags.sourceExplicit);
 
   // MEMORY_VERBS v1 [c4]: the verb params route through the recall OP so the
   // CLI and MCP exercise the same arm (query/budget packing/superset envelope).
@@ -251,7 +320,7 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
  * through the recall OP (same code path MCP exercises) and renders facts +
  * search results with the budget footer. `--json` prints the raw envelope.
  */
-async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId: string): Promise<void> {
+async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId?: string): Promise<void> {
   const { operationsByName } = await import('../core/operations.ts');
   const op = operationsByName['recall'];
   const ctx = {
@@ -264,9 +333,9 @@ async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId: 
     },
     dryRun: false,
     remote: false as const,
-    sourceId,
+    sourceId: sourceId ?? 'default',
   };
-  const result = (await op.handler(ctx, {
+  const params = {
     ...(flags.entity ? { entity: flags.entity } : {}),
     ...(flags.query ? { query: flags.query } : {}),
     ...(flags.budgetTokens ? { budget_tokens: flags.budgetTokens } : {}),
@@ -274,7 +343,17 @@ async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId: 
     ...(flags.grep ? { grep: flags.grep } : {}),
     include_expired: flags.includeExpired,
     limit: flags.limit,
-  })) as {
+    ...(flags.budgetPolicy !== null ? {
+      budget_policy: flags.budgetPolicy,
+      ...(sourceId !== undefined ? { source_id: sourceId } : {}),
+      ...(flags.sessionId ? { session_id: flags.sessionId } : {}),
+      ...(flags.supersessions ? { supersessions: true } : {}),
+      ...(flags.pending ? { include_pending: true } : {}),
+    } : {}),
+  };
+  const result = (flags.budgetPolicy !== null && isThinClient(ctx.config)
+    ? unpackToolResult(await callRemoteTool(ctx.config, 'recall', params, { timeoutMs: 30_000 }))
+    : await op.handler(ctx, params)) as {
     facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string }>;
     results?: Array<{ slug: string; title: string | null; evidence: string; chunk: string | null }>;
     search_degraded?: string;
@@ -365,7 +444,11 @@ async function runRecallOnce(
     if (resolvedSince) params.since = resolvedSince.toISOString();
     if (flags.grep) params.grep = flags.grep;
     if (flags.pending) params.include_pending = true;
-    if (sourceId !== 'default') params.source_id = sourceId;
+    // #5535: send source_id whenever the selector was explicit — including
+    // an explicit 'default'. Omitting it let the remote server apply ITS
+    // own default (sources.default / GBRAIN_SOURCE server-side), so an
+    // explicit `--source default` silently queried a different source.
+    if (sourceId !== 'default' || flags.sourceExplicit) params.source_id = sourceId;
 
     const raw = await callRemoteTool(cfg!, 'recall', params, { timeoutMs: 30_000 });
     const unpacked = unpackToolResult<{
@@ -402,7 +485,10 @@ async function runRecallOnce(
     }
   }
 
-  if (flags.grep) {
+  // `--grep` narrows in SQL before LIMIT on every engine path (op params,
+  // thin-client params, and fetchRowsLocal's list calls). listSupersessions
+  // takes no grep option, so the client-side filter remains only there.
+  if (flags.grep && flags.supersessions) {
     const g = flags.grep;
     rows = rows.filter(r => r.fact.toLowerCase().includes(g));
   }
@@ -465,11 +551,13 @@ async function fetchRowsLocal(
           sessionId: flags.sessionId || undefined,
           activeOnly: !flags.includeExpired,
           limit: flags.limit,
+          grep: flags.grep ?? undefined,
           excludeAuditRows: true,
         })
       : await engine.listFactsByEntity(sourceId, slug, {
           activeOnly: !flags.includeExpired,
           limit: flags.limit,
+          grep: flags.grep ?? undefined,
           excludeAuditRows: true,
         });
     // #4720: the bare positional is entity-first, but keyless/casual usage
@@ -504,12 +592,14 @@ async function fetchRowsLocal(
         sessionId: flags.sessionId,
         activeOnly: !flags.includeExpired,
         limit: flags.limit,
+        grep: flags.grep ?? undefined,
         excludeAuditRows: true,
       });
     }
     return engine.listFactsBySession(sourceId, flags.sessionId, {
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      grep: flags.grep ?? undefined,
       excludeAuditRows: true,
     });
   }
@@ -527,6 +617,7 @@ async function fetchRowsLocal(
       eventTime: !flags.sinceLastRun,
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      grep: flags.grep ?? undefined,
       excludeAuditRows: true,
     });
   }
@@ -534,6 +625,7 @@ async function fetchRowsLocal(
     eventTime: true,
     activeOnly: !flags.includeExpired,
     limit: flags.limit,
+    grep: flags.grep ?? undefined,
     excludeAuditRows: true,
   });
 }
@@ -717,10 +809,10 @@ function factRowToJson(r: FactRow): Record<string, unknown> {
   };
 }
 
-export async function runForget(engine: BrainEngine, args: string[]): Promise<void> {
+export async function runForget(engine: BrainEngine | (() => Promise<BrainEngine>), args: string[]): Promise<void> {
   const idArg = args.find(a => /^\d+$/.test(a));
   if (!idArg) {
-    process.stderr.write('Usage: gbrain forget <fact-id> [--reason <text>]\n');
+    process.stderr.write('Usage: gbrain forget <fact-id> [--reason <text>] [--source <id>] [--request-id <uuid>] [--json]\n');
     process.exit(1);
   }
   const id = parseInt(idArg, 10);
@@ -730,6 +822,31 @@ export async function runForget(engine: BrainEngine, args: string[]): Promise<vo
   let reason: string | undefined = undefined;
   const idx = args.indexOf('--reason');
   if (idx >= 0 && idx + 1 < args.length) reason = args[idx + 1];
+  const requestIndex = args.findIndex(arg => arg === '--request-id' || arg.startsWith('--request-id='));
+  const sourceIndex = args.findIndex(arg => arg === '--source' || arg.startsWith('--source='));
+  const requestValue = requestIndex < 0 ? undefined : args[requestIndex].startsWith('--request-id=')
+    ? args[requestIndex].slice('--request-id='.length) : args[requestIndex + 1];
+  const sourceValue = sourceIndex < 0 ? undefined : args[sourceIndex].startsWith('--source=')
+    ? args[sourceIndex].slice('--source='.length) : args[sourceIndex + 1];
+  const { parseWriteRequestId } = await import('../core/persistence/preconditions.ts');
+  const { randomUUID } = await import('node:crypto');
+  const { OperationError, operations } = await import('../core/operations.ts');
+  const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
+  const json = args.includes('--json');
+  let requestId: string;
+  try {
+    if (requestIndex >= 0 && (!requestValue || requestValue.startsWith('--'))) {
+      throw new OperationError('invalid_params', '--request-id requires a UUID.');
+    }
+    if (sourceIndex >= 0 && (!sourceValue || sourceValue.startsWith('--'))) {
+      throw new OperationError('invalid_params', '--source requires a source ID.');
+    }
+    requestId = parseWriteRequestId(requestValue) ?? randomUUID();
+  } catch (error) {
+    if (await reportPersistenceCliError(error, json)) return;
+    throw error;
+  }
+  const params: Record<string, unknown> = { id: String(id), request_id: requestId, ...(reason !== undefined ? { reason } : {}) };
 
   // v0.33: thin-client routing. Without this, `gbrain forget <id>` on a
   // thin-client install would call the local fence helper against the empty
@@ -737,35 +854,45 @@ export async function runForget(engine: BrainEngine, args: string[]): Promise<vo
   // remote brain.
   const cfg = loadConfig();
   if (isThinClient(cfg)) {
-    const params: Record<string, unknown> = { id };
-    if (reason !== undefined) params.reason = reason;
-    const raw = await callRemoteTool(cfg!, 'forget_fact', params, { timeoutMs: 30_000 });
-    const result = unpackToolResult<{ id: number; expired: boolean }>(raw);
-    if (!result.expired) {
-      process.stderr.write(`No active fact with id=${id}\n`);
-      process.exit(1);
+    try {
+      if (sourceValue) throw new OperationError('invalid_params', '--source cannot override the remote memory writer grant.');
+      const raw = await callRemoteTool(cfg!, 'forget', params, { timeoutMs: 30_000 });
+      const result = unpackToolResult<{ id: string; expired: boolean }>(raw);
+      if (json) console.log(JSON.stringify(result, null, 2));
+      else process.stdout.write(result.expired ? `Forgot fact id=${id}\n` : `Fact id=${id} was already withdrawn\n`);
+    } catch (error) {
+      if (await reportPersistenceCliError(error, json)) return;
+      console.error(error instanceof Error ? error.message : String(error));
+      console.error(`Retry the same forget with --request-id ${requestId}.`);
+      const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
+      setCliExitVerdict(1);
     }
-    process.stdout.write(`Forgot fact id=${id}\n`);
     return;
   }
 
-  // v0.32.2: route through forgetFactInFence so the forget rewrites the
-  // page's `## Facts` fence and survives `gbrain rebuild`. Legacy rows
-  // fall back to the legacy DB-only expire path; the helper handles
-  // the fallback internally.
-  const { forgetFactInFence } = await import('../core/facts/forget.ts');
-  const result = await forgetFactInFence(engine, id, { reason });
-
-  if (!result.ok && result.path === 'not_found') {
-    process.stderr.write(`No fact with id=${id}\n`);
-    process.exit(1);
+  try {
+    const { maybeDelegateLocalOperation } = await import('../core/persistence/local-client.ts');
+    const { getCliOptions } = await import('../core/cli-options.ts');
+    const cli = getCliOptions();
+    const source = sourceValue ?? null;
+    const delegated = await maybeDelegateLocalOperation('forget', params, cfg, {
+      brain: cli.brain, source, timeoutMs: cli.timeoutMs ?? undefined,
+    });
+    let result: { id: string; expired: boolean };
+    if (delegated.handled) result = delegated.result as typeof result;
+    else {
+      const connected = typeof engine === 'function' ? await engine() : engine;
+      const sourceId = await resolveSourceId(connected, source);
+      const op = operations.find(operation => operation.name === 'forget')!;
+      result = await op.handler({ engine: connected, config: cfg ?? { engine: 'pglite' }, remote: false,
+        dryRun: false, sourceId, logger: { info: console.log, warn: console.warn, error: console.error } }, params) as typeof result;
+    }
+    if (json) console.log(JSON.stringify(result, null, 2));
+    else process.stdout.write(result.expired ? `Forgot fact id=${id}\n` : `Fact id=${id} was already withdrawn\n`);
+  } catch (error) {
+    if (await reportPersistenceCliError(error, json)) return;
+    throw error;
   }
-  if (!result.ok && result.path === 'already_expired') {
-    process.stderr.write(`Fact id=${id} is already expired\n`);
-    process.exit(1);
-  }
-  const suffix = result.path === 'fence' ? '' : ' (legacy DB-only — will not survive gbrain rebuild)';
-  process.stdout.write(`Forgot fact id=${id}${suffix}\n`);
 }
 
 function renderToday(rows: FactRow[]): string {

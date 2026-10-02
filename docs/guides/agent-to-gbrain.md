@@ -160,13 +160,17 @@ The agent's host needs a worker that processes shell jobs:
 gbrain jobs submit shell --params '{...}' --follow
 
 # Persistent worker (Postgres only — PGLite uses --follow inline):
-GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs work
+gbrain jobs work --allow-shell-jobs        # or: GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs work
 ```
 
-`GBRAIN_ALLOW_SHELL_JOBS=1` is the worker-side opt-in. Without it, shell jobs
-sit in `waiting` indefinitely. Set it on the worker process env (or in your
-deploy unit / launchd plist), not per-submission — submitter env is a weak
-proxy for worker env.
+`--allow-shell-jobs` (equivalently `GBRAIN_ALLOW_SHELL_JOBS=1` exported on the
+worker; a `.env` in the worker's directory cannot set it) is the worker-side
+opt-in. The handler is always registered but guarded: an unflagged worker that
+claims a shell job dead-letters it immediately (`UnrecoverableError`, no
+retries) — a shell job that stays in `waiting` means no worker is running at
+all. Put the flag on the worker's command line (or the variable in its deploy
+unit / launchd plist), not per-submission — submitter env is a weak proxy for
+worker env.
 
 ## Decision table
 
@@ -190,8 +194,7 @@ proxy for worker env.
 - **Free-form names.** `inherit:` accepts any snake_case config-key on your
   worker — `database_url`, `anthropic_api_key`, `openai_api_key`,
   `openrouter_api_key`, `voyage_api_key`, `groq_api_key`,
-  `zeroentropy_api_key`, or any custom
-  field you stuff into `~/.gbrain/config.json`. The agent picks what it
+  or any custom field you stuff into `~/.gbrain/config.json`. The agent picks what it
   needs.
 - **`env:` still works** for non-secret values, or for cases where you
   WANT the value in the row (e.g. an opaque correlation token your audit

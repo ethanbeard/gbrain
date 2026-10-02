@@ -28,6 +28,9 @@ import {
 } from './validate-params.ts';
 import { backupCheckDisabled, backupNagGate, backupNoticeText, loadBackupStatus } from '../core/backup/status-file.ts';
 import { maybeRefreshBackupStatusInProcess } from '../core/backup/coverage.ts';
+import { operationScopesAllowed } from '../core/scope.ts';
+import { invalidateHotMemoryForEngine } from '../core/facts/meta-hook.ts';
+import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
 
 // WP3: normalization + validation moved to validate-params.ts (direct unit
 // surface). Re-exported here so existing imports/tests keep working.
@@ -125,6 +128,8 @@ export interface ToolResult {
 }
 
 export interface DispatchOpts {
+  /** Configuration selected by the resident transport, never populated from wire params. */
+  config?: OperationContext['config'];
   /** Defaults to true (remote/untrusted). Local CLI callers (`gbrain call`) pass false. */
   remote?: boolean;
   /** Override the default stderr logger (e.g. CLI uses console.* directly). */
@@ -161,6 +166,12 @@ export interface DispatchOpts {
    * caller params. See OperationContext.localFederatedSourceIds.
    */
   localFederatedSourceIds?: string[];
+  /**
+   * #5081: explicit-read admission for a stdio connection bound by
+   * GBRAIN_SOURCE or a .gbrain-source pin. Stdio transport only; see
+   * OperationContext.explicitReadBinding.
+   */
+  explicitReadBinding?: OperationContext['explicitReadBinding'];
   /**
    * `gbrain serve --source-guard` (plugin lanes): when set, write/admin ops
    * are blocked unless the source resolution tier proves the binding is
@@ -468,7 +479,7 @@ export function buildOperationContext(
       : undefined) ?? metaSessionIdFrom(params);
   return {
     engine,
-    config: loadConfig() || { engine: 'postgres' },
+    config: opts.config ?? loadConfig() ?? { engine: 'postgres' },
     logger: opts.logger || stderrLogger,
     dryRun: !!params.dry_run,
     remote: opts.remote ?? true,
@@ -481,6 +492,7 @@ export function buildOperationContext(
     sourceId: opts.sourceId ?? 'default',
     ...(sessionId ? { sessionId } : {}),
     ...(opts.localFederatedSourceIds ? { localFederatedSourceIds: opts.localFederatedSourceIds } : {}),
+    ...(opts.explicitReadBinding ? { explicitReadBinding: opts.explicitReadBinding } : {}),
     ...(opts.surfaceCeiling ? { surfaceCeiling: opts.surfaceCeiling } : {}),
     auth: opts.auth,
   };
@@ -604,7 +616,7 @@ export async function dispatchToolCall(
   // config read.
   const unknownParamWarnings = findUnknownParams(op, safeParams);
   if (unknownParamWarnings.length > 0) {
-    const strictMode = await resolveStrictParamsMode(engine, loadConfig());
+    const strictMode = await resolveStrictParamsMode(engine, opts.config ?? loadConfig());
     if (strictMode === 'reject') {
       logVerb(false);
       // Privacy (amendment 11): the raw unknown key rides `suggestion` ONLY.
@@ -664,12 +676,39 @@ export async function dispatchToolCall(
   }
 
   try {
+    if (ctx.remote !== false && op.requiredScopes?.length) {
+      let scopes = ctx.auth?.scopes;
+      if (!scopes && ctx.transport === 'stdio') {
+        const verified = currentVerifiedLocalWriter() ?? await verifyLocalWriter(engine, await readLocalWriter(engine, 'stdio'));
+        scopes = verified.remote ? verified.grant.scopes : [];
+      }
+      if (!operationScopesAllowed(scopes ?? [], op)) {
+        throw new OperationError('permission_denied', 'This operation requires an explicit shared-skills grant.',
+          `Ask the brain owner to grant ${op.requiredScopes.join(', ')} for this connection.`);
+      }
+    }
     // Fail-closed gate for slug-bound OAuth clients, applied here because
     // this is the one path both MCP transports share. Per-op fences still
     // run inside the handlers; this stops an unfenced write op from being
     // a silent hole. See CLIENT_FENCED_WRITE_OPS in operations.ts.
     enforceBoundClientOpAllowList(ctx.auth, op);
-    const result = await op.handler(ctx, safeParams);
+    const sharedStdio = ctx.transport === 'stdio' && !ctx.auth &&
+      (op.requiredScopes?.length || ['list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack'].includes(name));
+    let registration: Awaited<ReturnType<typeof readLocalWriter>> | undefined;
+    if (sharedStdio) {
+      try { registration = await readLocalWriter(engine, 'stdio'); }
+      catch (error) {
+        if (!(error instanceof OperationError) || error.code !== 'writer_registration_required' || op.requiredScopes?.length) throw error;
+      }
+    }
+    const result = registration
+      ? await withVerifiedLocalRegistration(engine, registration, async verified => {
+        if (!verified.remote) throw new OperationError('permission_denied', 'This registration is not an agent-facing connection.');
+        return op.handler(ctx, safeParams);
+      })
+      : await op.handler(ctx, safeParams);
+    // Hot memory built before a write (forget, remember, …) is never served after it, on every transport.
+    if (op.mutating) invalidateHotMemoryForEngine(engine);
     // [E4] verb success metrics: budget drops + entity hit/miss when present.
     {
       const r = result as { dropped_count?: number; found?: boolean; status?: string } | null;
@@ -730,6 +769,7 @@ export async function dispatchToolCall(
     return out;
   } catch (e: unknown) {
     logVerb(false);
+    if (op.mutating) invalidateHotMemoryForEngine(engine); // a failed write may have committed part of its work
     if (e instanceof OperationError) {
       return { content: [{ type: 'text', text: JSON.stringify(e.toJSON(), null, 2) }], isError: true };
     }

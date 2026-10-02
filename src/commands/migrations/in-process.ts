@@ -22,8 +22,10 @@
  */
 
 import { execSync } from 'child_process';
+import { resolveChildCliInvocation } from '../../core/minions/job-isolation.ts';
 
 import { loadConfig, toEngineConfig } from '../../core/config.ts';
+import { buildGatewayConfig } from '../../core/ai/build-gateway-config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
 
 /** Default wall-clock guard for in-process initSchema. Matches the 600s cap
@@ -68,13 +70,7 @@ export async function runMigrateOnlyCore(opts?: { timeoutMs?: number }): Promise
   // whose file config is missing embedding fields must not fall through to
   // stale hardcoded fallbacks. loadConfig already merged env; propagate it.
   const { configureGateway } = await import('../../core/ai/gateway.ts');
-  configureGateway({
-    embedding_model: config.embedding_model,
-    embedding_dimensions: config.embedding_dimensions,
-    expansion_model: config.expansion_model,
-    chat_model: config.chat_model,
-    env: { ...process.env },
-  });
+  configureGateway(buildGatewayConfig(config));
 
   const timeoutMs = opts?.timeoutMs ?? MIGRATE_ONLY_TIMEOUT_MS;
   const engine = await createEngine(toEngineConfig(config));
@@ -94,6 +90,32 @@ export async function runMigrateOnlyCore(opts?: { timeoutMs?: number }): Promise
 }
 
 /**
+ * #5184: point every `gbrain` command word in a migration's shell command at
+ * the CLI that is running this migration (the compiled executable, or bun plus
+ * the source entrypoint), through the same `resolveChildCliInvocation` the
+ * supervisor and autopilot use. A bare `gbrain` resolved from PATH can be a
+ * different version, or a wrapper that sets its own GBRAIN_HOME or database
+ * URL, so backfills and installs would act on another brain. When the running
+ * CLI cannot be identified the command is left as written (PATH resolution).
+ */
+export function gbrainChildCommand(
+  cmd: string,
+  env: Record<string, string | undefined> = process.env,
+  execPath: string = process.execPath,
+  argv1: string | undefined = process.argv[1],
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const inv = resolveChildCliInvocation(env, execPath, argv1, () => null);
+  if (!inv) return cmd;
+  // execSync runs cmd.exe on Windows, which does not understand single quotes.
+  const quote = platform === 'win32'
+    ? (s: string) => `"${s}"`
+    : (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+  const prefix = [inv.cmd, ...inv.argsPrefix].map(quote).join(' ');
+  return cmd.replace(/(^|\|\||&&|;)(\s*)gbrain(?=\s|$)/g, (_m, sep: string, space: string) => `${sep}${space}${prefix}`);
+}
+
+/**
  * Run a `gbrain ...` subcommand as a subprocess, capturing child stderr so a
  * failure surfaces the real reason. Used for the non-schema backfill phases
  * (extract/repair/stats) that aren't yet in-process. On Windows these may still
@@ -106,7 +128,8 @@ export async function runMigrateOnlyCore(opts?: { timeoutMs?: number }): Promise
  */
 export function runGbrainSubprocess(cmd: string, opts?: { timeoutMs?: number }): string {
   try {
-    const out = execSync(cmd, {
+    // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- cmd is a fixed migration subcommand string from the orchestrators; gbrainChildCommand prefixes the running CLI (#5184)
+    const out = execSync(gbrainChildCommand(cmd), {
       stdio: ['inherit', 'pipe', 'pipe'],
       timeout: opts?.timeoutMs ?? MIGRATE_ONLY_TIMEOUT_MS,
       env: process.env,

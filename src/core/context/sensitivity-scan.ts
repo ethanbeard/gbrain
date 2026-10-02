@@ -224,13 +224,28 @@ export function scanSensitive(
   const out: SensitivityFinding[] = [];
 
   // (a) Secrets — scanText applies the fingerprint allowlist itself.
+  const secretFingerprints = new Set<string>();
   for (const f of scanText(text, { allowlist: config.allowlist })) {
     out.push({ family: `secret:${f.pattern}`, fingerprint: f.fingerprint });
+    secretFingerprints.add(f.fingerprint);
   }
 
-  // (b) PII — detection over the ordered PII_PATTERNS families.
+  // (b) PII — detection over the ordered PII_PATTERNS families. secret-scan
+  // OWNS the credential-shaped families it also matches (jwt, bearer): a
+  // value the secret pass already reported is not reported a second time
+  // under `pii:*`. Dedupe is by fingerprint, not by family name, so a short
+  // bearer token under the secret-scan floor still reaches `pii:bearer`, and
+  // `Bearer <vendor key>` collapses onto the vendor finding. The PII bearer
+  // match includes the `Bearer ` keyword; the token-only fingerprint is the
+  // one secret-scan emits, so both spellings are checked.
   for (const f of findPii(text)) {
-    pushUnlessAllowed(out, `pii:${f.family}`, text.slice(f.start, f.end), config.allowlist);
+    const value = text.slice(f.start, f.end);
+    const tokenOnly = value.replace(/^[Bb]earer\s+/, '');
+    if (
+      secretFingerprints.has(fingerprintValue(value).fingerprint) ||
+      secretFingerprints.has(fingerprintValue(tokenOnly).fingerprint)
+    ) continue;
+    pushUnlessAllowed(out, `pii:${f.family}`, value, config.allowlist);
   }
 
   // (c1) Private path shapes.
@@ -249,4 +264,20 @@ export function scanSensitive(
   }
 
   return out;
+}
+
+/**
+ * The one diagnostic line for an entry dropped by the scan: reason, family,
+ * fingerprint and the recovery hint. Content-free by construction (the slug
+ * is the page id the caller already reports; the value is never passed in).
+ */
+export function formatSensitivityDrop(
+  drop: { slug: string; family: string; fingerprint: string },
+  workspaceRoot: string,
+): string {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const allowPath = join(workspaceRoot, SCAN_ALLOW_FILENAME);
+  return `omitted ${drop.slug} from the compiled context (reason: sensitivity_scan, pattern: ${drop.family}, ` +
+    `fingerprint: ${drop.fingerprint}). Remove the value from the page; if it is a reviewed false positive, ` +
+    `add the line "${drop.fingerprint}" to ${allowPath}.`;
 }

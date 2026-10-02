@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
 /**
  * brain-writer — frontmatter validation/audit/auto-fix orchestrator.
  *
@@ -125,6 +126,9 @@ export function createFrontmatterBackup(filePath: string, opts: FrontmatterBacku
  *   - MISSING_CLOSE     — insert `---` before the first heading found inside
  *                          the YAML zone
  *   - SLUG_MISMATCH     — remove `slug:` line (gbrain derives slug from path)
+ *                          when `opts.filePath` is given. It must be the path
+ *                          the slug derives from (relative to the brain or
+ *                          source root, #5053), never an absolute path.
  *
  * Idempotent: running twice is a no-op on already-clean input. Any error class
  * not in the list above is left untouched (e.g. EMPTY_FRONTMATTER, YAML_PARSE,
@@ -359,6 +363,7 @@ export function writeBrainPage(
   content: string,
   opts: { sourcePath: string; autoFix?: boolean; backupRoot?: string; backupRunId?: string },
 ): { fixes: AuditFix[]; backupPath?: string } {
+  assertManagedFilesystemWrite(filePath);
   const resolvedSource = resolve(opts.sourcePath);
   const resolvedTarget = resolve(filePath);
   if (resolvedTarget !== resolvedSource && !resolvedTarget.startsWith(resolvedSource + '/')) {
@@ -372,7 +377,7 @@ export function writeBrainPage(
   let toWrite = content;
   let fixes: AuditFix[] = [];
   if (opts.autoFix) {
-    const result = autoFixFrontmatter(content, { filePath });
+    const result = autoFixFrontmatter(content, { filePath: relative(resolvedSource, resolvedTarget) });
     toWrite = result.content;
     fixes = result.fixes;
   }

@@ -16,8 +16,9 @@ adding or changing a format.
    pattern explicitly requires full-body scoring.
 4. Reject the winner when its acceptance score is below the false-positive
    floor.
-5. Apply the winning pattern to every line and attach continuation lines to the
-   preceding message.
+5. Apply the winning pattern to every line and attach supported continuation
+   lines to the preceding message. Speaker-object transcripts instead reject
+   unsupported candidate regions rather than attributing their text to a speaker.
 6. Optionally run LLM polish or fallback when those features are enabled.
 
 Pattern order is only a tie-breaker. A new regex must be structurally distinct
@@ -136,11 +137,41 @@ formats:
 
 - `**Speaker** (09:15): text` uses `bold-paren-time`.
 - `**Speaker** (9:15 AM): text` uses `bold-paren-time-12h`.
-- `**Speaker:** text` uses `bold-name-no-time`.
+- `**Speaker:** text` uses `bold-name-no-time`. Its `repeat_speaker_min_turns: 3` structure gate returns no_match when three or more turns never repeat a speaker — a status note's `**Status:**`/`**Owner:**`/`**Next step:**` labels are not a conversation (gbrain-evals N12-1).
 - `**Speaker** (2026-04-09 9:15 AM): text` uses `imessage-slack`.
 
 Keeping these examples in both `test_negative` and parser regression tests makes
 the non-shadowing contract executable.
+
+## Single-quoted speaker objects
+
+The `python-dict-utterance` pattern recognizes this narrow export shape without
+evaluating Python or guessing a person's identity:
+
+```text
+{'source': 'microphone', 'attribution': 'me'}: hello
+{'source': 'speaker', 'name': 'alice-example', 'attribution': 'them'}: hi
+```
+
+`source` and `attribution` must be `microphone`/`me` or `speaker`/`them`.
+An optional explicit `name` wins regardless of field order. Names are 1–80
+letters, digits, spaces, periods, underscores, or hyphens, starting with a
+letter or digit. Unknown or duplicate keys, conflicting pairs, nested values,
+escaped names, JSON-style quoting, and multiline utterances are not supported.
+
+A bare transcript must start with a complete supported speaker header, apart
+from date headings and blank or fenced-code lines. A dedicated `Transcript`
+heading may follow summary sections. Quoted/nested wrappers cannot open that
+section, and unsupported lines inside a candidate invalidate the candidate
+rather than exposing interior examples as speakers. Fenced and indented code
+cannot open speakers; excluded lines still count toward the density threshold.
+A following non-date heading ends the section without erasing its genuine
+turns. Dates use the existing page-date fallback and recognized date headings.
+
+**Say to your agent:** *"Preview this conversation and tell me whether its
+speakers can be read without guessing."* The agent can use
+`gbrain extract-conversation-facts --source-id default --slug conversations/example --dry-run`;
+the preview does not call a model or mark the page complete.
 
 ## Adding a built-in format
 

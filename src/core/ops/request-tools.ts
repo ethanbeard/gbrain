@@ -17,7 +17,7 @@
 // array itself — are loaded via dynamic import inside the handler instead
 // (the verbs.ts house pattern).
 import { isUndefinedColumnError } from '../utils.ts';
-import { hasScope } from '../scope.ts';
+import { hasScope, operationScopesAllowed } from '../scope.ts';
 import { RateLimiter } from '../../mcp/rate-limit.ts';
 import { writeSurfaceChangeAudit } from '../surface-audit.ts';
 import type { Operation, OperationContext } from './contract.ts';
@@ -103,9 +103,8 @@ async function visibleOpsForCaller(
 
   return filterOpsForSurface(operations, ceiling).filter(op =>
     (canSeeLocalOnly || !op.localOnly)
-    && (scopes === null
-      || hasScope(scopes, op.scope ?? 'read')
-      || (op.agentCallable === true && hasScope(scopes, 'agent')))
+    && (ctx.remote === false || (scopes === null && !op.requiredScopes?.length)
+      || operationScopesAllowed(scopes ?? [], op))
     && opAllowedForBoundClient(ctx.auth, op)
     && !gateDisabled.has(op.name),
   );
@@ -113,6 +112,7 @@ async function visibleOpsForCaller(
 
 const request_tools: Operation = {
   name: 'request_tools',
+  outputRedaction: 'no_stored_text',
   description:
     'Discover this brain\'s tool catalog and optionally unlock a wider tool surface for your client. ' +
     'No arguments → the catalog visible to YOUR credentials, grouped by area (tool names + one-line summaries). ' +

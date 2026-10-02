@@ -5,6 +5,7 @@ import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
 import { loadConfigSnapshot } from './config-snapshot.ts';
 import { loadGbrainEnvFile } from './gbrain-env-file.ts';
+import { dotenvValuesForKey } from './env-trust.ts';
 import { REMOTE_PRIVATE_PAGES_KEY } from './search/private-visibility.ts';
 
 /**
@@ -73,35 +74,13 @@ export interface GBrainConfig {
   openai_api_key?: string;
   anthropic_api_key?: string;
   /**
-   * ZeroEntropy API key. v0.37 fix wave (CDX2-5+6): ZE became the default
-   * embedding + reranker provider in v0.36 but lacked a file-plane config
-   * slot. `gbrain config set zeroentropy_api_key X` wrote DB plane,
-   * `loadConfig` only merged OpenAI/Anthropic, and `buildGatewayConfig`
-   * at cli.ts:1401 only mapped those two — so the key never reached the
-   * embed pipeline. Now wired through: file plane → loadConfig env
-   * merge → buildGatewayConfig env dict → recipe reads ZEROENTROPY_API_KEY.
-   */
-  zeroentropy_api_key?: string;
-  /**
    * OpenRouter API key. File-plane slot so `gbrain config set
    * openrouter_api_key X` (or config.json) reaches the openrouter recipe:
    * file plane → loadConfig env merge → buildGatewayConfig env dict → recipe
    * reads OPENROUTER_API_KEY.
    */
   openrouter_api_key?: string;
-  /**
-   * Voyage AI API key (#2662). File-plane slot so `~/.gbrain/config.json`'s
-   * `voyage_api_key` reaches the voyage recipe the same way
-   * zeroentropy_api_key/openrouter_api_key do: file plane →
-   * buildGatewayConfig env dict → recipe reads VOYAGE_API_KEY. Before this,
-   * launchd/daemon/MCP contexts without a process-env export silently
-   * failed multimodal embeds despite config.json looking complete.
-   *
-   * NOTE: `gbrain config set voyage_api_key X` routes to the FILE plane
-   * (FILE_PLANE_API_KEYS in src/commands/config.ts); a value that landed in
-   * the DB plane anyway is still honored via the #2119 read-side merge
-   * (DB_MERGED_PROVIDER_KEY_FIELDS, env > file > DB).
-   */
+
   voyage_api_key?: string;
   /**
    * Alibaba DashScope API key (#3500). File-plane slot so config.json's
@@ -148,7 +127,7 @@ export interface GBrainConfig {
   azure_openai_endpoint?: string;
   azure_openai_deployment?: string;
   azure_openai_use_entra?: string;
-  /** AI gateway config (v0.14+). v0.36+ default: "zeroentropyai:zembed-1" / 1280 / "anthropic:claude-haiku-4-5-20251001". */
+
   embedding_model?: string;
   embedding_dimensions?: number;
   /**
@@ -273,6 +252,8 @@ export interface GBrainConfig {
     adaptive_return_entity_max?: number;
     adaptive_return_other_max?: number;
     adaptive_return_min_keep?: number;
+    /** #5824 rollback switch (search/vector-legacy-guard.ts); file > DB, env wins over both. */
+    vector_legacy_guard?: boolean;
   };
 
   /**
@@ -644,68 +625,18 @@ export function loadConfigFileOnly(): GBrainConfig | null {
  * #427 guard — DATABASE_URL hijack via Bun's cwd .env auto-load.
  *
  * Bun merges `.env` files from the process cwd into process.env before any
- * user code runs. For a globally-installed tool that is a footgun: running
- * gbrain inside any checkout whose `.env` defines DATABASE_URL (Next.js,
- * Hono, Supabase, most web apps) silently retargets the brain at that app's
- * database. Reads hit the wrong DB; `apply-migrations` can write gbrain's
- * schema — including its DDL event trigger — into a production app database
- * (see the v0.42.8 report on #427).
- *
- * Bun gives no way to ask which vars came from a .env file (the merge
- * happens before module load), so we re-parse the .env files Bun auto-loads
- * from cwd and treat DATABASE_URL as "not operator-provided" when its value
- * matches one of them. Deliberate overrides still work two ways:
- *   - GBRAIN_DATABASE_URL: namespaced to this tool, never auto-ignored;
- *   - exporting DATABASE_URL in the shell: exported vars win over .env in
- *     Bun, and a deliberate export that happens to EQUAL the cwd .env value
- *     would have selected the same database anyway — ignoring it changes
- *     the outcome only by honoring the brain config, which is the safe
- *     reading of ambiguous intent.
- *
- * The file list is a superset of Bun's auto-load set across NODE_ENV values
- * so the guard doesn't depend on replicating Bun's exact selection logic.
+ * user code runs, so running gbrain inside any checkout whose `.env` defines
+ * DATABASE_URL (Next.js, Hono, Supabase, most web apps) would silently
+ * retarget the brain at that app's database — `apply-migrations` could write
+ * gbrain's schema into a production app database (the v0.42.8 report on #427).
+ * The cwd-.env parser (`CWD_DOTENV_FILES`, `dotenvValuesForKey`) lives in
+ * env-trust.ts beside the key-presence security quarantine; both symbols are
+ * re-exported here so import sites never chase the move. This guard keeps
+ * VALUE-match semantics: a DATABASE_URL equal to a cwd-.env assignment is
+ * file-origin; a deliberate export that happens to EQUAL it would have chosen
+ * the same database anyway, and GBRAIN_DATABASE_URL is never auto-ignored.
  */
-const CWD_DOTENV_FILES = [
-  '.env', '.env.local',
-  '.env.development', '.env.development.local',
-  '.env.production', '.env.production.local',
-  '.env.test', '.env.test.local',
-];
-
-/**
- * All values assigned to `key` across the .env files in `dir`. Collecting
- * every assignment (rather than emulating override order) keeps the guard
- * independent of dotenv precedence rules — a match against ANY assignment
- * means the value is file-origin. Exported for tests.
- */
-export function dotenvValuesForKey(key: string, dir: string = process.cwd()): Set<string> {
-  const values = new Set<string>();
-  const assignment = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/;
-  for (const name of CWD_DOTENV_FILES) {
-    let content: string;
-    try {
-      content = readFileSync(join(dir, name), 'utf-8');
-    } catch {
-      continue; // missing/unreadable file — nothing to guard against
-    }
-    for (const rawLine of content.split('\n')) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const m = line.match(assignment);
-      if (!m || m[1] !== key) continue;
-      let v = m[2].trim();
-      if ((v.startsWith('"') && v.endsWith('"') && v.length >= 2) ||
-          (v.startsWith("'") && v.endsWith("'") && v.length >= 2)) {
-        v = v.slice(1, -1);
-      } else {
-        const hash = v.indexOf(' #');
-        if (hash !== -1) v = v.slice(0, hash).trim();
-      }
-      if (v) values.add(v);
-    }
-  }
-  return values;
-}
+export { CWD_DOTENV_FILES, dotenvValuesForKey } from './env-trust.ts';
 
 let warnedCwdEnvDbUrlIgnored = false;
 
@@ -788,7 +719,6 @@ export function loadConfig(): GBrainConfig | null {
     ...(dbUrl ? { database_path: undefined } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.ANTHROPIC_API_KEY ? { anthropic_api_key: process.env.ANTHROPIC_API_KEY } : {}),
-    ...(process.env.ZEROENTROPY_API_KEY ? { zeroentropy_api_key: process.env.ZEROENTROPY_API_KEY } : {}),
     ...(process.env.OPENROUTER_API_KEY ? { openrouter_api_key: process.env.OPENROUTER_API_KEY } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(process.env.GBRAIN_EMBEDDING_DIMENSIONS ? { embedding_dimensions: parseInt(process.env.GBRAIN_EMBEDDING_DIMENSIONS, 10) } : {}),
@@ -1225,6 +1155,8 @@ export async function loadConfigWithEngine(
     const n = Number(await dbStr(`search.${cap}`));
     if (Number.isFinite(n)) mergedSearch[cap] = n;
   }
+  const dbVectorLegacyGuard = await dbBoolStrict('search.vector_legacy_guard');
+  if (mergedSearch.vector_legacy_guard === undefined && dbVectorLegacyGuard !== undefined) mergedSearch.vector_legacy_guard = dbVectorLegacyGuard;
   if (Object.keys(mergedSearch).length > 0) {
     merged.search = mergedSearch;
   }
@@ -1271,7 +1203,6 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'database_path',
   'openai_api_key',
   'anthropic_api_key',
-  'zeroentropy_api_key',
   'openrouter_api_key',
   'voyage_api_key',
   'dashscope_api_key',
@@ -1297,11 +1228,14 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'protocol_installed_at',
   'provider_chat_options',
   'storage',
+  'schema_pack',
   'eval',
   'eval.capture',
   'eval.scrub_pii',
   'embedding_multimodal',
   'embedding_multimodal_model',
+  // #5691: per-brain query instruction (DB plane; read by search/query-prefix.ts).
+  'embedding_query_prefix',
   'embedding_image_ocr',
   'embedding_image_ocr_model',
   'embedding_columns',
@@ -1377,6 +1311,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #4415: per-brain query-intent pattern extensions (JSON bank→regex[]),
   // merged over the shipped banks in src/core/search/query-intent.ts.
   'search.intent_patterns',
+  // Per-brain source-boost map (`prefix:factor,...`; `none` drops the
+  // defaults), read by search/mode.ts loadSearchModeConfig and ops/search.ts.
+  'search.source_boosts',
+  // #5428 opt-in single-token alias hop (`true` enables), read by
+  // search/mode.ts loadSearchModeConfig.
+  'search.alias_token_hop',
   // 2026-08 fix wave (E5a): the adaptive-return / autocut / CRAG knobs were
   // read by the search path but never registered — `gbrain config set`
   // rejected them, making the documented config plane a no-op. Read sites:
@@ -1389,6 +1329,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // weak-graded query), and unlike crag_think it is reachable by remote
   // callers — attacker-shaped weak queries drive that spend (ship security
   // review). See docs/operations/spend-controls.md.
+  // #5824 one-release rollback, latched per process (search/vector-legacy-guard.ts).
+  'search.vector_legacy_guard',
   'search.adaptive_return',
   'search.adaptive_return_entity_max',
   'search.adaptive_return_other_max',
@@ -1407,6 +1349,14 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.metadata_boost_gate',
   'search.crag_escalation',
   'search.crag_think',
+  // Evidence delivery (search/evidence-delivery.ts): default unit (auto),
+  // window radius, default/auto/remote-max token budgets; think reads its own unit.
+  'search.return_unit',
+  'search.return_window',
+  'search.return_budget_default',
+  'search.return_budget_conversation',
+  'search.return_budget_max_remote',
+  'think.return_unit',
   // Models tier system (v0.31.12)
   'models.default',
   'models.tier.utility',
@@ -1460,10 +1410,14 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #3852: kill-switch for the deterministic junk gate on extracted fact text
   // (plan narration / provider error strings / meta-chatter). Default on.
   'facts.extraction_junk_filter',
+  // B-16: confidence stored for an extracted candidate whose confidence is
+  // missing or non-numeric (a number in 0..1). Unset keeps the legacy 1.0.
+  'facts.extraction_missing_confidence',
   // [ENG-8] Brain-level default visibility for facts writes when the caller
   // didn't specify one: 'private' (default) | 'world'. Resolved by
   // src/core/facts/visibility.ts; explicit caller values always win.
   'facts.default_visibility',
+  'facts.entity_inference', // #5836: write-time subject inference kill switch (subject-infer.ts)
   // Ambient memory writeback (opt-in, default OFF): 'off' | 'salient' | 'all'.
   // DUAL-PLANE: `gbrain config set` writes the DB plane (authoritative — the
   // serve-side harvest gate re-checks it) AND mirrors into the file plane's
@@ -1484,8 +1438,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // personal brains and never auto-enables anything.
   'brain.audience',
   // Conversation parser LLM fallback. Deliberately register the exact key,
-  // not a conversation_parser.* prefix: fallback is the only live opt-in
-  // consumer, while the polish scaffold remains unwired.
+  // not a conversation_parser.* prefix: fallback is the only opt-in consumer.
   'conversation_parser.llm_fallback_enabled',
   // Dream cycle config
   'dream.synthesize.session_corpus_dir',
@@ -1532,6 +1485,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // dream.synthesize.* pair from #1594).
   'dream.patterns.subagent_timeout_ms',
   'dream.patterns.subagent_wait_timeout_ms',
+  // Paid-loop breaker: dead submissions of one dream key within 24h before
+  // it is refused (default 3; 0 disables). `gbrain dream reset-key` clears one.
+  'dream.breaker.max_dead_submissions',
   // Emotional weight (v0.29)
   'emotional_weight.high_tags',
   'emotional_weight.user_holder',
@@ -1539,6 +1495,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #4348: IANA timezone that owns the dream-cycle calendar day (summary
   // bucketing). Unset → host timezone → UTC. Validated at set time.
   'cycle.timezone',
+  // A11: IANA timezone for offset-less frontmatter datetimes in effective_date.
+  // Unset → UTC (date-only values are always UTC calendar dates). Validated at set time.
+  'brain.timezone',
+  // A12 (opt-in, default off): undated new pages in git-backed sources take the
+  // file's git first-commit date as their effective-date fallback on full import.
+  'sync.git_first_commit_dates',
   'cycle.grade_takes.write_gstack_learnings',
   // #4102: off switch for the propose_takes LLM phase (default ON; the
   // phase ships in the default list). Read by src/core/cycle/propose-takes.ts.
@@ -1602,13 +1564,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // isAutoTimelineEnabled); registered so `gbrain config set auto_timeline off`
   // works without --force, as the compiled-truth guide documents.
   'auto_timeline',
-  // v0.46.3: the provider_sunset doctor check's own suppression escape hatch
-  // (doctor.ts) and docs/guides/embedding-migration.md both document
-  // `gbrain config set doctor.suppress_provider_sunset true`, but the key was
-  // never registered — the documented command exited 1 with "Unknown config
-  // key". Same class as auto_chronicle above. Deliberately an exact key, not
-  // a blanket 'doctor.' prefix (unbounded namespaces defeat the typo gate).
-  'doctor.suppress_provider_sunset',
+  // #5584: skillopt optimizer output cap (default 32000 thinking / 4096 otherwise).
+  'skillopt.reflect_max_tokens',
+  // #5585: skillopt strict model provenance (true|1|yes|on; other values count as on).
+  'skillopt.models_strict',
   // #2606: chronicle judge output-token cap (default 4000). Event-dense
   // pages overflowed the old hardcoded 1500 and were misrecorded as
   // no_events; the cap is now configurable and truncation is surfaced.
@@ -1617,6 +1576,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // consent reads this key, and enabling it is the documented path to
   // `gbrain takes extract --from-pages` — same unregistered-key class.
   'takes.bootstrap_enabled',
+  // B-14: USD cap for one takes-bootstrap run's classifier calls (default 5.0;
+  // 0 disables). Read by src/core/extract-takes-from-pages.ts.
+  'takes.bootstrap_budget_usd',
   // Orphan reporting scope. These are consumed by core/orphan-policy.ts and
   // documented there as the per-brain override path.
   'orphans.exclude_prefixes',
@@ -1654,6 +1616,14 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'schema.type_warnings',
   // #4795 reindex-search-vector marker (doctor fts_reindex_incomplete reads it); `config unset` is the escape hatch.
   'fts.reindex_in_progress',
+  // #5470: managed-write journal caps + receipt retention, read by
+  // persistence/limits.ts (JOURNAL_CONFIG_KEYS; drift-guarded by test).
+  'persistence.limits.principal_outstanding', 'persistence.limits.brain_outstanding',
+  'persistence.limits.principal_intent_bytes', 'persistence.limits.brain_intent_bytes',
+  'persistence.limits.principal_lifetime_ids', 'persistence.limits.brain_lifetime_ids',
+  'persistence.limits.principal_terminal_bytes', 'persistence.limits.brain_terminal_bytes',
+  'persistence.limits.brain_recovery_bytes', 'persistence.limits.worktree_recovery_bytes',
+  'persistence.receipt_retention_days', 'persistence.unbound_write', // #5254: persistence/unbound-source.ts
 ];
 
 /**
@@ -1681,6 +1651,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   //   parser; numeric 0 disables.
   'minions.',
   'pace.',              // pace.mode + PACE_MODE_CONFIG_KEYS (src/core/pace-mode.ts)
+  'decide.',            // System One decide.* (validated by src/core/ai/decide/config.ts DECIDE_CONFIG_KEYS)
   'connectors.',        // chat-connectors: source_id, sync_floor_min, embed_kickoff_min_pages, doctor_stale_hours, <provider>.{auto_sync,last_sync_at,auth_error_at,watermark_iso} (no secrets — creds are file-plane)
 ];
 

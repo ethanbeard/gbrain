@@ -29,6 +29,11 @@ export interface EmbeddingPricing {
  * gateway model strings (e.g. 'openai:text-embedding-3-large').
  */
 export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
+  // TypeSafe Jev (reranker + decide; https://docs.typesafe.ai/models, verified 2026-09-30).
+  // System One bills input tokens only; rerank- and decide-kind budgets price through this table.
+  'typesafe:jev-1.13.0': { pricePerMTok: 0.042 },
+  'typesafe:jev-latest': { pricePerMTok: 0.042 },
+  'typesafe:jev-preview': { pricePerMTok: 0.042 },
   // OpenAI (https://developers.openai.com/api/docs/pricing, verified 2026-07-28)
   'openai:text-embedding-3-large': { pricePerMTok: 0.13 },
   'openai:text-embedding-3-small': { pricePerMTok: 0.02 },
@@ -44,11 +49,6 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   'voyage:voyage-finance-2':       { pricePerMTok: 0.12 },
   'voyage:voyage-law-2':           { pricePerMTok: 0.12 },
   'voyage:voyage-multimodal-3':    { pricePerMTok: 0.12 },
-  // Voyage rerankers (same pricing page; 2.5 pair verified 2026-08-21, the
-  // rerank-3 preview pair 2026-09-06). Same budget-tracker rerank-kind
-  // fallback rationale as the zerank-2 row below. Rows carry the list rate:
-  // Voyage's free-token grants are per-account and not modeled here, so
-  // over-reporting inside a grant beats under-reporting past it.
   'voyage:rerank-2.5':             { pricePerMTok: 0.05 },
   'voyage:rerank-2.5-lite':        { pricePerMTok: 0.02 },
   'voyage:rerank-3':               { pricePerMTok: 0.05 },
@@ -67,12 +67,6 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   'voyage:voyage-3':               { pricePerMTok: 0.06 },
   'voyage:voyage-3-lite':          { pricePerMTok: 0.02 },
   'voyage:voyage-code-3':          { pricePerMTok: 0.18 },
-  // ZeroEntropy (https://www.zeroentropy.dev/pricing, verified 2026-07-28)
-  'zeroentropyai:zembed-1':        { pricePerMTok: 0.05 },
-  // ZeroEntropy reranker (docs/ai-providers/zeroentropy.md — $0.025/1M tokens).
-  // Reused here (not a separate rerank table) because budget-tracker.ts's
-  // rerank-kind lookup falls back to this same table for paid providers.
-  'zeroentropyai:zerank-2':        { pricePerMTok: 0.025 },
   // Mistral (https://mistral.ai/pricing/api/, verified 2026-07-28)
   'mistral:mistral-embed':         { pricePerMTok: 0.10 },
   'mistral:mistral-embed-2312':    { pricePerMTok: 0.10 },
