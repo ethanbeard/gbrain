@@ -2,11 +2,11 @@ import type { ParamDef } from '../ops/contract.ts';
 
 /** Capture input sugar stays data; the owner materializes generated fields once. */
 export const CAPTURE_EVENT_PARAMS: Record<string, ParamDef> = {
-  who: { type: 'string', description: 'For event captures, comma-separated entity slugs.' },
-  what: { type: 'string', description: 'For event captures, the event description.' },
-  where: { type: 'string', description: 'For event captures, the location.' },
-  kind: { type: 'string', description: 'For event captures, the event kind.' },
-  depth: { type: 'string', description: 'For event captures, the depth page to link.' },
+  who: { type: 'string', description: 'Event: comma-separated entity slugs.' },
+  what: { type: 'string', description: 'Event.' },
+  where: { type: 'string', description: 'Event place.' },
+  kind: { type: 'string', description: 'Event kind.' },
+  depth: { type: 'string', description: 'Event depth page to link.' },
 };
 import { WRITE_REQUEST_STATES, WRITE_HEALTH_REASONS, WRITE_HEALTH_ASSESSMENTS, WRITE_HEALTH_ACTIONS } from './types.ts';
 
@@ -16,21 +16,28 @@ import { WRITE_REQUEST_STATES, WRITE_HEALTH_REASONS, WRITE_HEALTH_ASSESSMENTS, W
  */
 export const WRITE_REQUEST_PARAM: ParamDef = {
   type: 'string',
-  description: 'Optional caller-generated UUID for this write. Reuse the same UUID and original arguments to recover its outcome after a timeout; a different intent requires a new UUID.',
+  description: 'UUID; retry with it on timeout.',
+};
+
+/** #6007: transport-only long-poll; never stored with the write or compared on replay. */
+export const WIRE_WRITE_WAIT_MAX_MS = 30_000;
+export const WRITE_WAIT_PARAM: ParamDef = {
+  type: 'number',
+  description: `Commit wait ms (0-${WIRE_WRITE_WAIT_MAX_MS}, default 5000).`,
 };
 
 export const PAGE_MUTATION_PARAMS: Record<string, ParamDef> = {
   source_id: {
     type: 'string',
-    description: 'Source to mutate. Defaults to the selected source. Remote callers may only use their current write source.',
+    description: 'Write source.',
   },
   expected_revision: {
     type: 'string',
-    description: 'Revision returned by the page read. Required when replacing an existing page unless force is true. Omit both for create-only writes.',
+    description: 'Revision read; omit to create.',
   },
   force: {
     type: 'boolean',
-    description: 'Explicitly overwrite the current revision. Mutually exclusive with expected_revision; does not bypass authorization or the empty-content guard.',
+    description: 'Ignore the revision.',
   },
   request_id: WRITE_REQUEST_PARAM,
 };

@@ -62,6 +62,14 @@ export interface ExtractedEdge {
    * references (Python's type hints are too sparse to be useful for v0.34).
    */
   edgeType: 'calls' | 'imports' | 'references';
+  /**
+   * A `calls` edge whose callee is a member access (`obj.m()`, `self.m()`,
+   * `pkg.F()`) with a receiver the extractor could not type, so `toSymbol`
+   * is the bare `m`. A member call never invokes a same-file top-level
+   * function, so the within-file resolver leaves these unresolved
+   * (gbrain-evals N13-8: `segments.join("/")` resolved to pathe's `join`).
+   */
+  memberCall?: true;
 }
 
 /**
@@ -187,6 +195,26 @@ function extractCalleeName(node: any, cfg: CallConfig): string | null {
     return m ? sanitizeIdent(m[1]!) : null;
   }
   return null;
+}
+
+const MEMBER_CALLEE_TYPES = new Set([
+  'member_expression',
+  'attribute',
+  'field_expression',
+  'selector_expression',
+  'navigation_expression',
+  'member_access_expression',
+]);
+
+/** True when the call goes through a receiver: `obj.m()`, `self.m()`, Java `o.m()`, Ruby `o.m`. */
+function isMemberCall(node: any, cfg: CallConfig): boolean {
+  if (node.childForFieldName?.('object') || node.childForFieldName?.('receiver')) return true;
+  const callee = cfg.calleeFieldName
+    ? node.childForFieldName(cfg.calleeFieldName)
+    : cfg.calleeFirstNamedChild
+      ? (node.namedChild?.(0) ?? null)
+      : null;
+  return !!callee && MEMBER_CALLEE_TYPES.has(callee.type);
 }
 
 function sanitizeIdent(s: string): string | null {
@@ -452,6 +480,7 @@ export function extractCallEdges(tree: any, language: SupportedCodeLanguage): Ex
           callSiteByteOffset: node.startIndex,
           toSymbol: qualified ?? callee,
           edgeType: 'calls',
+          ...(!qualified && isMemberCall(node, cfg) ? { memberCall: true as const } : {}),
         });
       }
     }

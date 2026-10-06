@@ -24,7 +24,7 @@ import { drainShadow } from '../../src/core/ai/decide/runtime.ts';
 import { packShape } from '../../src/core/ai/decide/pack.ts';
 import { resetDecideSearchCache } from '../../src/core/search/decide-stage.ts';
 import { assembleTurnContext, type TurnContextResult } from '../../src/core/context/turn-context.ts';
-import { applyRecallNeeded, startRecallNeeded, RECALL_NEEDED_DEADLINE_MS } from '../../src/core/context/recall-needed.ts';
+import { applyRecallNeeded, startRecallNeeded, RECALL_NEEDED_DEADLINE_MS, __setRecallDeadlinesForTests } from '../../src/core/context/recall-needed.ts';
 import {
   ensureIpcSecret, requestTurnContext, resolveSocketPath, startResolveIpcServer, TURN_CONTEXT_SERVER_BUDGET_MS, type TurnContextResponse,
 } from '../../src/core/context/resolve-ipc.ts';
@@ -150,6 +150,13 @@ describe('all slots off', () => {
 });
 
 describe('S6 on', () => {
+  // These cases pin what S6 decides, not how fast: wide windows keep a loaded
+  // runner from turning a decision into `late`. The fail directions (timeout,
+  // the late fire) run on the production deadlines.
+  let restoreDeadlines = () => {};
+  beforeEach(() => { restoreDeadlines = __setRecallDeadlinesForTests({ decisionMs: 5_000, serverBudgetMs: 5_150 }); });
+  afterEach(() => restoreDeadlines());
+
   test('fires one keyword-only search when the reflex was silent; world pages only; receipt fire', async () => {
     transport({ p: 0.9 });
     await setConfig(S6_ON);

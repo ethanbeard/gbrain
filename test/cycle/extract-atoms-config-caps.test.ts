@@ -73,7 +73,8 @@ describe('extract_atoms configurable caps (#4540)', () => {
     expect(calls[0].maxTokens).toBe(DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS);
     const content = userContent(calls[0]);
     // Body is prefix + truncated content: the 55k payload was cut to 50k.
-    expect(content.length).toBeLessThan(DEFAULT_EXTRACT_MAX_INPUT_CHARS + 200);
+    // + the preamble (source line and the default observation-date line).
+    expect(content.length).toBeLessThan(DEFAULT_EXTRACT_MAX_INPUT_CHARS + 300);
     expect(content.length).toBeGreaterThanOrEqual(DEFAULT_EXTRACT_MAX_INPUT_CHARS);
   });
 
@@ -91,8 +92,8 @@ describe('extract_atoms configurable caps (#4540)', () => {
     expect(calls.length).toBe(1);
     expect(calls[0].maxTokens).toBe(512);
     const content = userContent(calls[0]);
-    // 2000 content chars + the small "Source: ..." preamble.
-    expect(content.length).toBeLessThan(2_200);
+    // 2000 content chars + the small preamble ("Source: ..." and the observation-date line).
+    expect(content.length).toBeLessThan(2_300);
     expect(content).toContain('y'.repeat(2_000));
     expect(content).not.toContain('y'.repeat(2_001));
   });

@@ -27,6 +27,10 @@
 import { copyFileSync, existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { atomicWriteTextFile } from './atomic-write.ts';
+import { normalizeSeatLabel } from '../context/seat.ts';
+import { detectExecutionEnvironment } from '../execution-env.ts';
+import { stdioServeArgv } from '../mcp-registration.ts';
+import type { McpSurface } from '../../mcp/surface.ts';
 import {
   CLAUDE_COMMITTED_SETTINGS_FILE_RELPATH,
   CLAUDE_HOOK_DEFAULT_TIMEOUT_SECS,
@@ -56,6 +60,13 @@ export interface ClaudeHookEnv {
    * the same event never fires twice (Claude Code merges settings scopes).
    */
   GBRAIN_HOOK_LANE?: string;
+  /**
+   * #4618 seat label credited on captured sessions (`--seat`). Undefined
+   * keeps the seat a prior install of the same marker rendered; '' clears it
+   * (`--no-seat`). Local carriers only: the committed carrier travels between
+   * machines and never carries a seat.
+   */
+  GBRAIN_SEAT?: string;
 }
 
 export interface WriteClaudeHooksOpts {
@@ -163,8 +174,56 @@ export function buildClaudeHookCommand(
   if (env.GBRAIN_SOURCE !== undefined) assignments.push(`GBRAIN_SOURCE=${env.GBRAIN_SOURCE}`);
   if (env.GBRAIN_HOME) assignments.push(`GBRAIN_HOME=${env.GBRAIN_HOME}`);
   if (env.GBRAIN_HOOK_LANE) assignments.push(`GBRAIN_HOOK_LANE=${env.GBRAIN_HOOK_LANE}`);
+  if (env.GBRAIN_SEAT) assignments.push(`GBRAIN_SEAT=${env.GBRAIN_SEAT}`);
   const parts = ['env', ...assignments, gbrainBin, 'hook', CLAUDE_HOOK_SUBCOMMAND[event]];
   return parts.map(shellQuote).join(' ');
+}
+
+/**
+ * `--seat <label>` / `--no-seat` → the hook env's GBRAIN_SEAT: the validated
+ * label, '' to clear a carried seat, or undefined to keep the installed one.
+ * With the workspace lane's `harness`, `note` says where a seat cannot be
+ * rendered into a hook command and how to set it instead.
+ */
+export function parseSeatFlags(rest: string[], harness?: string): { seat?: string; error?: string; note?: string } {
+  const noSeat = rest.includes('--no-seat');
+  const i = rest.indexOf('--seat');
+  if (i < 0) return noSeat ? { seat: '' } : {};
+  if (noSeat) return { error: 'pass --seat <label> OR --no-seat, not both' };
+  const raw = rest[i + 1];
+  const seat = raw === undefined || raw.startsWith('--') ? null : normalizeSeatLabel(raw);
+  if (seat === null) {
+    return {
+      error:
+        `invalid --seat '${raw ?? ''}': a seat label is 1-64 characters of a-z, 0-9, '.', '_' or '-', ` +
+        'starting with a letter or digit — re-run with a valid label, e.g. `--seat alice-desk`',
+    };
+  }
+  if (harness === 'codex') {
+    return { seat, note: `note: --seat applies to Claude Code hooks; codex sessions are credited to their CODEX_HOME seat (home-<hash>) unless GBRAIN_SEAT=${seat} is set in the environment codex runs in.` };
+  }
+  if (harness === 'opencode') return { seat, note: 'note: --seat has no effect for opencode — gbrain installs no opencode session-capture hooks.' };
+  if (harness === 'claude-code' && detectExecutionEnvironment() === 'cloud-sandbox') {
+    return { seat, note: `note: --seat is not written to the COMMITTED hook carrier (it travels with the repo) — set GBRAIN_SEAT=${seat} in this cloud environment's variables instead.` };
+  }
+  return { seat };
+}
+
+/** The seat a prior install of `marker` rendered into this file's hook commands. */
+function installedSeat(hooks: Record<string, unknown>, marker: string): string | undefined {
+  for (const groups of Object.values(hooks)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      const entries = (group as HookMatcherGroup)?.hooks;
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (!isOurs(entry, marker) || typeof (entry as HookCommandEntry).command !== 'string') continue;
+        const m = /(?:^| )GBRAIN_SEAT=([a-z0-9][a-z0-9._-]{0,63})(?= )/.exec((entry as HookCommandEntry).command);
+        if (m) return m[1];
+      }
+    }
+  }
+  return undefined;
 }
 
 export function claudeCommittedSettingsPath(workspaceDir: string): string {
@@ -423,6 +482,10 @@ export function writeClaudeHooksAt(
   // --project lane does the same for its dirs) — this path-parameterized
   // writer has no workspace to derive it from.
   const carried = opts.carriedEvents ?? new Set<ClaudeHookEvent>();
+  // #4618: a re-install without --seat keeps the seat the prior install chose.
+  const env = opts.env.GBRAIN_SEAT === undefined
+    ? { ...opts.env, GBRAIN_SEAT: installedSeat(hooks, marker) }
+    : opts.env;
   let removedPrior = 0;
   const installed: Array<{ event: ClaudeHookEvent; command: string }> = [];
 
@@ -462,7 +525,7 @@ export function writeClaudeHooksAt(
       continue;
     }
 
-    const command = buildClaudeHookCommand(opts.gbrainBin, event, opts.env);
+    const command = buildClaudeHookCommand(opts.gbrainBin, event, env);
     const timeout = opts.timeoutSecs?.[event] ?? CLAUDE_HOOK_DEFAULT_TIMEOUT_SECS[event];
     const entry: HookCommandEntry = {
       type: 'command',
@@ -814,6 +877,8 @@ export interface ClaudeMcpRegistration {
   sourceId: string;
   /** PARENT dir for --isolated installs (config appends `.gbrain`) [CX2-8]. */
   gbrainHome?: string;
+  /** The serve surface; default REGISTRATION_SURFACE, `null` = bare `serve` (never-narrow carry-over). */
+  surface?: McpSurface | null;
 }
 
 export type CodexMcpRegistration = Omit<ClaudeMcpRegistration, 'scope'>;
@@ -823,9 +888,11 @@ export type CodexMcpRegistration = Omit<ClaudeMcpRegistration, 'scope'>;
  * (binary first) — the dispatcher execs them; nothing here touches the
  * filesystem or the network. Shape per TARGETS['claude-code-2026-08'].
  *
- * The serve argv pins `--surface full`: bootstrap's contract (put_page,
- * get_page, timeline, …) needs the full op surface, and a pre-existing
- * `mcp_surface: verbs` config row must not silently narrow the registration.
+ * The serve argv comes from `stdioServeArgv`: `--surface starter` by default
+ * (bootstrap's contract — put_page, get_page, add_timeline_entry, search,
+ * query — is in it, and a pre-existing `mcp_surface: verbs` config row cannot
+ * narrow a pinned registration); `surface` carries an existing entry's form
+ * over on replacement or applies `--surface`.
  */
 export function registerClaudeMcp(p: ClaudeMcpRegistration): string[][] {
   if (!isAbsolute(p.gbrainBin)) {
@@ -838,15 +905,15 @@ export function registerClaudeMcp(p: ClaudeMcpRegistration): string[][] {
     '-e', `GBRAIN_SOURCE=${p.sourceId}`,
   ];
   if (p.gbrainHome) argv.push('-e', `GBRAIN_HOME=${p.gbrainHome}`);
-  argv.push('--', p.gbrainBin, 'serve', '--surface', 'full');
+  argv.push('--', ...stdioServeArgv(p.gbrainBin, p.surface));
   return [argv];
 }
 
 /**
  * `codex mcp add` argv for a LOCAL stdio serve (writes ~/.codex/config.toml
  * itself — no TOML writer needed in v1, see TARGETS['codex-2026-08']).
- * Codex registrations are user-global; there is no scope flag.
- * `--surface full` pins the full op surface (see registerClaudeMcp).
+ * Codex registrations are user-global; there is no scope flag. The serve
+ * argv comes from `stdioServeArgv` (see registerClaudeMcp).
  */
 export function registerCodexMcp(p: CodexMcpRegistration): string[][] {
   if (!isAbsolute(p.gbrainBin)) {
@@ -855,6 +922,6 @@ export function registerCodexMcp(p: CodexMcpRegistration): string[][] {
   const name = p.name ?? 'gbrain';
   const argv = ['codex', 'mcp', 'add', name, '--env', `GBRAIN_SOURCE=${p.sourceId}`];
   if (p.gbrainHome) argv.push('--env', `GBRAIN_HOME=${p.gbrainHome}`);
-  argv.push('--', p.gbrainBin, 'serve', '--surface', 'full');
+  argv.push('--', ...stdioServeArgv(p.gbrainBin, p.surface));
   return [argv];
 }

@@ -11,6 +11,9 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import { gbrainPath } from '../../../core/config.ts';
 import { LATEST_VERSION } from '../../../core/migrate.ts';
 import { MINIMUM_BUN_VERSION, unsupportedBunMessage } from '../../../core/runtime-version.ts';
+import { isNewerVersion } from '../../../core/semver.ts';
+import type { SelfUpgradeAction } from '../../../core/self-upgrade.ts';
+import type { SelfUpgradeAuditEvent } from '../../../core/audit/self-upgrade-audit.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../../../version.ts';
 import type { Check } from '../../doctor.ts';
 
@@ -45,10 +48,23 @@ export function upgradeErrorResolved(
 }
 
 /**
+ * #5855: the auto-upgrade the newest autopilot event holds for the Bun floor,
+ * while its target is still newer than the running binary (a later apply, or
+ * a manual upgrade to the target, ends the hold); null otherwise. `recent` is
+ * in ts order.
+ */
+function heldAutoUpgrade(recent: SelfUpgradeAuditEvent[], runningVersion: string): SelfUpgradeAuditEvent | null {
+  const last = recent.filter((e) => e.channel === 'autopilot').at(-1);
+  if (last?.action !== ('unsupported_runtime' satisfies SelfUpgradeAction) || !last.latest) return null;
+  return isNewerVersion(runningVersion, last.latest) ? last : null;
+}
+
+/**
  * v0.42 self_upgrade_health. Surfaces the self-upgrade mode, whether an update
- * is pending (from the cache), and any recent failed auto-upgrade attempts.
- * File-plane only (no DB) so it runs on thin clients. Three-state: warn on
- * recent failures, otherwise ok.
+ * is pending (from the cache), an auto-upgrade held for the Bun floor (#5855),
+ * and any recent failed auto-upgrade attempts. File-plane only (no DB) so it
+ * runs on thin clients. Warn on a held auto-upgrade or recent failures,
+ * otherwise ok.
  */
 export function checkSelfUpgradeHealth(): Check {
   try {
@@ -81,7 +97,17 @@ export function checkSelfUpgradeHealth(): Check {
       parts.push(`skipping known-bad: ${failedVersions.join(', ')}`);
     }
 
-    const recent = readRecentSelfUpgrades(7) as Array<{ outcome?: string; error?: string; latest?: string | null }>;
+    // readRecent lists the current week before the previous one; order by ts.
+    const recent = (readRecentSelfUpgrades(7) as SelfUpgradeAuditEvent[])
+      .toSorted((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    const held = heldAutoUpgrade(recent, GBRAIN_BINARY_VERSION);
+    if (held) {
+      return {
+        name: 'self_upgrade_health',
+        status: 'warn',
+        message: `Auto-upgrade to ${held.latest} held: ${held.reason ?? 'Bun floor not met'} (${parts.join('; ')}).`,
+      };
+    }
     const failures = recent.filter((e) => e.outcome === 'failed');
     if (failures.length > 0) {
       const last = failures[failures.length - 1];

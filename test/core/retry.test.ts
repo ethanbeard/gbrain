@@ -346,6 +346,8 @@ describe('BATCH_AUDIT_SITES typed enum + isBatchAuditSite guard (D10c codex)', (
       'extract.by_mention',
       // #3674: --rebuild reconciling delete-then-insert of the mention scan's rows.
       'extract.by_mention.rebuild',
+      // Entity mention index: the stale sweep's reconciling mention pass.
+      'extract.mentions',
       'extract.stale',
       // #3961: atom-provenance edges banked after the completion-receipt flip.
       'cycle.extract_atoms.provenance',

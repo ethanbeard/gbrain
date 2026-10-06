@@ -71,6 +71,8 @@ if (skip) console.log('Skipping E2E schema catalog goldens (DATABASE_URL not set
 const CAPTURE_TIMEOUT = 240_000;
 /** Same allowlist as test/e2e/schema-drift.test.ts (Postgres-only by design). */
 const PG_ONLY_TABLES = ['file_migration_ledger'];
+/** F4b planner-stats accounting: PGLite-only by design (Postgres has autovacuum). */
+const PGLITE_ONLY_TABLES = ['planner_stats_deltas', 'planner_stats_state'];
 
 function withDatabase(url: string, name: string): string {
   const u = new URL(url);
@@ -189,7 +191,7 @@ describe.skipIf(skip)('Postgres catalog goldens (E4, E2E)', () => {
   test('T-G13: PG <-> PGLite column parity stays name-based (existing drift contract)', async () => {
     const pglite = await withCatalogConfig(CATALOG_CONFIGS[0], capturePgliteEngineCatalog);
     const diff = diffSnapshots(toSchemaSnapshot(requireCaptured('engine:default')), toSchemaSnapshot(pglite), {
-      allowlistPgOnlyTables: PG_ONLY_TABLES,
+      allowlistPgOnlyTables: PG_ONLY_TABLES, allowlistPgliteOnlyTables: PGLITE_ONLY_TABLES,
     });
     if (!isCleanDiff(diff)) throw new Error(`PG <-> PGLite column drift:\n${formatDiffForFailure(diff)}`);
     expect(isCleanDiff(diff)).toBe(true);

@@ -39,11 +39,13 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 . scripts/lib/test-env.sh
+receipts_init slow
 ensure_pglite_snapshot "run-slow-tests"
 ensure_default_pglite_snapshot "run-slow-tests"
 
 if [ "${#slow_files[@]}" -eq 0 ]; then
   echo "[run-slow-tests] no *.slow.test.ts files; nothing to do."
+  receipt_empty all "" ""
   exit 0
 fi
 
@@ -53,4 +55,8 @@ echo "[run-slow-tests] running ${#slow_files[@]} slow files (CI runs these as pa
 # when bun runs slow files in parallel, CPU contention pushes them past
 # 60s and individual tests timeout even though they'd pass solo. Slow
 # tests are explicit by-name — generous per-test budget is correct.
-exec bun test --timeout=120000 "${slow_files[@]}"
+receipt_begin primary all "" "" "" "${slow_files[@]}"
+rc=0
+bun test --timeout=120000 ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "${slow_files[@]}" || rc=$?
+receipt_end "$rc"
+exit "$rc"

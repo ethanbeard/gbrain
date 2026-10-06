@@ -13,7 +13,7 @@
  *
  * Lane: unit. Run: `bun test test/backfill-perf-pglite.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';

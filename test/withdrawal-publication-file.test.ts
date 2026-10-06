@@ -12,6 +12,7 @@ import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import { activatePersistence } from '../src/core/persistence/activation.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { localHostId, registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { admitWrite, claimNextWrite } from '../src/core/persistence/journal.ts';
@@ -79,8 +80,8 @@ test('a prepared repo-file write racing a withdrawal leaves the canonical file a
     expect(prepared.file?.content).toContain(claim);
 
     const fact = await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () =>
-      tx.insertFact({ fact: claim, source: 'remember', visibility: 'world' }, { source_id: sourceId })));
-    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => recordFactWithdrawal(tx, fact.id, sourceId, true)));
+      tx.insertFact({ fact: claim, source: 'remember', visibility: 'world' }, { source_id: sourceId }), TEST_WRITE_ATTRIBUTION));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => recordFactWithdrawal(tx, fact.id, sourceId, true), TEST_WRITE_ATTRIBUTION));
 
     const boundaries: string[] = [];
     const rejected = await publishMutation(engine, claimed, prepared, hostId, {

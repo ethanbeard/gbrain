@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { isPhysicalRootMetadata } from '../src/core/persistence/physical-root.ts';
 import { tmpdir } from 'node:os';
@@ -86,6 +86,32 @@ test('running publication refuses lifecycle before metadata or generation change
   expect((await getWorktreeBinding(engine,source))!.topology_generation).toBe(binding.topology_generation);
   expect((await engine.executeRaw<{archived:boolean}>('SELECT archived FROM sources WHERE id=$1',[source]))[0].archived).toBe(false);
 }),60_000);
+
+test('set-path at the bound checkout repairs a stale sources.local_path instead of no-oping (#5569)',()=>fixture(async(home,source,root)=>{
+  const stale=join(home,'old-location');
+  await engine.transaction(async tx=>{
+    await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
+    await tx.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[source,stale]);
+  });
+  const result=await runManagedSourceLifecycle(engine,{operation:'rebind',sourceId:source,path:root}) as {noop?:boolean};
+  expect(result.noop).toBeUndefined();
+  const [row]=await engine.executeRaw<{local_path:string}>('SELECT local_path FROM sources WHERE id=$1',[source]);
+  expect(row.local_path).toBe(realpathSync(root));
+  const again=await runManagedSourceLifecycle(engine,{operation:'rebind',sourceId:source,path:root}) as {noop?:boolean};
+  expect(again.noop).toBe(true);
+}));
+
+test('a local_path that is an alias (symlink) of the bound root is current: claim and rebind through it are no-ops',()=>fixture(async(home,source,root)=>{
+  const alias=join(home,'alias-root');symlinkSync(realpathSync(root),alias);
+  await engine.transaction(async tx=>{
+    await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
+    await tx.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[source,alias]);
+  });
+  for(const operation of ['claim','rebind'] as const){
+    expect(await runManagedSourceLifecycle(engine,{operation,sourceId:source,path:alias})).toMatchObject({state:'committed',noop:true});
+    expect(await engine.executeRaw('SELECT local_path FROM sources WHERE id=$1',[source])).toEqual([{local_path:alias}]);
+  }
+}));
 
 test('rebind requires exact manifest including deletion and old path remains fenced',()=>fixture(async(home,source,root)=>{
   const candidate=join(home,'candidate');cpSync(root,candidate,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});
@@ -190,6 +216,32 @@ test('expiry sweep rechecks restored sources under the topology guard',()=>fixtu
   expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source])).toHaveLength(1);
 }),60_000);
 
+
+test('gbrain#5452 managed purge refuses missing/epoch archive stamps and still purges a real expiry',()=>fixture(async(_home,source)=>{
+  await runManagedSourceLifecycle(engine,{operation:'archive',sourceId:source});
+  const purge=()=>runManagedSourceLifecycle(engine,{operation:'purge',sourceId:source,confirmDestructive:true,expiredOnly:true});
+  const survives=async()=>expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source])).toHaveLength(1);
+  // Epoch expiry — pre-column-stamp archive shape from the report.
+  await engine.executeRaw(`UPDATE sources SET archive_expires_at='1970-01-01T00:00:00Z' WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  // Missing expiry.
+  await engine.executeRaw(`UPDATE sources SET archive_expires_at=NULL WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  // A normal past expiry is not enough on its own: an epoch/missing
+  // archived_at means the 72h window was never provably granted.
+  await engine.executeRaw(`UPDATE sources SET archive_expires_at=now()-INTERVAL '1 hour' WHERE id=$1`,[source]);
+  await engine.executeRaw(`UPDATE sources SET archived_at='1970-01-01T00:00:00Z' WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  await engine.executeRaw(`UPDATE sources SET archived_at=NULL WHERE id=$1`,[source]);
+  expect(await purge()).toMatchObject({state:'committed',noop:true});await survives();
+  // Real stamps + past expiry purge normally — a real purge receipt carries
+  // no `noop` marker and the row is gone.
+  await engine.executeRaw(`UPDATE sources SET archived_at=now()-INTERVAL '73 hours' WHERE id=$1`,[source]);
+  const receipt=await purge();
+  expect(receipt).toMatchObject({state:'committed'});
+  expect('noop' in receipt).toBe(false);
+  expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source])).toHaveLength(0);
+}),60_000);
 
 test('a failed new clone retries under the retained physical identity and a new explicit request',()=>fixture(async(home)=>{
   const target=join(home,'new-clone');

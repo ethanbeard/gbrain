@@ -16,6 +16,7 @@ tools:
   - list_pages
   - get_timeline
 mutating: false
+when_to_use: "Use when the user asks: \"morning prep\", \"prepare for today\", \"what's on my plate\", \"day prep\"."
 ---
 
 # Daily Task Prep
@@ -54,8 +55,24 @@ Prep: {what to know before this meeting}
 - {task with priority}
 ```
 
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain waiting` refuses on stale data: run (or ask the user to run) the sync it names, then retry; do not prep from stale mail.
+- Meeting-context searches return nothing with a degraded notice: say the brain is searching keywords only right now, instead of "no prior context".
+
 ## Anti-Patterns
 
 - Listing meetings without loading attendee context from brain
 - Ignoring yesterday's unresolved threads
 - Presenting tasks without priority ordering
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
+
+- `get_timeline` → `gbrain timeline`
+
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

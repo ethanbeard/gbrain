@@ -9,7 +9,8 @@
  *   verifier (sealed revision, selected column, model and hashes), so the
  *   effect commits with no provider work.
  * - `superseded`: the page was deleted, or a newer revision of the same page
- *   (same page id) owns its own embedding effect; the effect commits with
+ *   (same page id) owns its own embedding effect or has independently
+ *   verified current vectors; the effect commits with
  *   `{ embedding: 'superseded' }`, as the owner's own run would.
  * - `retry_queued`: the owner embeds it. A stale queued effect is re-queued;
  *   a failed one gets the `retry-effects` allowance, or, when that allowance
@@ -26,7 +27,7 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
 import { EmbeddingDisabledError } from '../embedding-dim-check.ts';
 import { MAX_RATE_LIMIT_RETRIES } from '../embed-retry.ts';
 import { digest } from './digest.ts';
@@ -34,6 +35,7 @@ import { guardEffectSource } from './effect-recovery.ts';
 import { assertEmbeddingEffectEnabled, readEmbeddingEffectProjection, selectedEffectPage } from './effects.ts';
 import { targetedWithdrawalEffect } from './effect-targets.ts';
 import type { PersistenceEffect } from './effect-model.ts';
+import { declarePersistenceProtocol } from './protocol.ts';
 
 export type EmbeddingSettlementOutcome = 'reconciled' | 'superseded' | 'retry_queued' | 'blocked' | 'changed_since_preview';
 
@@ -84,6 +86,7 @@ export function embeddingGrantId(runId: string, effectId: string | number): stri
 export async function settleEmbeddingEffect(engine: BrainEngine, candidate: Pick<EmbeddingCandidate, 'effect_id' | 'state' | 'attempts'>,
   opts: { dryRun: boolean; config: GBrainConfig | null; hostId: string; runId?: string }): Promise<EmbeddingSettlement> {
   return engine.transaction(async tx => {
+    await declarePersistenceProtocol(tx);
     const [effect] = await tx.executeRaw<PersistenceEffect & { request_state: string }>(`SELECT e.*, r.state AS request_state
       FROM persistence_effects e JOIN persistence_requests r ON r.id = e.request_id WHERE e.id = $1 FOR UPDATE OF e`, [candidate.effect_id]);
     if (!effect || effect.kind !== 'embedding' || effect.request_state !== 'committed' || effect.state !== candidate.state
@@ -121,7 +124,23 @@ export async function settleEmbeddingEffect(engine: BrainEngine, candidate: Pick
         const [replacement] = deleted ? [] : await tx.executeRaw<{ id: string }>(`SELECT id::text FROM persistence_effects
           WHERE kind='embedding' AND source_id=$1 AND source_incarnation=$2::uuid AND revision=$3::uuid AND (data->>'page_id')::int=$4 AND id<>$5 LIMIT 1`,
         [effect.source_id, effect.source_incarnation, snapshot!.revision, snapshot!.page.id, effect.id]);
-        if (!deleted && !replacement) return { outcome: 'blocked', reason: 'no_replacement_obligation' };
+        if (!deleted && !replacement) {
+          // Classic import/embed can advance the canonical revision without
+          // scheduling a replacement outbox obligation. Verify its sealed,
+          // same-page projection under the existing source/page guards; never
+          // grant paid retries for an effect targeting the obsolete revision.
+          const signature = configuredSignature(opts.config);
+          if (!signature) return { outcome: 'blocked', reason: 'no_replacement_obligation' };
+          try {
+            const { pending } = await readEmbeddingEffectProjection(tx, effect, snapshot!, opts.hostId, signature);
+            if (pending.length) return { outcome: 'blocked', reason: 'no_replacement_obligation', pending_chunks: pending.length };
+          } catch (error) {
+            if (error instanceof OperationError && error.code === 'projection_pending') return { outcome: 'blocked', reason: 'no_replacement_obligation' };
+            throw error;
+          }
+          return await commit({ embedding: 'superseded', reason: 'current_vectors_verified', verified_revision: snapshot!.revision })
+            ? { outcome: 'superseded', reason: 'current_vectors_verified' } : { outcome: 'changed_since_preview' };
+        }
         const settled = await commit(deleted ? { embedding: 'superseded', reason: 'page_deleted' }
           : { embedding: 'superseded', reason: 'revision_changed', replaced_by: replacement.id });
         return settled ? { outcome: 'superseded', reason: deleted ? 'page_deleted' : 'revision_changed' } : { outcome: 'changed_since_preview' };
@@ -158,7 +177,10 @@ async function queueRetry(tx: BrainEngine, effect: PersistenceEffect, opts: { dr
   const grantId = paid && opts.runId ? embeddingGrantId(opts.runId, effect.id) : null;
   if (grantId && grants.includes(grantId)) return { ...base, reason: 'grant_replayed' };
   if (opts.dryRun) return { ...base, paid, ...(exhausted ? { reason: 'grant_new_retry_cycle' } : {}) };
-  if (paid && !grantId) throw new OperationError('invalid_params', 'An embedding retry grant needs a repair run id.');
+  if (paid && !grantId) {
+    throw opError('invalid_params', 'An embedding retry grant needs a repair run id.',
+      'Paid embedding retries run only through gbrain repair embedding-effects, which supplies the run id. Preview it with gbrain repair embedding-effects --json and apply it after the user approves the cost.');
+  }
   const now = new Date().toISOString();
   const data = { ...effect.data, repair_requeued_at: now,
     ...(effect.state === 'failed' ? { embedding_attempt_base: effect.attempts, embedding_retry_base: effect.attempts } : {}),

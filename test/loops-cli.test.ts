@@ -193,6 +193,40 @@ describe('runWaiting', () => {
     expect(r.verdict).toBe(0);
   });
 
+  test('partially stale google sources warn with source ids without refusing, including JSON', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config, last_sync_at)
+       VALUES ('g-stale', 'g-stale', '{"kind":"google"}'::jsonb, NULL)`,
+    );
+
+    const text = await captured(() => runWaiting(engine, []));
+    expect(text.out).toContain('⚠ some google sources have not synced recently');
+    expect(text.out).toContain('g-stale');
+    expect(text.out).toBe(
+      '⚠ some google sources have not synced recently — this may be out of date: g-stale.\n' +
+        'No open loops — no unanswered threads older than 24h and no tracked promises. You are clean.\n',
+    );
+    expect(text.err).toBe('');
+    expect(text.verdict).toBe(0);
+
+    const json = await captured(() => runWaiting(engine, ['--json']));
+    const envelope = JSON.parse(json.out) as {
+      ok: boolean;
+      status: string;
+      stale: boolean;
+      stale_sources?: string[];
+      sources: Array<{ id: string; stale: boolean }>;
+      text: string;
+    };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.status).toBe('ok');
+    expect(envelope.stale).toBe(false);
+    expect(envelope.stale_sources).toEqual(['g-stale']);
+    expect(envelope.sources).toHaveLength(2);
+    expect(envelope.text).toContain('g-stale');
+    expect(json.verdict).toBe(0);
+  });
+
   test('fresh --json → { ok:true, status:"ok" } envelope carrying groups + text', async () => {
     await upsertOpenLoop(engine, loop());
     const r = await captured(() => runWaiting(engine, ['--json']));
@@ -340,6 +374,16 @@ describe('runLoops', () => {
     expect(r.verdict).toBe(0);
     const rows = await engine.executeRaw<{ status: string }>(`SELECT status FROM open_loops WHERE id = 1`);
     expect(rows[0].status).toBe('dropped');
+  });
+
+  test('--note records a closed_by note instead of "manual" (#5446)', async () => {
+    await upsertOpenLoop(engine, loop());
+    const r = await captured(() => runLoops(engine, ['done', '1', '--note', 'handled in person']));
+    expect(r.out).toContain('Loop 1 done.');
+    const rows = await engine.executeRaw<{ closed_by: string }>(
+      `SELECT closed_by FROM open_loops WHERE id = 1`,
+    );
+    expect(rows[0].closed_by).toBe('handled in person');
   });
 
   test('done without a numeric id hard-exits with usage code 2', async () => {

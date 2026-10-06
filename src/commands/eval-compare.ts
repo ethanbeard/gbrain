@@ -435,7 +435,7 @@ export async function runEvalCompare(args: string[]): Promise<void> {
 
   if (records.length === 0) {
     process.stdout.write(`_No eval-results.jsonl found at <repo>/.gbrain-evals/eval-results.jsonl._\n`);
-    process.stdout.write(`_Run: gbrain eval run-all --modes conservative,balanced,tokenmax --suites longmemeval,replay --seed 42_\n`);
+    process.stdout.write(`_Run, once per mode (conservative, balanced, tokenmax): gbrain eval longmemeval <dataset.jsonl> --mode <mode> --record_\n`);
     return;
   }
 

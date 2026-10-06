@@ -1,16 +1,19 @@
+import { expect } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { GBrainConfig } from '../../src/core/config.ts';
-import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
-import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import { disposePersistenceConsumer, waitForWrites } from '../../src/core/persistence/service.ts';
+import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { isolatedPersistencePostgres } from './persistence-postgres.ts';
 import { syncLockId } from '../../src/core/db-lock.ts';
 import { testBackends } from './test-backends.ts';
-import { connectorWaitBudget } from '../../src/core/persistence/connector-sync.ts';
+import { CONNECTOR_WAIT_BUDGET_MS, connectorWaitBudget } from '../../src/core/persistence/connector-sync.ts';
+import { testWaitMs } from './wait-for.ts';
+import { connectTemplateBrain } from './brain-template.ts';
 import { readManagedConnectorState } from '../../src/core/persistence/connector-state.ts';
 
 export const options = { noEmbed: true, noExtract: true, noSchemaPack: true };
@@ -49,13 +52,10 @@ export function createConnectorFixture() {
   let closePostgres: (() => Promise<void>) | undefined;
   const env = { GBRAIN_HOME: home, CONNECTOR_TEST_TOKEN: 'synthetic-local-fixture' };
   const setup = async () => {
-    // Paused-owner fixtures stop on a 10 s wait budget instead of the production 30 s.
-    connectorWaitBudget.ms = 10_000;
+    // Paused-owner fixtures stop on a 1.5 s wait budget instead of the production 30 s.
+    connectorWaitBudget.ms = testWaitMs(1_500);
     if (backends.includes('pglite')) {
-      const lite = new PGLiteEngine();
-      await lite.connect({ database_path: join(home, 'database') });
-      await lite.initSchema();
-      engines.push(lite);
+      engines.push(await connectTemplateBrain(join(home, 'database')));
     }
     if (backends.includes('postgres')) {
       const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL!);
@@ -64,6 +64,7 @@ export function createConnectorFixture() {
     }
   };
   const teardown = async () => {
+    connectorWaitBudget.ms = CONNECTOR_WAIT_BUDGET_MS;
     for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
     await closePostgres?.();
     rmSync(home, { recursive: true, force: true });
@@ -134,6 +135,18 @@ export function withGoogleAccount(fetcher: ((url: string, init?: RequestInit) =>
     if (!fetcher) throw new Error('Unexpected external fixture route');
     return fetcher(url, init);
   };
+}
+
+/**
+ * A managed sweep returns with an accepted write still pending once its wait
+ * budget runs out; the cursor stays put and the write publishes later. A seed
+ * that reads its imported pages, or stops the consumer and hands the database
+ * to a child, first waits for every write the source admitted to commit.
+ */
+export async function settleConnectorWrites(engine: BrainEngine, sourceId: string) {
+  const rows = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY created_at', [sourceId]);
+  const settled = await waitForWrites(engine, rows, { engine: engine.kind }, testWaitMs(30_000));
+  expect(settled.map(row => [row.slug, row.state])).toEqual(rows.map(row => [row.slug, 'committed']));
 }
 
 /** #5600: the pending set a managed connector run ended with (connector state row). */

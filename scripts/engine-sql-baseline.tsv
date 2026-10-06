@@ -13,6 +13,7 @@ migrated	cjk-search
 migrated	code-edges
 migrated	facts
 migrated	files
+migrated	health
 migrated	links
 migrated	pages
 migrated	salience
@@ -20,6 +21,7 @@ migrated	sources
 migrated	tags
 migrated	takes
 migrated	timeline
+migrated	titles
 method	src/core/pglite-engine.ts	PGLiteEngine._connectInternal
 method	src/core/pglite-engine.ts	PGLiteEngine.deleteEvalCandidatesBefore
 method	src/core/pglite-engine.ts	PGLiteEngine.discoverOntologyDimensions
@@ -27,7 +29,6 @@ method	src/core/pglite-engine.ts	PGLiteEngine.findOntologyConflicts
 method	src/core/pglite-engine.ts	PGLiteEngine.getAllConfig
 method	src/core/pglite-engine.ts	PGLiteEngine.getConfig
 method	src/core/pglite-engine.ts	PGLiteEngine.getDreamVerdict
-method	src/core/pglite-engine.ts	PGLiteEngine.getHealth
 method	src/core/pglite-engine.ts	PGLiteEngine.getIngestLog
 method	src/core/pglite-engine.ts	PGLiteEngine.getOntology
 method	src/core/pglite-engine.ts	PGLiteEngine.getRawData
@@ -44,12 +45,11 @@ method	src/core/pglite-engine.ts	PGLiteEngine.putDreamVerdict
 method	src/core/pglite-engine.ts	PGLiteEngine.putRawData
 method	src/core/pglite-engine.ts	PGLiteEngine.searchKeyword
 method	src/core/pglite-engine.ts	PGLiteEngine.searchKeywordChunks
-method	src/core/pglite-engine.ts	PGLiteEngine.searchTitles
 method	src/core/pglite-engine.ts	PGLiteEngine.setConfig
 method	src/core/pglite-engine.ts	PGLiteEngine.sweepDreamVerdicts
 method	src/core/pglite-engine.ts	PGLiteEngine.unsetConfig
 method	src/core/pglite-engine.ts	probePgliteScratchStore
-method	src/core/pglite-engine/checkpoint-guard.ts	PgliteCheckpointGuard.beforeOutermostTransaction
+method	src/core/pglite-engine/checkpoint-guard.ts	PgliteCheckpointGuard.issueProbe
 method	src/core/pglite-engine/code-edges.ts	getEdgesByChunk
 method	src/core/postgres-engine.ts	PostgresEngine._searchKeywordCJK
 method	src/core/postgres-engine.ts	PostgresEngine.connect
@@ -59,7 +59,6 @@ method	src/core/postgres-engine.ts	PostgresEngine.findOntologyConflicts
 method	src/core/postgres-engine.ts	PostgresEngine.getAllConfig
 method	src/core/postgres-engine.ts	PostgresEngine.getConfig
 method	src/core/postgres-engine.ts	PostgresEngine.getDreamVerdict
-method	src/core/postgres-engine.ts	PostgresEngine.getHealth
 method	src/core/postgres-engine.ts	PostgresEngine.getIngestLog
 method	src/core/postgres-engine.ts	PostgresEngine.getOntology
 method	src/core/postgres-engine.ts	PostgresEngine.getRawData
@@ -78,7 +77,6 @@ method	src/core/postgres-engine.ts	PostgresEngine.putRawData
 method	src/core/postgres-engine.ts	PostgresEngine.resolveFactsEmbeddingCast
 method	src/core/postgres-engine.ts	PostgresEngine.searchKeyword
 method	src/core/postgres-engine.ts	PostgresEngine.searchKeywordChunks
-method	src/core/postgres-engine.ts	PostgresEngine.searchTitles
 method	src/core/postgres-engine.ts	PostgresEngine.setConfig
 method	src/core/postgres-engine.ts	PostgresEngine.sweepDreamVerdicts
 method	src/core/postgres-engine.ts	PostgresEngine.unsetConfig

@@ -9,6 +9,7 @@ tools:
   - get_page
   - search
 mutating: false
+when_to_use: "Use when the user asks: \"share this page\", \"publish page\", \"create shareable link\"."
 ---
 
 # Publish Skill
@@ -142,6 +143,13 @@ Same file, same URL (if hosted), updated content.
 
 Delete the file. If using signed URLs, the URL expires automatically (1 hour).
 If using static hosting, remove the file from the host.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- The source page returns `page_not_found`: resolve the real slug first; never publish a guessed page.
+- `gbrain files upload` / `gbrain files signed-url` fails (storage not configured, `bucket_not_found`): tell the user publishing needs storage and run `gbrain doctor --json`; do not paste private page content instead.
 
 ## Anti-Patterns
 

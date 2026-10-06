@@ -10,7 +10,7 @@
  * provider pointed at a local mock llama-server (OpenAI-compatible, no auth)
  * that can be flipped between failing and healthy. Single test, single
  * brain: every spawn pays a cold transpile cost (see
- * apply-migrations-pglite-spawn.serial.test.ts for the rationale).
+ * apply-migrations-pglite-spawn.test.ts for the rationale).
  *
  * Serial: spawns subprocesses + binds a local port + writes tmpdirs.
  */

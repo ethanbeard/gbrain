@@ -43,7 +43,9 @@ test('complete versions filter timeline and body fences remotely while local his
     await engine.addTag(slug, 'visible-tag', { sourceId });
     await engine.createVersion(slug, { sourceId });
     const stored = await engine.getVersions(slug, { sourceId });
-    expect(await history(engine, slug, false)).toEqual(stored);
+    // Trusted local history is the stored row plus who wrote and archived it (F1b, spec 2.7).
+    expect(await history(engine, slug, false)).toEqual(stored.map(version => ({ ...version,
+      written_by: expect.objectContaining({ origin: expect.any(String) }), archived_by: expect.objectContaining({ origin: expect.any(String) }) })));
     for (const remote of [true, undefined]) {
       const versions = await history(engine, slug, remote); expect(versions).toHaveLength(1);
       const version = versions[0];

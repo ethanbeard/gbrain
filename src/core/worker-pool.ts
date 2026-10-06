@@ -80,6 +80,7 @@
 /** Tagged error classes that bypass `onError` and hard-abort the pool. */
 export const MUST_ABORT_ERROR_TAGS: ReadonlySet<string> = new Set([
   'BUDGET_EXHAUSTED', // src/core/budget/budget-tracker.ts BudgetExhausted.tag
+  'SPEND_GROUP_REFUSED', // src/core/minions/spend-authorization.ts group refusals (exhaustion, pressure, no_pricing)
 ]);
 
 /**

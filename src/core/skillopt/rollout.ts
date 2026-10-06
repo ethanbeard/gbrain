@@ -111,6 +111,7 @@ export async function runRollout(opts: RolloutOpts): Promise<Trajectory> {
     cacheSystem: true, // D11: candidate skill is stable for a step's batch.
     abortSignal: opts.abortSignal,
     purpose: SKILLOPT_PURPOSE.target,
+    allowFallback: false,
     onToolCallStart: async (_turnIdx, _messageIdx, _ordinal, toolName, input, providerToolCallId) => {
       const gbrainToolUseId = `skillopt-${nextOrdinal++}-${providerToolCallId}`;
       const idx = toolCalls.length;

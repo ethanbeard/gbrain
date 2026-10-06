@@ -107,6 +107,30 @@ describe('runEmbed --all (parallel)', () => {
     expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(10);
   });
 
+  test('#5183: on Postgres neither embed loop runs more workers than the client pool', async () => {
+    const pages = Array.from({ length: 20 }, (_, i) => ({ slug: `pool-${i}`, source_id: 'default' }));
+    const chunks = (slug: string) => [{ chunk_index: 0, chunk_text: `text for ${slug}`, chunk_source: 'compiled_truth', embedded_at: null, token_count: 4 }];
+    const stale = pages.map((p, i) => ({ slug: p.slug, chunk_index: 0, chunk_text: `text for ${p.slug}`, chunk_source: 'compiled_truth' as const,
+      model: null, token_count: null, source_id: 'default', page_id: i + 1 }));
+    const previousPool = process.env.GBRAIN_POOL_SIZE;
+    process.env.GBRAIN_EMBED_CONCURRENCY = '10';
+    process.env.GBRAIN_POOL_SIZE = '3';
+    try {
+      await runEmbed(mockEngine({ kind: 'postgres', listPages: async () => pages, getChunks: async (slug: string) => chunks(slug), upsertChunks: async () => {} }), ['--all']);
+      expect(totalEmbedCalls).toBe(20);
+      expect(maxConcurrentEmbedCalls).toBeGreaterThan(1);
+      expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(3);
+      totalEmbedCalls = 0; maxConcurrentEmbedCalls = 0;
+      await runEmbedCore(mockEngine({ kind: 'postgres', countStaleChunks: async () => stale.length, listStaleChunks: async () => stale,
+        getChunks: async (slug: string) => chunks(slug) }), { stale: true });
+      expect(totalEmbedCalls).toBe(20);
+      expect(maxConcurrentEmbedCalls).toBeGreaterThan(1);
+      expect(maxConcurrentEmbedCalls).toBeLessThanOrEqual(3);
+    } finally {
+      if (previousPool === undefined) delete process.env.GBRAIN_POOL_SIZE; else process.env.GBRAIN_POOL_SIZE = previousPool;
+    }
+  });
+
   test('v0.41.31: stamps embedding_signature after embedding each page (--all)', async () => {
     const pages = [{ slug: 'a', source_id: 'default' }, { slug: 'b', source_id: 'default' }];
     const chunksBySlug = new Map(
@@ -915,6 +939,8 @@ describe('#3374 — transient network retry branch', () => {
         if (prop === 'putPage') {
           return async (slug: string, page: any) => { pageStore.set(slug, page); };
         }
+        // Like a real engine, executeRaw always resolves to a row array.
+        if (prop === 'executeRaw') return () => Promise.resolve([]);
         return () => Promise.resolve(null);
       },
     });
@@ -1026,6 +1052,75 @@ describe('embedAllStale wall-clock budget end-to-end (D3 + D3a)', () => {
     // Total wall-clock should be roughly the budget + the time for in-flight
     // workers to drain (1 worker × 80ms latency). Generous upper bound: 1500ms.
     expect(elapsed).toBeLessThan(1500);
+  });
+});
+
+// Large-brain ceiling (F4d): a 30-minute budget stop on a 52k-document brain
+// left 51,910 chunks unembedded with exit 0 and no error. A budget stop with
+// work left now reports reason, remaining count and the exact resume command,
+// and the CLI exits with BUDGET_STOP_EXIT_CODE.
+describe('embed --stale time-budget stop is loud (large-brain ceiling)', () => {
+  const rows = Array.from({ length: 10 }, (_, i) => ({
+    slug: `budget-${i}`, chunk_index: 0, chunk_text: `t${i}`, chunk_source: 'compiled_truth' as const,
+    model: null, token_count: 1, source_id: 'default', page_id: i + 1,
+  }));
+  const budgetEngine = () => mockEngine({
+    countStaleChunks: async () => rows.length,
+    listStaleChunks: async (opts: { afterPageId?: number } = {}) => rows.filter(r => r.page_id > (opts.afterPageId ?? 0)).slice(0, 1),
+    getChunks: async (slug: string) => rows.filter(r => r.slug === slug)
+      .map(r => ({ chunk_index: 0, chunk_text: r.chunk_text, chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 })),
+    upsertChunks: async () => {},
+  });
+
+  test('the result names the stop, the remaining stale chunks and the resume command', async () => {
+    process.env.GBRAIN_EMBED_TIME_BUDGET_MS = '100';
+    process.env.GBRAIN_EMBED_CONCURRENCY = '1';
+    embedBatchBehavior = async (texts) => {
+      await new Promise(r => setTimeout(r, 80));
+      return texts.map(() => new Float32Array(1536));
+    };
+    const result = await runEmbedCore(budgetEngine(), { stale: true, sourceId: 'default', batchSize: 1 });
+    expect(result.embedded).toBeGreaterThan(0);
+    expect(result.pages_processed).toBeLessThan(10);
+    expect(result.reason).toBe('time_budget');
+    expect(result.remaining_stale).toBe(10);
+    expect(result.resume_command).toBe('gbrain embed --stale --catch-up --source default');
+  });
+
+  test('the CLI prints the verdict on stdout and exits with the budget-stop status', async () => {
+    const { BUDGET_STOP_EXIT_CODE } = await import('../src/core/exit-codes.ts');
+    const { currentExitCode, _resetCliExitVerdictForTests } = await import('../src/core/cli-force-exit.ts');
+    const { run } = await import('../src/cli/commands/embed.ts');
+    process.env.GBRAIN_EMBED_TIME_BUDGET_MS = '100';
+    process.env.GBRAIN_EMBED_CONCURRENCY = '1';
+    embedBatchBehavior = async (texts) => {
+      await new Promise(r => setTimeout(r, 80));
+      return texts.map(() => new Float32Array(1536));
+    };
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.join(' ')); };
+    _resetCliExitVerdictForTests();
+    try {
+      // `--yes`: an explicit backfill is paid work and this run is the user's approved one.
+      await run(budgetEngine(), ['--stale', '--batch-size', '1', '--yes'], { SELECTED_CONFIG_BY_ENGINE: new Map() } as never);
+      expect(currentExitCode()).toBe(BUDGET_STOP_EXIT_CODE);
+      expect(BUDGET_STOP_EXIT_CODE).toBe(11);
+    } finally {
+      console.log = log;
+      _resetCliExitVerdictForTests();
+      process.exitCode = 0;
+    }
+    const verdict = lines.find(l => l.includes('reason: time_budget'));
+    expect(verdict).toContain('with 10 stale chunk(s) left');
+    expect(verdict).toContain('Finish without a time cap: gbrain embed --stale --catch-up');
+  });
+
+  test('a run that drains everything before the budget reports no stop', async () => {
+    process.env.GBRAIN_EMBED_TIME_BUDGET_MS = '60000';
+    const result = await runEmbedCore(mockEngine({ countStaleChunks: async () => 0 }), { stale: true });
+    expect(result.reason).toBeUndefined();
+    expect(result.remaining_stale).toBeUndefined();
   });
 });
 

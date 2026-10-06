@@ -296,3 +296,37 @@ describe('graph-query foreign-edge footer (#1153)', () => {
     expect(joined).toMatch(/2 edges to foreign-source pages hidden/);
   });
 });
+
+describe('graph-query --hop (typed chains)', () => {
+  beforeEach(async () => {
+    await truncateAll();
+    for (const [slug, type] of [['people/alice', 'person'], ['people/bob', 'person'], ['companies/acme', 'company']] as const) {
+      await engine.putPage(slug, { type, title: slug, compiled_truth: '', timeline: '' });
+    }
+    await engine.addLink('people/alice', 'companies/acme', 'alice backed acme', 'invested_in', 'markdown');
+    await engine.addLink('companies/acme', 'people/bob', 'founded by bob', 'founded', 'markdown');
+  });
+
+  test('prints each answer with the edges that prove it', async () => {
+    const r = await runWithExit(['people/alice', '--hop', 'invested_in:object', '--hop', 'founded:subject']);
+    expect(r.code).toBe(0);
+    const out = r.out.join('\n');
+    expect(out).toContain('1 answer for people/alice');
+    expect(out).toContain('people/bob');
+    expect(out).toContain('companies/acme -founded-> people/bob (written on the other page): "founded by bob"');
+  });
+
+  test('--hop with --type/--depth is refused; a malformed hop names the fix', async () => {
+    const conflict = await runWithExit(['people/alice', '--hop', 'invested_in:object', '--depth', '2']);
+    expect(conflict.code).toBe(1);
+    expect(conflict.err.join('\n')).toContain('--hop cannot be combined with --depth');
+    const bad = await runWithExit(['people/alice', '--hop', 'invested_in']);
+    expect(bad.code).toBe(1);
+    expect(bad.err.join('\n')).toContain('toward');
+  });
+
+  test('no answers names the empty hop and the inspection command', async () => {
+    const r = await runWithExit(['people/alice', '--hop', 'invested_in:object', '--hop', 'advises:subject']);
+    expect(r.out.join('\n')).toContain('hop 2 (advises:subject) found no typed edges');
+  });
+});

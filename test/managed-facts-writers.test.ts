@@ -39,6 +39,7 @@ import { runLoopsExtract } from '../src/core/google/loops-extract.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { testBackends } from './helpers/test-backends.ts';
 
 const backends = testBackends();
@@ -477,7 +478,7 @@ test('managed deleted-page expiry waits for a concurrent restore of that page (P
     await put('people/bob-demo', PERSON('Bob Demo', FENCE('| 1 | Plays chess | fact | 1.0 | world | low | 2019-01-01 |  | chat |  |')));
   }, async ({ engine, sourceId }) => {
     if (engine.kind !== 'postgres') return;
-    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.softDeletePage('people/bob-demo', { sourceId })));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.softDeletePage('people/bob-demo', { sourceId }), TEST_WRITE_ATTRIBUTION));
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     let locked!: () => void;
@@ -487,7 +488,7 @@ test('managed deleted-page expiry waits for a concurrent restore of that page (P
       await tx.executeRaw('UPDATE pages SET deleted_at=NULL WHERE source_id=$1 AND slug=$2', [sourceId, 'people/bob-demo']);
       locked();
       await gate;
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     await holding;
     const run = runExtractFacts(engine, { sourceId, slugs: [] });
     await new Promise(resolve => setTimeout(resolve, 500));

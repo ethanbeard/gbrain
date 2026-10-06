@@ -11,6 +11,7 @@ import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { BUNDLE_FILE_LIMITS } from '../src/core/persistence/bundle-files.ts';
 import { publishMutation, recoverPublication, type PreparedMutation } from '../src/core/persistence/coordinator.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { cancelWriteRequest } from '../src/core/persistence/control.ts';
 import { advanceEffectCursor, claimPersistenceEffect, completeEffect, renewPersistenceEffectClaim } from '../src/core/persistence/effect-journal.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
@@ -274,15 +275,15 @@ describe('typed skill bundle persistence', () => {
       await expect(f.engine.transaction(async tx => { await declarePersistenceProtocol(tx); await tx.executeRaw(query, params); })).rejects.toThrow('writer_coordinator_required');
       await f.engine.transaction(async tx => {
         await declarePersistenceProtocol(tx);
-        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(query, params));
+        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(query, params), TEST_WRITE_ATTRIBUTION);
       });
       await expect(f.engine.transaction(async tx => {
         await declarePersistenceProtocol(tx);
-        await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("DELETE FROM shared_skill_heads WHERE name='guarded-example'"));
+        await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("DELETE FROM shared_skill_heads WHERE name='guarded-example'"), TEST_WRITE_ATTRIBUTION);
       })).rejects.toThrow('writer_coordinator_required');
       await expect(f.engine.transaction(async tx => {
         await declarePersistenceProtocol(tx);
-        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw("UPDATE shared_skill_heads SET source_id='default' WHERE name='guarded-example'"));
+        await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw("UPDATE shared_skill_heads SET source_id='default' WHERE name='guarded-example'"), TEST_WRITE_ATTRIBUTION);
       })).rejects.toThrow('writer_coordinator_required');
       const [head] = await f.engine.executeRaw<{ source_id: string }>("SELECT source_id FROM shared_skill_heads WHERE name='guarded-example'");
       expect(head.source_id).toBe(sourceId);
@@ -369,7 +370,7 @@ describe('typed skill bundle persistence', () => {
           await tx.executeRaw(`INSERT INTO shared_skill_packs(source_id,source_incarnation,pack_id,revision,manifest,manifest_hash)
             VALUES($1,$2::uuid,'race-example-pack',$3::uuid,$4::text::jsonb,$5)`,
           [sourceId, f.binding.source_incarnation, revision, packBytes, sha256(packBytes)]);
-        });
+        }, TEST_WRITE_ATTRIBUTION);
       });
       const canonical = { bytes: readFileSync(join(f.root, pending.path), 'base64'), manifest: readFileSync(join(f.root, 'skillpack.json'), 'base64'),
         packs: await f.engine.executeRaw('SELECT * FROM shared_skill_packs ORDER BY source_id'),

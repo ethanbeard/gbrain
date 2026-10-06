@@ -17,6 +17,7 @@ import { compactWriteReceipts } from '../../src/core/persistence/journal.ts';
 import { declarePersistenceProtocol } from '../../src/core/persistence/protocol.ts';
 import { localHostId } from '../../src/core/persistence/identity.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { acquireWorktree, getWorktreeBinding } from '../../src/core/persistence/ownership.ts';
 import { extractStaleFromDB } from '../../src/commands/extract.ts';
 import { computeRecommendations } from '../../src/core/brain-score-recommendations.ts';
@@ -232,7 +233,7 @@ export async function managedStaleSweepKeepsNormalizedTimeline(databaseUrl?: str
     const [alice] = await engine.executeRaw<{ id: number }>("SELECT id FROM pages WHERE slug='people/alice-example'");
     // A row written before timeline normalization (whitespace differs from the bullet).
     await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], () =>
-      tx.executeRaw("UPDATE timeline_entries SET summary='Met  Acme ' WHERE page_id=$1", [alice.id])));
+      tx.executeRaw("UPDATE timeline_entries SET summary='Met  Acme ' WHERE page_id=$1", [alice.id]), TEST_WRITE_ATTRIBUTION));
     const timeline = () => engine.executeRaw('SELECT date::text,source,summary FROM timeline_entries WHERE page_id=$1 ORDER BY id', [alice.id]);
     const before = await timeline();
     expect(before).toEqual([{ date: '2026-01-02', source: 'test', summary: 'Met  Acme ' }]);

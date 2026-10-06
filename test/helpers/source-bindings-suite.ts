@@ -55,7 +55,7 @@ export function sourceBindingsSuite(label: string, getEngine: () => BrainEngine)
 
     test('purging an expired archive drops the binding', async () => {
       await bind('expired-a', await addSource('expired-a'));
-      await getEngine().executeRaw("UPDATE sources SET archived = true, archive_expires_at = now() - interval '1 day' WHERE id = 'expired-a'");
+      await getEngine().executeRaw("UPDATE sources SET archived = true, archived_at = now() - interval '4 days', archive_expires_at = now() - interval '1 day' WHERE id = 'expired-a'");
       await withEnv({ GBRAIN_HOME: '/tmp/gbrain-5732-no-clones' }, () => quiet(() => purgeExpiredSources(getEngine())));
       expect(await bindings('expired-a')).toBe(0);
     });

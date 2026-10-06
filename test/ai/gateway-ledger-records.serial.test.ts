@@ -96,16 +96,18 @@ describe('chat() record site', () => {
 });
 
 describe('embed() record site', () => {
-  test('char-estimated tokens -> estimated embedding row with the requested model', async () => {
+  test('provider-reported tokens -> measured embedding row with the requested model', async () => {
     configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 8, env: { OPENAI_API_KEY: 'sk-test' } });
     __setEmbedTransportForTests((async (args: { values: string[] }) => ({
       embeddings: args.values.map(() => Array.from({ length: 8 }, () => 0.1)),
       usage: { tokens: 3 },
     })) as never);
     await withBudgetTracker(tracker, () => embed(['alpha beta', 'gamma']));
+    // The stub reports usage.tokens, so the record banks EXACTLY that count
+    // (not the chars-per-token estimate) and the row reads 'measured'.
     expect(tracker.snapshot().models).toEqual([expect.objectContaining({
       requested_model: 'openai:text-embedding-3-small', model: 'openai:text-embedding-3-small',
-      touchpoint: 'embedding', calls: 1, failed_calls: 0, cost_basis: 'estimated',
+      touchpoint: 'embedding', calls: 1, failed_calls: 0, cost_basis: 'measured', input_tokens: 3,
     })]);
   });
 });

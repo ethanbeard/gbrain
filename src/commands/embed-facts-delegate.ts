@@ -7,13 +7,19 @@ import { maybeDelegateLocalAdministration, persistenceConfigForBrain } from '../
 import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
 import { validateEmbedFactsOptions, type EmbedFactsOptions } from '../core/embed-facts-options.ts';
 import type { EmbedFactsResult } from '../core/embed-facts.ts';
-import { OperationError } from '../core/ops/contract.ts';
+import { OperationError, opError } from '../core/ops/contract.ts';
+import { readFix } from '../core/ops/op-fix.ts';
 import { setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { reportPersistenceCliError } from './persistence-delegate.ts';
 
+const FACT_EMBED_EXAMPLES: Record<string, string> = { '--source': 'default', '--max-cost-usd': '1', '--max-facts': '500', '--batch-size': '50', '--budget-ms': '60000' };
+const invalid = (message: string, suggestion: string) => opError('invalid_params', message, suggestion,
+  { fix: readFix('Prints every gbrain embed form, including fact repair and its flags.', { argv: ['gbrain', 'embed', '--help'] }) });
+
 export function parseFactEmbedArgs(args: string[]): EmbedFactsOptions {
   if (!args.includes('--stale') || !args.includes('--facts')) {
-    throw new OperationError('invalid_params', 'Use embed --stale --facts --source <id> [--dry-run | --yes --max-cost-usd N] [--max-facts N]');
+    throw invalid('Use embed --stale --facts --source <id> [--dry-run | --yes --max-cost-usd N] [--max-facts N]',
+      'Fact repair takes both --stale and --facts: preview with gbrain embed --stale --facts --source SOURCE --dry-run, then apply with --yes --max-cost-usd N after the user approves the cost.');
   }
   const options: Record<string, unknown> = {};
   const booleans = { '--dry-run': 'dryRun', '--yes': 'yes' } as const;
@@ -24,10 +30,11 @@ export function parseFactEmbedArgs(args: string[]): EmbedFactsOptions {
     const boolean = booleans[arg as keyof typeof booleans];
     if (boolean) { options[boolean] = true; continue; }
     const key = values[arg as keyof typeof values];
-    if (!key) throw new OperationError('invalid_params', 'Use embed --stale --facts with only source, preview, approval, and bounded repair options');
+    if (!key) throw invalid('Use embed --stale --facts with only source, preview, approval, and bounded repair options',
+      `Remove ${arg.split('=')[0]}; fact repair accepts --source, --dry-run, --yes, --max-cost-usd, --max-facts, --batch-size, --budget-ms, --json and --quiet.`);
     const value = args[++i];
-    if (!value || value.startsWith('--')) throw new OperationError('invalid_params', `${arg} requires a value`);
-    if (options[key] !== undefined) throw new OperationError('invalid_params', `${arg} may be supplied only once`);
+    if (!value || value.startsWith('--')) throw invalid(`${arg} requires a value`, `Give ${arg} its value right after it, e.g. ${arg} ${FACT_EMBED_EXAMPLES[arg]}.`);
+    if (options[key] !== undefined) throw invalid(`${arg} may be supplied only once`, `Pass ${arg} once, with the one value you mean.`);
     options[key] = key === 'sourceId' ? value : Number(value);
   }
   return validateEmbedFactsOptions(options);
@@ -41,7 +48,13 @@ export async function maybeDelegateFactEmbed(hostConfig: GBrainConfig | null, ar
   try {
     const delegated = await maybeDelegateLocalAdministration('writer_embed_facts', { options }, config,
       { timeoutMs: (options.budgetMs ?? 60_000) + 30_000 });
-    if (!delegated.handled) throw new OperationError('owner_unavailable', 'The observed PGLite owner stopped before fact repair admission');
+    if (!delegated.handled) {
+      const paid = options.dryRun !== true;
+      throw opError('owner_unavailable', 'The observed PGLite owner stopped before fact repair admission',
+        `Nothing ran: the running serve exited before admitting the repair. Run the same command again; it opens the brain directly or delegates to the new owner.${paid ? ' It spends up to the approved --max-cost-usd, as before.' : ''}`,
+        { fix: { argv: ['gbrain', 'embed', ...args], consent: paid ? ['paid'] : [], actor: 'agent', requires_exclusive: false,
+          why: 'The owner stopped before admission, so the same request has not run yet.' } });
+    }
     const result = delegated.result as EmbedFactsResult;
     await writeStdoutFinal(JSON.stringify(result, null, 2) + '\n');
     if (result.failures) setCliExitVerdict(1);

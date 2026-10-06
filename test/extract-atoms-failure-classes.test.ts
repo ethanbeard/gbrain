@@ -23,6 +23,7 @@ import {
 import { runPhaseWithStoredPageFixtures as runPhaseExtractAtoms } from './helpers/extract-atoms-page-fixtures.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChatResult, ChatOpts } from '../src/core/ai/gateway.ts';
+import { normalizeAIError } from '../src/core/ai/errors.ts';
 
 let engine: PGLiteEngine;
 
@@ -98,6 +99,39 @@ describe('parseAtomsOutcome — typed parse (gbrain#4148)', () => {
 });
 
 describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
+  test('provider content block counts by content and tombstones without stopping other pages', async () => {
+    await engine.putPage('meetings/blocked', {
+      title: 'blocked meeting', type: 'meeting', compiled_truth: 'blocked prose '.repeat(60),
+    } as never, { sourceId: 'default' });
+    await seedPage('note/healthy');
+    const blocked = normalizeAIError(Object.assign(new Error('Invalid JSON response'), {
+      name: 'AI_APICallError', statusCode: 200,
+      responseBody: JSON.stringify({ promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } }),
+    }), 'chat(google:x)');
+    const opts = {
+      sourceId: 'default', _transcripts: [],
+      _pages: [
+        { slug: 'meetings/blocked', content: 'blocked prose '.repeat(60), contentHash: HASH_A },
+        { slug: 'note/healthy', content: 'healthy prose', contentHash: 'b'.repeat(16) },
+      ],
+      _chat: async (o: ChatOpts) => {
+        if (String(o.messages[0]?.content).includes('blocked prose')) throw blocked;
+        return okChatResult('[]');
+      },
+    };
+    for (let n = 1; n <= MAX_DETERMINISTIC_FAILURES; n++) {
+      const result = await runPhaseExtractAtoms(engine, opts);
+      expect(result.details.aborted_global_error).toBeUndefined();
+      expect(result.details.pages_processed).toBe(1);
+      expect((await stateOf('meetings/blocked'))?.fail_count).toBe(n);
+      expect(result.details.tombstoned_for_failures).toEqual(n === MAX_DETERMINISTIC_FAILURES ? ['meetings/blocked'] : []);
+      expect((await stateOf('meetings/blocked'))?.tombstoned).toBe(n === MAX_DETERMINISTIC_FAILURES);
+      expect((await discoverExtractablePages(engine, 'default')).map(p => p.slug).includes('meetings/blocked'))
+        .toBe(n < MAX_DETERMINISTIC_FAILURES);
+      expect((result.details.failures as Array<{ error: string }>)[0].error).toContain(`provider blocked content: PROHIBITED_CONTENT (consecutive failure ${n}`);
+    }
+  });
+
   test('prompt truncation never splits a UTF-16 surrogate pair', async () => {
     await seedPage('note/surrogate-boundary');
     const content = `${'a'.repeat(49_999)}💡trailing prose`;

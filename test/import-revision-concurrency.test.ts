@@ -72,7 +72,23 @@ test('absence guards reject create races and physical recreation of the same slu
     const original = (await engine.getPage(slug, { sourceId }))!;
     await engine.deletePage(slug, { sourceId });
     await importFromContent(engine, slug, content('recreated'), { sourceId, noEmbed: true });
-    await expect(engine.transaction(tx => assertImportBase(tx, slug, sourceId, original))).rejects.toMatchObject({ code: 'page_identity_changed' });
+    await expect(engine.transaction(tx => assertImportBase(tx, slug, sourceId, original))).rejects.toMatchObject({ code: 'page_identity_changed',
+      fix: { argv: ['gbrain', 'get', '--source', sourceId, '--', slug], mcp: { tool: 'get_page', arguments: { slug, source_id: sourceId } } } });
     expect((await engine.getPage(slug, { sourceId }))!.frontmatter.captured_at).toBe('recreated');
+  }
+});
+
+test('embedding reuse refuses a concurrent contextual-mode change without a canonical revision change', async () => {
+  for (const engine of engines) {
+    const slug = 'notes/contextual-race';
+    await importFromContent(engine, slug, content('initial'), { sourceId, noEmbed: true });
+    const original = (await engine.getPage(slug, { sourceId }))!;
+    await engine.updatePageContextualRetrievalState(slug, sourceId, 'none', null);
+    const updated = (await engine.getPage(slug, { sourceId }))!;
+    expect(updated.knowledge_revision).toBe(original.knowledge_revision);
+    await expect(engine.transaction(tx => assertImportBase(tx, slug, sourceId, original, true)))
+      .rejects.toMatchObject({ code: 'revision_conflict',
+        fix: { argv: ['gbrain', 'get', '--source', sourceId, '--', slug] } });
+    expect((await engine.getPage(slug, { sourceId }))!.contextual_retrieval_mode).toBe('none');
   }
 });

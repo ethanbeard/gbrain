@@ -82,7 +82,7 @@ export function inferNerLinkType(
 ): string | null {
   if (!targetType) return null;
   try {
-    return inferLinkTypeFromPack(pack, targetType, context);
+    return inferLinkTypeFromPack(pack, targetType, context, undefined, undefined, { ner: true });
   } catch {
     return null;
   }

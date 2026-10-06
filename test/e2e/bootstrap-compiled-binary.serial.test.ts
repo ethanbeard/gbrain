@@ -50,11 +50,11 @@ let buildFailReason = '';
     built = true;
   }
   if (!built) {
-    // On CI (or wherever GBRAIN_REQUIRE_COMPILE=1 is set) a failed compile
+    // On CI (or wherever GBRAIN_TEST_REQUIRE_COMPILE=1 is set) a failed compile
     // must be a loud red — skipIf(!built) would otherwise become a PERMANENT
     // silent skip the moment `bun build --compile` breaks. Dev boxes keep
     // the graceful skip.
-    if (process.env.GITHUB_ACTIONS || process.env.GBRAIN_REQUIRE_COMPILE === '1') {
+    if (process.env.GITHUB_ACTIONS || process.env.GBRAIN_TEST_REQUIRE_COMPILE === '1') {
       throw new Error(`[bootstrap-compiled-binary] compile is required in this environment but failed: ${buildFailReason}`);
     }
     console.error(`[bootstrap-compiled-binary] SKIPPING: ${buildFailReason}`);

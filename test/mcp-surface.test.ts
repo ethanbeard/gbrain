@@ -263,3 +263,59 @@ describe('resolveClientRowSurface (amendment 18)', () => {
     expect(warnings[1]).toContain('client-b');
   });
 });
+
+describe('stdio surface resolution: GBRAIN_SURFACE > --surface > config > full', () => {
+  it('env wins, then the flag, then config, then the default; each with its source', async () => {
+    const { resolveStdioSurface } = await import('../src/mcp/surface.ts');
+    expect(resolveStdioSurface('full', { mcp_surface: 'starter' }, 'verbs')).toEqual({ surface: 'verbs', source: 'env' });
+    expect(resolveStdioSurface('full', { mcp_surface: 'starter' }, undefined)).toEqual({ surface: 'full', source: 'flag' });
+    expect(resolveStdioSurface(null, { mcp_surface: 'starter' }, '')).toEqual({ surface: 'starter', source: 'config' });
+    expect(resolveStdioSurface(null, null, undefined)).toEqual({ surface: 'full', source: 'default' });
+  });
+
+  it('an invalid env value is ignored (never fatal) and reported', async () => {
+    const { resolveStdioSurface, surfaceEnvInvalidNotice } = await import('../src/mcp/surface.ts');
+    const r = resolveStdioSurface('starter', null, 'everything');
+    expect(r).toEqual({ surface: 'starter', source: 'flag', invalidEnv: 'everything' });
+    const notice = surfaceEnvInvalidNotice('everything', r.surface, r.source);
+    expect(notice).toMatchObject({ code: 'surface_env_invalid', kind: 'info' });
+    expect(notice.why).toContain('use verbs, starter or full');
+    expect(notice.why).toContain("serves 'starter' (source: --surface)");
+  });
+
+  it('serve --http ignores GBRAIN_SURFACE and says so on stderr', async () => {
+    const { withEnv } = await import('./helpers/with-env.ts');
+    const { runServe } = await import('../src/commands/serve.ts');
+    const errors: string[] = [];
+    let served: string | undefined;
+    const origError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await withEnv({ GBRAIN_SURFACE: 'verbs' }, () => runServe({ disconnect: async () => {} } as never, ['--http', '--surface', 'starter'], {
+        runServeHttp: async (_e: unknown, o: { surface?: string }) => { served = o.surface; },
+        exit: () => {}, log: () => {}, stallWatchdogMs: 0,
+      } as never));
+    } finally {
+      console.error = origError;
+    }
+    expect(served).toBe('starter');
+    expect(errors.join('\n')).toContain('GBRAIN_SURFACE is ignored with --http');
+    expect(errors.join('\n')).toContain('surface=starter (source: --surface)');
+  });
+
+  it('the stdio session surface widens one allow-set and never passes --access read-only', async () => {
+    const { createStdioSurfaceState } = await import('../src/mcp/surface.ts');
+    const changes: Array<{ from: string; to: string; added: string[] }> = [];
+    const session = createStdioSurfaceState(operations, { surface: 'starter', source: 'flag', readOnly: false, onWiden: c => changes.push(c) });
+    expect(session.allowedOps?.has('get_health')).toBe(false);
+    session.widen('full');
+    expect(session.surface).toBe('full');
+    expect(session.allowedOps).toBeUndefined();
+    expect(session.surfacedOps.some(op => op.name === 'get_health')).toBe(true);
+    expect(changes[0]?.added).toContain('get_health');
+    const ro = createStdioSurfaceState(operations, { surface: 'starter', source: 'flag', readOnly: true });
+    ro.widen('full');
+    expect(ro.allowedOps?.has('put_page')).toBe(false);
+    expect(ro.allowedOps?.has('get_timeline')).toBe(true);
+  });
+});

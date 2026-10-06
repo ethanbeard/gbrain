@@ -106,6 +106,11 @@ command runs, or Postgres will reject the trigger recreation with
 - Keep `GBRAIN_FTS_LANGUAGE` set consistently in every environment that
   writes to the brain (CLI shells, MCP server, cron jobs) — a writer without
   the env var tokenizes new rows in `english` until the next reindex.
+- Remote title matching (MCP and other safe-chunks callers) reads the title
+  lexemes stored in `pages.search_vector`, so it follows the language those
+  vectors were built with. After a language change, run
+  `gbrain reindex-search-vector` so remote title search tokenizes like the
+  query.
 - **Interrupted reindex:** the trigger flip commits before the backfill, so a
   `reindex-search-vector` run killed mid-way (crash, full disk, SIGKILL)
   leaves new writes in the new language and un-backfilled rows in the old one

@@ -16,6 +16,8 @@ import { createConnectorFixture, options, sourceCheckpoint, sourceCursor, withGo
 import { HOLD_CAP } from '../src/core/connectors/item-holds.ts';
 import { addThread, fakeGitHub, fakeGmail, githubHoldsFetch, gmailFetch } from './helpers/connector-holds-fixture.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const { engines, env, source, setup, teardown } = createConnectorFixture();
 beforeAll(setup, 120_000);
@@ -68,6 +70,26 @@ async function githubSource(engine: BrainEngine, managed: boolean) {
 async function sourceHolds(engine: BrainEngine, id: string) {
   return (await readAllSourceHolds(engine, { sourceIds: [id] }))[0]?.held ?? [];
 }
+
+test('sources status reports an unreadable hold state for that source only', async () => withEnv(env, async () => {
+  const { readConnectorSourceStatuses, connectorStatusLines } = await import('../src/core/persistence/connector-status.ts');
+  for (const engine of engines) {
+    const broken = await githubSource(engine, false);
+    const healthy = await githubSource(engine, false);
+    const before = (await readConnectorSourceStatuses(engine)).get(healthy.id);
+    writeFileSync(join(broken.dir, '.github-source.json'), '{not json');
+    const statuses = await readConnectorSourceStatuses(engine);
+    const status = statuses.get(broken.id)!;
+    expect(status.held).toEqual([]);
+    expect(typeof status.held_error).toBe('string');
+    expect(connectorStatusLines(broken.id, status).filter(line => line.startsWith('    hold state unreadable: '))).toHaveLength(1);
+    expect(statuses.get(healthy.id)).toEqual(before);
+    expect(statuses.get(healthy.id)!.held_error).toBeUndefined();
+    await expect(readAllSourceHolds(engine, { sourceIds: [broken.id] })).rejects.toThrow();
+    rmSync(join(broken.dir, '.github-source.json'));
+    expect((await readConnectorSourceStatuses(engine)).get(broken.id)!.held_error).toBeUndefined();
+  }
+}));
 
 test('#5740: a GitHub item failing 3 runs is held, the watermark advances past it, and retry-held clears it on recovery', async () => withEnv(env, async () => {
   for (const engine of engines) for (const managed of [false, true]) {

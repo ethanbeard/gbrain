@@ -47,3 +47,45 @@ export function composablePgliteTransaction(handle: Transaction, state = { next:
     },
   }) as unknown as PGlite;
 }
+
+const memos = new WeakMap<object, Map<string, Promise<unknown>>>();
+/**
+ * #5984: a read every statement of one page transaction may share (the
+ * embedding config rows, the local writer, source membership). The first key
+ * stores the read; later keys are entries that also satisfy it (a `FOR SHARE`
+ * read satisfies a plain one). Outside a page transaction the read runs every
+ * time. A rejected read is not kept.
+ */
+export function transactionMemo<T>(tx: object, keys: string | readonly string[], read: () => Promise<T>): Promise<T> {
+  if ((tx as { _pageTransaction?: boolean })._pageTransaction !== true) return read();
+  const [key, ...alternatives] = typeof keys === 'string' ? [keys] : keys;
+  let byKey = memos.get(tx);
+  if (!byKey) { byKey = new Map(); memos.set(tx, byKey); }
+  const hit = [key!, ...alternatives].map(k => byKey!.get(k)).find(Boolean);
+  if (hit) return hit as Promise<T>;
+  const stored = read();
+  byKey.set(key!, stored);
+  stored.catch(() => byKey!.delete(key!));
+  return stored;
+}
+
+/**
+ * #5984: issues one transaction's statements back to back without awaiting
+ * between them, so postgres.js pipelines those already prepared on the
+ * transaction's connection (docs/eval/managed-sync-catchup.md, "Pipelining
+ * spike": order kept, later statements of a failed pipeline fail with 25P02).
+ * Each call must send its statement synchronously (`executeRaw`, engine-sql
+ * `run`), so call order is send order. The first failure in call order is
+ * thrown. PGLite runs the calls one at a time.
+ */
+export async function pipelined(engine: { kind: string }, calls: ReadonlyArray<() => Promise<unknown>>): Promise<unknown[]> {
+  if (engine.kind !== 'postgres') {
+    const results: unknown[] = [];
+    for (const call of calls) results.push(await call());
+    return results;
+  }
+  const settled = await Promise.allSettled(calls.map(call => { try { return call(); } catch (error) { return Promise.reject(error); } }));
+  const failed = settled.find(s => s.status === 'rejected') as PromiseRejectedResult | undefined;
+  if (failed) throw failed.reason;
+  return settled.map(s => (s as PromiseFulfilledResult<unknown>).value);
+}

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
 import { loadPricingOverrides } from './budget/budget-tracker.ts';
 import { reservationCostUsd, usageCostUsd, type BudgetKind } from './budget/reservation-cost.ts';
+import { noPricingGuidance, noPricingSteps } from './budget/no-pricing.ts';
 import type { AIInvocation, AIInvocationPermit, AIInvocationUsage } from './ai/invocation-guard.ts';
 import { MIGRATION_STATE_KEY, readMigrationState, type EmbeddingMigrationPlan, type MigrationState } from './embedding-migration.ts';
 import type { DbLockHandle } from './db-lock.ts';
@@ -147,7 +148,7 @@ export async function authorizeMigrationBudget(engine: BrainEngine, plan: Embedd
     const kind: BudgetKind = call.kind === 'embedding' ? 'embed' : 'rerank';
     const reserved = reservationCostUsd(call.model, kind, call.maxInputTokens!, 0, pricingOverrides);
     if (reserved === null) {
-      throw new Error(`Migration authorization cannot price ${call.model} (${kind}); no request dispatched. Declare an operator rate with gbrain config set pricing.overrides '{"${call.model}": <usd-per-1M-tokens>}'.`);
+      throw new Error(`Migration authorization cannot price ${call.model} (${kind}); no request dispatched. ${noPricingSteps(noPricingGuidance(call.model, kind))}`);
     }
     const attempt = randomUUID();
     await engine.transaction(async tx => {

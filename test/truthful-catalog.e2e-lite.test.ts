@@ -42,7 +42,7 @@
  * (FOV-6c: exactly ONE warn-mode case below, probing a READ op only).
  *
  * Wall-clock budget: the whole file should finish in < 3 minutes (ENG-21).
- * The budget is ENFORCED only under GBRAIN_ENFORCE_E5_BUDGET=1 (a loaded CI
+ * The budget is ENFORCED only under GBRAIN_TEST_ENFORCE_E5_BUDGET=1 (a loaded CI
  * shard or laptop makes wall-clock assertions flaky); otherwise an overrun
  * warns loudly so drift is still visible.
  */
@@ -388,6 +388,8 @@ describe('E5 truthful catalog — legacy bearer transport (real HTTP, PGLite)', 
       const denied = await legacyToolCall(name, args);
       expect(denied.envelope?.error).toBe('permission_denied');
       expect(denied.envelope?.message).toBe('Tool requires agent scope');
+      expect(denied.envelope).toMatchObject({ code: 'insufficient_scope', reason: 'insufficient_scope', fix: { actor: 'host_admin', next: 'tell_user_to_run' } });
+      expect((denied.envelope as { fix?: { argv?: string[] } }).fix?.argv?.slice(0, 2)).toEqual(['gbrain', 'auth']);
     }
   });
 
@@ -795,7 +797,7 @@ describe('E5 budget', () => {
         `trim probe work or split cells before raising this budget.`;
       // Machine load makes wall-clock assertions flaky — hard-fail only when
       // the budget gate is explicitly armed (dedicated perf lane / local run).
-      if (process.env.GBRAIN_ENFORCE_E5_BUDGET === '1') throw new Error(msg);
+      if (process.env.GBRAIN_TEST_ENFORCE_E5_BUDGET === '1') throw new Error(msg);
       console.warn(msg);
     }
   });

@@ -3,7 +3,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
-import { activeGitHooks, installHook, uninstallHook } from '../src/commands/frontmatter-install-hook.ts';
+import {
+  activeGitHooks, FRONTMATTER_HOOK_VERSION, frontmatterHookVersion, inspectFrontmatterHook, installHook, uninstallHook,
+} from '../src/commands/frontmatter-install-hook.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 function gitInit(dir: string) {
@@ -38,6 +40,28 @@ function runHookWithFailingGbrain(repo: string): number {
     return 0;
   } catch (e) {
     return (e as { status: number }).status;
+  } finally {
+    rmSync(bin, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Run the installed hook with a `gbrain` stub that records each invocation's
+ * argv (one line per call, NUL-separated args) and exits `exit`.
+ */
+function runHookRecordingGbrain(repo: string, exit = 0): { status: number; calls: string[][] } {
+  const bin = mkdtempSync(join(tmpdir(), 'fm-hook-bin-'));
+  const log = join(bin, 'calls');
+  writeFileSync(join(bin, 'gbrain'), `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a" >> '${log}'; done\necho >> '${log}'\nexit ${exit}\n`, { mode: 0o755 });
+  try {
+    let status = 0;
+    try {
+      execFileSync('sh', [join(repo, '.githooks', 'pre-commit')], { cwd: repo, env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` }, stdio: 'pipe' });
+    } catch (e) {
+      status = (e as { status: number }).status;
+    }
+    const calls = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => l.split('\0').filter(Boolean)) : [];
+    return { status, calls };
   } finally {
     rmSync(bin, { recursive: true, force: true });
   }
@@ -390,4 +414,73 @@ describe('frontmatter install-hook (B13)', () => {
       rmSync(plain, { recursive: true, force: true });
     }
   });
+
+  test('#5988 the hook carries a version marker and validates every staged file in ONE --staged call', async () => {
+    mkdirSync(join(tmp, 'brain'));
+    await install(join(tmp, 'brain'));
+    const hookPath = join(tmp, '.githooks', 'pre-commit');
+    const content = readFileSync(hookPath, 'utf8');
+    expect(content).toContain(`# gbrain-hook-version: ${FRONTMATTER_HOOK_VERSION}`);
+    expect(frontmatterHookVersion(content)).toBe(FRONTMATTER_HOOK_VERSION);
+    writeFileSync(join(tmp, 'brain', 'a.md'), 'x\n');
+    writeFileSync(join(tmp, 'brain', 'my note.md'), 'x\n');
+    writeFileSync(join(tmp, 'README.md'), 'outside\n');
+    execFileSync('git', ['-C', tmp, 'add', '.']);
+    const run = runHookRecordingGbrain(tmp, 0);
+    expect(run.status).toBe(0);
+    expect(run.calls).toEqual([['frontmatter', 'validate', '--staged', '--', 'brain/a.md', 'brain/my note.md']]);
+    expect(runHookRecordingGbrain(tmp, 1).status).toBe(1);
+  });
+
+  test('#5988 hook version detection: old gbrain hooks are outdated and name the refresh; foreign hooks are not ours', async () => {
+    expect(inspectFrontmatterHook(tmp)).toBeNull();
+    const hooksDir = join(tmp, '.githooks');
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, 'pre-commit');
+    writeFileSync(hookPath, '#!/bin/sh\necho "user hook"\n');
+    expect(frontmatterHookVersion(readFileSync(hookPath, 'utf8'))).toBeNull();
+    expect(inspectFrontmatterHook(tmp)).toBeNull();
+
+    // A pre-marker gbrain hook (validated working-tree bytes) is version 1.
+    writeFileSync(hookPath, '#!/bin/sh\n# gbrain frontmatter pre-commit hook (v0.22.4+)\n# gbrain-scope: brain/\ngbrain frontmatter validate "$f"\n');
+    expect(inspectFrontmatterHook(tmp, 'wiki')).toEqual({
+      hookPath, version: 1, current: false, fix: ['gbrain', 'frontmatter', 'install-hook', '--source', 'wiki', '--force'],
+    });
+
+    mkdirSync(join(tmp, 'brain'));
+    expect(await install(join(tmp, 'brain'))).toBe('installed');
+    const refreshed = readFileSync(hookPath, 'utf8');
+    expect(refreshed).toContain('# gbrain-scope: brain/');
+    expect(refreshed).toContain('validate --staged');
+    expect(existsSync(hookPath + '.bak')).toBe(false);
+    expect(inspectFrontmatterHook(join(tmp, 'brain'))).toMatchObject({ version: FRONTMATTER_HOOK_VERSION, current: true });
+  });
+
+  test('#5988 with the real CLI: a broken staged blob blocks the commit even though the working copy is fixed', async () => {
+    await install(tmp);
+    const bin = mkdtempSync(join(tmpdir(), 'fm-hook-real-'));
+    writeFileSync(join(bin, 'gbrain'), `#!/bin/sh\nexec '${process.execPath}' '${join(import.meta.dir, '..', 'src', 'cli.ts')}' "$@"\n`, { mode: 0o755 });
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, GBRAIN_HOME: join(bin, 'home'), DATABASE_URL: '', GBRAIN_DATABASE_URL: '', GBRAIN_SKIP_STARTUP_HOOKS: '1' };
+    const hook = () => {
+      try {
+        execFileSync('sh', [join(tmp, '.githooks', 'pre-commit')], { cwd: tmp, env, stdio: 'pipe' });
+        return { status: 0, stderr: '' };
+      } catch (e) {
+        return { status: (e as { status: number }).status, stderr: String((e as { stderr: Buffer }).stderr) };
+      }
+    };
+    try {
+      writeFileSync(join(tmp, 'note.md'), '---\ntitle: a: b\ntype: note\n---\n\nbody\n');
+      execFileSync('git', ['-C', tmp, 'add', 'note.md']);
+      writeFileSync(join(tmp, 'note.md'), '---\ntitle: "a: b"\ntype: note\n---\n\nbody\n');
+      const blocked = hook();
+      expect(blocked.status).toBe(1);
+      expect(blocked.stderr).toContain('the staged version of note.md is broken; the working copy passes. Review it and git add note.md');
+      expect(blocked.stderr).toContain('importable but not canonical; run gbrain frontmatter validate note.md --fix (quoting only)');
+      execFileSync('git', ['-C', tmp, 'add', 'note.md']);
+      expect(hook().status).toBe(0);
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

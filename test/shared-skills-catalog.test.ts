@@ -14,6 +14,7 @@ import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { cancelWriteRequest } from '../src/core/persistence/control.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { getSharedSkill, getSharedSkillAsset, listSharedSkills } from '../src/core/shared-skills/catalog.ts';
 import { getSharedSkillPolicy, setSharedSkillPolicy as approvePolicy } from '../src/core/shared-skills/policy.ts';
 import { normalizeSkillFiles } from '../src/core/shared-skills/manifest.ts';
@@ -466,7 +467,7 @@ test('retention preserves active heads, tombstones, delivery, explicit pins and 
   await disposePersistenceConsumer(f.engine);
   await f.engine.transaction(async tx => {
     await declarePersistenceProtocol(tx);
-    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE shared_skill_revisions SET created_at=created_at-interval '48 hours' WHERE source_id='default'"));
+    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE shared_skill_revisions SET created_at=created_at-interval '48 hours' WHERE source_id='default'"), TEST_WRITE_ATTRIBUTION);
   });
   const authority = await submissionAuthority(f.local, 'put_skill', 'default', f.incarnation, 'skills/alpha/SKILL.md');
   const binding = (await getWorktreeBinding(f.engine, 'default'))!;
@@ -521,7 +522,7 @@ test('retention budget provides real backpressure before canonical file effects'
       (source_id,source_incarnation,pack_id,name,revision,metadata,files,policy_epoch,request_id)
       SELECT r.source_id,r.source_incarnation,r.pack_id,r.name,gen_random_uuid(),r.metadata,r.files,r.policy_epoch,r.request_id
       FROM shared_skill_revisions r CROSS JOIN generate_series(1,$1) n WHERE r.revision=$2::uuid`,
-    [SHARED_SKILL_RETENTION_LIMITS.sourceRevisions - 1, before.revision]));
+    [SHARED_SKILL_RETENTION_LIMITS.sourceRevisions - 1, before.revision]), TEST_WRITE_ATTRIBUTION);
   });
   const status = await getSharedSkillRetention(f.local);
   expect(status.retained_revisions).toBe(SHARED_SKILL_RETENTION_LIMITS.sourceRevisions);
@@ -541,7 +542,7 @@ test.skipIf(!postgresUrl)('Postgres retention serializes delivery issuance again
   const member = await joinBrain(f.local, { adapter: 'generic', follow_policy: { approved: true } });
   await f.engine.transaction(async tx => {
     await declarePersistenceProtocol(tx);
-    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE shared_skill_revisions SET created_at=created_at-interval '48 hours' WHERE source_id='default'"));
+    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE shared_skill_revisions SET created_at=created_at-interval '48 hours' WHERE source_id='default'"), TEST_WRITE_ATTRIBUTION);
   });
   const key = `${[old.brain_id, old.source_id, old.source_incarnation, old.pack_id, old.name].map(encodeURIComponent).join('/')}@${old.revision}`;
   const insertBatch = (tx: BrainEngine, sequence: number) => tx.executeRaw(`INSERT INTO shared_skill_delivery_batches

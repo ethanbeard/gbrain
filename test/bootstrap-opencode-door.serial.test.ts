@@ -188,8 +188,7 @@ describe('opencode workspace lane — default scope is USER-GLOBAL', () => {
     };
     expect(entry.type).toBe('local');
     expect(entry.command[0]).toBe(FAKE_BIN); // user scope: absolute path
-    expect(entry.command).toContain('--surface');
-    expect(entry.command).toContain('full');
+    expect(entry.command.slice(1)).toEqual(['serve', '--surface', 'starter']);
     expect(entry.environment.GBRAIN_SOURCE).toBeDefined();
     expect(entry.enabled).toBe(true);
 
@@ -323,7 +322,7 @@ describe('opencode workspace lane — explicit project opt-in', () => {
     const cfgPath = join(ws, 'opencode.json');
     const parsed = parseOpencodeConfig(readFileSync(cfgPath, 'utf8'), cfgPath);
     const entry = (parsed.mcp as Record<string, unknown>).gbrain as { command: string[] };
-    expect(entry.command[0]).toBe('gbrain'); // committed-candidate file: PATH-resolved, never absolute
+    expect(entry.command).toEqual(['gbrain', 'serve', '--surface', 'starter']); // committed-candidate file: PATH-resolved, never absolute
     expect(r.out).toContain('project (explicit opt-in)');
     expect(r.err).toContain('SHARING WARNING');
     expect(r.err).toContain('"enabled": false');
@@ -367,6 +366,28 @@ describe('opencode workspace lane — explicit project opt-in', () => {
     expect(existsSync(join(ws, 'opencode.json'))).toBe(true);
     rmSync(ws, { recursive: true, force: true });
   });
+});
+
+describe('opencode never-narrow: a rewritten entry keeps its surface form', () => {
+  async function rerunWith(command: string[], extra: string[] = []): Promise<string[]> {
+    const ws = await readyWs();
+    const cfgPath = opencodeGlobalConfigPath();
+    const first = await capture(() => runBootstrap(['hooks', '--workspace', ws, '--harness', 'opencode', '--gbrain-bin', FAKE_BIN], { runner: makeRunner().runner, probeSpawn: makeProbeSpawn().spawn }));
+    expect(first.result).toBe(0);
+    const parsed = parseOpencodeConfig(readFileSync(cfgPath, 'utf8'), cfgPath) as { mcp: Record<string, { command: string[] }> };
+    parsed.mcp.gbrain.command = command;
+    writeFileSync(cfgPath, JSON.stringify(parsed, null, 2));
+    const again = await capture(() => runBootstrap(['hooks', '--workspace', ws, '--harness', 'opencode', '--gbrain-bin', FAKE_BIN, ...extra], { runner: makeRunner().runner, probeSpawn: makeProbeSpawn().spawn }));
+    expect(again.result).toBe(0);
+    rmSync(ws, { recursive: true, force: true });
+    return ((parseOpencodeConfig(readFileSync(cfgPath, 'utf8'), cfgPath).mcp as Record<string, { command: string[] }>).gbrain).command;
+  }
+
+  test('a pinned --surface full stays full, a bare serve stays bare, an explicit --surface wins', async () => {
+    expect(await rerunWith([FAKE_BIN, 'serve', '--surface', 'full'])).toEqual([FAKE_BIN, 'serve', '--surface', 'full']);
+    expect(await rerunWith([FAKE_BIN, 'serve'])).toEqual([FAKE_BIN, 'serve']);
+    expect(await rerunWith([FAKE_BIN, 'serve', '--surface', 'full'], ['--surface', 'verbs'])).toEqual([FAKE_BIN, 'serve', '--surface', 'verbs']);
+  }, 60_000);
 });
 
 describe('opencode two-filename WRITE reconcile (sibling global file)', () => {

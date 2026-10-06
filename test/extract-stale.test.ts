@@ -432,13 +432,17 @@ describe('gbrain extract --stale', () => {
       timeBudgetMs: 0,
     });
     expect(r.pagesProcessed).toBe(25);
-    expect(r.staleRemaining).toBe(1);
+    // staleRemaining counts link-stale pages plus mention-due pages (the
+    // mention pass shares the exhausted budget, so all 26 are still due).
+    expect(r.mentions?.remaining).toBe(26);
+    expect(r.staleRemaining).toBe(1 + 26);
 
     // Default budget (~30 min) finishes the remainder.
     const r2 = await extractStaleFromDB(engine, {
       dryRun: false, jsonMode: true, includeFrontmatter: false, catchUp: false,
     });
     expect(r2.pagesProcessed).toBe(1);
+    expect(r2.mentions?.remaining).toBe(0);
     expect(r2.staleRemaining).toBe(0);
   });
 

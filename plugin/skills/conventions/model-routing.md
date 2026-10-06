@@ -89,6 +89,25 @@ never hardcode a model string. The v0.31.6 chat default
 API and made `extractFactsFromTurn` silently return `[]`. The tier system
 + doctor probe is the structural fix for that bug class.
 
+### A model gbrain has no price for
+
+Under default settings an unpriced model (a newly released one, a proxy
+route) warns and runs. Under a cost cap the user set, the run stops with
+`no_pricing`, because the cap cannot be enforced without a price. The refusal
+names the model, provider and kind and the exact registration command. Then:
+
+1. Look up the provider's current price for that model, for example by
+   searching the web for its pricing page. A chat model needs USD per 1M input
+   tokens and USD per 1M output tokens; an embedding or reranker model needs
+   USD per 1M tokens.
+2. With a shell on the brain host, run the command the refusal names, such as
+   `gbrain pricing set <model> --input <usd> --output <usd> --source <url>`
+   (or `--rate <usd>`), then retry. Over MCP you cannot register prices: give
+   the command and the price you found to the brain's operator.
+
+Do not register $0 to get past the refusal unless the route really is free:
+it makes every call to that model count as free against every cap.
+
 ## 2. Subagent spawn routing
 
 When the user-facing agent (Claude in the main session) chooses which model

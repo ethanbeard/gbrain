@@ -35,12 +35,23 @@ const LinkInferenceSchema = z.object({
   regex: z.string().optional(),
   page_type: z.string().optional(),
   target_type: z.string().optional(),
+  /** The regex labels body mentions found by NER only; markdown links fall through to the in-code matchers (#5882). */
+  ner_only: z.boolean().optional(),
 }).strict();
 
 const LinkTypeSchema = z.object({
   name: z.string().min(1),
   inverse: z.string().optional(),
   inference: LinkInferenceSchema.optional(),
+  /**
+   * Temporal typed edges: `state` relations can end (works_at, reports_to) and
+   * graph reads return the ones true today; `event` relations happened on a
+   * date and stay true. Omitted: the built-in table decides, else a plain
+   * reference. See docs/guides/temporal-edges.md.
+   */
+  temporal: z.enum(['state', 'event']).optional(),
+  /** `one_per_from`: a page holds at most one live relationship of this type; a newer dated start closes the older one (docs/guides/temporal-edges.md). */
+  cardinality: z.enum(['many', 'one_per_from']).optional(),
 }).strict();
 
 /**

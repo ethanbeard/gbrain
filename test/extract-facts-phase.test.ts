@@ -3,7 +3,7 @@
  *
  * Covers the reconciliation contract: parse fence → deleteFactsForPage
  * → insertFacts. Plus the empty-fence guard (Codex R2-#7) that refuses
- * to run when legacy v0.31 rows are pending the v0_32_2 backfill.
+ * to reconcile while unfenced rows the phase could not fence remain.
  *
  * Uses a real PGLite engine. Pages seeded via engine.putPage so
  * compiled_truth + frontmatter are realistic.
@@ -1021,7 +1021,10 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
     expect(r.legacyRowsPending).toBe(1);
     expect(r.factsInserted).toBe(0);
     expect(r.factsDeleted).toBe(0);
-    expect(r.warnings.some(w => w.includes('apply-migrations'))).toBe(true);
+    // The page's canonical file is not on this host, so the phase's own fence
+    // step could not fence the row; the warning names the page and why.
+    expect(r.warnings.some(w => w.startsWith('FACTS_FENCE_FAILED: people/alice ('))).toBe(true);
+    expect(r.warnings.some(w => w.includes('unfenced fact row(s)') && !w.includes('v0.31'))).toBe(true);
 
     // Legacy row was NOT touched.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1320,7 +1323,7 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
     expect(r.legacyRowsPending).toBe(1);
     expect(r.factsInserted).toBe(0);
     expect(r.factsDeleted).toBe(0);
-    expect(r.warnings.some(w => w.includes('apply-migrations'))).toBe(true);
+    expect(r.warnings.some(w => w.startsWith('FACTS_FENCE_FAILED: people/bob ('))).toBe(true);
   });
 
   test('#2484: a soft-deleted backing page makes its legacy row unfenceable (does NOT gate)', async () => {
@@ -1442,9 +1445,8 @@ describe('runExtractFacts — multi-source isolation', () => {
     expect(rWork.guardTriggered).toBe(true);
     expect(rWork.legacyRowsPending).toBe(1);
     expect(rWork.factsInserted).toBe(0);
-    // The drain advice must be one that actually re-runs Phase B — a bare
-    // `apply-migrations --yes` no-ops once the ledger says complete.
-    expect(rWork.warnings.some(w => w.includes('--force-retry 0.32.2'))).toBe(true);
+    // The advice names the page the phase's own fence step could not fence.
+    expect(rWork.warnings.some(w => w.startsWith('FACTS_FENCE_FAILED: people/alice ('))).toBe(true);
     expect(rWork.warnings.some(w => w.includes('forget_fact'))).toBe(true);
     expect(rWork.warnings.some(w => w.includes('source "work"'))).toBe(true);
   });

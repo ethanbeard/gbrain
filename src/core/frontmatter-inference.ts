@@ -366,6 +366,15 @@ export function isSafePlainYamlScalar(title: string): boolean {
 }
 
 /**
+ * One YAML scalar for a frontmatter (or pack YAML) line: plain when
+ * `isSafePlainYamlScalar` proves it safe, otherwise a JSON double-quoted
+ * string (valid YAML for every string, newlines and `---` included).
+ */
+export function yamlScalar(value: string): string {
+  return isSafePlainYamlScalar(value) ? value : JSON.stringify(value);
+}
+
+/**
  * Generate a YAML frontmatter block from inferred fields.
  * Returns the `---\n...\n---\n` string to prepend to content.
  */
@@ -377,7 +386,7 @@ export function serializeFrontmatter(fm: InferredFrontmatter): string {
   // Title — emit as a plain scalar ONLY when provably safe (see
   // isSafePlainYamlScalar). Everything else is quoted.
   lines.push(
-    `title: ${isSafePlainYamlScalar(fm.title) ? fm.title : JSON.stringify(fm.title)}`,
+    `title: ${yamlScalar(fm.title)}`,
   );
 
   lines.push(`type: ${fm.type}`);

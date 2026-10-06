@@ -30,7 +30,7 @@
  * shell or stalls can eat the wrapper. The marker path and label are baked as
  * absolute strings at install time so they cannot be misrouted; if the poll
  * times out, the failure dump names this vector. Escape hatch:
- * GBRAIN_SKIP_LAUNCHD_E2E=1.
+ * GBRAIN_TEST_SKIP_LAUNCHD=1.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync } from 'fs';
@@ -42,7 +42,7 @@ import { autopilotLaunchdLabel } from '../src/core/autopilot-paths.ts';
 
 const REPO = resolve(import.meta.dir, '..');
 const CLI = join(REPO, 'src', 'cli.ts');
-const SKIP_SUBPROCESS = process.env.GBRAIN_SKIP_SUBPROCESS_TESTS === '1';
+const SKIP_SUBPROCESS = process.env.GBRAIN_TEST_SKIP_SUBPROCESS === '1';
 
 // ── label seam unit tests (serial file on purpose: env mutation would
 //    interleave with other autopilot tests in the parallel lane) ─────────────
@@ -193,7 +193,7 @@ describe.skipIf(SKIP_SUBPROCESS)('autopilot launchd lifecycle — shimmed (all p
     expect(refused.stderr).toContain('--force');
     expect(existsSync(plist())).toBe(false);
 
-    const r = runCli(['autopilot', '--install', '--force', '--target', 'macos', '--repo', repoDir], env, 90_000);
+    const r = runCli(['autopilot', '--install', '--force', '--yes', '--target', 'macos', '--repo', repoDir], env, 90_000);
     expect(r.exitCode).toBe(0);
     expect(existsSync(plist())).toBe(true);
     const xml = readFileSync(plist(), 'utf8');
@@ -247,7 +247,7 @@ describe.skipIf(SKIP_SUBPROCESS)('autopilot launchd lifecycle — shimmed (all p
     // marker-clearing while leaving an immediately-doomed install.
     mkdirSync(repoDir, { recursive: true });
     // --force: PGLite daemon guard (#677) — see test 2.
-    const r = runCli(['autopilot', '--install', '--force', '--target', 'macos', '--repo', repoDir], env, 90_000);
+    const r = runCli(['autopilot', '--install', '--force', '--yes', '--target', 'macos', '--repo', repoDir], env, 90_000);
     expect(r.exitCode).toBe(0);
     expect(existsSync(marker())).toBe(false);
   }, 120_000);
@@ -278,15 +278,15 @@ describe.skipIf(SKIP_SUBPROCESS)('autopilot launchd lifecycle — shimmed (all p
 
 function canUseLaunchd(): boolean {
   if (process.platform !== 'darwin') return false;
-  if (process.env.GBRAIN_SKIP_LAUNCHD_E2E === '1') return false;
+  if (process.env.GBRAIN_TEST_SKIP_LAUNCHD === '1') return false;
   if (typeof process.getuid !== 'function') return false;
   const probe = spawnSync('launchctl', ['print', `gui/${process.getuid()}`], { encoding: 'utf8', timeout: 10_000 });
   return probe.status === 0;
 }
 
 const LAUNCHD_OK = canUseLaunchd();
-if (!LAUNCHD_OK && process.env.GBRAIN_REQUIRE_LAUNCHD === '1') {
-  throw new Error('[autopilot-launchd-lifecycle] GBRAIN_REQUIRE_LAUNCHD=1 but the launchd GUI domain is unavailable');
+if (!LAUNCHD_OK && process.env.GBRAIN_TEST_REQUIRE_LAUNCHD === '1') {
+  throw new Error('[autopilot-launchd-lifecycle] GBRAIN_TEST_REQUIRE_LAUNCHD=1 but the launchd GUI domain is unavailable');
 }
 
 describe.skipIf(SKIP_SUBPROCESS || !LAUNCHD_OK)('autopilot launchd lifecycle — REAL launchd (darwin)', () => {
@@ -337,7 +337,7 @@ describe.skipIf(SKIP_SUBPROCESS || !LAUNCHD_OK)('autopilot launchd lifecycle —
   test('1. install loads a real job and RunAtLoad runs our wrapper', async () => {
     // --force: PGLite daemon guard (#677) — the shimmed describe pins the
     // refusal; this one exercises the real-launchd arc past it.
-    const r = runCli(['autopilot', '--install', '--force', '--target', 'macos', '--repo', repoDir], env, 90_000);
+    const r = runCli(['autopilot', '--install', '--force', '--yes', '--target', 'macos', '--repo', repoDir], env, 90_000);
     expect(r.exitCode).toBe(0);
     expect(existsSync(plist())).toBe(true);
 
@@ -357,7 +357,7 @@ describe.skipIf(SKIP_SUBPROCESS || !LAUNCHD_OK)('autopilot launchd lifecycle —
       throw new Error(
         `wrapper never ran under launchd within 30s.\n`
         + `Likely: a dotfile in the REAL user zshenv/zshrc exec'd another shell or stalled `
-        + `(launchd runs the wrapper with your real HOME). Escape hatch: GBRAIN_SKIP_LAUNCHD_E2E=1.\n`
+        + `(launchd runs the wrapper with your real HOME). Escape hatch: GBRAIN_TEST_SKIP_LAUNCHD=1.\n`
         + `launchctl print (exit ${p.status}):\n${(p.stdout || p.stderr).slice(0, 1500)}`,
       );
     }

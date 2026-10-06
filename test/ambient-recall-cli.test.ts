@@ -6,7 +6,7 @@
  * later spawns reuse the persisted brain). Pins:
  *   - exit 0 + parseable JSON envelope with protocol_version 1 on both verbs
  *   - `since` echoed NORMALIZED to ISO (never the raw string)
- *   - unparseable --since → exit 1 + the verbError rendering on stderr
+ *   - unparseable --since → exit 2 (usage) + the verbError rendering on stderr
  *     (`Error [invalid_params]: …` + the `Fix:` suggestion line)
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -77,12 +77,13 @@ describe('gbrain delta (CLI)', () => {
     expect(env.since).toBe('1970-01-01T00:00:00.000Z');
     expect(env.pages).toEqual([]);
     expect(env.has_more).toBe(false);
-    expect(env.next_cursor).toEqual({ since: '1970-01-01T00:00:00.000Z', slug: '' });
+    expect(env.next_cursor).toMatchObject({ since: '1970-01-01T00:00:00.000Z', slug: '' });
+    expect(typeof env.next_cursor.cursor).toBe('string');
   }, 60_000);
 
-  test('unparseable --since: exit 1, invalid_params rendering on stderr', () => {
+  test('unparseable --since: exit 2 (usage), invalid_params rendering on stderr', () => {
     const { stdout, stderr, status } = run(['delta', '--since', 'not-a-date', '--json']);
-    expect(status).toBe(1);
+    expect(status).toBe(2); // agent contract v1 A3: invalid_params exits 2
     // verbError CLI rendering: `Error [code]: message` + the Fix line (stderr).
     expect(stderr).toContain('Error [invalid_params]:');
     expect(stderr).toContain('not a parseable timestamp');

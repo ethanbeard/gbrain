@@ -28,8 +28,7 @@ import { getPgliteMigrationLockPath } from './pglite-lock.ts';
 import { tryAcquireNativeLock } from './persistence/native-lock.ts';
 
 export const MIGRATION_ORCHESTRATION_LOCK_ID = 'gbrain-apply-migrations';
-/** Exit status of a runner refused because another runner holds the lock (EX_TEMPFAIL). */
-export const MIGRATIONS_RUNNING_EXIT_CODE = 75;
+export { MIGRATIONS_RUNNING_EXIT_CODE } from './exit-codes.ts';
 // Long enough to outlast a synchronous orchestrator phase (subprocess timeouts
 // reach 30 minutes) that starves the refresh timer; ownership is rechecked
 // before every orchestrator.
@@ -50,6 +49,8 @@ export class MigrationsRunningError extends Error {
 }
 
 export interface MigrationOrchestrationLock {
+  /** Postgres lease acquisition token; quiescence checks exclude this runner's own row by it. */
+  leaseToken?: string;
   /** Throws MigrationsRunningError when the lease was lost to another runner. */
   assertHeld(): Promise<void>;
   release(): Promise<void>;
@@ -125,6 +126,7 @@ async function acquirePostgres(config: GBrainConfig): Promise<MigrationOrchestra
   }, LEASE_REFRESH_MS);
   timer.unref?.();
   return {
+    leaseToken: handle.acquisitionToken,
     assertHeld: async () => {
       if (await handle.refresh()) return;
       const snapshot = await inspectLock(engine, MIGRATION_ORCHESTRATION_LOCK_ID).catch(() => null);

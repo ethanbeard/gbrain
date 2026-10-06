@@ -19,6 +19,9 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { runImport } from '../src/commands/import.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
+import { renderFactsTable } from '../src/core/facts-fence.ts';
+import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-file-import-'));
 const engines: BrainEngine[] = [];
@@ -149,7 +152,8 @@ test('managed import refuses cross-source input, symlink targets, skills, malfor
     symlinkSync(other.root, join(f.root, 'escape'));
     await expect(importManagedFile(engine, file, 'escape/note.md', opts)).rejects.toThrow('escapes');
     await expect(importManagedFile(engine, file, 'skills/unsafe.md', opts)).rejects.toThrow('skill');
-    writeFileSync(file, '---\ntitle: invalid: yaml\n---\nBody\n');
+    // #5988: `title: invalid: yaml` now imports by quoting; a mis-indented list cannot be read.
+    writeFileSync(file, '---\ntags:\n  - a\n - b\n---\nBody\n');
     await expect(importManagedFile(engine, file, 'note.md', opts)).rejects.toThrow('Invalid YAML');
     await expect(importManagedFile(engine, file, 'image.png', opts)).rejects.toThrow('GBRAIN_EMBEDDING_MULTIMODAL=true');
     expect(await engine.getPage('note', { sourceId: f.sourceId })).toBeNull();
@@ -195,7 +199,7 @@ test('publication refuses admitted input-byte, canonical-target and page-identit
     if (race === 'page') {
       await engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => tx.putPage(slug, {
         type: 'note', title: 'Concurrent page', compiled_truth: 'Concurrent accepted page must survive.', timeline: '', frontmatter: {}, content_hash: 'concurrent',
-      }, { sourceId: f.sourceId })));
+      }, { sourceId: f.sourceId }), TEST_WRITE_ATTRIBUTION));
     } else writeFileSync(changedPath, 'Concurrent local edit must survive.\n');
     const outcome = await publishMutation(engine, row, prepared, localHostId());
     expect(outcome.state).toBe('conflict');
@@ -206,5 +210,40 @@ test('publication refuses admitted input-byte, canonical-target and page-identit
     }
     if (race !== 'target') expect(existsSync(join(f.root, 'race.md'))).toBe(false);
     await expect(prepareManagedImportMutation(engine, { ...row, authority: { ...row.authority, remote: true } }, { engine: engine.kind })).rejects.toThrow('trusted local CLI');
+  }
+}), 120_000);
+
+test('publication refuses a fact withdrawn between managed-import preparation and publication', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    await disposePersistenceConsumer(engine);
+    const f = await fixture(engine), file = join(f.input, 'withdrawn.md');
+    const claim = 'withdrawn between managed import preparation and publication';
+    const fence = renderFactsTable([{ rowNum: 1, claim, kind: 'fact', confidence: 1, visibility: 'world',
+      notability: 'medium', active: true, context: 'test evidence' }]);
+    const bytes = Buffer.from(`---\ntitle: Withdrawn import\ntype: note\n---\nFacts: ${fence}\n`); writeFileSync(file, bytes);
+    const binding = (await getWorktreeBinding(engine, f.sourceId))!;
+    const { slug, content } = managedImportContent('withdrawn.md', bytes);
+    const ctx = { engine, remote: false, sourceId: f.sourceId } as OperationContext;
+    const authority = await submissionAuthority(ctx, 'put_page', f.sourceId, binding.source_incarnation, slug);
+    const intent: ManagedImportIntent = { kind: 'managed_file_import', slug, content, sourcePath: 'withdrawn.md', inputPath: file,
+      inputHash: sha256(bytes), targetHash: null, ownerEpoch: String(binding.owner_epoch), noEmbed: true };
+    await admitWrite(engine, { principal: authority.principal, operation: 'put_page', sourceId: f.sourceId, sourceIncarnation: binding.source_incarnation,
+      slug, pageId: null, requestId: randomUUID(), callerIntent: intent, intent, authority, worktreeId: binding.worktree_id, topologyGeneration: binding.topology_generation });
+    const row = (await claimNextWrite(engine, localHostId()))!;
+    const prepared = await prepareManagedImportMutation(engine, row, { engine: engine.kind });
+    expect(prepared.file?.content).toContain(claim);
+
+    const fact = await engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () =>
+      tx.insertFact({ fact: claim, source: 'remember', visibility: 'world' }, { source_id: f.sourceId }), TEST_WRITE_ATTRIBUTION));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => recordFactWithdrawal(tx, fact.id, f.sourceId, true), TEST_WRITE_ATTRIBUTION));
+
+    const boundaries: string[] = [];
+    const outcome = await publishMutation(engine, row, prepared, localHostId(), {
+      boundary: async name => { boundaries.push(name); }, fileBoundary: name => { boundaries.push(name); } });
+    expect(outcome).toMatchObject({ state: 'conflict', error_code: 'revision_conflict' });
+    expect(boundaries).not.toContain('before_publication');
+    expect(boundaries).not.toContain('before_file');
+    expect(await engine.getPage(slug, { sourceId: f.sourceId })).toBeNull();
+    expect(existsSync(join(f.root, 'withdrawn.md'))).toBe(false);
   }
 }), 120_000);

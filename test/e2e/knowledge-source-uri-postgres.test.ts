@@ -5,7 +5,7 @@ import { requirePostgresTestDatabase } from '../helpers/test-backends.ts';
 requirePostgresTestDatabase();
 
 test('invalid source URI diagnostics survive managed publication on Postgres', async () => {
-  const child = Bun.spawn([process.execPath, 'test', 'test/shared-skills-writer-boundary.serial.test.ts',
+  const child = Bun.spawn([process.execPath, 'test', 'test/shared-skills-writer-boundary.test.ts',
     '--test-name-pattern', 'unresolvable stored file aliases'], {
     cwd: join(import.meta.dir, '../..'),
     env: { ...process.env, GBRAIN_TEST_ALLOW_DATABASE_URL: '1', GBRAIN_TEST_BACKEND: 'postgres' },

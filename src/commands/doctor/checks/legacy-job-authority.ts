@@ -52,6 +52,34 @@ export async function readLegacyJobAuthority(engine: BrainEngine): Promise<Legac
 
 const sum = (counts: Record<string, number>) => Object.values(counts).reduce((n, c) => n + c, 0);
 
+export interface QueuedSpendState {
+  /** Queued paid jobs by spend basis (NULL rows of consent-gated producers count as `legacy_default`: the claim stamps them). */
+  by_basis: Record<string, number>;
+  /** Spend-authorized rows waiting longer than FENCED_ROW_WAIT_MS (first 10 ids). */
+  long_waiting_ids: number[];
+  long_waiting: number;
+}
+
+/** The informational spend-basis census plus the long-waiting fenced rows, read-only. */
+export async function readQueuedSpend(engine: BrainEngine): Promise<QueuedSpendState> {
+  const { paidJobNames } = await import('../../jobs/shared.ts');
+  const { FENCED_ROW_WAIT_MS, LEGACY_SPEND_KEY_PREFIXES } = await import('../../../core/minions/spend-authorization.ts');
+  const legacy = Object.entries(LEGACY_SPEND_KEY_PREFIXES)
+    .map(([name, prefixes]) => `(name = '${name}' AND (${prefixes.map(p => `idempotency_key LIKE '${p}%'`).join(' OR ')}))`).join(' OR ');
+  const rows = await engine.executeRaw<{ name: string; basis: string; n: number | string }>(
+    `SELECT name, CASE WHEN spend_authorization IS NOT NULL THEN spend_authorization->>'kind'
+                       WHEN ${legacy} THEN 'legacy_default' ELSE 'unrecorded' END AS basis, count(*) AS n
+       FROM minion_jobs WHERE status IN ('waiting','delayed','paused','waiting-children')
+      GROUP BY 1, 2`);
+  const paid = new Set(await paidJobNames(rows.map(r => r.name)));
+  const by_basis: Record<string, number> = {};
+  for (const r of rows) if (paid.has(r.name)) by_basis[r.basis] = (by_basis[r.basis] ?? 0) + Number(r.n);
+  const waiting = await engine.executeRaw<{ id: number }>(
+    `SELECT id FROM minion_jobs WHERE status = 'waiting' AND spend_authorization IS NOT NULL
+        AND updated_at < now() - ($1::double precision * interval '1 millisecond') ORDER BY id`, [FENCED_ROW_WAIT_MS]);
+  return { by_basis, long_waiting_ids: waiting.slice(0, 10).map(r => Number(r.id)), long_waiting: waiting.length };
+}
+
 export async function legacyJobAuthorityCheck(engine: BrainEngine): Promise<Check> {
   const state = await readLegacyJobAuthority(engine);
   const authorizable = sum(state.authorizable);
@@ -78,8 +106,21 @@ export async function legacyJobAuthorityCheck(engine: BrainEngine): Promise<Chec
 
 async function runLegacyJobAuthority(ctx: DoctorContext): Promise<Check[]> {
   const checks: Check[] = [];
-  const { status, message, details } = await legacyJobAuthorityCheck(connectedEngine(ctx));
-  checks.push({ name: 'legacy_job_authority', status, message, details });
+  const engine = connectedEngine(ctx);
+  const { status, message, details } = await legacyJobAuthorityCheck(engine);
+  const spend = await readQueuedSpend(engine).catch(() => null);
+  const workers = spend?.long_waiting ? (await import('../../../core/minions/worker-registry.ts')).readWorkers().length : 0;
+  const census = spend && Object.keys(spend.by_basis).length
+    ? ` Queued paid jobs by spend basis: ${Object.entries(spend.by_basis).map(([b, n]) => `${b} ${n}`).join(', ')}.` : '';
+  if (status === 'ok' && spend?.long_waiting && workers > 0) {
+    checks.push({ name: 'legacy_job_authority', status: 'warn', details: { ...details, queued_spend: spend, live_workers: workers },
+      message: `${spend.long_waiting} spend-authorized job(s) (${spend.long_waiting_ids.join(', ')}) have waited over 10 minutes while ${workers} worker(s) run: `
+        + `an un-upgraded worker may be fenced off; un-upgraded workers stop claiming at a fenced row. Upgrade gbrain on every worker host and restart the workers (gbrain jobs supervisor stop, then gbrain jobs supervisor start, or your service manager).${census}`,
+      fix: { argv: ['gbrain', 'jobs', 'list', '--status', 'waiting', '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Shows the waiting rows and their spend records; fenced rows run once every worker runs the upgraded binary.' } });
+    return checks;
+  }
+  checks.push({ name: 'legacy_job_authority', status, message: `${message}${census}`, details: spend ? { ...details, queued_spend: spend } : details });
   return checks;
 }
 
@@ -98,3 +139,12 @@ export async function legacyJobAuthorityBannerNote(engine: BrainEngine): Promise
     + `Stop producers (gbrain serve, gbrain autopilot) and workers, cancel active jobs, then preview with: ${LIVE_LEGACY_PREVIEW}`
     + `${state.unsupported ? `; ${state.unsupported} unsupported row(s) need matching versions or gbrain jobs cancel <id>` : ''}. Recipe: ${ERROR_CATALOGUE.legacy_job_authority.docs}`;
 }
+
+/** `gbrain post-upgrade` banner line when queued paid jobs will run under the legacy default cap. */
+export async function legacyDefaultSpendBannerNote(engine: BrainEngine): Promise<string | null> {
+  const n = (await readQueuedSpend(engine)).by_basis.legacy_default ?? 0;
+  if (!n) return null;
+  return `spend: ${n} queued paid job(s) (book-mirror chapters or enrich runs) were queued before submit-time authorization and run under a $5 default cap each. `
+    + 'To authorize a different amount, re-run the command that queued them with --max-usd <usd>; inspect them with: gbrain jobs list --status waiting --json';
+}
+

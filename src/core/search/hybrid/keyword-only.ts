@@ -5,9 +5,11 @@
  */
 import { type HybridRequest, applyIdentityBoosts, emitHybridMeta } from './request.ts';
 import type { LexicalArms } from './arms.ts';
+import { applyFeedbackStage } from '../feedback-boost.ts';
 import { type PostFusionOpts, RRF_K, rrfFusionWeighted, runPostFusionStages, stampContentFlags, stampUnverifiedExtractions } from '../hybrid.ts';
 import { type RelationalEvidenceSlotDecision, ensureRelationalEvidenceSlot } from '../relational-recall.ts';
 import type { SearchResult } from '../../types.ts';
+import type { FusionListEntry } from '../fusion-lists.ts';
 import { applyAliasHop } from '../alias-hop.ts';
 import { applyExactLookupTier } from '../exact-lookup.ts';
 import { dedupResults } from '../dedup.ts';
@@ -35,21 +37,31 @@ export async function searchWithoutEmbeddings(
   // boost skips them (flag survives fusion's result spread).
   await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList], opts);
   let noEmbedResults = keywordResults;
+  const trace = opts?.explainTarget;
+  if (trace) {
+    trace.observe('arm:keyword', keywordResults);
+    trace.observe('arm:title', titleResults);
+    trace.observe('arm:relational', relationalList);
+  }
   if (relationalList.length > 0 || titleResults.length > 0) {
     const fk = opts?.rrfK ?? RRF_K;
-    const noEmbedLists = [{ list: keywordResults, k: fk }];
-    if (titleResults.length > 0) noEmbedLists.push({ list: titleResults, k: fk });
-    if (relationalList.length > 0) noEmbedLists.push({ list: relationalList, k: fk });
-    noEmbedResults = rrfFusionWeighted(noEmbedLists, ctBoost);
+    const noEmbedLists: FusionListEntry[] = [{ list: keywordResults, k: fk, arm: 'keyword' }];
+    if (titleResults.length > 0) noEmbedLists.push({ list: titleResults, k: fk, arm: 'title' });
+    if (relationalList.length > 0) noEmbedLists.push({ list: relationalList, k: fk, arm: 'relational' });
+    noEmbedResults = rrfFusionWeighted(noEmbedLists, ctBoost, opts?.explain === true || trace !== undefined);
   }
   if (noEmbedResults.length > 0) {
     await runPostFusionStages(engine, noEmbedResults, postFusionOpts);
     await applyIdentityBoosts(req, noEmbedResults);
     noEmbedResults.sort((a, b) => b.score - a.score);
+    noEmbedResults = await applyFeedbackStage(engine, noEmbedResults, { reranked: false });
   }
   // T3/T4 — alias hop + evidence stamp even without an embedding provider
   // (the named-thing fix is most valuable exactly when vector is unavailable).
-  const noEmbedPreExact = await applyAliasHop(engine, dedupResults(noEmbedResults), query, aliasHopOpts);
+  trace?.observe('fused', noEmbedResults);
+  const noEmbedDeduped = dedupResults(noEmbedResults);
+  trace?.observe('deduped', noEmbedDeduped);
+  const noEmbedPreExact = await applyAliasHop(engine, noEmbedDeduped, query, aliasHopOpts);
   // #1663 — structural exact-lookup tier (slug / exact-title identity).
   const noEmbedHopped = await applyExactLookupTier(engine, noEmbedPreExact, query, exactLookupOpts);
   stampEvidence(noEmbedHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
@@ -64,13 +76,16 @@ export async function searchWithoutEmbeddings(
   if (relationalList.length > 0) {
     const r = ensureRelationalEvidenceSlot(noEmbedGated, relationalList, limit, offset, {
       cosineFloor: resolvedMode.evidence_cosine_floor,
-    });
+    }, resolvedMode.relational_chain_slots);
     noEmbedPool = r.pool;
     noEmbedRelSlot = r.decision;
   }
+  trace?.observe('return_pool', noEmbedPool);
   const noEmbedSliced = noEmbedPool.slice(offset, offset + limit);
+  trace?.observe('limit_slice', noEmbedSliced);
   // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
   const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
+  trace?.observe('token_budget', noEmbedBudgeted);
   await stampContentFlags(engine, noEmbedBudgeted, opts);
   req.lastResultsCount = noEmbedBudgeted.length;
   req.lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
@@ -78,7 +93,14 @@ export async function searchWithoutEmbeddings(
   // vector didn't run, and whether the keyword arm itself came up empty
   // (skipped-by-modality is not a keyword miss, hence the image gate).
   // System One S6 fire retrieval asks for keyword-only on purpose: vector is not degraded.
-  if (!opts?.decide?.keywordOnly) {
+  if (!opts?.decide?.keywordOnly && opts?._embeddingOptedOut) {
+    // The brain opted out of embedding: keyword-only by choice, and the query text never left the brain.
+    pushDegraded(degraded, 'embed_unavailable', 'embedding_disabled');
+    warnOncePerProcess(
+      'search-vector-leg-opted-out',
+      '[gbrain] embeddings are off on this brain by choice (embedding_disabled), so search is keyword-only and no query text is sent to an embedding provider. If the user wants semantic search, `gbrain doctor --json` names the enable command; turning it on needs their consent.',
+    );
+  } else if (!opts?.decide?.keywordOnly) {
     pushDegraded(degraded, 'embed_unavailable', 'no_provider');
     // #3808: meta names the degradation for programmatic callers, but a CLI
     // human never saw it — mirror the embed-failure warn (once per process,
@@ -138,27 +160,49 @@ export async function searchVectorFallback(
   // no-embedding-provider path for rationale).
   await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList], opts);
   let fallbackResults = keywordResults;
+  const trace = opts?.explainTarget;
+  if (trace) {
+    trace.observe('arm:keyword', keywordResults);
+    trace.observe('arm:title', titleResults);
+    trace.observe('arm:relational', relationalList);
+  }
   if (relationalList.length > 0 || titleResults.length > 0) {
     const fk = opts?.rrfK ?? RRF_K;
-    const fallbackLists = [{ list: keywordResults, k: fk }];
-    if (titleResults.length > 0) fallbackLists.push({ list: titleResults, k: fk });
-    if (relationalList.length > 0) fallbackLists.push({ list: relationalList, k: fk });
-    fallbackResults = rrfFusionWeighted(fallbackLists, ctBoost);
+    const fallbackLists: FusionListEntry[] = [{ list: keywordResults, k: fk, arm: 'keyword' }];
+    if (titleResults.length > 0) fallbackLists.push({ list: titleResults, k: fk, arm: 'title' });
+    if (relationalList.length > 0) fallbackLists.push({ list: relationalList, k: fk, arm: 'relational' });
+    fallbackResults = rrfFusionWeighted(fallbackLists, ctBoost, opts?.explain === true || trace !== undefined);
   }
   if (fallbackResults.length > 0) {
     await runPostFusionStages(engine, fallbackResults, postFusionOpts);
     await applyIdentityBoosts(req, fallbackResults);
     fallbackResults.sort((a, b) => b.score - a.score);
+    fallbackResults = await applyFeedbackStage(engine, fallbackResults, { reranked: false });
   }
-  const kwPreExact = await applyAliasHop(engine, dedupResults(fallbackResults), query, aliasHopOpts);
+  trace?.observe('fused', fallbackResults);
+  const kwDeduped = dedupResults(fallbackResults);
+  trace?.observe('deduped', kwDeduped);
+  const kwPreExact = await applyAliasHop(engine, kwDeduped, query, aliasHopOpts);
   // #1663 — structural exact-lookup tier (slug / exact-title identity).
   const kwHopped = await applyExactLookupTier(engine, kwPreExact, query, exactLookupOpts);
   stampEvidence(kwHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
   // System One S3 evidence gate (no-op when the slot is off), at the fused path's position.
   const kwGated = await applyEvidenceGate(req.decide, query, kwHopped);
-  const kwSliced = kwGated.slice(offset, offset + limit);
+  // #3995 — the same guaranteed page-1 relational evidence as the other two
+  // return paths: a vector failure must not drop a fired arm's answer.
+  let kwPool = kwGated;
+  let kwRelSlot: RelationalEvidenceSlotDecision | undefined;
+  if (relationalList.length > 0) {
+    const r = ensureRelationalEvidenceSlot(kwGated, relationalList, limit, offset, { cosineFloor: resolvedMode.evidence_cosine_floor }, resolvedMode.relational_chain_slots);
+    kwPool = r.pool;
+    kwRelSlot = r.decision;
+  }
+  trace?.observe('return_pool', kwPool);
+  const kwSliced = kwPool.slice(offset, offset + limit);
+  trace?.observe('limit_slice', kwSliced);
   // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
   const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
+  trace?.observe('token_budget', kwBudgeted);
   await stampContentFlags(engine, kwBudgeted, opts);
   req.lastResultsCount = kwBudgeted.length;
   req.lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
@@ -181,6 +225,7 @@ export async function searchVectorFallback(
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: kwBudgetMeta }
       : {}),
+    ...(kwRelSlot ? { relational_evidence_slot: kwRelSlot } : {}),
   });
   return kwBudgeted;
 }

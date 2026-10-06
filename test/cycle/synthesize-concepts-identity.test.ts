@@ -118,6 +118,20 @@ describe('synthesize_concepts narrative stability (C-5)', () => {
     expect(page?.frontmatter.synthesis_mode).toBe('llm');
   }, 120000);
 
+  test('a narrative a chat_fallback_chain model wrote is re-synthesized on the next cycle', async () => {
+    const calls = { n: 0 };
+    const viaChain = chatReturning('Chain narrative.', calls);
+    await runPhaseSynthesizeConcepts(engine, {
+      _atoms: t2Atoms(), sourceId: 'default',
+      _chat: async (o: ChatOpts) => ({ ...(await viaChain(o)), model: 'openai:gpt-example', fallbackFrom: o.model }),
+    });
+    expect((await engine.getPage('concepts/flywheel', { sourceId: 'default' }))?.compiled_truth.trim()).toBe('Chain narrative.');
+
+    await runPhaseSynthesizeConcepts(engine, { _atoms: t2Atoms(), sourceId: 'default', _chat: chatReturning('Configured narrative.', calls) });
+    expect(calls.n).toBe(2);
+    expect((await engine.getPage('concepts/flywheel', { sourceId: 'default' }))?.compiled_truth.trim()).toBe('Configured narrative.');
+  }, 120000);
+
   test('a fallback page is retried with the LLM on the next cycle', async () => {
     const failing = (async () => { throw new Error('boom: unexpected provider fault'); }) as unknown as (o: ChatOpts) => Promise<ChatResult>;
     await runPhaseSynthesizeConcepts(engine, { _atoms: t2Atoms(), sourceId: 'default', _chat: failing });

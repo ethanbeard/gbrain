@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { probeProjectionReadiness } from '../src/core/search/projection-readiness.ts';
+import { __resetProjectionReadinessCacheForTests, probeProjectionReadiness } from '../src/core/search/projection-readiness.ts';
+import { withEnv } from './helpers/with-env.ts';
 import { checkProjectionReadiness } from '../src/commands/doctor/checks/projection-readiness.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
@@ -113,12 +114,14 @@ describe('canonical projection readiness', () => {
       },
     } as any, { sourceId: "source-'quote", excludePrivate: true });
     expect(result.status).toBe('projection_pending');
-    expect(calls).toHaveLength(1);
-    expect(calls[0].sql).toContain('SELECT EXISTS');
-    expect(calls[0].sql).toContain('IS DISTINCT FROM');
-    expect(calls[0].sql).not.toMatch(/COUNT\(|UPDATE |INSERT |DELETE /);
-    expect(calls[0].sql).not.toContain("source-'quote");
-    expect(calls[0].params).toEqual(["source-'quote"]);
+    // Besides the probe, at most the cache's read-only generation read runs.
+    const probes = calls.filter(call => call.sql.includes('SELECT EXISTS'));
+    expect(probes).toHaveLength(1);
+    expect(calls.length).toBeLessThanOrEqual(2);
+    expect(probes[0].sql).toContain('IS DISTINCT FROM');
+    for (const call of calls) expect(call.sql).not.toMatch(/COUNT\(|UPDATE |INSERT |DELETE /);
+    expect(probes[0].sql).not.toContain("source-'quote");
+    expect(probes[0].params).toEqual(["source-'quote"]);
   });
 
   test('doctor distinguishes ready, pending and unknown without returning identifiers', async () => {
@@ -132,5 +135,87 @@ describe('canonical projection readiness', () => {
     expect(unknown.status).toBe('warn');
     expect(unknown.details).toEqual({ readiness: 'unknown', ready: false });
     expect(JSON.stringify(unknown)).not.toContain('private connection');
+  });
+});
+
+/**
+ * The readiness cache (Foundations 2, Lane F): a repeat search reuses the
+ * last answer for the same normalized scope while the database-visible
+ * generation (page clock, pages relation file, source archive flags) holds.
+ */
+describe('projection readiness cache', () => {
+  const counted = () => {
+    let probes = 0;
+    const wrapped = { executeRaw: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT EXISTS')) probes++;
+      return engine.executeRaw(sql, params);
+    } };
+    return { engine: wrapped as unknown as PGLiteEngine, probes: () => probes };
+  };
+  beforeEach(() => { __resetProjectionReadinessCacheForTests(); });
+
+  test('a repeat call for an equal scope reuses the answer; a page write invalidates it', async () => {
+    await seed('markdown', 'source-a', 'current');
+    await engine.executeRaw('UPDATE pages SET text_projection_revision=knowledge_revision');
+    const c = counted();
+    expect((await probeProjectionReadiness(c.engine, { sourceIds: ['source-b', 'source-a'], types: ['concept'] })).status).toBe('ready');
+    expect((await probeProjectionReadiness(c.engine, { sourceIds: ['source-a', 'source-b', 'source-a'], types: ['concept'] })).status).toBe('ready');
+    expect(c.probes()).toBe(1);
+    await seed('markdown', 'source-a', 'pending');
+    expect((await probeProjectionReadiness(c.engine, { sourceIds: ['source-a', 'source-b'], types: ['concept'] })).status).toBe('projection_pending');
+    expect(c.probes()).toBe(2);
+    await engine.executeRaw('UPDATE pages SET text_projection_revision=knowledge_revision');
+    expect((await probeProjectionReadiness(c.engine, { sourceIds: ['source-a', 'source-b'], types: ['concept'] })).status).toBe('ready');
+    expect(c.probes()).toBe(3);
+  });
+
+  test('every scope input is part of the key', async () => {
+    await seed('code', 'source-a', 'excluded/pending', { visibility: 'private' });
+    const c = counted();
+    const scopes = [{}, { sourceId: 'source-a' }, { sourceIds: ['source-b'] }, { excludePrivate: true }, { pageKind: 'markdown' },
+      { types: ['person'] }, { excludeSlugPrefixes: ['excluded/'] }];
+    const statuses = [];
+    for (const scope of scopes) statuses.push((await probeProjectionReadiness(c.engine, scope)).status);
+    expect(statuses).toEqual(['projection_pending', 'projection_pending', 'ready', 'ready', 'ready', 'ready', 'ready']);
+    expect(c.probes()).toBe(scopes.length);
+  });
+
+  test('restoring an archived source with pending pages invalidates a cached ready', async () => {
+    await seed('markdown', 'source-b', 'pending');
+    await engine.executeRaw("UPDATE sources SET archived=true WHERE id='source-b'");
+    const c = counted();
+    expect((await probeProjectionReadiness(c.engine)).status).toBe('ready');
+    await engine.executeRaw("UPDATE sources SET archived=false WHERE id='source-b'");
+    expect((await probeProjectionReadiness(c.engine)).status).toBe('projection_pending');
+    expect(c.probes()).toBe(2);
+  });
+
+  test('an unknown answer is never reused, and GBRAIN_PROJECTION_READINESS_CACHE=0 always probes', async () => {
+    let fail = true;
+    const flaky = { executeRaw: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT EXISTS') && fail) throw new Error('transient');
+      return engine.executeRaw(sql, params);
+    } } as unknown as PGLiteEngine;
+    expect((await probeProjectionReadiness(flaky)).status).toBe('unknown');
+    fail = false;
+    expect((await probeProjectionReadiness(flaky)).status).toBe('ready');
+    const c = counted();
+    await withEnv({ GBRAIN_PROJECTION_READINESS_CACHE: '0' }, async () => {
+      await probeProjectionReadiness(c.engine);
+      await probeProjectionReadiness(c.engine);
+    });
+    expect(c.probes()).toBe(2);
+  });
+
+  test('nothing is cached while a transaction is in flight', async () => {
+    let probes = 0;
+    const busy = { executeRaw: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT EXISTS')) probes++;
+      const rows = await engine.executeRaw<Record<string, unknown>>(sql, params);
+      return sql.includes('pg_current_snapshot') ? rows.map(row => ({ ...row, quiescent: false })) : rows;
+    } } as unknown as PGLiteEngine;
+    await probeProjectionReadiness(busy);
+    await probeProjectionReadiness(busy);
+    expect(probes).toBe(2);
   });
 });

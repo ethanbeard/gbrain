@@ -42,6 +42,7 @@ import {
   loadPricingOverrides,
   type PricingOverrides,
 } from '../../budget/budget-tracker.ts';
+import { pricingSetCommand } from '../../budget/no-pricing.ts';
 import { getEmbeddingModel, withBudgetTracker } from '../../ai/gateway.ts';
 import { embedStaleForSource } from '../../embed-stale.ts';
 import { createEmbedStallWatchdog, resolveEmbedStallAbortSeconds } from '../../embed-stall.ts';
@@ -187,7 +188,8 @@ function capForModel(
   if (cap.defaulted && modelId && !isModelPriceable(modelId, 'embed', pricingOverrides)) {
     console.error(
       `[embed-backfill] model "${modelId}" is not in the pricing maps; ` +
-        `running without the default per-job cost gate. Add pricing.overrides ` +
+        `running without the default per-job cost gate. Look up its price and register it ` +
+        `(${pricingSetCommand(modelId, 'embed')}) ` +
         `or set embed.backfill_max_usd to an explicit numeric cap to fail closed.`,
     );
     return undefined;

@@ -9,6 +9,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
@@ -54,7 +55,7 @@ async function fixture(run: (f: Fixture) => Promise<void>) {
     const ctx = { engine, sourceId, remote: false as const, config: { engine: engine.kind, embedding_disabled: true },
       dryRun: false, logger: { info() {}, warn() {}, error() {} } };
     const coordinated = (sql: string, params: unknown[]) =>
-      engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params)));
+      engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params), TEST_WRITE_ATTRIBUTION));
     const f: Fixture = {
       engine, sourceId,
       put: (slug, content, extra = {}) => submitPageMutation(ctx, { operation: 'put_page', params: { slug, content, request_id: randomUUID(), ...extra } }),
@@ -124,7 +125,7 @@ describe('#5567 coordinated writes keep database-only timeline history', () => {
       await f.put('projects/example', page('Draft.', '- **2026-08-01** | markdown — Launch review'));
       const pageId = await f.pageId('projects/example');
       await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => tx.executeRaw(
-        `UPDATE timeline_entries SET summary='Launch  review ' WHERE page_id=$1`, [pageId])));
+        `UPDATE timeline_entries SET summary='Launch  review ' WHERE page_id=$1`, [pageId]), TEST_WRITE_ATTRIBUTION));
       await f.put('projects/example', page('Draft without the bullet.'), { expected_revision: await f.revision('projects/example') });
       expect(await f.timeline('projects/example')).toEqual([]);
     });
@@ -135,7 +136,7 @@ describe('#5567 coordinated writes keep database-only timeline history', () => {
       await f.put('projects/example', page('Draft.', '- **2026-08-01** | markdown — Launch review'));
       const pageId = await f.pageId('projects/example');
       await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => tx.executeRaw(
-        `UPDATE timeline_entries SET summary='Launch  review ' WHERE page_id=$1`, [pageId])));
+        `UPDATE timeline_entries SET summary='Launch  review ' WHERE page_id=$1`, [pageId]), TEST_WRITE_ATTRIBUTION));
       await f.put('projects/example', page('Edited draft.', '- **2026-08-01** | markdown — Launch review'), { force: true });
       expect(await f.timeline('projects/example')).toEqual([{ date: '2026-08-01', source: 'markdown', summary: 'Launch review', detail: '' }]);
     });
@@ -163,8 +164,8 @@ describe('#5567 coordinated writes keep database-only timeline history', () => {
         await tx.executeRaw(`INSERT INTO timeline_entries(page_id,date,source,summary,detail) VALUES($1,'2026-08-01','markdown','Removed later','recreated')`, [pageId]);
         await tx.executeRaw(`UPDATE timeline_entries SET detail='concurrent detail' WHERE page_id=$1 AND summary='Kept bullet'`, [pageId]);
         await tx.executeRaw(`INSERT INTO timeline_entries(page_id,date,source,summary,detail) VALUES($1,'2026-08-03','','Arrived mid-flight','')`, [pageId]);
-      }));
-      await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx)));
+      }, TEST_WRITE_ATTRIBUTION));
+      await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx), TEST_WRITE_ATTRIBUTION));
       expect(await f.timeline(slug)).toEqual([
         { date: '2026-08-01', source: 'markdown', summary: 'Removed later', detail: 'recreated' },
         { date: '2026-08-02', source: 'markdown', summary: 'Kept bullet', detail: 'concurrent detail' },
@@ -181,10 +182,10 @@ describe('#5567 coordinated writes keep database-only timeline history', () => {
         await f.legacyTimeline(slug, legacy);
         const snapshot = await f.engine.readPageSnapshot(slug, { sourceId: f.sourceId, includeDeleted: true });
         const project = await prepareCanonicalProjections(f.engine, parseMarkdown(page(`Next for ${writer}.`), slug), slug, f.sourceId, snapshot, writer);
-        await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx)));
+        await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx), TEST_WRITE_ATTRIBUTION));
         expect(await f.timeline(slug)).toEqual([legacy]);
         await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => tx.executeRaw(
-          'DELETE FROM timeline_entries WHERE page_id=$1', [snapshot!.page.id])));
+          'DELETE FROM timeline_entries WHERE page_id=$1', [snapshot!.page.id]), TEST_WRITE_ATTRIBUTION));
       }
     });
   });
@@ -211,7 +212,7 @@ describe('#5567 managed sync keeps database-only timeline history', () => {
           await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
           await performManagedSync(engine, { sourceId, noPull: true });
           await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(`INSERT INTO timeline_entries(page_id,date,source,summary,detail)
-            SELECT id,$3::date,$4,$5,$6 FROM pages WHERE source_id=$1 AND slug=$2`, [sourceId, 'projects/example', legacy.date, legacy.source, legacy.summary, legacy.detail])));
+            SELECT id,$3::date,$4,$5,$6 FROM pages WHERE source_id=$1 AND slug=$2`, [sourceId, 'projects/example', legacy.date, legacy.source, legacy.summary, legacy.detail]), TEST_WRITE_ATTRIBUTION));
           const edited = page('Edited draft.', '- **2026-08-02** | markdown — Follow-up');
           writeFileSync(file, edited); commit(root);
           expect(await performManagedSync(engine, { sourceId, noPull: true })).toMatchObject({ status: 'synced' });

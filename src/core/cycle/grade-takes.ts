@@ -37,6 +37,7 @@
 import { createHash } from 'node:crypto';
 import { BaseCyclePhase, effectivePhaseDeadlineMs, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { hybridSearch } from '../search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import type { SearchResult } from '../types.ts';
 import { chat as gatewayChat, getChatModel } from '../ai/gateway.ts';
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
@@ -48,6 +49,7 @@ import type { PhaseStatus, CyclePhase } from '../cycle.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { parseTakesFence } from '../takes-fence.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /**
  * Bump when the judge prompt or the JSON output shape changes. Old verdicts
@@ -389,6 +391,7 @@ export async function defaultEvidenceRetriever(
 ): Promise<string> {
   try {
     const hits = await hybridSearch(engine, take.claim, {
+      ...INTERNAL_BREADTH_SEARCH_OPTS,
       limit: EVIDENCE_SEARCH_LIMIT,
       expansion: false,
       ...(scope.sourceIds && scope.sourceIds.length > 0
@@ -434,6 +437,7 @@ export async function defaultJudge(input: {
     messages: [{ role: 'user', content: prompt }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens: 600,
+    allowFallback: false,
   });
   const parsed = parseJudgeOutput(result.text);
   if (!parsed) {
@@ -807,7 +811,7 @@ class GradeTakesPhase extends BaseCyclePhase {
               evidence: resolution.source, resolved_by: resolution.resolvedBy,
               request_id: createHash('sha256').update(`grade_takes:${take.id}:${recordedSig}:${snapshot.revision}`).digest('hex').replace(/^(.{8})(.{4}).(.{3}).(.{3})(.{12}).*/, '$1-$2-4$3-a$4-$5') } });
           } else {
-            await engine.resolveTake(take.page_id, take.row_num, resolution);
+            await maintenanceTransaction(engine, tx => tx.resolveTake(take.page_id, take.row_num, resolution));
           }
           result.auto_applied += 1;
 

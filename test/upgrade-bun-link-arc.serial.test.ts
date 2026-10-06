@@ -52,7 +52,7 @@
  *
  * Lane: serial. Run: `bash scripts/run-serial-tests.sh test/upgrade-bun-link-arc.serial.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect, afterEach, afterAll } from 'bun:test';
@@ -104,6 +104,7 @@ interface BaseFixture {
 interface Fixture extends BaseFixture {
   origin: string;          // local bare origin; its PATH carries the detection marker
   clone: string;           // the "bun-linked" source clone, one commit behind origin
+  ahead: string;           // working copy that pushes to origin
   driver: string;          // untracked <clone>/src/cli.ts — the bun-link entry point
   originHead: string;      // commit B (ahead)
   cloneHeadBefore: string; // commit A
@@ -126,16 +127,22 @@ function makeBase(label: string): BaseFixture {
   // Recorder ONLY (never runs the real bun, prints nothing). Also notes the
   // cwd repo's HEAD at call time so "git pull ran BEFORE bun install" is
   // provable without shimming git itself.
+  // #5855: `bun --version` is the Bun-floor probe, answered (not recorded) with
+  // GBRAIN_TEST_BUN_VERSION; GBRAIN_TEST_ON_BUN_PROBE runs a script there, the
+  // moment between the floor check and the fast-forward.
   writeShim(
     shimDir,
     'bun',
-    `printf 'bun %s ::head=%s\\n' "$*" "$(git rev-parse HEAD 2>/dev/null || echo none)" >> "${argvLog}"\nexit 0\n`,
+    `if [ "\${1:-}" = "--version" ]; then echo "\${GBRAIN_TEST_BUN_VERSION:-1.4.2}"; if [ -n "\${GBRAIN_TEST_ON_BUN_PROBE:-}" ]; then bash "$GBRAIN_TEST_ON_BUN_PROBE" >/dev/null 2>&1; fi; exit 0; fi\n`
+      + `printf 'bun %s ::head=%s\\n' "$*" "$(git rev-parse HEAD 2>/dev/null || echo none)" >> "${argvLog}"\nexit 0\n`,
   );
-  // Recorder; answers --version so verifyUpgrade resolves a new version.
+  // Recorder; answers --version so verifyUpgrade resolves a new version, and
+  // fails the post-swap `--help` smoke when GBRAIN_TEST_HELP_EXIT is set.
   writeShim(
     shimDir,
     'gbrain',
-    `printf 'gbrain %s\\n' "$*" >> "${argvLog}"\nif [ "\${1:-}" = "--version" ]; then echo 'gbrain ${SHIM_NEW_VERSION}'; fi\nexit 0\n`,
+    `printf 'gbrain %s\\n' "$*" >> "${argvLog}"\nif [ "\${1:-}" = "--version" ]; then echo 'gbrain ${SHIM_NEW_VERSION}'; fi\n`
+      + `if [ "\${1:-}" = "--help" ] && [ -n "\${GBRAIN_TEST_HELP_EXIT:-}" ]; then echo 'GBrain requires Bun 1.4.0 or newer (found Bun 1.3.14).' >&2; exit "$GBRAIN_TEST_HELP_EXIT"; fi\nexit 0\n`,
   );
   // Containment no-ops: nothing in these arcs should reach machine-global
   // schedulers; if a future regression does, it lands here, not in crontab.
@@ -145,13 +152,21 @@ function makeBase(label: string): BaseFixture {
   return { root, home, shimDir, argvLog };
 }
 
-/** Local seed repo → bare origin (path contains the marker) → clone one commit behind. */
-function buildFixture(label: string): Fixture {
+function releasePackage(version: string, bunFloor: string): string {
+  return JSON.stringify({ name: 'gbrain', version, engines: { bun: bunFloor } }) + '\n';
+}
+
+/**
+ * Local seed repo → bare origin (path contains the marker) → clone one commit
+ * behind. `aheadFloor` is the `engines.bun` of the commit the clone upgrades to.
+ */
+function buildFixture(label: string, aheadFloor = '>=1.4.0'): Fixture {
   const base = makeBase(label);
 
   const seed = join(base.root, 'seed');
   mkdirSync(seed, { recursive: true });
   writeFileSync(join(seed, 'notes.txt'), 'commit one\n');
+  writeFileSync(join(seed, 'package.json'), releasePackage('0.0.1.0', '>=1.4.0'));
   git(['init', '-q'], seed);
   git(['add', '-A'], seed);
   git([...GIT_IDENTITY, 'commit', '-q', '-m', 'c1'], seed);
@@ -169,6 +184,7 @@ function buildFixture(label: string): Fixture {
   const ahead = join(base.root, 'ahead');
   git(['clone', '-q', origin, ahead]);
   writeFileSync(join(ahead, 'feature.txt'), 'commit two\n');
+  writeFileSync(join(ahead, 'package.json'), releasePackage(SHIM_NEW_VERSION, aheadFloor));
   git(['add', '-A'], ahead);
   git([...GIT_IDENTITY, 'commit', '-q', '-m', 'c2'], ahead);
   git(['push', '-q', 'origin', 'HEAD'], ahead);
@@ -209,7 +225,7 @@ function buildFixture(label: string): Fixture {
     ].join('\n'),
   );
 
-  return { ...base, origin, clone, driver, originHead, cloneHeadBefore };
+  return { ...base, origin, clone, ahead, driver, originHead, cloneHeadBefore };
 }
 
 function argvLines(fx: BaseFixture): string[] {
@@ -335,6 +351,7 @@ describe('runUpgrade — bun-link arc (real git vs local bare origin; bun/gbrain
     expect(argvLines(fx)).toEqual([
       `bun install ::head=${fx.originHead}`,
       'gbrain --version',
+      'gbrain --help',
       'gbrain post-upgrade',
       'gbrain features',
     ]);
@@ -358,10 +375,11 @@ describe('runUpgrade — bun-link arc (real git vs local bare origin; bun/gbrain
 
     // Swap still happened...
     expect(git(['rev-parse', 'HEAD'], fx.clone).trim()).toBe(fx.originHead);
-    // ...but the child chain stops after the version verify.
+    // ...but the child chain stops after the version verify and runtime smoke.
     expect(argvLines(fx)).toEqual([
       `bun install ::head=${fx.originHead}`,
       'gbrain --version',
+      'gbrain --help',
     ]);
 
     // State + breadcrumb still written (the next launch runs post-upgrade).
@@ -369,6 +387,66 @@ describe('runUpgrade — bun-link arc (real git vs local bare origin; bun/gbrain
     expect(state.last_upgrade.from).toBe(VERSION);
     expect(state.last_upgrade.to).toBe(SHIM_NEW_VERSION);
     expect(readFileSync(join(fx.home, '.gbrain', 'just-upgraded-from'), 'utf-8').trim()).toBe(VERSION);
+  }, 120_000);
+});
+
+// ── 2b. the Bun floor gate and post-swap smoke (#5855) ───────────────────────
+
+describe('runUpgrade — bun-link Bun floor gate (#5855)', () => {
+  test('a target whose Bun floor is above the host Bun is refused with the fix; nothing is swapped', async () => {
+    const fx = buildFixture('floor-unmet', '>=9.9.9');
+    const run = await spawnWithShims(fx, [fx.driver, '--swap-only']);
+    expect(run.code).toBe(78);
+    expect(run.err).toContain(`gbrain ${SHIM_NEW_VERSION} requires Bun >=9.9.9; bun on PATH (${join(fx.shimDir, 'bun')}) is 1.4.2. `
+      + 'Fix: bun upgrade, then gbrain upgrade. Docs: docs/guides/upgrades-auto-update.md#bun-floor');
+    expect(run.err).toContain('Nothing was changed.');
+    expect(git(['rev-parse', 'HEAD'], fx.clone).trim()).toBe(fx.cloneHeadBefore);
+    expect(argvLines(fx)).toEqual([]);
+    expect(existsSync(join(fx.home, '.gbrain', 'upgrade-state.json'))).toBe(false);
+    expect(existsSync(join(fx.home, '.gbrain', 'just-upgraded-from'))).toBe(false);
+  }, 120_000);
+
+  test('an unreadable floor refuses and names the read and --no-bun-floor-check, which overrides it', async () => {
+    const fx = buildFixture('floor-unreadable', '^1.4.0');
+    const refused = await spawnWithShims(fx, [fx.driver, '--swap-only']);
+    expect(refused.code).toBe(78);
+    expect(refused.err).toContain(`Could not read the Bun floor of gbrain ${SHIM_NEW_VERSION}: \`git show ${fx.originHead.slice(0, 12)}:package.json\` has no \`engines.bun\` floor of the form >=X.Y.Z.`);
+    expect(refused.err).toContain('Re-run with --no-bun-floor-check to upgrade without this check.');
+    expect(git(['rev-parse', 'HEAD'], fx.clone).trim()).toBe(fx.cloneHeadBefore);
+
+    const forced = await spawnWithShims(fx, [fx.driver, '--swap-only', '--no-bun-floor-check']);
+    assertExit0('upgrade driver (--no-bun-floor-check)', forced);
+    expect(git(['rev-parse', 'HEAD'], fx.clone).trim()).toBe(fx.originHead);
+  }, 120_000);
+
+  test('the installed commit is the checked one when upstream raises its floor after the check (E11)', async () => {
+    const fx = buildFixture('floor-race');
+    const advance = join(fx.root, 'advance.sh');
+    writeFileSync(advance, [
+      `cd ${JSON.stringify(fx.ahead)}`,
+      `printf '%s' ${JSON.stringify(releasePackage('9.9.9.10', '>=9.9.9'))} > package.json`,
+      'git add -A',
+      `git ${GIT_IDENTITY.join(' ')} commit -q -m c3`,
+      'git push -q origin HEAD',
+    ].join('\n'));
+    const run = await spawnWithShims(fx, [fx.driver, '--swap-only'], { GBRAIN_TEST_ON_BUN_PROBE: advance });
+    assertExit0('upgrade driver (upstream advanced mid-upgrade)', run);
+    const originNow = git(['rev-parse', 'HEAD'], fx.origin).trim();
+    expect(originNow).not.toBe(fx.originHead);
+    expect(git(['rev-parse', 'HEAD'], fx.clone).trim()).toBe(fx.originHead);
+  }, 120_000);
+
+  test('a swapped release that fails the runtime smoke exits non-zero with per-method recovery', async () => {
+    const fx = buildFixture('smoke');
+    const run = await spawnWithShims(fx, [fx.driver, '--swap-only'], { GBRAIN_TEST_HELP_EXIT: '1' });
+    expect(run.code).toBe(1);
+    expect(run.err).toContain(`gbrain ${SHIM_NEW_VERSION} was installed but does not start: \`gbrain --help\` failed (exit 1).`);
+    expect(run.err).toContain('GBrain requires Bun 1.4.0 or newer (found Bun 1.3.14).');
+    expect(run.err).toContain('If it names an old Bun: bun upgrade, then gbrain post-upgrade');
+    expect(run.err).toContain(`To return to ${VERSION}: git -C ${fx.clone} checkout ${fx.cloneHeadBefore} && bun install`);
+    const errors = readFileSync(join(fx.home, '.gbrain', 'upgrade-errors.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(errors.at(-1)).toMatchObject({ phase: 'post-swap-smoke', from_version: VERSION, to_version: SHIM_NEW_VERSION });
+    expect(existsSync(join(fx.home, '.gbrain', 'just-upgraded-from'))).toBe(false);
   }, 120_000);
 });
 

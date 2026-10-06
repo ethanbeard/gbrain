@@ -23,6 +23,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { setCliExitVerdict } from '../src/core/cli-force-exit.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -216,6 +217,8 @@ describe('parseHarnessArgs', () => {
     expect(parseHarnessArgs(['--source', 'Not Valid']).error).toMatch(/invalid --source/);
     expect(parseHarnessArgs(['--source', '__all__']).error).toMatch(/invalid --source/);
     expect(parseHarnessArgs(['--source', 'wiki']).source).toBe('wiki');
+    expect(parseHarnessArgs(['--refresh-skills']).refreshSkills).toBe(true);
+    expect(parseHarnessArgs(['--refresh-skills', '--status']).error).toMatch(/--refresh-skills alone/);
   });
   test('--project is repeatable and resolved', () => {
     const f = parseHarnessArgs(['--project', '/a', '--project', '/b']);
@@ -226,11 +229,40 @@ describe('parseHarnessArgs', () => {
 describe('consent gate', () => {
   test('non-TTY without --yes refuses BEFORE any mutation (no mint, no files)', async () => {
     const f = makeFake();
-    const code = await applyHarness(parseHarnessArgs([]), f.deps);
-    expect(code).toBe(2);
-    expect(f.err.join('\n')).toMatch(/pass --yes/);
+    let stdout = '';
+    const write = process.stdout.write;
+    process.stdout.write = ((c: string | Uint8Array) => { stdout += String(c); return true; }) as typeof process.stdout.write;
+    let code: number;
+    try {
+      code = await applyHarness(parseHarnessArgs(['--json']), f.deps);
+    } finally {
+      process.stdout.write = write;
+      setCliExitVerdict(0);
+    }
+    // C6: exit 3 with the consent payload (was exit 2 with a 'pass --yes' line).
+    expect(code).toBe(3);
+    const payload = JSON.parse(stdout);
+    expect(payload).toMatchObject({ code: 'confirmation_required', effects: ['persistent_install', 'credentials'] });
+    expect(payload.fix.argv).toEqual(['gbrain', 'bootstrap', 'harness', '--json', '--yes']);
+    expect(payload.user_message).toContain('bootstrap harness --remove');
     expect(existsSync(f.userSettings)).toBe(false);
     expect(existsSync(f.codexConfig)).toBe(false);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('C6: a declined or EOF prompt (TTY) is a refusal, exit 3, nothing written', async () => {
+    const f = makeFake();
+    const write = process.stdout.write;
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    let code: number;
+    try {
+      code = await applyHarness(parseHarnessArgs([]), { ...f.deps, isTTY: true, prompt: async () => '' });
+    } finally {
+      process.stdout.write = write;
+      setCliExitVerdict(0);
+    }
+    expect(code).toBe(3);
+    expect(existsSync(f.userSettings)).toBe(false);
     expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
   });
 
@@ -318,6 +350,19 @@ describe('full apply', () => {
     expect(code).toBe(0);
     const hooks = readJson(f.userSettings).hooks as Record<string, unknown>;
     expect(Object.keys(hooks).sort()).toEqual(['PreCompact', 'SessionStart', 'UserPromptSubmit']);
+  });
+
+  test('#5893 re-run mints each host from the token it replaces, carrying its grants', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(), f.deps)).toBe(0);
+    const first = readHarnessReceiptState(f.home);
+    if (first.state !== 'ok') throw new Error('expected a receipt');
+    expect(f.mintCalls.slice(0, 3).every(call => (call as { carry?: unknown }).carry === undefined)).toBe(true);
+    expect(await applyHarness(flags(['--source', 'wiki']), f.deps)).toBe(0);
+    const carried = f.mintCalls.slice(3).map(call => (call as { name: string; carry?: { fromId: string; explicitSource: boolean; policyAdded: string[] } }));
+    expect(carried.map(call => call.carry?.fromId)).toEqual(
+      carried.map(call => first.receipt.harness_tokens![call.name.replace('bootstrap-harness-', '') as HarnessTarget['host']]!.id));
+    expect(carried.every(call => call.carry?.explicitSource === true && call.carry.policyAdded.length === 0)).toBe(true);
   });
 
   test('re-run rotates mint-first [C7]: one entry per event, previous token revoked by id AFTER confirm', async () => {

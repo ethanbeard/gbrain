@@ -20,6 +20,7 @@ import type { ExplicitReadBinding } from './ops/contract.ts';
 import { isSourceFederated, parseSourceConfig } from './sources-load.ts';
 import { SOURCE_ID_RE, isValidSourceId, ALL_SOURCES } from './source-id.ts';
 import { isTrustedDotfile, realpathOrResolve, realpathOrResolveAsync } from './path-confine.ts';
+import { noteResolvedSource } from './fix-routing.ts';
 
 // Re-export so scope-resolution call sites can import the sentinel from
 // either module (#1712).
@@ -151,6 +152,17 @@ export async function resolveSourceId(
   // Local IPC already evaluated the client's flag/env/dotfile tiers. The
   // owner's environment must never redirect that client's unscoped request.
   opts: { skipLocalSignals?: boolean } = {},
+): Promise<string> {
+  const id = await resolveSourceIdChain(engine, explicit, cwd, opts);
+  if (!opts.skipLocalSignals) noteResolvedSource(id);
+  return id;
+}
+
+async function resolveSourceIdChain(
+  engine: BrainEngine,
+  explicit: string | null | undefined,
+  cwd: string,
+  opts: { skipLocalSignals?: boolean },
 ): Promise<string> {
   // 1. Explicit flag wins. The __all__ sentinel passes through verbatim
   //    (#1712) — it is not a source id, so it skips both the regex and
@@ -574,7 +586,8 @@ export function formatDefaultWriteWarning(a: DefaultWriteAssessment, sourceFlag?
   return (
     `[gbrain] WARNING: writing to source 'default' on a multi-source brain ` +
     `(${a.nonDefaultSources} non-default source(s), ${a.nonDefaultPages} pages). ` +
-    `${escape} to scope writes and avoid cross-source duplicate slugs.`
+    `${escape} to scope writes and avoid cross-source duplicate slugs.` +
+    (sourceFlag ? ` GBRAIN_SOURCE=<id> works too; GBRAIN_ALLOW_DEFAULT_WRITE=1 keeps 'default' on purpose.` : '')
   );
 }
 
@@ -757,6 +770,16 @@ export async function resolveSourceWithTier(
   engine: BrainEngine,
   explicit: string | null | undefined,
   cwd: string = process.cwd(),
+): Promise<{ source_id: string; tier: SourceTier; detail?: string }> {
+  const resolved = await resolveSourceWithTierChain(engine, explicit, cwd);
+  noteResolvedSource(resolved.source_id);
+  return resolved;
+}
+
+async function resolveSourceWithTierChain(
+  engine: BrainEngine,
+  explicit: string | null | undefined,
+  cwd: string,
 ): Promise<{ source_id: string; tier: SourceTier; detail?: string }> {
   // 1. Explicit flag wins. __all__ sentinel passes through verbatim (#1712).
   if (explicit) {

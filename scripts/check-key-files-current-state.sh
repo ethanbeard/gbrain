@@ -13,7 +13,9 @@
 #      marker is the disease signature; it must not appear in those docs. Plain prose
 #      ("as of pgvector 0.7", "Postgres 11+") is fine — only the bolded release
 #      marker is banned, so this never false-fires on legitimate version mentions.
-#   2. Size caps for CLAUDE.md, README.md, the index, and each subsystem.
+#   2. Size caps for CLAUDE.md, README.md, the index, each subsystem and
+#      docs/TESTING.md. The TESTING.md cap is a ratchet: lower it when the file
+#      shrinks, never raise it; detail moves next to its code instead.
 #   3. One reference bullet per src file across the index and subsystems — a cherry-pick that keeps both sides
 #      of a hunk leaves two "- `src/x.ts`" bullets describing two different
 #      "current states" for one file. Merge into the survivor, never append a twin.
@@ -27,6 +29,7 @@
 # Env overrides (for the guard's own test):
 #   GBRAIN_DOC_GUARD_ROOT        repo root to scan (default: script's ../)
 #   GBRAIN_CLAUDE_MD_MAX_BYTES   CLAUDE.md hard cap (default: 35000)
+#   GBRAIN_TESTING_MD_MAX_BYTES  docs/TESTING.md hard cap (default: 120000)
 #
 # Exit codes:
 #   0   clean
@@ -36,6 +39,7 @@ set -uo pipefail
 
 ROOT="${GBRAIN_DOC_GUARD_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 MAX_BYTES="${GBRAIN_CLAUDE_MD_MAX_BYTES:-35000}"
+TESTING_MAX_BYTES="${GBRAIN_TESTING_MD_MAX_BYTES:-120000}"
 
 # Reference docs that MUST stay current-state (history-free).
 REFERENCE_DOCS=(
@@ -93,6 +97,17 @@ for spec in "README.md:45000" "docs/architecture/KEY_FILES.md:10000"; do
     echo "FAIL: $rel is $bytes bytes, over the $cap cap. Move detail to a linked reference." >&2
   fi
 done
+testing="$ROOT/docs/TESTING.md"
+if [ -f "$testing" ]; then
+  bytes=$(wc -c < "$testing" | tr -d ' ')
+  if [ "$bytes" -gt "$TESTING_MAX_BYTES" ]; then
+    fail=1
+    echo "FAIL: docs/TESTING.md is $bytes bytes, over the $TESTING_MAX_BYTES cap (a ratchet: it only goes down)." >&2
+    echo "      Trim: move subsystem detail next to its code (a README beside the harness or module) and leave a" >&2
+    echo "      two-line pointer; describe lanes and guards, not individual test files (each test's header does that)." >&2
+    echo "      Docs: docs/TESTING.md#quick-start" >&2
+  fi
+fi
 for doc in "$ROOT"/docs/architecture/key-files/*.md; do
   bytes=$(wc -c < "$doc" | tr -d ' ')
   if [ "$bytes" -gt 60000 ]; then

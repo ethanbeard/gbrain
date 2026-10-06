@@ -3,10 +3,14 @@ import { OperationError, type OperationContext } from '../ops/contract.ts';
 import { sourceScopeOpts } from '../ops/context.ts';
 import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, type LocalGrant } from '../persistence/identity.ts';
 import type { Principal } from '../persistence/model.ts';
-import { coerceLegacyPermissions, normalizeTokenScopes, parseLegacyTokenScope } from '../legacy-token-scope.ts';
+import { normalizeTokenScopes } from '../legacy-token-scope.ts';
+import { authSourcesFromGrant, grantFromTokenRow } from '../grants/model.ts';
 import { hasScope } from '../scope.ts';
 
-const deny = (): never => { throw new OperationError('permission_denied', 'An intact, current skills_member_self grant and explicit operation approval are required. Membership grants no other authority.'); };
+const deny = (): never => {
+  throw new OperationError('permission_denied', 'An intact, current skills_member_self grant and explicit operation approval are required. Membership grants no other authority.',
+    'Ask the brain host\'s operator to grant this connection the skills_member_self scope and the membership operation it calls, then reconnect; nothing was enrolled or changed.');
+};
 
 export async function memberAuthority(ctx: OperationContext, operation: string): Promise<{ principal: Principal; digest: string; ctx: OperationContext }> {
   const auth = ctx.auth;
@@ -26,14 +30,14 @@ export async function memberAuthority(ctx: OperationContext, operation: string):
       sources = [...new Set([row.source_id, ...(row.federated_read ?? [])])].filter(Boolean);
       grant = row;
     } else {
-      const [row] = await ctx.engine.executeRaw<{ scopes: unknown; permissions: unknown }>('SELECT scopes,permissions FROM access_tokens WHERE id=$1 AND revoked_at IS NULL FOR SHARE', [principal.id]);
-      const scopes = normalizeTokenScopes(row?.scopes) ?? [];
-      const permissions = coerceLegacyPermissions(row?.permissions);
-      const operations = permissions?.allowed_operations;
-      if (!row || !hasScope(scopes, 'read') || !hasScope(scopes, 'skills_member_self') || !Array.isArray(operations) || !operations.includes(operation)) deny();
-      const parsed = parseLegacyTokenScope(permissions?.source_id);
+      const [row] = await ctx.engine.executeRaw<Record<string, unknown>>('SELECT * FROM access_tokens WHERE id=$1 AND revoked_at IS NULL FOR SHARE', [principal.id]);
+      if (!row) deny();
+      const scopes = normalizeTokenScopes(row.scopes) ?? [];
+      const tokenGrant = grantFromTokenRow(row);
+      if (!hasScope(scopes, 'read') || !hasScope(scopes, 'skills_member_self') || !tokenGrant.allowedOperations?.includes(operation)) deny();
+      const parsed = authSourcesFromGrant(tokenGrant);
       sources = parsed.allowedSources ?? [parsed.sourceId];
-      grant = row;
+      grant = { scopes: row.scopes, permissions: row.permissions };
     }
     const scope = sourceScopeOpts(ctx);
     const original = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : []);

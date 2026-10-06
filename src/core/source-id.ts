@@ -44,6 +44,15 @@ export const SOURCE_ID_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
  */
 export const ALL_SOURCES = '__all__';
 
+/**
+ * Sentinel for a legacy token whose stored source grant is an explicit empty
+ * list (`gbrain auth rescope-token <name> --sources none`). Like
+ * `ALL_SOURCES` it can never name a real source; `sourceScopeOpts`, the
+ * dispatch fence and write submission refuse it instead of falling back to
+ * the `default` floor.
+ */
+export const NO_SOURCES = '__none__';
+
 /** Returns true if the string matches the canonical source_id regex. */
 export function isValidSourceId(s: unknown): s is string {
   return typeof s === 'string' && SOURCE_ID_RE.test(s);

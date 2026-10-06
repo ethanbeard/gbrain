@@ -14,6 +14,7 @@ import { parseMarkdown } from '../src/core/markdown.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { materializeTimeline, prepareCanonicalProjections, renderMaterializedBullet, type ProjectionWriter } from '../src/core/persistence/canonical-projections.ts';
@@ -73,7 +74,7 @@ async function fixture(run: (f: Fixture) => Promise<void>) {
       },
       legacy: async (slug, row) => { await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(
         `INSERT INTO timeline_entries(page_id,date,source,summary,detail) SELECT id,$3::date,$4,$5,$6 FROM pages WHERE source_id=$1 AND slug=$2`,
-        [sourceId, slug, row.date, row.source, row.summary, row.detail ?? '']))); },
+        [sourceId, slug, row.date, row.source, row.summary, row.detail ?? '']), TEST_WRITE_ATTRIBUTION)); },
       timeline: async slug => engine.executeRaw<Row>(`SELECT t.date::text AS date,t.source,t.summary,t.detail FROM timeline_entries t
         JOIN pages p ON p.id=t.page_id WHERE p.source_id=$1 AND p.slug=$2 AND t.event_page_id IS NULL ORDER BY t.date,t.summary`, [sourceId, slug]),
     };
@@ -223,9 +224,9 @@ describe('#5567 database-only rows are materialized as marked bullets', () => {
       await f.put(slug, page('Draft.'), { force: true });
       const rendered = f.file(slug);
       await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => tx.executeRaw(
-        `UPDATE pages SET compiled_truth='', timeline='' WHERE source_id=$1 AND slug=$2`, [f.sourceId, slug])));
+        `UPDATE pages SET compiled_truth='', timeline='' WHERE source_id=$1 AND slug=$2`, [f.sourceId, slug]), TEST_WRITE_ATTRIBUTION));
       await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () =>
-        importFromContent(tx, slug, rendered, { sourceId: f.sourceId, noEmbed: true, forceRechunk: true })));
+        importFromContent(tx, slug, rendered, { sourceId: f.sourceId, noEmbed: true, forceRechunk: true }), TEST_WRITE_ATTRIBUTION));
       expect(await f.body(slug)).toContain(bullet);
       await f.put(slug, page('Stale copy.'), { force: true });
       expect(await f.timeline(slug)).toEqual([normalized]);
@@ -271,7 +272,7 @@ describe('#5567 per-writer classes for marked rows', () => {
         const carried = await materializeTimeline(f.engine, next, slug, prior, writer);
         expect(carried.materialized).toBe(renders ? 1 : 0);
         const project = await prepareCanonicalProjections(f.engine, { ...next, timeline: carried.timeline }, slug, f.sourceId, prior, writer);
-        await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx)));
+        await f.engine.transaction(tx => withCoordinatedWrite(tx, [f.sourceId], () => project(tx), TEST_WRITE_ATTRIBUTION));
         expect(await f.timeline(slug)).toEqual(keeps ? [normalized] : []);
       });
     });

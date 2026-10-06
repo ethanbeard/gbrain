@@ -56,7 +56,7 @@ export async function moveSlugBindings(
        AND EXISTS (SELECT 1 FROM facts o WHERE o.source_id = $1 AND o.source_markdown_slug = $2 AND o.row_num = f.row_num)`,
     `UPDATE facts SET source_markdown_slug = $3 WHERE source_id = $1 AND source_markdown_slug = $2`,
     `DELETE FROM page_aliases a WHERE a.source_id = $1 AND a.slug = $3
-       AND EXISTS (SELECT 1 FROM page_aliases o WHERE o.source_id = $1 AND o.slug = $2 AND o.alias_norm = a.alias_norm)`,
+       AND EXISTS (SELECT 1 FROM page_aliases o WHERE o.source_id = $1 AND o.slug = $2 AND o.alias_norm = a.alias_norm AND o.origin = a.origin)`,
     `UPDATE page_aliases SET slug = $3 WHERE source_id = $1 AND slug = $2`,
   ];
   for (const sql of statements) {

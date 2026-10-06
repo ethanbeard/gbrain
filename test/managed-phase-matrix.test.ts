@@ -27,9 +27,13 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { ALL_PHASES, runCycle, type CycleOpts, type CyclePhase, type PhaseResult } from '../src/core/cycle.ts';
 import { MANAGED_PHASE_TABLE } from '../src/core/cycle/phase-table.ts';
 import { runPhaseGradeTakes } from '../src/core/cycle/grade-takes.ts';
+import { runChronicleBackfill } from '../src/core/chronicle/backfill.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
+import { claimPersistenceEffect } from '../src/core/persistence/effect-journal.ts';
+import { dispatchFactsBackstopEffect } from '../src/core/persistence/effect-facts.ts';
+import { localHostId } from '../src/core/persistence/identity.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import type { ChatOpts, ChatResult } from '../src/core/ai/gateway.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
@@ -106,6 +110,12 @@ async function seedFacts(engine: BrainEngine, sourceId: string, slug: string) {
 const MATRIX: Record<CyclePhase, Entry> = {
   lint: {
     seed: async ({ engine, sourceId }) => put(engine, sourceId, 'notes/lint-example', page('note', 'Lint example', 'Body with a trailing space. \n\n\n\nToo many blank lines.')),
+    // #5180: the seeded page has a fixable issue (missing-created, promotable from its capture timestamp);
+    // the repair is admitted and committed by the coordinator, never written to the worktree by lint itself.
+    assert: async ({ engine, sourceId, result }) => {
+      expect(await committed(engine, sourceId, 'notes/lint-example')).not.toHaveLength(0);
+      expect(result.details).toMatchObject({ write_path: 'coordinator', fix_pending: 0 });
+    },
   },
   backlinks: {
     seed: async ({ engine, sourceId }) => {
@@ -271,6 +281,60 @@ const MATRIX: Record<CyclePhase, Entry> = {
       expect((await engine.getPage(slug!, { sourceId: 'default' }))?.compiled_truth).toContain('DRIFTED — notes/drift-example');
     },
   },
+  edge_contradictions: {
+    config: { 'dream.edge_contradictions.mode': 'apply', 'models.dream.edge_contradictions': 'anthropic:claude-sonnet-4-6' },
+    seed: async ({ engine, sourceId }) => {
+      await put(engine, sourceId, 'companies/acme-example', page('company', 'Acme', 'A company.'));
+      await put(engine, sourceId, 'companies/widget-co', page('company', 'Widget', 'A company.'));
+      await put(engine, sourceId, 'people/edge-example', page('person', 'Edge Example',
+        'Works at [Acme](../companies/acme-example) and at [Widget](../companies/widget-co).\n\n## Timeline\n\n' +
+        '- **2019-02-01** | test — joined [Acme](../companies/acme-example)\n- **2024-05-01** | test — joined [Widget](../companies/widget-co)'));
+    },
+    reply: () => JSON.stringify({ pairs: [{ a: 1, b: 2, conflict: true, confidence: 0.9 }] }),
+    assert: async ({ engine, sourceId, result }) => {
+      expect(result.details).toMatchObject({ proposed: 1, applied: 1 });
+      const ops = await committed(engine, sourceId, 'people/edge-example');
+      expect(ops.some(o => (o as { operation: string }).operation === 'add_timeline_entry')).toBe(true);
+      expect((await engine.getPage('people/edge-example', { sourceId }))?.timeline).toContain('Ended works_at [[companies/acme-example]]');
+    },
+  },
+  chronicle: {
+    seed: async ({ engine, sourceId }) => {
+      await put(engine, sourceId, 'meetings/chronicle-example', page('meeting', 'Weekly sync',
+        `${'Alice and Bob reviewed the launch plan and agreed on the next steps. '.repeat(3)}`, `date: ${daysAgo(1)}\n`));
+      await runChronicleBackfill(engine, { sourceId, yes: true });
+    },
+    reply: () => JSON.stringify([{ when: daysAgo(1), who: ['people/alice-example'], what: 'Alice agreed to ship the beta', kind: 'commitment' }]),
+    assert: async ({ engine, sourceId, result }) => {
+      expect(result.details).toMatchObject({ judged: 1, extracted: 1, events_written: 1 });
+      const [event] = await engine.executeRaw<{ slug: string }>("SELECT slug FROM pages WHERE source_id=$1 AND type='event'", [sourceId]);
+      expect(await committed(engine, sourceId, event.slug)).not.toHaveLength(0);
+      expect(await engine.executeRaw("SELECT state FROM chronicle_page_state WHERE source_id=$1", [sourceId])).toEqual([{ state: 'extracted' }]);
+    },
+  },
+  facts_drain: {
+    config: { embedding_disabled: 'true' },
+    seed: async ({ engine, sourceId }) => {
+      if (engine.kind !== 'pglite') return;
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      await put(engine, sourceId, 'notes/drain-example', page('note', 'Field notes', 'Carol Example founded Widget Co in 2019 and leads its design team. '.repeat(3)));
+      const held = await engine.executeRaw<{ id: number; next_attempt_at: string | null }>(
+        "SELECT id, next_attempt_at::text FROM persistence_effects WHERE kind<>'facts-backstop'");
+      await engine.executeRaw("UPDATE persistence_effects SET next_attempt_at=now()+interval '1 hour' WHERE kind<>'facts-backstop'");
+      const effect = await claimPersistenceEffect(engine, localHostId());
+      for (const h of held) await engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=$2::timestamptz WHERE id=$1', [h.id, h.next_attempt_at]);
+      if (effect) await dispatchFactsBackstopEffect(engine, effect, localHostId());
+      const jobs = await engine.executeRaw("SELECT id FROM minion_jobs WHERE name='facts-absorb' AND data->>'slug'='notes/drain-example' AND status='waiting'");
+      expect(jobs).toHaveLength(1);
+    },
+    reply: () => JSON.stringify({ facts: [{ fact: 'Carol founded Widget Co in 2019', kind: 'fact', entity: 'people/carol-example', confidence: 0.9, notability: 'high' }] }),
+    assert: async ({ engine, sourceId, result }) => {
+      if (engine.kind !== 'pglite') { expect(result.details.reason).toBe('not_applicable'); return; }
+      expect(result.details).toMatchObject({ outcome: 'drained', failed: 0, backlog_after: 0 });
+      expect(Number(result.details.completed)).toBeGreaterThanOrEqual(1);
+      expect(await engine.executeRaw("SELECT fact FROM facts WHERE source_id=$1 AND fact LIKE '%Widget Co%'", [sourceId])).not.toHaveLength(0);
+    },
+  },
   conversation_facts_backfill: {
     config: { 'cycle.conversation_facts_backfill.enabled': 'true' },
     seed: async ({ engine, sourceId }) => put(engine, sourceId, 'conversations/2026-09-20-example', page('conversation', 'Chat',
@@ -418,4 +482,20 @@ for (const phase of ALL_PHASES) {
       });
     }, 120_000);
   }
+}
+
+// #5255: autopilot asks every cycle to pull. On a managed brain the sync phase
+// must still import local HEAD (no refusal) and report the skipped refresh.
+for (const backend of backends) {
+  test(`sync with pull:true on a managed ${backend} brain: writes, upstream_refresh skipped_managed`, async () => {
+    await runPhase(engines[backends.indexOf(backend)], 'sync', { ...MATRIX.sync, cycle: { pull: true } }, async ctx => {
+      expect(ctx.result.status).not.toBe('fail');
+      for (const refusal of REFUSALS) {
+        expect(JSON.stringify(ctx.result)).not.toContain(refusal);
+        expect(ctx.logs).not.toContain(refusal);
+      }
+      expect(ctx.result.details?.upstream_refresh).toBe('skipped_managed');
+      await MATRIX.sync.assert!(ctx);
+    });
+  }, 120_000);
 }

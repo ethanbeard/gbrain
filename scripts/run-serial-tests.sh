@@ -73,6 +73,15 @@ case "${1:-}" in
 esac
 
 . scripts/lib/test-env.sh
+receipts_init serial
+RECEIPT_SHARD=""
+RECEIPT_OF=""
+RECEIPT_TAG="all"
+if [ -n "$SERIAL_SHARD" ]; then
+  RECEIPT_SHARD="$shard_n"
+  RECEIPT_OF="$shard_m"
+  RECEIPT_TAG="s${shard_n}of${shard_m}"
+fi
 
 # ──────────────────────────────────────────────────────────────────────────
 # EXCLUSIVE_FILES: files that must never run concurrently with anything else
@@ -156,7 +165,11 @@ if [ "$DRY_RUN_MODE" = "--dry-run-list-exclusive" ]; then
   exit 0
 fi
 
-if [ "${#ordered_files[@]}" -gt 0 ]; then ensure_pglite_snapshot "serial-tests"; fi
+if [ "${#ordered_files[@]}" -gt 0 ]; then
+  ensure_pglite_snapshot "serial-tests"
+else
+  receipt_empty "$RECEIPT_TAG" "$RECEIPT_SHARD" "$RECEIPT_OF"
+fi
 
 # ──────────────────────────────────────────────────────────────────────────
 # Pool sizing: min(detect_cpus, 4) — each pooled bun process can hold a
@@ -293,8 +306,9 @@ echo "[serial-tests] ${#ordered_files[@]} file(s): pool=$POOL (${#exclusive_pres
 # against in v0.40.10. The literal `bun test --max-concurrency=1` below is
 # contract-pinned by test/scripts/serial-files.test.ts.
 run_one_file() {
-  # $1 file, $2 log path, $3 exit-sentinel path, $4 wrap ("wrap"|"nowrap")
-  local f="$1" log="$2" exitf="$3" wrap="$4" rc=0
+  # $1 file, $2 log path, $3 exit-sentinel path, $4 wrap ("wrap"|"nowrap"),
+  # $5 receipt kind (primary|rescue; default primary)
+  local f="$1" log="$2" exitf="$3" wrap="$4" kind="${5:-primary}" rc=0
   local key="${log%.log}" started finished
   printf '%s\n' "$f" > "$key.file"
   started=$(now_ms)
@@ -309,12 +323,14 @@ run_one_file() {
     cov_key=$(basename "$log" .log)
     cov_args=(--coverage --coverage-reporter=lcov --coverage-dir="$COVERAGE_DIR/serial-$cov_key")
   fi
+  receipt_begin "$kind" "$RECEIPT_TAG-$(basename "$log" .log)" "$RECEIPT_SHARD" "$RECEIPT_OF" "" "$f"
   if [ "$wrap" = "wrap" ] && [ -n "$TIMEOUT_BIN" ]; then
     "$TIMEOUT_BIN" -k 15 "$PER_FILE_TIMEOUT" \
-      bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} "$f" > "$log" 2>&1 || rc=$?
+      bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$f" > "$log" 2>&1 || rc=$?
   else
-    bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} "$f" > "$log" 2>&1 || rc=$?
+    bun test --max-concurrency=1 --timeout=120000 ${cov_args[@]+"${cov_args[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$f" > "$log" 2>&1 || rc=$?
   fi
+  receipt_end "$rc"
   echo "$rc" > "$exitf"
   finished=$(now_ms)
   echo "$((finished - started))" > "$key.duration-ms"
@@ -420,7 +436,7 @@ if [ "${#rescue_files[@]}" -gt 0 ]; then
     is_exclusive "$f" && wrap_mode="nowrap"
     s=$(date +%s)
     [ "$wrap_mode" != "nowrap" ] || running_exclusive=1
-    run_one_file "$f" "$LOG_DIR/$i.log" "$LOG_DIR/$i.exit" "$wrap_mode" &
+    run_one_file "$f" "$LOG_DIR/$i.log" "$LOG_DIR/$i.exit" "$wrap_mode" rescue &
     wait "$!"
     running_exclusive=0
     e=$(date +%s)

@@ -12,6 +12,15 @@
  *     `assemble_evidence` with `auto` delivers for the same hits.
  *
  * Postgres arm runs when DATABASE_URL is set.
+ *
+ * The off-path golden is a keyless capture: with an embedding key the query
+ * family turns on the vector path and the reranker, which changes the
+ * retrieval meta and can reorder rows (the nightly full-corpus lane carries
+ * OPENAI_API_KEY and ANTHROPIC_API_KEY, run 37273083933). So the golden is
+ * compared under an explicitly keyless gateway in every lane, and a keyed lane
+ * additionally checks the keyed capture: key-independent calls (keyword search,
+ * think's prompt) still match the frozen bytes, and query/recall report the
+ * vector path as on.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
@@ -22,7 +31,11 @@ import type { SearchResult } from '../../src/core/types.ts';
 import { operations, type OperationContext } from '../../src/core/operations.ts';
 import { evidenceFingerprint, pageEvidenceText } from '../../src/core/search/evidence-delivery.ts';
 import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
-import { captureOffPath, seedOffPath } from '../helpers/evidence-delivery-fixture.ts';
+import { captureOffPath, seedOffPath, withCostWave } from '../helpers/evidence-delivery-fixture.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
+import { PROVIDER_ENV_KEYS } from '../helpers/provider-env.ts';
+import { emptyHome, withEnv } from '../helpers/with-env.ts';
 
 const FIXTURE = join(import.meta.dir, '../fixtures/goldens/evidence-delivery/off-path.json');
 const backends = process.env.DATABASE_URL ? ['pglite', 'postgres'] as const : ['pglite'] as const;
@@ -35,6 +48,21 @@ function ctxOf(engine: BrainEngine, remote = false): OperationContext {
 }
 
 const op = (name: string) => operations.find(o => o.name === name)!;
+const keyedLane = PROVIDER_ENV_KEYS.some(k => k.endsWith('_API_KEY') && process.env[k]);
+const gatewayFromProcessEnv = () => configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: { ...process.env } });
+
+async function keyless<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await withEnv({ ...Object.fromEntries(PROVIDER_ENV_KEYS.map(k => [k, undefined])), GBRAIN_HOME: emptyHome() }, async () => {
+      gatewayFromProcessEnv();
+      return fn();
+    });
+  } finally {
+    gatewayFromProcessEnv();
+  }
+}
+
+const KEY_INDEPENDENT = /^(search|search-remote|search-subagent|mcp-search)(:chunk)?$|^think-prompt$/;
 
 beforeAll(async () => {
   for (const backend of backends) {
@@ -66,8 +94,23 @@ describe('evidence delivery parity', () => {
       await engine.setConfig('search.return_unit', 'chunk');
       await engine.setConfig('think.return_unit', 'chunk');
       try {
-        const got = await captureOffPath(engine);
-        for (const key of Object.keys(want)) expect(`${key}: ${got[key]}`).toBe(`${key}: ${want[key]}`);
+        const got = await keyless(() => captureOffPath(engine));
+        for (const key of Object.keys(want)) expect(`${key}: ${got[key]}`).toBe(`${key}: ${withCostWave(key, want[key])}`);
+        if (keyedLane) {
+          const keyed = await captureOffPath(engine);
+          const independent = Object.keys(want).filter(k => KEY_INDEPENDENT.test(k));
+          expect(independent.length).toBe(8);
+          for (const key of independent) expect(`${key}: ${keyed[key]}`).toBe(`${key}: ${withCostWave(key, want[key])}`);
+          for (const key of Object.keys(want).filter(k => /^query/.test(k))) {
+            const retrieval = (JSON.parse(keyed[key]).meta as Array<{ key: string; value: { vector_enabled: boolean; degraded?: Array<{ stage: string }> } }>)
+              .find(m => m.key === 'retrieval')!.value;
+            expect(`${key}: vector_enabled=${retrieval.vector_enabled}`).toBe(`${key}: vector_enabled=true`);
+            expect((retrieval.degraded ?? []).map(d => d.stage)).not.toContain('embed_unavailable');
+          }
+          for (const key of Object.keys(want).filter(k => /^recall/.test(k))) {
+            expect(JSON.parse(keyed[key]).result.search_degraded).toBeUndefined();
+          }
+        }
       } finally {
         await engine.executeRaw(`DELETE FROM config WHERE key IN ('search.return_unit', 'think.return_unit')`);
       }
@@ -78,8 +121,9 @@ describe('evidence delivery parity', () => {
       let expanded = 0;
       for (const remote of [false, true]) {
         for (const query of ['ocelot', 'ocelot renewal roadmap']) {
-          const hits = await op('search').handler(ctxOf(engine, remote), { query, return_unit: 'chunk' }) as SearchResult[];
-          const viaDefault = await op('search').handler(ctxOf(engine, remote), { query }) as SearchResult[];
+          // fields: 'full': these checks compare complete rows (page_id, delivered) with assemble_evidence.
+          const hits = await op('search').handler(ctxOf(engine, remote), { fields: 'full', query, return_unit: 'chunk' }) as SearchResult[];
+          const viaDefault = await op('search').handler(ctxOf(engine, remote), { fields: 'full', query }) as SearchResult[];
           const viaAssemble = await op('assemble_evidence').handler(ctxOf(engine, remote), {
             hits: hits.map(h => ({ source_id: h.source_id, slug: h.slug, chunk_id: h.chunk_id })), return_unit: 'auto',
           }) as { results: SearchResult[] };
@@ -99,7 +143,7 @@ describe('evidence delivery parity', () => {
     test(`page evidence is byte-identical to the stored body minus frontmatter and protected content (${backend})`, async () => {
       const engine = engines[backend]!;
       for (const remote of [false, true]) {
-        const rows = await op('search').handler(ctxOf(engine, remote), { query: 'ocelot', return_unit: 'page', token_budget: 32000 }) as SearchResult[];
+        const rows = await op('search').handler(ctxOf(engine, remote), { fields: 'full', query: 'ocelot', return_unit: 'page', token_budget: 32000 }) as SearchResult[];
         expect(rows.length).toBeGreaterThan(0);
         for (const r of rows) {
           const [page] = await engine.executeRaw<{ compiled_truth: string; timeline: string }>('SELECT compiled_truth, timeline FROM pages WHERE id = $1', [r.page_id]);
@@ -111,17 +155,17 @@ describe('evidence delivery parity', () => {
     test(`search/query and assemble_evidence deliver identical evidence for the same hits (${backend})`, async () => {
       const engine = engines[backend]!;
       for (const remote of [false, true]) {
-        const hits = await op('search').handler(ctxOf(engine, remote), { query: 'ocelot' }) as SearchResult[];
+        const hits = await op('search').handler(ctxOf(engine, remote), { fields: 'full', query: 'ocelot' }) as SearchResult[];
         expect(hits.length).toBeGreaterThan(0);
         for (const unit of UNITS) {
-          const viaSearch = await op('search').handler(ctxOf(engine, remote), { query: 'ocelot', return_unit: unit, token_budget: 2500 }) as SearchResult[];
+          const viaSearch = await op('search').handler(ctxOf(engine, remote), { fields: 'full', query: 'ocelot', return_unit: unit, token_budget: 2500 }) as SearchResult[];
           const viaAssemble = await op('assemble_evidence').handler(ctxOf(engine, remote), {
             hits: hits.map(h => ({ source_id: h.source_id, slug: h.slug, chunk_id: h.chunk_id })), return_unit: unit, token_budget: 2500,
           }) as { results: SearchResult[] };
           expect(evidenceFingerprint(viaAssemble.results)).toBe(evidenceFingerprint(viaSearch));
         }
-        const qHits = await op('query').handler(ctxOf(engine, remote), { query: 'ocelot pricing', expand: false }) as SearchResult[];
-        const viaQuery = await op('query').handler(ctxOf(engine, remote), { query: 'ocelot pricing', expand: false, return_unit: 'page', token_budget: 2500 }) as SearchResult[];
+        const qHits = await op('query').handler(ctxOf(engine, remote), { fields: 'full', query: 'ocelot pricing', expand: false }) as SearchResult[];
+        const viaQuery = await op('query').handler(ctxOf(engine, remote), { fields: 'full', query: 'ocelot pricing', expand: false, return_unit: 'page', token_budget: 2500 }) as SearchResult[];
         const viaAssemble = await op('assemble_evidence').handler(ctxOf(engine, remote), {
           hits: qHits.map(h => ({ source_id: h.source_id, slug: h.slug, chunk_id: h.chunk_id })), return_unit: 'page', token_budget: 2500,
         }) as { results: SearchResult[] };
@@ -135,8 +179,8 @@ describe('evidence delivery parity', () => {
       const [a, b] = [engines.pglite!, engines.postgres!];
       const textOf = (rows: SearchResult[]) => rows.map(r => [r.slug, r.chunk_text, r.delivered?.unit, r.delivered?.tokens, r.delivered?.truncated]);
       for (const unit of [...UNITS, undefined]) {
-        const ra = await op('search').handler(ctxOf(a), { query: 'ocelot', return_unit: unit, token_budget: 2500 }) as SearchResult[];
-        const rb = await op('search').handler(ctxOf(b), { query: 'ocelot', return_unit: unit, token_budget: 2500 }) as SearchResult[];
+        const ra = await op('search').handler(ctxOf(a), { fields: 'full', query: 'ocelot', return_unit: unit, token_budget: 2500 }) as SearchResult[];
+        const rb = await op('search').handler(ctxOf(b), { fields: 'full', query: 'ocelot', return_unit: unit, token_budget: 2500 }) as SearchResult[];
         expect(textOf(rb)).toEqual(textOf(ra));
       }
       const windows = async (engine: BrainEngine) => {

@@ -394,6 +394,110 @@ describe('soft-delete + restore lifecycle (column-based v0.26.5)', () => {
     expect(remainingPages[0].n).toBe(0);
   });
 
+  test('gbrain#5452 — epoch or missing archive timestamps are never purge-eligible and are reported', async () => {
+    const epochId = 'pe-epoch';
+    const nullId = 'pe-null-expiry';
+    await seedSource(engine, epochId, { withPages: 1 });
+    await seedSource(engine, nullId, { withPages: 1 });
+    await softDeleteSource(engine, epochId);
+    await softDeleteSource(engine, nullId);
+    await engine.executeRaw(
+      `UPDATE sources SET archived_at = '1970-01-01T00:00:00Z', archive_expires_at = '1970-01-01T00:00:00Z' WHERE id = $1`,
+      [epochId],
+    );
+    await engine.executeRaw(
+      `UPDATE sources SET archive_expires_at = NULL WHERE id = $1`,
+      [nullId],
+    );
+    const { purged, blocked } = await purgeExpiredSources(engine);
+    expect(purged).not.toContain(epochId);
+    expect(purged).not.toContain(nullId);
+    expect(blocked.map((b) => b.id)).toEqual(expect.arrayContaining([epochId, nullId]));
+    // Both sources and their pages survive — full contents intact.
+    const intact = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM pages WHERE source_id IN ($1, $2)`,
+      [epochId, nullId],
+    );
+    expect(intact[0].n).toBe(2);
+    // Cleanup: leftover archived rows are reported as suspects by every
+    // later purge sweep in this describe.
+    await engine.executeRaw(`DELETE FROM sources WHERE id IN ($1, $2)`, [epochId, nullId]);
+  });
+
+  test('gbrain#5452 — a missing/epoch archived_at refuses purge even with a normal past expiry', async () => {
+    const epochArchId = 'pe-epoch-arch';
+    const nullArchId = 'pe-null-arch';
+    await seedSource(engine, epochArchId, { withPages: 1 });
+    await seedSource(engine, nullArchId, { withPages: 1 });
+    await softDeleteSource(engine, epochArchId);
+    await softDeleteSource(engine, nullArchId);
+    // Past expiry is a perfectly normal value here — the refusal comes from
+    // archived_at, which can no longer prove the 72h window ever existed.
+    await engine.executeRaw(
+      `UPDATE sources SET archived_at = '1970-01-01T00:00:00Z', archive_expires_at = now() - INTERVAL '1 hour' WHERE id = $1`,
+      [epochArchId],
+    );
+    await engine.executeRaw(
+      `UPDATE sources SET archived_at = NULL, archive_expires_at = now() - INTERVAL '1 hour' WHERE id = $1`,
+      [nullArchId],
+    );
+    const { purged, blocked } = await purgeExpiredSources(engine);
+    expect(purged).not.toContain(epochArchId);
+    expect(purged).not.toContain(nullArchId);
+    expect(blocked.map((b) => b.id)).toEqual(expect.arrayContaining([epochArchId, nullArchId]));
+    const intact = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM pages WHERE source_id IN ($1, $2)`,
+      [epochArchId, nullArchId],
+    );
+    expect(intact[0].n).toBe(2);
+    await engine.executeRaw(`DELETE FROM sources WHERE id IN ($1, $2)`, [epochArchId, nullArchId]);
+  });
+
+  test('gbrain#5452 — timestamps flipped to epoch/missing after candidate selection are refused at delete time', async () => {
+    const flipExpiryId = 'pe-flip-expiry';
+    const flipArchId = 'pe-flip-arch';
+    await seedSource(engine, flipExpiryId, { withPages: 1 });
+    await seedSource(engine, flipArchId, { withPages: 1 });
+    await softDeleteSource(engine, flipExpiryId);
+    await softDeleteSource(engine, flipArchId);
+    // Both start as legitimate candidates: real archived_at, past expiry.
+    await engine.executeRaw(
+      `UPDATE sources SET archive_expires_at = now() - INTERVAL '1 hour' WHERE id IN ($1, $2)`,
+      [flipExpiryId, flipArchId],
+    );
+    // The sweep reads candidates, then deletes one row at a time. Reproduce a
+    // stamp flip landing in between: the moment the first DELETE arrives, both
+    // rows' stamps degrade to the refusal set — the DELETE itself must refuse.
+    const orig = engine.executeRaw.bind(engine);
+    let flipped = false;
+    engine.executeRaw = (async (sql: string, params?: unknown[]) => {
+      if (!flipped && typeof sql === 'string' && sql.includes('DELETE FROM sources')) {
+        flipped = true;
+        await orig(
+          `UPDATE sources SET archive_expires_at = '1970-01-01T00:00:00Z' WHERE id = $1`,
+          [flipExpiryId],
+        );
+        await orig(`UPDATE sources SET archived_at = NULL WHERE id = $1`, [flipArchId]);
+      }
+      return orig(sql, params);
+    }) as typeof engine.executeRaw;
+    let purged: string[] = [];
+    try {
+      ({ purged } = await purgeExpiredSources(engine));
+    } finally {
+      engine.executeRaw = orig;
+    }
+    expect(flipped).toBe(true);
+    expect(purged).not.toContain(flipExpiryId);
+    expect(purged).not.toContain(flipArchId);
+    const intact = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM pages WHERE source_id IN ($1, $2)`,
+      [flipExpiryId, flipArchId],
+    );
+    expect(intact[0].n).toBe(2);
+    await engine.executeRaw(`DELETE FROM sources WHERE id IN ($1, $2)`, [flipExpiryId, flipArchId]);
+  });
+
   test('gbrain#4115 — an FK-blocked source is reported and skipped; the deletable one still purges', async () => {
     const blockedId = 'pe-fk-blocked';
     const deletableId = 'pe-fk-deletable';
@@ -457,6 +561,7 @@ describe('soft-delete + restore lifecycle (column-based v0.26.5)', () => {
   test('gbrain#4115 — a source restored between SELECT and DELETE is neither purged nor blocked (review gap G8)', async () => {
     const stub = {
       async executeRaw(sql: string): Promise<Array<{ id: string }>> {
+        if (sql.includes('archive_expires_at IS NULL')) return []; // #5452 unverified-archive listing: none here
         if (sql.trimStart().startsWith('SELECT')) return [{ id: 'restored-mid-sweep' }];
         return []; // per-id DELETE re-checks the expiry predicate → 0 rows
       },

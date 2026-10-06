@@ -219,6 +219,12 @@ export interface ContextPackRequest {
    * OpenClaw assemble poll.
    */
   manifestOnly?: boolean;
+  /**
+   * Always-loaded core (additive, read-only): return only the core block for
+   * the session source — no assembly, no cursor advance, no banking. Used by
+   * the OpenClaw assemble lane. An older serve ignores it and assembles.
+   */
+  coreOnly?: boolean;
 }
 
 export type IpcRequest =
@@ -351,18 +357,36 @@ export interface IpcPathConfig {
  * database_path must not key off the path — there is no PGLite brain (and
  * no serve) behind it (v0.45.7 gate, preserved).
  *
- * Multi-serve note: on Postgres several serves for the SAME database_url
- * share this path; the first LIVE provider wins — a later serve probes the
- * socket, finds a live owner, and defers (null binding) instead of unlinking
- * it (#4896). Bound-source rejection [CX2-10] still applies per request.
+ * Multi-serve note (#5042): on Postgres every serve binds the resolve
+ * socket of its own bound source (`sourceId` → `resolve-<hash12(url)>-
+ * <hash12(source)>.sock`), so serves for different sources of one database
+ * coexist. Without `sourceId` this returns the legacy URL-only path, which a
+ * serve also binds when it is free (first LIVE provider wins; a later serve
+ * defers instead of unlinking it, #4896). The persistence socket ignores
+ * `sourceId`: it routes to the single resident owner, so it stays
+ * brain-keyed. Bound-source rejection [CX2-10] still applies per request.
  */
-export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined, kind: 'resolve' | 'persistence' = 'resolve'): string | null {
+export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined, kind: 'resolve' | 'persistence' = 'resolve', sourceId?: string): string | null {
   if (!cfg) return null;
   if (cfg.engine === 'pglite' && cfg.database_path) return localIpcSocketPath(join(cfg.database_path, `.gbrain-${kind}.sock`));
   if (cfg.engine === 'postgres' && cfg.database_url) {
-    return localIpcSocketPath(join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}.sock`));
+    const sourceKey = kind === 'resolve' && sourceId ? `-${hash12(sourceId)}` : '';
+    return localIpcSocketPath(join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}${sourceKey}.sock`));
   }
   return null;
+}
+
+/**
+ * The resolve socket a hook calls (#5042): its own source's socket
+ * (`GBRAIN_SOURCE`, else `default`) when a serve listens there, else the
+ * legacy URL-only socket (an older serve, or a serve bound to a source the
+ * hook does not name). PGLite has a single path (one serve per data dir).
+ */
+export async function hookResolveSocketForConfig(cfg: IpcPathConfig | null | undefined, sourceId: string | undefined): Promise<string | null> {
+  const legacy = resolveSocketPathForConfig(cfg);
+  const keyed = resolveSocketPathForConfig(cfg, 'resolve', sourceId || 'default');
+  if (!legacy || !keyed || keyed === legacy) return legacy;
+  return (await socketHasLiveListener(keyed)) ? keyed : legacy;
 }
 
 /**

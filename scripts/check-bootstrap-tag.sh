@@ -132,6 +132,7 @@ if [ "$fail" -ne 0 ]; then
 fi
 if [ "$checked" -eq 0 ]; then
   echo "check-bootstrap-tag: ok (no bootstrap entry docs present yet — all checks skipped)"
+  echo "GBRAIN_CHECK_SKIPPED: no bootstrap entry docs present"
 else
   echo "check-bootstrap-tag: ok ($checked doc(s) on the '$SANCTIONED' distribution ref)"
 fi

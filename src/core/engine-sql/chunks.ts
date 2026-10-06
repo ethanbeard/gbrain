@@ -46,6 +46,8 @@ import { joinFragments, renderFragment, sqlFragment, trustedSql, type SqlFragmen
 export interface ChunkPageGuards {
   lockPageKeys(keys: readonly PageKey[]): Promise<void>;
   readPageSnapshot(slug: string, opts?: PageSnapshotOptions): Promise<PageSnapshot | null>;
+  /** #5984: shares a config read across one page transaction (the engine's `transactionMemo`). */
+  memo?<T>(key: string, read: () => Promise<T>): Promise<T>;
 }
 
 /**
@@ -62,8 +64,9 @@ export async function upsertChunksOnce(
   guards: ChunkPageGuards,
   slug: string,
   chunks: ChunkInput[],
-  opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string },
+  opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number },
 ): Promise<void> {
+    const memo = guards.memo ?? (<T>(_key: string, read: () => Promise<T>) => read());
     // Normalize the same way putPage does — pages.slug is stored lowercased,
     // so a raw mixed-case slug here would miss the row it just wrote (#430).
     slug = validateSlug(slug);
@@ -79,23 +82,32 @@ export async function upsertChunksOnce(
     // Source-scope the page-id lookup. Without this filter, multi-source
     // brains where the slug exists in 2+ sources return >1 row and the
     // chunk replacement targets the wrong page (or fans out across pages).
-    const pages = (await exec.run<{ id: number }>(sqlFragment`SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId} FOR UPDATE`)).rows;
+    // #5984: `sealChunkerVersion` is a complete replacement: the caller deleted
+    // every chunk of the page earlier in this transaction, so nothing stale can
+    // remain, and the seal (which also locks the page row and yields its id)
+    // commits only together with the insert below.
+    const seal = opts?.sealChunkerVersion;
+    const pages = (await exec.run<{ id: number }>(seal === undefined
+      ? sqlFragment`SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId} FOR UPDATE`
+      : sqlFragment`UPDATE pages SET chunker_version = ${seal} WHERE slug = ${slug} AND source_id = ${sourceId} RETURNING id`)).rows;
     if (pages.length === 0) throw new Error(`Page not found: ${slug} (source=${sourceId})`);
     const pageId = pages[0].id;
 
-    // A fragment write cannot certify the full-body fence boundary. Import seals
-    // only after its complete replacement succeeds in the same transaction.
-    const invalidation = chunkWriteInvalidation(pageId, chunks);
-    await exec.unsafe(invalidation.sql, invalidation.params);
+    if (seal === undefined) {
+      // A fragment write cannot certify the full-body fence boundary. Import seals
+      // only after its complete replacement succeeds in the same transaction.
+      const invalidation = chunkWriteInvalidation(pageId, chunks);
+      await exec.unsafe(invalidation.sql, invalidation.params);
 
-    // Remove chunks that no longer exist (chunk_index beyond new count)
-    const newIndices = chunks.map(c => c.chunk_index);
-    if (newIndices.length > 0) {
-      await exec.run(sqlFragment`DELETE FROM content_chunks WHERE page_id = ${pageId} AND chunk_index != ALL(${newIndices})`);
-    } else {
-      await exec.run(sqlFragment`DELETE FROM content_chunks WHERE page_id = ${pageId}`);
-      return;
-    }
+      // Remove chunks that no longer exist (chunk_index beyond new count)
+      const newIndices = chunks.map(c => c.chunk_index);
+      if (newIndices.length > 0) {
+        await exec.run(sqlFragment`DELETE FROM content_chunks WHERE page_id = ${pageId} AND chunk_index != ALL(${newIndices})`);
+      } else {
+        await exec.run(sqlFragment`DELETE FROM content_chunks WHERE page_id = ${pageId}`);
+        return;
+      }
+    } else if (chunks.length === 0) return;
 
     // Batch upsert: build a single multi-row INSERT ON CONFLICT statement.
     // v0.19.0: includes language/symbol_name/symbol_type/start_line/end_line
@@ -127,7 +139,8 @@ export async function upsertChunksOnce(
       let searchEmbeddingColumn: string | null = null;
       let embeddingColumnsJson: string | null = null;
       try {
-        const cfgRows = (await exec.run<{ key: string; value: string }>(sqlFragment`SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns')`)).rows;
+        const cfgRows = await memo('config:embedding-columns', async () =>
+          (await exec.run<{ key: string; value: string }>(sqlFragment`SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns')`)).rows);
         for (const r of cfgRows) {
           if (r.key === 'search_embedding_column') searchEmbeddingColumn = r.value;
           else if (r.key === 'embedding_columns') embeddingColumnsJson = r.value;
@@ -145,8 +158,6 @@ export async function upsertChunksOnce(
     // later text rewrite that keeps the vector is detectable as content
     // drift (invalidateContentDriftEmbeddings). NULL when no embedding lands.
     const cols = `(page_id, chunk_index, chunk_text, chunk_source, ${writeColId}, model, token_count, embedded_at, embedded_text_hash, embedding_input_hash, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified, modality, embedding_image)`;
-    const rows: SqlFragment[] = [];
-
     let resolvedModel: string | null = null;
     try {
       // Keep the gateway lazy so module-load failure remains inside this soft
@@ -156,7 +167,8 @@ export async function upsertChunksOnce(
     } catch {}
     if (!resolvedModel) {
       try {
-        const cfg = (await exec.run<{ value?: string }>(sqlFragment`SELECT value FROM config WHERE key = 'embedding_model'`)).rows;
+        const cfg = await memo('config:embedding-model', async () =>
+          (await exec.run<{ value?: string }>(sqlFragment`SELECT value FROM config WHERE key = 'embedding_model'`)).rows);
         resolvedModel = cfg[0]?.value ?? null;
       } catch {}
     }
@@ -166,33 +178,33 @@ export async function upsertChunksOnce(
     }
     if (!resolvedModel) resolvedModel = 'unconfigured';
 
-    for (const chunk of chunks) {
-      const embeddingStr = chunk.embedding
-        ? '[' + Array.from(chunk.embedding).join(',') + ']'
-        : null;
-      const embeddingImageStr = chunk.embedding_image
-        ? '[' + Array.from(chunk.embedding_image).join(',') + ']'
-        : null;
-      const parentPath = chunk.parent_symbol_path && chunk.parent_symbol_path.length > 0
-        ? chunk.parent_symbol_path
-        : null;
-      const modality = chunk.modality ?? 'text';
-      // Already normalized before the seal snapshot. Both storage and the
-      // embedded_text_hash input must use those same canonical bytes.
-      const sanitizedChunkText = chunk.chunk_text;
-
-      const embeddingPh = embeddingStr ? sqlFragment`${embeddingStr}${trustedSql(writeCast)}` : sqlFragment`NULL`;
-      const embeddedAtPh = trustedSql(embeddingStr ? 'now()' : 'NULL');
-      const embeddingImagePh = embeddingImageStr ? sqlFragment`${embeddingImageStr}::vector` : sqlFragment`NULL`;
-      // #4246: hash in SQL (not JS) so stamp + drift comparison share ONE
-      // md5 implementation. Binds chunk_text a second time.
-      const embeddedTextHashPh = embeddingStr ? sqlFragment`md5(${sanitizedChunkText})` : sqlFragment`NULL`;
-      // #5553: embedding-input provenance travels only with the vector it describes.
-      const embeddingInputHash = embeddingStr ? chunk.embedding_input_hash ?? null : null;
-      const embeddingInputHashPh = embeddingInputHash ? sqlFragment`${embeddingInputHash}` : sqlFragment`NULL`;
-
-      rows.push(sqlFragment`(${pageId}, ${chunk.chunk_index}, ${sanitizedChunkText}, ${chunk.chunk_source}, ${embeddingPh}, ${chunk.model || resolvedModel}, ${chunk.token_count || null}, ${embeddedAtPh}, ${embeddedTextHashPh}, ${embeddingInputHashPh}, ${chunk.language || null}, ${chunk.symbol_name || null}, ${chunk.symbol_type || null}, ${chunk.start_line ?? null}, ${chunk.end_line ?? null}, ${parentPath}::text[], ${chunk.doc_comment || null}, ${chunk.symbol_name_qualified || null}, ${modality}, ${embeddingImagePh})`);
-    }
+    // #5984: one statement text per brain whatever the chunk count (the rows bind as one
+    // JSON document), so a prepared connection pays no describe round trip per page.
+    const incoming = chunks.map(chunk => {
+      const embedding = chunk.embedding ? '[' + Array.from(chunk.embedding).join(',') + ']' : null;
+      return {
+        chunk_index: chunk.chunk_index,
+        // Already normalized before the seal snapshot. Both storage and the
+        // embedded_text_hash input must use those same canonical bytes.
+        chunk_text: chunk.chunk_text,
+        chunk_source: chunk.chunk_source ?? null,
+        embedding,
+        model: chunk.model || resolvedModel,
+        token_count: chunk.token_count || null,
+        // #5553: embedding-input provenance travels only with the vector it describes.
+        embedding_input_hash: embedding ? chunk.embedding_input_hash ?? null : null,
+        language: chunk.language || null,
+        symbol_name: chunk.symbol_name || null,
+        symbol_type: chunk.symbol_type || null,
+        start_line: chunk.start_line ?? null,
+        end_line: chunk.end_line ?? null,
+        parent_symbol_path: chunk.parent_symbol_path && chunk.parent_symbol_path.length > 0 ? chunk.parent_symbol_path : null,
+        doc_comment: chunk.doc_comment || null,
+        symbol_name_qualified: chunk.symbol_name_qualified || null,
+        modality: chunk.modality ?? 'text',
+        embedding_image: chunk.embedding_image ? '[' + Array.from(chunk.embedding_image).join(',') + ']' : null,
+      };
+    });
 
     // Single statement upsert: preserves existing embeddings via COALESCE when new value is NULL.
     // CONSISTENCY: when chunk_text changes and no new embedding is supplied, BOTH embedding AND
@@ -225,9 +237,18 @@ export async function upsertChunksOnce(
     // relabeled preserved (older-model) vectors with the current gateway model on every
     // partial re-embed, corrupting provenance without changing the vector.
     //
-    // Master's raw path (it was `unsafe` on both engines). No bind batching:
-    // master PGLite never split this statement.
-    const { text, params } = renderFragment(sqlFragment`INSERT INTO content_chunks ${trustedSql(cols)} VALUES ${joinFragments(rows, ', ')}
+    // #4246: embedded_text_hash is md5(chunk_text) in SQL (not JS) so stamp + drift
+    // comparison share ONE md5 implementation; it, embedded_at and the input hash
+    // are set only when the row carries a vector.
+    const { text, params } = renderFragment(sqlFragment`INSERT INTO content_chunks ${trustedSql(cols)}
+       SELECT ${pageId}::int, c.chunk_index, c.chunk_text, c.chunk_source, c.embedding${trustedSql(writeCast)}, c.model, c.token_count,
+         CASE WHEN c.embedding IS NULL THEN NULL ELSE now() END,
+         CASE WHEN c.embedding IS NULL THEN NULL ELSE md5(c.chunk_text) END,
+         c.embedding_input_hash, c.language, c.symbol_name, c.symbol_type, c.start_line, c.end_line,
+         c.parent_symbol_path, c.doc_comment, c.symbol_name_qualified, c.modality, c.embedding_image::vector
+       FROM jsonb_to_recordset(${JSON.stringify(incoming)}::text::jsonb) AS c(chunk_index int, chunk_text text, chunk_source text,
+         embedding text, model text, token_count int, embedding_input_hash text, language text, symbol_name text, symbol_type text,
+         start_line int, end_line int, parent_symbol_path text[], doc_comment text, symbol_name_qualified text, modality text, embedding_image text)
        ON CONFLICT (page_id, chunk_index) DO UPDATE SET
          chunk_text = EXCLUDED.chunk_text,
          chunk_source = EXCLUDED.chunk_source,
@@ -282,7 +303,7 @@ export async function upsertChunksOnce(
          symbol_name_qualified = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.symbol_name_qualified ELSE COALESCE(EXCLUDED.symbol_name_qualified, content_chunks.symbol_name_qualified) END,
          modality = EXCLUDED.modality,
          embedding_image = COALESCE(EXCLUDED.embedding_image, content_chunks.embedding_image)`);
-    await exec.unsafe(text, params);
+    await exec.query(text, params);
   }
 
 export async function getChunks(
@@ -414,6 +435,7 @@ export async function invalidateStaleSignatureEmbeddings(
             SET ${colId} = NULL, embedded_at = NULL
            FROM pages p
           WHERE cc.page_id = p.id
+            AND p.deleted_at IS NULL
             AND p.source_id=ANY(${sources}::text[])
             AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)
             AND cc.${colId} IS NOT NULL

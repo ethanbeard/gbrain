@@ -9,6 +9,7 @@ import { OperationError } from '../../src/core/ops/contract.ts';
 import { managedAtomSession, readAtomOrigin, resumeManagedAtoms } from '../../src/core/persistence/atom-maintenance.ts';
 import { retryManagedAtomBatch } from '../../src/core/persistence/atom-retry.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { compactWriteReceipts, receiptFor } from '../../src/core/persistence/journal.ts';
 import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { disposePersistenceConsumer, waitForWrite } from '../../src/core/persistence/service.ts';
@@ -69,7 +70,7 @@ export async function exerciseAtomCompaction(engine: BrainEngine, scenario: type
           await tx.lockPageKeys([{ sourceId, slug: slugs[0] }]);
           const atom = (await tx.getPage(slugs[0], { sourceId }))!;
           await tx.putPage(slugs[0], { ...atom, compiled_truth: 'Independent correction after the original atom committed.' }, { sourceId });
-        }));
+        }, TEST_WRITE_ATTRIBUTION));
       }
       const pagesBefore = await engine.executeRaw('SELECT * FROM pages WHERE source_id=$1 ORDER BY id', [sourceId]);
       const checkpointsBefore = await engine.executeRaw("SELECT * FROM op_checkpoints WHERE op='managed-atoms' AND completed_keys->0->>'sourceId'=$1 ORDER BY fingerprint", [sourceId]);

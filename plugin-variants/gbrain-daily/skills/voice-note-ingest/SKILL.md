@@ -19,6 +19,7 @@ writes_to:
   - companies/
   - ideas/
   - personal/
+when_to_use: "Use when the user asks: \"voice note\", \"ingest this voice memo\", \"transcribe and file\", \"voice note ingest\", \"save this audio note\"."
 ---
 
 # voice-note-ingest — Exact-Phrasing Voice Capture
@@ -167,6 +168,13 @@ Include timestamps when available:
 
 This skill handles ONE voice note at a time. Each is its own ingest cycle.
 No batching.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Transcription is unavailable or the storage backend refuses the audio (`gbrain storage` shows no backend): file the note text you have and tell the user the audio was not stored.
+- The routed page write returns `revision_conflict` or `write_pending`: re-read and merge, or poll `gbrain write-request <request_id>`; never paraphrase to resolve a conflict.
 
 ## Anti-Patterns
 

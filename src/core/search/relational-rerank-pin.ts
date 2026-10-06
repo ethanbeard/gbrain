@@ -147,6 +147,8 @@ export function pinRelationalRows(
   opts: PinRelationalRowsOpts,
 ): SearchResult[] {
   const max = Number.isFinite(opts.max) ? Math.floor(opts.max) : 0;
+  // Chain intermediates/origins are evidence, not answers: they never claim a pin.
+  relationalList = relationalList.filter(r => r.relational === undefined || r.relational.role === 'answer');
   if (max <= 0 || reranked.length === 0 || relationalList.length === 0) return reranked;
 
   const relKeys = new Set(relationalList.map(pageKey));

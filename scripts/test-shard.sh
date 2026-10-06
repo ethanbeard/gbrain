@@ -58,29 +58,22 @@ fi
 cd "$(dirname "$0")/.."
 
 . scripts/lib/test-env.sh
+receipts_init unit
 
 # Collect non-E2E, non-serial unit test files. Slow files INCLUDED — see
 # header comment. Local run-unit-shard.sh excludes slow files (different
 # policy by design).
 #
-# Two test files are pulled out of the matrix and into their own dedicated
-# CI jobs (see .github/workflows/test.yml):
-#   - eval-longmemeval-e2e.slow.test.ts (~200s after TODO #1 engine sharing)
-#     → job: slow-eval-longmemeval
-#   - entity-resolve-perf.slow.test.ts (~159s, single non-subdivisible
-#     perf test)
-#     → job: slow-entity-resolve-perf
-#
-# Removing both heavy atoms from matrix-eligible files keeps the per-shard
-# total bounded. With 8 matrix shards the per-shard total is ~344s.
-# Dedicated jobs run in parallel so total CI wallclock = max(matrix ~4.5min,
-# slow-eval ~3.3min, slow-entity-resolve-perf ~2.6min, slow-brainbench ~1.5min)
-# ≈ 4.5min. eval-brainbench-e2e was the matrix's heaviest atom (98s mined —
-# 10% of the whole corpus weight) and capped shard-count scaling; it now rides
-# its own job like the other two outliers.
+# Heavy atoms ride dedicated CI jobs (see .github/workflows/test.yml) so no
+# single file dominates a shard: entity-resolve-perf.slow.test.ts (~159s,
+# non-subdivisible) and entity-card-perf → job slow-entity-resolve-perf;
+# eval-brainbench-e2e (98s mined, 10% of the corpus weight) → job
+# slow-brainbench-e2e. eval-longmemeval-e2e.slow.test.ts is back in the matrix
+# (GBRA-47 E6): engine sharing cut it from ~200s to ~8s, under the ~40s
+# keep-in-matrix bar.
 # export-scale.slow.test.ts (571s at its 100,001-page master scale) rides the
 # slow-entity-resolve-perf job, which sets GBRAIN_TEST_EXPORT_SCALE_PAGES per
-# event. reconcile-crash.slow.test.ts (244s) is not duplicated here: the
+# event. reconcile-crash-*.slow.test.ts (244s) is not duplicated here: the
 # persistence-validation invariants job already runs it on PGLite for every
 # event, before and after activation.
 # evals/ is included: its *.test.ts files (eval-harness unit tests) were
@@ -91,12 +84,11 @@ cd "$(dirname "$0")/.."
 # docs/TESTING.md "CI vs local: intentionally divergent file sets").
 ALL_FILES=$(find test evals -name '*.test.ts' \
   -not -name '*.serial.test.ts' \
-  -not -name 'eval-longmemeval-e2e.slow.test.ts' \
   -not -name 'entity-resolve-perf.slow.test.ts' \
   -not -name 'entity-card-perf.slow.test.ts' \
   -not -name 'eval-brainbench-e2e.slow.test.ts' \
   -not -name 'export-scale.slow.test.ts' \
-  -not -name 'reconcile-crash.slow.test.ts' \
+  -not -name 'reconcile-crash-*.slow.test.ts' \
   -not -path 'test/e2e/*' | sort)
 
 if [ -z "$ALL_FILES" ]; then
@@ -130,6 +122,7 @@ echo "shard $SHARD_INDEX/$TOTAL_SHARDS: ${SHARD_COUNT}/${ALL_COUNT} files (LPT-b
 
 if [ "$SHARD_COUNT" -eq 0 ]; then
   echo "warning: shard $SHARD_INDEX has no files (total shards may exceed file count)" >&2
+  receipt_empty "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_SHARDS"
   exit 0
 fi
 
@@ -153,11 +146,19 @@ if [ -n "${COVERAGE_DIR:-}" ]; then
   COVERAGE_ARGS=(--coverage --coverage-reporter=lcov --coverage-dir="$COVERAGE_DIR/shard")
   XARGS_FLAGS=(-n 100000 -x)
 fi
+# Receipts (X2): one JUnit report per bun process. A second xargs batch would
+# overwrite it the same way it overwrites lcov.info, so receipts also force
+# the single-invocation -x tripwire.
+shard_file_args=()
+while IFS= read -r f; do [ -n "$f" ] && shard_file_args+=("$f"); done <<< "$SHARD_FILES"
+receipt_begin primary "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_SHARDS" "" "${shard_file_args[@]}"
+[ "${#RECEIPT_ARGS[@]}" -eq 0 ] || XARGS_FLAGS=(-n 100000 -x)
 # --max-concurrency mirrors the local runner: unbounded intra-process
 # concurrency under parallel PGLite boots produced real shard deaths (the
 # 22-minute matrix timeout in test.yml records 13 of them).
 rc=0
-printf '%s\n' "$SHARD_FILES" | xargs ${XARGS_FLAGS[@]+"${XARGS_FLAGS[@]}"} bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} || rc=$?
+printf '%s\n' "$SHARD_FILES" | xargs ${XARGS_FLAGS[@]+"${XARGS_FLAGS[@]}"} bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} || rc=$?
+receipt_end "$rc"
 
 # Lane manifest: written ONLY on a fully green run (complete:true means the
 # lcov data represents the whole shard). The real exit code is preserved

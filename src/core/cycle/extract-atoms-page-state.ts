@@ -2,6 +2,7 @@ import type { SqlEngine } from '../persistence/model.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { stableJson } from '../persistence/digest.ts';
 import type { BrainEngine } from '../engine.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 export interface AtomPageIdentity {
   pageId: number;
@@ -65,7 +66,7 @@ export async function writeAtomPageState(
 export async function completeAtomReceipts(
   engine: BrainEngine, sourceId: string, importedSlugs: string[], hash16: string, page?: AtomPageInput,
 ): Promise<void> {
-  await engine.transaction(async tx => {
+  await maintenanceTransaction(engine, async tx => {
     const completed = await tx.executeRaw(
       `UPDATE pages
           SET frontmatter = frontmatter || jsonb_build_object('source_hash', $1::text)

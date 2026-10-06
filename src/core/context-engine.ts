@@ -17,6 +17,7 @@ import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
 import { backupNagReadOnlyConsult, backupNoticeText, loadBackupStatus } from './backup/status-file.ts';
+import { estimateMessageTokens, openClawCoreLane } from './context/openclaw-core.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
 
@@ -780,6 +781,32 @@ export function sanitizeEngineSessionId(raw: unknown): string | null {
   return s && !/^\.+$/.test(s) ? s : null;
 }
 
+/**
+ * #4618: record the session's seat before its segment is spooled (the hook
+ * lane's ordering), keyed to the OpenClaw agent dir holding `sessions/`.
+ * Additive provenance: a failure never fails the checkpoint, but a seat
+ * reason (write failure, conflict, invalid label) lands in the hook
+ * heartbeat as a degraded `compact` entry with its fixed recovery hint, the
+ * way the hook lane reports it.
+ */
+async function recordOpenclawSeat(dir: string, sessionId: string, sessionFile: string): Promise<void> {
+  try {
+    const { resolveSeat, writeSeatSidecar } = await import('./context/seat.ts');
+    let reasons: string[];
+    try {
+      const seat = resolveSeat({ env: process.env, harness: 'openclaw', transcriptPath: sessionFile });
+      reasons = seat ? writeSeatSidecar(dir, sessionId, seat, { harness: 'openclaw', hookLane: 'context-engine' }) : [];
+    } catch {
+      reasons = ['seat_write_failed'];
+    }
+    const reason = reasons[0];
+    if (!reason) return;
+    const { writeHeartbeat } = await import('./context/hook-heartbeat.ts');
+    // trim:false: the gateway process is long-lived; only short-lived hooks trim the heartbeat file. The entry gets the reason's hint.
+    await writeHeartbeat({ ts: new Date().toISOString(), event: 'compact', outcome: 'degraded', reason, duration_ms: 0 }, { trim: false });
+  } catch { /* provenance and telemetry never fail the checkpoint */ }
+}
+
 // ── Engine Implementation ───────────────────────────────────────────────
 
 export function createGBrainContextEngine(ctx: {
@@ -889,6 +916,7 @@ export function createGBrainContextEngine(ctx: {
     ]);
   }
 
+
   /** assemble()-side: memo-first, hash-keyed polls, settle-and-render. */
   async function getCheckpointBlock(sessionId: string): Promise<string | null> {
     let memo = checkpointMemo.get(sessionId);
@@ -952,6 +980,7 @@ export function createGBrainContextEngine(ctx: {
     const { loadConfig } = await import('./config.ts');
     const cfg = loadConfig();
     const dir = await engineCorpusDir(cfg);
+    await recordOpenclawSeat(dir, sessionId, sessionFile);
     const w = segs.writeSegment(dir, sessionId, rendered.text);
     const ordinal = segs.appendSegmentLedger(dir, sessionId, w.hash);
     const memo = checkpointMemo.get(sessionId) ?? { links: [], polls: 0, expectSeg: null, settled: false };
@@ -1219,7 +1248,9 @@ export function createGBrainContextEngine(ctx: {
       // whether memory/reflex fire) + memory prompt + reflex pointers. No
       // manifest ⇒ parts untouched ⇒ byte-identical to the pre-cathedral-5
       // output (pinned).
-      const parts = [contextBlock];
+      // Always-loaded core + the context-pressure notice right after the live block (context/openclaw-core.ts).
+      const parts = [contextBlock, ...await openClawCoreLane(workspaceDir, CHECKPOINT_POLL_TIMEOUT_MS).additions({
+        sessionId: sanitizeEngineSessionId(sessionId ?? sessionKey ?? null), messages: msgs, tokenBudget, availableTools })];
       if (checkpointBlock) parts.push(checkpointBlock);
       if (memoryAddition) parts.push(memoryAddition);
       if (reflexAddition) parts.push(reflexAddition);
@@ -1243,14 +1274,7 @@ export function createGBrainContextEngine(ctx: {
       // 4. Pass through messages unchanged (legacy assembly)
       return {
         messages: msgs,
-        estimatedTokens: msgs.reduce((sum, m) => {
-          const text = typeof m.content === 'string'
-            ? m.content
-            : JSON.stringify(m.content);
-          // #2880: JSON.stringify(undefined) is undefined, not a string —
-          // a content-less message counts 0 instead of throwing.
-          return sum + (typeof text === 'string' ? Math.ceil(text.length / 4) : 0);
-        }, 0),
+        estimatedTokens: estimateMessageTokens(msgs),
         systemPromptAddition: parts.join('\n\n'),
       };
     },
@@ -1258,6 +1282,7 @@ export function createGBrainContextEngine(ctx: {
     async compact(params) {
       // Lazy SDK load on first method call (was top-level await pre-L0-B).
       await ensureSdkLoaded();
+      openClawCoreLane(workspaceDir, CHECKPOINT_POLL_TIMEOUT_MS).compacted(sanitizeEngineSessionId(params?.sessionId ?? params?.sessionKey ?? null));
       // Cathedral 5 — time-bounded, FAIL-OPEN checkpoint step BEFORE the
       // delegate. A checkpoint failure/timeout must never break compaction.
       // The deadline CANCELS the work (adversarial review): the race alone

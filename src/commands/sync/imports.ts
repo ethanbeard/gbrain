@@ -28,10 +28,11 @@ import { sanitizePathForDisplay } from '../../core/sync.ts';
 import { isWindowsColonTarget } from '../../core/persistence/native-file-target.ts';
 import { ERROR_CATALOGUE } from '../../core/error-catalogue.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
+import { clearLegacyHold, holdRefusedImport, noteScreenedImport, type LegacyHolds } from './holds.ts';
 import { partial, markCompleted, noteTypeWarning, maybeYield } from './sync-run.ts';
 import type { SyncPlan, SyncProgress, SyncRun } from './sync-run.ts';
 
-type ImportPlan = Pick<SyncPlan, 'opts' | 'filtered' | 'lastCommit' | 'pin' | 'company' | 'gitContextRoot' | 'syncImportRoot' | 'syncActivePack'>;
+type ImportPlan = Pick<SyncPlan, 'opts' | 'filtered' | 'lastCommit' | 'pin' | 'company' | 'gitContextRoot' | 'syncImportRoot' | 'syncActivePack' | 'holds'>;
 
 type ImportContext = {
   opts: SyncOpts;
@@ -43,6 +44,7 @@ type ImportContext = {
   pacer: DbPacer;
   progressAt: { last: number };
   progress: SyncProgress;
+  holds: LegacyHolds | null;
 };
 
 /** The add/modify drain. Returns a partial result when the run aborts. */
@@ -53,7 +55,7 @@ export async function runImportsPhase(
   noEmbed: boolean,
 ): Promise<SyncResult | undefined> {
   const { engine, completed } = run;
-  const { filtered, company, gitContextRoot, syncImportRoot, syncActivePack } = plan;
+  const { filtered, company, gitContextRoot, syncImportRoot, syncActivePack, holds } = plan;
   let { opts } = plan;
   // Process adds and modifies.
   //
@@ -74,6 +76,8 @@ export async function runImportsPhase(
   // future maintainers know to thread additional failure surfaces through
   // the same array.
   const addsAndMods = [...filtered.added, ...filtered.modified];
+  // #5988: held files due for a re-screen join the drain though Git did not touch them.
+  addsAndMods.push(...(holds?.rescreen ?? []));
 
   // Sort newest-first so date-prefixed brain paths get embedded before older
   // ones. See src/core/sort-newest-first.ts for the policy.
@@ -100,7 +104,7 @@ export async function runImportsPhase(
     opts = watchdog.opts;
     const { stallTimer, progressAt } = watchdog;
 
-    const ctx: ImportContext = { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress };
+    const ctx: ImportContext = { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds };
     const aborted = await drainImports(run, plan, ctx, importsToDo, effectiveConcurrency, runParallel, stallTimer);
     if (aborted) return aborted;
 
@@ -244,7 +248,7 @@ function startStallWatchdog(
 /** Core import logic shared by the serial and parallel paths. */
 async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine, path: string): Promise<void> {
   const { failedFiles, succeededPaths, pagesAffected, deletedSlugs } = run;
-  const { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress } = ctx;
+  const { opts, company, gitContextRoot, syncRepoPath, syncActivePack, noEmbed, pacer, progressAt, progress, holds } = ctx;
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `path` is a git-diff path from the synced repo (repo content can be hostile), but the joined path is checked by isPathSafe(filePath, gitContextRoot) realpath containment below before any read
   const filePath = join(syncRepoPath, path);
   // #5032: Windows cannot store ':' in a file name (it names an alternate data
@@ -275,6 +279,7 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
     // its row so it can't age doctor to a permanent FAIL. (This covers the
     // net-zero add-then-delete range where the path isn't in filtered.deleted.)
     succeededPaths.push(path);
+    await clearLegacyHold(eng, holds, path);
     progressAt.last = Date.now(); // #1950: forward progress → reset stall watchdog
     progress.tick(1, `skip:${path}`);
     return;
@@ -321,7 +326,12 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
         ? importImageFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId })
         : company ? importCompanyBrainFile(eng, filePath, opts.sourceId!) : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
     noteTypeWarning(run, result.type_warning);
-    if (result.status === 'imported') {
+    noteScreenedImport(holds, path, result);
+    if (await holdRefusedImport(eng, holds, path, filePath, result)) {
+      // #5988: a content refusal is held, not failed: out of failedFiles and
+      // the auto-skip streak, so it never gates the bookmark.
+      await markCompleted(run, path);
+    } else if (result.status === 'imported') {
       run.chunksCreated += result.chunks;
       pagesAffected.push(result.slug);
       deletedSlugs.delete(result.slug); // #1284: deleted-then-re-added in the same run → embeddable again
@@ -332,6 +342,7 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
       // persist. partial() reports this so cron operators see how
       // much actually landed before --timeout fired.
       run.filesImported++;
+      await clearLegacyHold(eng, holds, path);
       // v0.42.x (#1794): checkpoint this path so a kill banks it.
       await markCompleted(run, path);
     } else if (result.status === 'skipped' && result.skip_reason === 'malformed_path') {
@@ -352,12 +363,17 @@ async function importOnePath(run: SyncRun, ctx: ImportContext, eng: BrainEngine,
       // status 'skipped' with no error == content_hash short-circuit
       // (already imported, unchanged). It IS done for checkpoint purposes,
       // so mark it completed (matches import-checkpoint's posture).
+      await clearLegacyHold(eng, holds, path);
       await markCompleted(run, path);
     }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    serr(`  Warning: skipped ${path}: ${msg}`);
-    failedFiles.push({ path, error: msg });
+    if (await holdRefusedImport(eng, holds, path, filePath, { status: 'error', error: msg })) {
+      await markCompleted(run, path);
+    } else {
+      serr(`  Warning: skipped ${path}: ${msg}`);
+      failedFiles.push({ path, error: msg });
+    }
   } finally {
     permit.release();
   }

@@ -177,6 +177,7 @@ async function scoreLlm(
       maxTokens: skilloptOutputCap(judgeModel, JUDGE_SITE_MAX_TOKENS),
       cacheSystem: true, // D11: judge system prompt is stable across calls.
       purpose: SKILLOPT_PURPOSE.judge,
+      allowFallback: false,
     });
     const parsed = parseJudgeJson(result.text);
     if (!parsed) {

@@ -156,6 +156,8 @@ services:
       - gbrain-ci-node-modules:/app/node_modules
       - gbrain-ci-admin-node-modules:/app/admin/node_modules
       - gbrain-ci-admin-dist:/app/admin/dist
+      # Compiled CLI tests must execute a Linux binary, never a host Mac build.
+      - gbrain-ci-bin:/app/bin
       # Warm install cache across runs.
       - gbrain-ci-bun-cache:/root/.bun/install/cache
 
@@ -167,4 +169,5 @@ volumes:
   gbrain-ci-node-modules:
   gbrain-ci-admin-node-modules:
   gbrain-ci-admin-dist:
+  gbrain-ci-bin:
   gbrain-ci-bun-cache:

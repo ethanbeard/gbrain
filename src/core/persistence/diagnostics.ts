@@ -5,6 +5,7 @@ import { publicationConcurrency } from './pool-capacity.ts';
 import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { writeHealth } from './health.ts';
 import type { WriteRequestState } from './types.ts';
+import { DATABASE_REFUSAL_HINT, DATABASE_TRIGGER_HINT } from './connector-errors.ts';
 
 export const WRITER_NEXT_ACTIONS: Record<string, string> = {
   unexpected_staging_bytes: 'Keep the worktree blocked and retain its staging files and recovery capacity. Compare the recorded staging size and hash, then reconcile unexpected bytes explicitly before retrying; never discard unverified staging files.',
@@ -23,6 +24,7 @@ export const WRITER_NEXT_ACTIONS: Record<string, string> = {
   consumer_stopping: 'Restart the resident owner and inspect the same request_id before resubmitting.',
   source_changed: 'Inspect the source incarnation and worktree binding; queued requests cannot follow a recreated source.',
   permission_denied: 'Inspect the durable principal and current source, operation, and namespace grants.',
+  writer_coordinator_required: DATABASE_REFUSAL_HINT,
 };
 export function writerNextAction(reason: string | null | undefined): string {
   return reason && WRITER_NEXT_ACTIONS[reason] || 'Inspect the sanitized receipt and owner diagnostics before retrying with the same request_id.';
@@ -70,11 +72,21 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
   const effects = await engine.executeRaw(`SELECT e.kind,e.state,COUNT(*)::integer AS count,MIN(r.created_at) AS oldest_at
     FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id
     WHERE e.state<>'committed' GROUP BY e.kind,e.state ORDER BY e.kind,e.state`);
+  // #5974: trusted-admin view of database refusals, including owner-only source ids and the executing build.
+  const failures = await engine.executeRaw<{ request_id: string; operation: string; source_id: string; state: WriteRequestState;
+    error_code: string | null; error_detail: Record<string, unknown>; completed_at: Date | string | null }>(
+    `SELECT request_id,operation,source_id,state,error_code,error_detail,completed_at FROM persistence_requests
+    WHERE error_detail IS NOT NULL ORDER BY sequence DESC LIMIT 20`);
   const limits = await readJournalLimits(engine);
   const { persistenceConsumerStatus } = await import('./service.ts');
-  const ingress = persistenceConsumerStatus(engine);
+  // C-NEW-4: the consumer is per process, so this is the answering process's own ingress, never proof the brain's owner is down.
+  const local = persistenceConsumerStatus(engine);
+  const local_process_ingress = { ...local, scope: local.state === 'not_running'
+    ? 'The process that answered has no resident consumer (a one-shot CLI, for example); another process may own writes. See worktrees and bindings for ownership.'
+    : 'The resident consumer of the process that answered this status.' };
   return { ...brain, sampled_at: new Date().toISOString(), publication_concurrency: publicationConcurrency(engine),
-    ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits),
+    local_process_ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits),
+    recent_failures: failures.map(row => ({ ...row, next_action: row.error_detail?.origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT })),
     blockers: blockers.map(row => {
       const health = writeHealth(row);
       const advice = writerNextAction(row.blocked_reason ?? row.error_code);

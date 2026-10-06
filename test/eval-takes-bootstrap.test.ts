@@ -16,9 +16,11 @@
  * GRADUATES (TODO-E) — this file guards the instrument, not the score.
  */
 import { describe, test, expect } from 'bun:test';
-import { readFileSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ALLOWED_PAGE_TYPES } from '../src/core/extract-takes-from-pages.ts';
 import { scoreCorpus, GRADUATION, type CorpusCase } from '../evals/takes-bootstrap/scorer.ts';
 
 const repoRoot = join(import.meta.dir, '..');
@@ -42,6 +44,16 @@ describe('corpus integrity', () => {
       }
       for (const f of c.forbid) expect(() => new RegExp(f)).not.toThrow();
     }
+  });
+
+  test('every case passes the production eligibility filter (allowed type, body over 200 chars)', () => {
+    // extractTakesFromPages selects only these pages; an ineligible case is
+    // never classified, so a live run could never score it.
+    for (const c of corpus) {
+      expect({ id: c.id, allowed: (ALLOWED_PAGE_TYPES as readonly string[]).includes(c.page.type) }).toEqual({ id: c.id, allowed: true });
+      expect({ id: c.id, long: c.page.body.length > 200 }).toEqual({ id: c.id, long: true });
+    }
+    expect(new Set(corpus.map(c => c.archetype)).size).toBe(41);
   });
 
   test('category floors: precision classes are represented', () => {
@@ -111,12 +123,12 @@ describe('corpus integrity', () => {
 describe('scorer math', () => {
   const mini: CorpusCase[] = [
     {
-      id: 'a', category: 'take', page: { slug: 't/a', type: 'note', title: 'A', body: 'x' },
+      id: 'a', archetype: 'a', category: 'take', page: { slug: 't/a', type: 'note', title: 'A', body: 'x' },
       expected: [{ claim_re: 'strongest team', kind: 'take', weight_min: 0.4, weight_max: 1 }],
       forbid: [], notes: '',
     },
     {
-      id: 'b', category: 'empty', page: { slug: 't/b', type: 'note', title: 'B', body: 'x' },
+      id: 'b', archetype: 'b', category: 'empty', page: { slug: 't/b', type: 'note', title: 'B', body: 'x' },
       expected: [], forbid: ['fraudulent'], notes: '',
     },
   ];
@@ -179,7 +191,7 @@ describe('scorer math', () => {
     // 5 expected takes; 4 matched (recall .8 >= .7 ok), 5 predicted 4 precise
     // (precision .8 >= .8 ok) → graduates. Drop one precise → .6 precision → fails.
     const cases: CorpusCase[] = Array.from({ length: 5 }, (_, i) => ({
-      id: `c${i}`, category: 'take', page: { slug: `t/c${i}`, type: 'note', title: 'C', body: 'x' },
+      id: `c${i}`, archetype: `c${i % 2}`, category: 'take', page: { slug: `t/c${i}`, type: 'note', title: 'C', body: 'x' },
       expected: [{ claim_re: `claim-${i}`, kind: 'take', weight_min: 0, weight_max: 1 }],
       forbid: [], notes: '',
     }));
@@ -194,6 +206,48 @@ describe('scorer math', () => {
     expect(passing.by_kind.find(k => k.kind === 'take')!.recall).toBe(0.8);
     expect(passing.graduated).toBe(true);
     expect(GRADUATION.minPrecision).toBe(0.8);
+  });
+
+  test('per-variant and per-archetype rows explain the verdict', () => {
+    const cases: CorpusCase[] = [0, 1, 2].map(i => ({
+      id: `t-v${i}`, archetype: 't', category: 'take', page: { slug: `t/v${i}`, type: 'writing', title: 'T', body: 'x' },
+      expected: [{ claim_re: 'strongest team', kind: 'take', weight_min: 0.4, weight_max: 1 }],
+      forbid: ['fraudulent'], notes: '',
+    }));
+    const r = scoreCorpus(cases, [
+      { id: 't-v0', claims: [{ claim: 'the strongest team', kind: 'take', weight: 0.8 }] },
+      { id: 't-v1', claims: [{ claim: 'the strongest team', kind: 'take', weight: 0.8 }, { claim: 'acme is fraudulent', kind: 'fact', weight: 1 }] },
+      { id: 't-v2', claims: null },
+    ]);
+    expect(r.by_variant).toEqual([
+      { id: 't-v0', archetype: 't', category: 'take', malformed: false, pass: true, expected: 1, matched: 1, predicted: 1, precise: 1, forbid_violations: 0 },
+      { id: 't-v1', archetype: 't', category: 'take', malformed: false, pass: false, expected: 1, matched: 1, predicted: 2, precise: 1, forbid_violations: 1 },
+      { id: 't-v2', archetype: 't', category: 'take', malformed: true, pass: false, expected: 1, matched: 0, predicted: 0, precise: 0, forbid_violations: 0 },
+    ]);
+    expect(r.by_archetype).toEqual([
+      { archetype: 't', category: 'take', variants: 3, variants_passed: 1, malformed: 1, expected: 3, matched: 2, predicted: 3, precise: 2, forbid_violations: 1 },
+    ]);
+  });
+
+  test('replay --max N scores only the first N cases', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'takes-eval-replay-'));
+    try {
+      const head = corpus.slice(0, 3);
+      const preds = head.map(c => ({
+        id: c.id,
+        claims: c.expected.map(e => ({ claim: new RegExp(e.claim_re, 'i').exec(c.page.body)![0], kind: e.kind, weight: (e.weight_min + e.weight_max) / 2 })),
+      }));
+      const file = join(dir, 'preds.jsonl');
+      writeFileSync(file, preds.map(p => JSON.stringify(p)).join('\n') + '\n');
+      const res = spawnSync(process.execPath, ['evals/takes-bootstrap/harness.mjs', '--replay', file, '--max', '3'], { cwd: repoRoot, encoding: 'utf8' });
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout.slice(0, res.stdout.lastIndexOf('}') + 1));
+      expect(report.cases).toBe(3);
+      expect(report.malformed).toEqual([]);
+      expect(report.by_variant.map((v: { id: string }) => v.id)).toEqual(head.map(c => c.id));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('the committed corpus scores 100% against its own oracle predictions (labels are satisfiable)', () => {

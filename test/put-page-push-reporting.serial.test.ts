@@ -32,7 +32,7 @@ function git(cwd: string, ...args: string[]): string {
   }).trim();
 }
 
-/** Same fixture as write-through-commit.serial.test.ts: a hook file carrying
+/** Same fixture as write-through-commit.test.ts: a hook file carrying
  *  the gbrain banner (the only thing `isDurabilityHardened` checks) with a
  *  no-op body so tests never attempt a real network push. */
 function installFakeDurabilityHook(repoPath: string): void {

@@ -35,7 +35,7 @@
  *
  * Lane: serial. Run: `bash scripts/run-serial-tests.sh test/v0_28_5-fix-wave.serial.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect } from 'bun:test';
@@ -260,15 +260,15 @@ describe('v0.28.5 A4 — existing-brain dim mismatch loud failure', () => {
         engineKind: 'pglite',
       });
 
-      // PGLite branch: wipe-and-reinit recipe (no ALTER COLUMN — that fails
-      // on PGLite's WASM pgvector). Asserts the recipe references the
-      // correct dim and model and points at `gbrain init --pglite`.
+      // PGLite branch (no ALTER COLUMN — that fails on PGLite's WASM
+      // pgvector). Asserts the recipe references the correct dim and model
+      // and points at the data-preserving migration, never a hand-run wipe.
       expect(msg).toContain('vector(1536)');
       expect(msg).toContain('vector(768)');
-      expect(msg).toContain('gbrain init --pglite --embedding-model ollama:nomic-embed-text --embedding-dimensions 768');
+      expect(msg).toContain('gbrain migrate embeddings --to ollama:nomic-embed-text --dim 768 --dry-run');
       expect(msg).toContain('PGLite cannot ALTER vector column types');
       expect(msg).toContain('docs/embedding-migrations.md');
-      expect(msg).toContain('gbrain embed --stale');
+      expect(msg).not.toMatch(/\bmv /);
     } finally {
       await engine.disconnect();
     }

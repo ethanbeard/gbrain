@@ -11,7 +11,9 @@ import { withEnv } from './helpers/with-env.ts';
 import { inspectCompanyBrain } from '../src/core/company-brain/inspection.ts';
 import { admitCompanyBrain, previewCompanyBrain } from '../src/core/company-brain/admission.ts';
 import { connectCompanyBrain, resumeCompanyBrain } from '../src/core/company-brain/runtime.ts';
-import { companyBrainProfile, companyBrainPolicyFingerprint } from '../src/core/company-brain/policy.ts';
+import { assertCompanyBrainPolicy, companyBrainProfile, companyBrainPolicyFingerprint, type CompanyBrainProfile } from '../src/core/company-brain/policy.ts';
+import type { SourceIngestionReceipt } from '../src/core/company-brain/receipts.ts';
+import { caught, envelopeFor } from './helpers/agent-envelope.ts';
 import { performSync } from '../src/commands/sync.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { submitEmbedBackfill } from '../src/core/embed-backfill-submit.ts';
@@ -114,7 +116,8 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
         expect(shared.config.federated).toBe(true);
         expect(companyBrainPolicyFingerprint(companyBrainProfile(shared.config)!, request.sourceId)).toBe(approval);
         if (engine.kind === 'pglite') expect(await submitEmbedBackfill(engine, request.sourceId, { reason: 'federation_flip' })).toMatchObject({ status: 'no_worker_surface' });
-        else await expect(submitEmbedBackfill(engine, request.sourceId, { reason: 'federation_flip' })).rejects.toMatchObject({ code: 'source_profile_no_backfill' });
+        else await expect(submitEmbedBackfill(engine, request.sourceId, { reason: 'federation_flip' })).rejects.toMatchObject({ code: 'source_profile_no_backfill',
+          docs: 'docs/guides/company-brain-ingestion.md#what-stays-opt-in', fix: { argv: ['gbrain', 'sources', 'status', request.sourceId, '--json'] } });
         const file = join(request.path, 'people/person-01.md');
         const content = readFileSync(file, 'utf8') + '\nAn explicitly committed update after sharing.\n';
         writeFileSync(file, content); git(request.path, 'add', '.'); git(request.path, 'commit', '-qm', 'Synthetic shared source update');
@@ -177,4 +180,13 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
       await expect(previewCompanyBrain(engine, replacement)).rejects.toMatchObject({ code: 'source_id_taken' });
     }
   }), 120_000);
+});
+
+test('a policy that drifted from its approval previews the removal and never edits the profile', async () => {
+  const profile = { brainId: 'company-example', databaseId: randomUUID() } as unknown as CompanyBrainProfile;
+  const receipt = { id: randomUUID(), sourceId: 'wiki' } as unknown as SourceIngestionReceipt;
+  const env = envelopeFor(await caught(() => assertCompanyBrainPolicy(profile, receipt, randomUUID(), '/checkout')));
+  expect(env).toMatchObject({ code: 'profile_incompatible', docs: expect.stringContaining('company-brain-ingestion.md#resume-and-verify'),
+    fix: { argv: ['gbrain', 'sources', 'remove', 'wiki', '--brain', 'company-example', '--dry-run'], next: 'run' } });
+  expect(() => companyBrainProfile({ company_brain: { version: 2 } })).toThrow(expect.objectContaining({ code: 'profile_incompatible', suggestion: expect.stringContaining('Do not edit it back by hand') }));
 });

@@ -13,6 +13,7 @@
  * hermetic; rows are written through the real writeReceipt seam.
  */
 
+import { parseGraduationArgs, routesToGraduation } from '../src/commands/migrate-graduation.ts';
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -120,15 +121,21 @@ describe('pgliteScaleCheck', () => {
     expect(await pgliteScaleCheck(engine)).toBeNull();
   });
 
-  test('pglite at 1500 pages → warn mentioning migrate --to supabase', async () => {
+  test('pglite at 1500 pages → warn whose fix is the read-only graduation plan, naming mcp expose', async () => {
     const engine = { kind: 'pglite', getStats: async () => ({ page_count: 1500 }) } as unknown as BrainEngine;
     const check = await pgliteScaleCheck(engine);
     expect(check).not.toBeNull();
     expect(check!.name).toBe('pglite_scale');
     expect(check!.status).toBe('warn');
     expect(check!.message).toContain('1500');
-    expect(check!.message).toContain('migrate --to supabase');
+    expect(check!.message).toContain('migrate --to postgres --plan');
+    expect(check!.message).toContain('gbrain mcp expose');
     expect(check!.message).toContain(String(PGLITE_SCALE_PAGE_THRESHOLD));
+    const fix = check!.fix as { argv: string[]; consent: string[] };
+    expect(fix.argv).toEqual(['gbrain', 'migrate', '--to', 'postgres', '--plan', '--json']);
+    expect(fix.consent).toEqual([]);
+    expect(parseGraduationArgs(fix.argv.slice(2)).mode).toBe('plan');
+    expect(routesToGraduation(fix.argv.slice(2), { engine: 'pglite' }, 'linux')).toBe(true);
   });
 
   test('pglite at 10 pages → ok, comfortable below the threshold', async () => {

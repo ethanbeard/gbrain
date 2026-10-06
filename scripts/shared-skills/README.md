@@ -84,3 +84,34 @@ by the validator. `--informational` permits a measured relative-latency failure
 to return zero, but never permits correctness or sample-validity errors. The
 default full-gate identity still requires the documented default corpus and
 measurement dimensions; custom or smoke runs cannot impersonate it.
+
+## Tests and CI
+
+Shared-skill tests distinguish canonical publication, protocol delivery, installed
+files and native harness use. `test/shared-skills-transports.test.ts` and
+`test/e2e/shared-skills-transports.test.ts` use real HTTP authentication, OAuth
+issuance and a new stdio process; they do not prove vendor-native activation.
+`test/persistence-skill-bundles.serial.test.ts` and
+`test/persistence-skill-crash.slow.test.ts` exercise typed file-set CAS and
+independent-process publication/restoration kills on PGLite in the unit lane and
+PostgreSQL through `test/e2e/persistence-skill-bundles-postgres.test.ts`.
+
+The required `shared-skills-compatibility` CI job builds the pinned pre-feature
+executable with `scripts/build-shared-skills-baseline.sh` and supplies
+`GBRAIN_TEST_OLD_BINARY` to `test/persistence-skill-old-binary.slow.test.ts`.
+An absent old executable is an explicit skip, never old-writer evidence.
+`test/shared-skills-catalog-performance.test.ts` runs the reproducible
+10/100/1,000-skill read benchmark when `GBRAIN_TEST_SHARED_SKILLS_BENCHMARK=1`;
+its timings and database-call counts are recorded diagnostics, while identity
+and catalog-size assertions are deterministic.
+The shared-skills cases under `evals/harness-instructions/` test interpretation
+separately from executed calls and native sessions.
+
+`scripts/shared-skills/lifecycle.ts` measures real authenticated HTTP enrollment,
+revision/asset reads, publication, missed-notification polling, acknowledgments,
+queue/recovery bytes, and concurrent read latency at 10/100/1,000 skills. Run it on
+a quiet machine with the protocol and fixture boundaries above. Its additional body/asset latency
+comparison is experimental; report each engine's measured result without
+substituting it for the existing `scripts/persistence/performance.ts` memory-read
+gate. The five pure accounting tests run normally; the small runtime smoke is
+explicitly opt-in and never counts as a full performance pass.

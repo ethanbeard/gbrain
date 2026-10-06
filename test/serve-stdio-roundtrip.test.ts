@@ -26,7 +26,7 @@
  *
  * Lane: unit. Run: `bun test test/serve-stdio-roundtrip.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -40,7 +40,7 @@ import { join } from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { VERB_NAMES } from '../src/core/verbs.ts';
-import { GBRAIN_MCP_INSTRUCTIONS } from '../src/mcp/instructions.ts';
+import { contractFor } from './helpers/instructions-parity.ts';
 
 function execFixture(args: string[], env: Record<string, string>): void {
   const result = spawnSync('bun', ['--no-env-file', ...args], { cwd: process.cwd(), env, encoding: 'utf8' });
@@ -53,10 +53,11 @@ function execFixture(args: string[], env: Record<string, string>): void {
 const MARKER = 'qantani-marker-9f3z';
 const FEDERATED_MARKER = 'umbriel-federated-marker-71c4';
 
+/** The result body: content[0] (agent contract v1 — notice blocks ride after it). */
 function textOf(result: unknown): string {
   const content = (result as { content?: Array<{ type?: string; text?: string }> })?.content;
   if (!Array.isArray(content)) return '';
-  return content.map((c) => (typeof c?.text === 'string' ? c.text : '')).join('\n');
+  return typeof content[0]?.text === 'string' ? content[0].text : '';
 }
 
 function resultSourceIds(text: string): string[] {
@@ -132,9 +133,10 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
 
   test('initialize handshake + tools/list exposes the core retrieval tools', async () => {
     expect(connected).toBe(true);
-    expect(client!.getInstructions()).toBe(GBRAIN_MCP_INSTRUCTIONS);
     const { tools } = await client!.listTools();
     const names = new Set(tools.map((t) => t.name));
+    // F1: the contract for exactly this connection's tools/list (+ readiness tail).
+    expect(client!.getInstructions()).toStartWith(contractFor(names));
     // The core MCP tools the connect LEARN_INSTRUCTION promises always work.
     // `capture` earned its MCP slot in the CLI-to-MCP gap-closure wave: the
     // LEARN_INSTRUCTION names it, so tools/list parity requires it advertised
@@ -327,6 +329,9 @@ describe('serve --surface verbs stdio E2E (the 7 frozen memory verbs over a real
     expect(['inserted', 'duplicate', 'superseded']).toContain(rem.status);
     expect(typeof rem.id).toBe('string');
 
+    // delta never advances a cursor past now() - 2 s (commit-visibility lag), so
+    // let the seeded pages age past it; otherwise wake 2 re-delivers them once.
+    await new Promise((r) => setTimeout(r, 2_100));
     // Wake 1: explicit epoch cursor + session_id — delivers every seeded page
     // and establishes the per-session keyset cursor server-side.
     const first = await client!.callTool({

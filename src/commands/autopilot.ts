@@ -34,13 +34,16 @@ import { VERSION } from '../version.ts';
 import {
   canSelfUpdate,
   decideSelfUpgrade,
+  gateOnTargetRuntime,
   isCacheFresh,
   readUpdateCache,
   reconcileBreadcrumb,
+  resolveQuietHoursWindow,
   resolveSelfUpgradeMode,
 } from '../core/self-upgrade.ts';
 import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
-import { detectInstallMethod } from './upgrade.ts';
+import { BUN_FLOOR_EXIT_CODE, BUN_FLOOR_FIX, readHostBun } from '../core/bun-floor.ts';
+import { detectInstallMethod, readInstallTargetFloor } from './upgrade.ts';
 import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
 import { relativeSourceLocalPathSkipWarning } from '../core/sources-load.ts';
@@ -79,6 +82,7 @@ import {
   systemdUnitPath,
   unitWrapperPath,
 } from './autopilot/jobs.ts';
+import { autopilotInstallConsent, renderInstallDryRun } from './autopilot/install-consent.ts';
 export { cronLineBelongsToBrain, crontabIndicatesAutopilotInstall, plistWrapperPath, scriptWrapperPath, unitWrapperPath };
 export { autopilotLockPath, autopilotDisabledMarkerPath, autopilotPausedMarkerPath, autopilotLaunchdLabel };
 export { relativeSourceLocalPathSkipWarning as relativeLocalPathSkipWarning };
@@ -329,14 +333,15 @@ export function decideLockAcquisition(
 
 /**
  * Reconcile the pre-swap breadcrumb at daemon boot (the post-swap attribution
- * gate). If we're running the version we attempted, the swap+relaunch worked;
- * if not, the new binary failed to launch and we record it as a known-bad
- * version so the auto channel never retries it. Best-effort.
+ * gate). If we're running the version we attempted or a newer one, the
+ * swap+relaunch worked; if not, the new binary failed to launch and we record
+ * it as a known-bad version so the auto channel never retries it. Best-effort.
  */
 export function reconcileSelfUpgradeAtBoot(): void {
   try {
     const cfg = loadConfig();
     if (!cfg) return;
+    const attempted = cfg.self_upgrade?.attempting_version;
     const { state, transition } = reconcileBreadcrumb(cfg.self_upgrade, VERSION);
     if (!transition) return;
     cfg.self_upgrade = state;
@@ -345,16 +350,17 @@ export function reconcileSelfUpgradeAtBoot(): void {
       channel: 'autopilot',
       action: 'apply',
       current: VERSION,
+      latest: attempted,
       outcome: transition === 'applied' ? 'applied' : 'failed',
       reason:
         transition === 'applied'
-          ? 'breadcrumb matched running version'
-          : 'crash-on-launch: attempted version != running version (recorded known-bad)',
+          ? 'running version is at or past the attempted version'
+          : 'crash-on-launch: running version is not at or past the attempted version (recorded known-bad)',
     });
     if (transition === 'applied') {
-      console.log(`[autopilot] self-upgrade confirmed: now running ${VERSION}.`);
+      console.log(`[autopilot] self-upgrade confirmed: attempted ${attempted}, now running ${VERSION}.`);
     } else {
-      console.error('[autopilot] self-upgrade did not take (running an older version); recorded known-bad.');
+      console.error(`[autopilot] self-upgrade did not take: attempted ${attempted}, still running ${VERSION}; recorded ${attempted} known-bad.`);
     }
   } catch {
     /* best-effort */
@@ -438,12 +444,10 @@ export async function attemptAutopilotSelfUpgrade(
     const latestVersion = entry.marker.latest;
 
     const idle = await computeAutopilotIdle(engine, engineType);
-    const qh = cfg.self_upgrade?.quiet_hours;
-    const tz = qh?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    const verdict = evaluateQuietHours({ start: qh?.start ?? 23, end: qh?.end ?? 8, tz }, new Date());
+    const verdict = evaluateQuietHours(resolveQuietHoursWindow(cfg.self_upgrade?.quiet_hours), new Date());
     const installMethod = detectInstallMethod();
 
-    const decision = decideSelfUpgrade({
+    let decision = decideSelfUpgrade({
       mode: 'auto',
       channel: 'autopilot',
       currentVersion: VERSION,
@@ -454,9 +458,13 @@ export async function attemptAutopilotSelfUpgrade(
       canSelfUpdate: canSelfUpdate(installMethod),
       throttledByInterval: false, // cache TTL is the fetch throttle
     });
+    // #5855: never swap in a release the host's Bun cannot start (a binary carries its own Bun).
+    if (decision.action === 'apply' && installMethod !== 'binary') {
+      decision = gateOnTargetRuntime(decision, await readInstallTargetFloor(installMethod), readHostBun());
+    }
 
     if (decision.action !== 'apply') {
-      if (['unsupported_install', 'known_bad'].includes(decision.action)) {
+      if (['unsupported_install', 'known_bad', 'unsupported_runtime'].includes(decision.action)) {
         logSelfUpgrade({
           channel: 'autopilot',
           action: decision.action,
@@ -484,21 +492,18 @@ export async function attemptAutopilotSelfUpgrade(
       });
     } catch (e) {
       const fresh = loadConfig();
+      // #5855: the swap's own floor re-check refused; hold, never known-bad.
+      const held = (e as { status?: number }).status === BUN_FLOOR_EXIT_CODE;
       if (fresh) {
         const failed = new Set(fresh.self_upgrade?.failed_versions ?? []);
-        failed.add(latestVersion);
+        if (!held) failed.add(latestVersion);
         fresh.self_upgrade = { ...(fresh.self_upgrade ?? {}), failed_versions: [...failed] };
         delete fresh.self_upgrade.attempting_version;
         saveConfig(fresh);
       }
-      logSelfUpgrade({
-        channel: 'autopilot',
-        action: 'apply',
-        current: VERSION,
-        latest: latestVersion,
-        outcome: 'failed',
-        error: e instanceof Error ? e.message : String(e),
-      });
+      logSelfUpgrade(held
+        ? { channel: 'autopilot', action: 'unsupported_runtime', current: VERSION, latest: latestVersion, outcome: 'skipped', reason: `gbrain upgrade refused the swap: the Bun floor of ${latestVersion} is not met or unreadable. ${BUN_FLOOR_FIX}` }
+        : { channel: 'autopilot', action: 'apply', current: VERSION, latest: latestVersion, outcome: 'failed', error: e instanceof Error ? e.message : String(e) });
       console.error(`[autopilot] self-upgrade swap failed; staying on ${VERSION}.`);
       return;
     }
@@ -757,7 +762,7 @@ const GBRAIN_ENV_TEMPLATE = `# gbrain daemon environment — sourced by autopilo
 # API keys (~/.gbrain/config.json file plane works too):
 # export ANTHROPIC_API_KEY=sk-ant-...
 # export OPENAI_API_KEY=sk-...
-# export VOYAGE_API_KEY=pa-...
+# export VOYAGE_API_KEY=pa-...  (off disk, as this file is bash: ="$(op read 'op://Private/Voyage/credential')")
 #
 # Process-level env that must exist before the daemon boots:
 # export NODE_EXTRA_CA_CERTS=/path/to/corp-ca.pem
@@ -927,6 +932,8 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
     process.exit(1);
   }
 
+  if (args.includes('--dry-run')) { console.log(renderInstallDryRun({ target, repoPath, job })); return; }
+  if (!await autopilotInstallConsent(engine, args, { target, repoPath, job })) return;
   const wrapperPath = writeWrapperScript(repoPath, target, job);
   // #2608: tell the operator about the deterministic key channel — launchd/
   // systemd don't inherit the login shell env, and rc-file interactive guards
@@ -935,7 +942,7 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
   console.log(
     `API keys: the daemon sources ${join(gbrainHomePath(), 'env')} (plain KEY=value lines, ` +
     `auto-exported) in addition to your shell profile. If LLM phases report no provider, put ` +
-    'ANTHROPIC_API_KEY=... (or your provider\'s key) there and re-run `gbrain autopilot --install`.',
+    'ANTHROPIC_API_KEY=... (or KEY="$(your-secret-manager get KEY)" to keep it off disk) there and re-run `gbrain autopilot --install`.',
   );
   // A fresh install clears any prior self-disable AND any leaked pause, so a
   // reinstall does not report "disabled" forever or park itself from day one

@@ -305,3 +305,42 @@ describe('check-test-isolation.sh', () => {
     });
   });
 });
+
+describe('check-test-isolation.sh --as-parallel', () => {
+  function runAsParallel(files: FakeFile[], targets: string[]): RunResult {
+    const dir = mkdtempSync(join(tmpdir(), 'lint-isolation-parallel-'));
+    try {
+      mkdirSync(join(dir, 'scripts'), { recursive: true });
+      writeFileSync(join(dir, 'scripts/check-test-isolation.allowlist'), '');
+      for (const f of files) {
+        const full = join(dir, 'test', f.path);
+        mkdirSync(resolve(full, '..'), { recursive: true });
+        writeFileSync(full, f.contents);
+      }
+      const r = spawnSync('bash', [LINT_SH, '--as-parallel', ...targets.map(t => `test/${t}`)], { cwd: dir, encoding: 'utf-8' });
+      return { status: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  it('lints a serial file as if it ran in the parallel pool', () => {
+    const r = runAsParallel([{ path: 'env.serial.test.ts', contents: "process.env.EXAMPLE_FLAG = '1';\n" }], ['env.serial.test.ts']);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('ERROR: test/env.serial.test.ts');
+    expect(r.stdout).toContain('rule R1');
+  });
+
+  it('passes a parallel-safe serial file and lints only the named files', () => {
+    const r = runAsParallel([
+      { path: 'clean.serial.test.ts', contents: "import { test } from 'bun:test';\ntest('x', () => {});\n" },
+      { path: 'other.serial.test.ts', contents: "mock.module('x', () => ({}));\n" },
+    ], ['clean.serial.test.ts']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('OK (1 ');
+  });
+
+  it('requires at least one file', () => {
+    const r = runAsParallel([], []);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('--as-parallel FILE');
+  });
+});

@@ -95,13 +95,13 @@ describe('Postgres adapter driver options (EO2 / EO6 / EO9)', () => {
     expect(gauge.acquired).toEqual({});
   });
 
-  test('executeRaw keeps master executeRaw options and counts the raw gauge; unsafe keeps driver defaults', async () => {
+  test('executeRaw prepares parameterized statements (#5984) and counts the raw gauge; unsafe keeps driver defaults', async () => {
     const { engine, fake, gauge, exec } = fakeEngine();
     await exec().executeRaw('SELECT $1::int AS v', [1]);
     await exec().unsafe('SELECT $1::int AS v', [1]);
     await exec().unsafe('SELECT 1', []);
     await engine.executeRaw('SELECT $1::int AS v', [1]);
-    const masterExecuteRaw = { cancelFence: false, prepare: false, simple: false };
+    const masterExecuteRaw = { cancelFence: false, prepare: true, simple: false };
     expect(fake.statements().map((s) => s.unsafeOptions)).toEqual([
       masterExecuteRaw,
       { prepare: false, simple: false },

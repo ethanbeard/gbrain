@@ -128,8 +128,8 @@ support that claim.
    timeline.
 
 5. **The sentinel does not scope timeline extraction — dated citations above
-   it mint rows too.** Every trusted write (`put_page`/`capture`, `auto_timeline`
-   on by default) and `extract timeline` scan the WHOLE page for dated markers:
+   it mint rows too.** Every trusted write (`put_page`/`capture`) and
+   `extract timeline` scan the WHOLE page for dated markers:
    `- **YYYY-MM-DD** | ...` bullets and inline `[Source: ..., YYYY-MM-DD]`
    citations. The citation shape the quality convention mandates on every fact
    therefore files one permanent timeline row per citation when it sits in
@@ -137,8 +137,10 @@ support that claim.
    in, code spans stripped). The example page above keeps its citations below
    the sentinel, so it does not show the hazard. The one placement that mints
    nothing is a citation alone in its own paragraph — blank line above and
-   below. `gbrain config set auto_timeline off` disables the write-path
-   extraction; there is no timeline-remove command, only exact-duplicate dedup.
+   below. Timeline rows commit with their page on every write;
+   `gbrain config set auto_timeline off` stops only the maintenance sweep's
+   timeline pass, not write-path extraction. There is no timeline-remove
+   command, only exact-duplicate dedup.
 
 6. **Don't skip the Assessment section.** The assessment is the value. "Strong
    technical leader" is something no API can provide. It's YOUR read on this

@@ -10,7 +10,8 @@ import { redactFindings } from './secret-scan.ts';
 import { currentVerifiedLocalWriter } from './persistence/identity.ts';
 import { submissionAuthority, authorizeWrite } from './persistence/authority.ts';
 import type { OperationContext } from './ops/contract.ts';
-import { OperationError } from './ops/contract.ts';
+import { OperationError, opError } from './ops/contract.ts';
+import { readFix } from './ops/op-fix.ts';
 import { validateEmbedFactsOptions, type EmbedFactsOptions } from './embed-facts-options.ts';
 import { AUDIT_ROW_SOURCES } from './facts/audit-sources.ts';
 import { resolveMaxChunkTokens } from './embedding-input-limit.ts';
@@ -55,7 +56,9 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
   const verified = currentVerifiedLocalWriter();
   if (verified && (verified.remote || verified.principal.kind !== 'local_cli' || verified.grant.slugPrefixes !== null
     || !verified.grant.sourceIds.includes('*') && !verified.grant.sourceIds.includes(opts.sourceId))) {
-    throw new OperationError('permission_denied', 'Fact backfill requires a trusted source-wide CLI grant');
+    throw opError('permission_denied', 'Fact backfill requires a trusted source-wide CLI grant',
+      `The registered CLI writer cannot repair every fact of source ${opts.sourceId}: fact repair needs the local CLI lane with no slug prefixes and a grant covering that source. Show the grant to the user; widening it (gbrain auth local-writer register cli --replace) is their decision.`,
+      { fix: readFix('Shows the local writer registrations and their grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
   }
   const [source] = await engine.executeRaw<{ incarnation: string }>(
     'SELECT incarnation::text FROM sources WHERE id=$1 AND archived=false', [opts.sourceId]);
@@ -68,7 +71,9 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     const [row] = await target.executeRaw<{ unrestricted_slugs: boolean }>(
       `SELECT grant_ceiling->'slugPrefixes' = 'null'::jsonb AS unrestricted_slugs
        FROM persistence_local_writers WHERE id=$1::uuid`, [authority.principal.id]);
-    if (row?.unrestricted_slugs !== true) throw new OperationError('permission_denied', 'Fact backfill requires a current source-wide CLI grant');
+    if (row?.unrestricted_slugs !== true) throw opError('permission_denied', 'Fact backfill requires a current source-wide CLI grant',
+      `The current CLI writer registration has slug prefixes, so it cannot repair every fact of source ${opts.sourceId}. Show the grant to the user; replacing it with an unprefixed grant is their decision.`,
+      { fix: readFix('Shows the local writer registrations and their grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
   };
   await authorize(engine);
   const model = getEmbeddingModel();
@@ -93,7 +98,7 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
     if (disabled !== null && disabled !== 'true' && disabled !== 'false') {
       throw new Error('Selected brain embedding_disabled must be true or false');
     }
-    assertEmbeddingEnabled({ embedding_disabled: disabled === 'true' });
+    assertEmbeddingEnabled({ engine: target.kind, ...selectedConfig, embedding_disabled: disabled === 'true' });
   };
   await assertEnabled(engine);
   const shape = await readFactsEmbeddingDim(engine);
@@ -139,10 +144,10 @@ export async function embedStaleFacts(engine: BrainEngine, opts: EmbedFactsOpts,
         if (await engine.getConfig('embedding_model') !== dbModel || await engine.getConfig('embedding_dimensions') !== dbDims) {
           throw new Error('Embedding model changed during fact backfill; rerun the scoped preview');
         }
-        tracker.reserve({ modelId: call.model, kind: 'embed', estimatedInputTokens: inputCeiling, maxOutputTokens: 0 });
+        const reservation = tracker.reserve({ modelId: call.model, kind: 'embed', estimatedInputTokens: inputCeiling, maxOutputTokens: 0 });
         return { settle: async usage => {
           if (!usage) result.cost_estimated = true;
-          tracker.record({ modelId: call.model, kind: 'embed', inputTokens: usage?.inputTokens ?? inputCeiling, outputTokens: 0 });
+          tracker.record({ modelId: call.model, reservation, kind: 'embed', inputTokens: usage?.inputTokens ?? inputCeiling, outputTokens: 0 });
         } };
       }, () => embed(batch.map(row => row.fact), {
         abortSignal: signal, embeddingModel: model, dimensions: dims, inputType: 'document',

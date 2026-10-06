@@ -128,6 +128,23 @@ ${TAKES_FENCE_END}`;
 });
 
 describe('renderTakesFence', () => {
+  test('a struck multiline take stays inactive after a round trip', () => {
+    const original = parseTakesFence(SAMPLE_BODY).takes[1];
+    const rendered = renderTakesFence([{ ...original, claim: 'First line\nSecond line', active: false }]);
+    const { takes, warnings } = parseTakesFence(rendered);
+    expect(warnings).toEqual([]);
+    expect(takes[0]).toMatchObject({ claim: 'First line\nSecond line', active: false });
+  });
+
+  test('round-trips a multiline take claim without warnings', () => {
+    const original = parseTakesFence(SAMPLE_BODY).takes[1];
+    const rendered = renderTakesFence([{ ...original, claim: 'First line\nSecond line' }]);
+    const { takes, warnings } = parseTakesFence(rendered);
+    expect(warnings).toEqual([]);
+    expect(takes).toHaveLength(1);
+    expect(takes[0].claim).toBe('First line\nSecond line');
+  });
+
   test('round-trip preserves all fields', () => {
     const original = parseTakesFence(SAMPLE_BODY);
     const rendered = renderTakesFence(original.takes);

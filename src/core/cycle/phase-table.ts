@@ -20,7 +20,7 @@ export type ManagedPhaseClass = 'writes' | 'no_coordinated_write' | 'managed_ski
 export interface ManagedPhaseEntry { class: ManagedPhaseClass; reason: string }
 
 export const MANAGED_PHASE_TABLE: Readonly<Record<CyclePhase, ManagedPhaseEntry>> = {
-  lint: { class: 'no_coordinated_write', reason: 'On a managed brain lint reports issues and skips its file fixes; canonical markdown changes go through page mutations.' },
+  lint: { class: 'writes', reason: 'Lint repairs publish through the maintenance coordinator, one page per repair; a file with no indexed page is reported and left for the next cycle.' },
   backlinks: { class: 'no_coordinated_write', reason: 'Audit-only: counts missing back-links and never writes files.' },
   sync: { class: 'writes', reason: 'Managed sync admits each changed file through the coordinator.' },
   synthesize: { class: 'writes', reason: 'Dream synthesis publishes pages through the maintenance coordinator.' },
@@ -35,7 +35,10 @@ export const MANAGED_PHASE_TABLE: Readonly<Record<CyclePhase, ManagedPhaseEntry>
   propose_takes: { class: 'no_coordinated_write', reason: 'Writes the take_proposals review queue; managed brains skip the legacy receipt page.' },
   grade_takes: { class: 'no_coordinated_write', reason: 'The cycle runs it with auto-resolve off, so it only caches verdicts in take_grade_cache; opt-in auto-applied resolutions go through the coordinated takes_resolve mutation.' },
   calibration_profile: { class: 'no_coordinated_write', reason: 'Writes the calibration_profiles side table only.' },
+  edge_contradictions: { class: 'writes', reason: 'Applied closures append a timeline line through the coordinated add_timeline_entry mutation; proposals live in the link_edge_proposals side table.' },
   drift: { class: 'writes', reason: 'The drift report page publishes through the maintenance coordinator.' },
+  chronicle: { class: 'writes', reason: 'Life Chronicle event pages and their projections publish through the maintenance coordinator, re-validated against the judged depth revision.' },
+  facts_drain: { class: 'writes', reason: 'Queued facts-absorb jobs publish facts through the same coordinated write path as the job worker.' },
   conversation_facts_backfill: { class: 'writes', reason: 'Backfilled conversation facts publish through coordinated writes.' },
   enrich_thin: { class: 'writes', reason: 'Enriched pages publish through the maintenance coordinator.' },
   skillopt: { class: 'no_coordinated_write', reason: 'Writes skill files and proposals outside the brain database.' },

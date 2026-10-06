@@ -8,8 +8,9 @@
  * modules, owner cookie vs OAuth admin bearer at /admin/api/*, session
  * revocation, the PKCE authorization-code and refresh-token flows through
  * owner consent, resource-audience rejection at /mcp, the /mcp dispatch
- * context (remote, auth, source scope, surface) and the OAuth CORS gate
- * ordered ahead of the SDK router's own `*` CORS.
+ * context (remote, auth, source scope, surface), the transport whoami and
+ * gbrain://capabilities report from the verified principal, and the OAuth
+ * CORS gate ordered ahead of the SDK router's own `*` CORS.
  * Fails when: a module builds its own limiter or session map, an OAuth token
  * can administer, sign-out leaves a session alive, a flow step breaks, a
  * foreign-audience token reaches dispatch, dispatch loses remote/auth/source
@@ -25,6 +26,7 @@ import express from 'express';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { buildServeHttpApp } from '../src/commands/serve-http.ts';
 import { VERB_NAMES } from '../src/core/verbs.ts';
+import { mintLegacyToken } from '../src/core/token-mint.ts';
 import { TEST_PKCE_CHALLENGE, TEST_PKCE_VERIFIER } from './helpers/oauth.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -268,6 +270,52 @@ describe('/mcp dispatch context', () => {
     const hidden = await mcpResult(app, token, 'tools/call', { name: 'list_pages', arguments: {} });
     expect(hidden.isError).toBe(true);
     expect(toolPayload(hidden).error).toBe('unknown_operation');
+  });
+});
+
+// whoami and gbrain://capabilities must report the transport the verifier
+// actually authenticated, not one guessed from the id: hand-provisioned OAuth
+// client ids need not start with gbrain_cl_, and legacy tokens may be named
+// like one. Both callers are checked through the real HTTP stack so principal
+// propagation and serialization are covered, not just the helper.
+describe('/mcp transport provenance', () => {
+  async function capabilities(app: RunningApp, token: string): Promise<any> {
+    const read = await mcpResult(app, token, 'resources/read', { uri: 'gbrain://capabilities' });
+    return JSON.parse(read.contents[0].text);
+  }
+
+  test('an OAuth client whose id lacks the gbrain_cl_ prefix reports oauth on both surfaces', async () => {
+    const app = await startApp();
+    const cookie = await ownerCookie(app);
+    const { clientId, clientSecret } = await registerClient(app, cookie, { scopes: 'read write', grantTypes: ['client_credentials'] });
+    const handProvisioned = `research-custom-client-${clientSeq}`;
+    await engine.executeRaw('UPDATE oauth_clients SET client_id = $1 WHERE client_id = $2', [handProvisioned, clientId]);
+    const token = await clientCredentialsToken(app, handProvisioned, clientSecret!, 'read write');
+
+    const who = toolPayload(await mcpResult(app, token, 'tools/call', { name: 'whoami', arguments: {} }));
+    expect(who.transport).toBe('oauth');
+    expect(who.client_id).toBe(handProvisioned);
+    expect(who.source_id).toBe('default');
+    expect(who.token_name).toBeUndefined();
+
+    const caps = await capabilities(app, token);
+    expect(caps.transport).toBe('oauth');
+    expect(caps.client_id).toBe(handProvisioned);
+  });
+
+  test('a legacy token named like an OAuth client id reports legacy on both surfaces', async () => {
+    const app = await startApp();
+    const lookalike = `gbrain_cl_lookalike-${++clientSeq}`;
+    const { token } = await mintLegacyToken(engine, { name: lookalike, takesHolders: ['world'], scopes: ['read'] });
+
+    const who = toolPayload(await mcpResult(app, token, 'tools/call', { name: 'whoami', arguments: {} }));
+    // Agent contract v1 (F2): additive config-plane `readiness`.
+    expect(who).toMatchObject({ transport: 'legacy', token_name: lookalike, scopes: ['read'], expires_at: null });
+    expect(Array.isArray(who.readiness)).toBe(true);
+
+    const caps = await capabilities(app, token);
+    expect(caps.transport).toBe('legacy');
+    expect(caps.client_id).toBe(lookalike);
   });
 });
 

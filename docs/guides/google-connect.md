@@ -159,6 +159,41 @@ deep backfill carries on. A thread that keeps failing is held (see
 source synced after its first sync; a source that has never synced stays idle
 until you run `gbrain sync --source <id>` once.
 
+### What runs on synced mail and calendar pages
+
+**Say to your agent:** *"Make sure my Gmail threads are checked for open loops
+and linked to the people in them"* or *"Also extract atoms from my email and
+calendar pages."*
+
+- **Links and timelines.** Every autopilot or dream cycle extracts links and
+  timeline entries for connector pages straight from the database (a connector
+  source has no checkout), source-scoped and bounded by the cycle's 3-minute
+  stale-drain budget; a large backlog finishes over later cycles. The cycle
+  reports `extract: ok` with `database_only: true`. On demand:
+  `gbrain extract --stale`.
+- **Open loops.** Every Gmail sweep queues commitment extraction for the
+  threads it touched, on managed and unmanaged brains. The sync result carries
+  `loops_enqueue` (`enqueued`, `deferred`, `skipped_reason`), and every skip is
+  logged with its reason (extraction off, no chat model, the enqueue ceiling).
+  On a managed brain the first sweep also runs a one-time catch-up over email
+  threads whose newest message is from the last 30 days, so threads synced
+  before extraction was queued are analyzed once; it finishes over later
+  sweeps when the enqueue ceiling binds.
+- **Quiet threads.** A thread still inside its waiting window (24 h for
+  inbound, 72 h for your own question) is re-checked when the window ends,
+  even if no new mail arrives, and opens its loop then. See
+  [open loops](open-loops.md#quiet-threads-and-grace-holds).
+- **Atoms (on by default).** Atom extraction covers Gmail threads and Calendar
+  events like other pages: the text of each extracted email thread or calendar
+  event is sent to the configured `extract_atoms` model under the daily
+  auto-drain cap. `gbrain config set cycle.extract_atoms.connector_pages false`
+  opts out and stops new extraction. Caps, the off switch and exactly what leaves the machine:
+  [spend controls](../operations/spend-controls.md#atom-extraction-auto-drain-cap-and-connector-pages).
+
+`gbrain doctor`'s `orphan_ratio` reports orphaned email and meeting renders of
+a connector source apart (`connector_renders_excluded`), since a mail page
+with no links is normal, and leaves them out of the ratio.
+
 ### Rate limits during backfill
 
 A large mailbox backfilling a wide `--history-days` window can trip Gmail's
@@ -169,8 +204,8 @@ patiently — 6 attempts by default, exponential backoff with jitter capped at
 60s, honoring `Retry-After` when Google sends one — before finally giving up
 and reporting `rate_limited`. That budget is deliberately much larger than
 the 2-attempt budget used for other retryable failures (like a 401 needing a
-token refresh): giving up too early used to mean a thread that would have
-succeeded a few seconds later was instead skipped for the rest of the sync.
+token refresh), so a thread that would succeed a few seconds later is not
+skipped for the rest of the sync.
 
 Even when a thread's retry budget IS exhausted, a rate-limit failure is never
 counted toward a hold — unlike a genuine per-thread
@@ -313,6 +348,10 @@ upstream failures rather than triggering a full re-list.
   capped per sweep) to your configured chat provider. Kill switch:
   `gbrain config set loops.extraction_enabled false`. The deterministic
   unanswered-thread detector is free and always on.
+- Atom extraction from email and calendar pages is on by default: page text
+  goes to the `extract_atoms` model under the auto-drain cap. Opt out with
+  `gbrain config set cycle.extract_atoms.connector_pages false`
+  ([spend controls](../operations/spend-controls.md#atom-extraction-auto-drain-cap-and-connector-pages)).
 
 ## File permissions
 
@@ -341,13 +380,13 @@ This is deliberate: the pages are your private mail, calendar and contacts,
 and a page that quietly stays group-readable after a sync is the failure
 this rule prevents. There is no per-source setting for a looser mode yet.
 
-### Files written before v0.60.31.0
+### Files readable by other local users
 
-Older releases wrote these files with your umask, typically 0644 (readable by
-every local user), and an upgrade does not rewrite them. In the default
-directory that is harmless, because gbrain keeps `~/.gbrain` at 0700. In a
-custom `--dir` outside `~/.gbrain`, older pages stay readable by other local
-users until they are rewritten.
+gbrain releases before v0.60.31.0 wrote these files with your umask, typically
+0644 (readable by every local user), and an upgrade does not rewrite them. In
+the default directory that is harmless, because gbrain keeps `~/.gbrain` at
+0700. In a custom `--dir` outside `~/.gbrain`, those pages stay readable by
+other local users until they are rewritten.
 
 The upgrade prints a one-time notice for each Google source outside
 `~/.gbrain`, naming the directory, how many readable entries it found and
@@ -420,6 +459,14 @@ The whole setup is exactly two user interactions: (1) the GCP checklist +
 client JSON hand-back, (2) one consent click. Never pass secrets via argv —
 use `--client-json <path>`, stdin, or env.
 
+**Exit codes (contract v1 legacy).** `gbrain google` exits 0 when done, 1 when
+it failed, and 2 both for usage errors and when it is waiting on the user (for
+example `status: "awaiting_consent"` after printing the consent URL, or
+`status: "no_brain"`). Other gbrain commands use exit 3 for "the user must agree
+first"; `google` keeps 2 under contract v1 and moves to 3 in a future contract
+version. Branch on the JSON `status`, not on exit 2 alone. `next_action` is the
+legacy name for `fix` ([legacy advice names](../protocol/AGENT_OPERATOR_v1.md#legacy-advice-names)).
+
 ## Attachment receipts and historical repair
 
 Gmail attachment receipts record filenames, MIME types, byte sizes when supplied,
@@ -451,10 +498,11 @@ explicit MIME metadata fields; `body.data`, raw messages and snippets are never
 selected. The selection includes child-identity sentinels beyond depth 32 so a
 deeper MIME tree remains incomplete rather than appearing empty. Decoded metadata
 responses are capped at 2 MiB before JSON parsing; oversized responses fail without
-advancing repair. Ordinary sync's message-body requests are unchanged.
+advancing repair. Ordinary sync fetches message bodies; only historical repair
+uses this metadata-only request.
 
-Upgrading changes future ingestion, **not** every historical page. Ordinary
-incremental sync only revisits changed threads and its success does not establish
+Sync records receipts for threads it ingests; it does **not** revisit every
+historical page. Ordinary incremental sync only revisits changed threads and its success does not establish
 historical inspection. To repair already-imported pages without replaying bodies:
 
 ```sh

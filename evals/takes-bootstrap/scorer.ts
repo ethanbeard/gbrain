@@ -11,6 +11,12 @@
  * zero malformed cases, forbid-violations = 0. Autopilot tier for
  * takes-bootstrap stays manual_only until a LIVE run passes this bar
  * (TODOS.md TODO-E); loosening the bar is a reviewer-visible edit here.
+ *
+ * Besides the per-kind verdict, the report breaks results down per variant
+ * (one row per case) and per archetype (its variants rolled up). A case
+ * passes when its output parsed, every expected claim matched, every
+ * prediction was precise and no forbid pattern fired; these rows explain the
+ * verdict and never change it.
  */
 
 export const SCORER_VERSION = 1;
@@ -20,6 +26,8 @@ export type TakeKindLabel = 'fact' | 'take' | 'bet' | 'hunch';
 
 export interface CorpusCase {
   id: string;
+  /** The hand-authored archetype this case is a label-invariant variant of. */
+  archetype: string;
   category: string;
   page: { slug: string; type: string; title: string; body: string };
   expected: Array<{ claim_re: string; kind: TakeKindLabel; weight_min: number; weight_max: number }>;
@@ -43,12 +51,38 @@ export interface KindScore {
   recall: number;       // 1 when expected === 0
 }
 
+export interface CaseTally {
+  expected: number;
+  matched: number;
+  predicted: number;
+  precise: number;
+  forbid_violations: number;
+}
+
+export interface VariantScore extends CaseTally {
+  id: string;
+  archetype: string;
+  category: string;
+  malformed: boolean;
+  pass: boolean;
+}
+
+export interface ArchetypeScore extends CaseTally {
+  archetype: string;
+  category: string;
+  variants: number;
+  variants_passed: number;
+  malformed: number;
+}
+
 export interface ScoreReport {
   scorer_version: number;
   cases: number;
   malformed: string[];          // case ids with claims === null — FAILURES
   forbid_violations: Array<{ id: string; forbid_re: string; claim: string }>;
   by_kind: KindScore[];
+  by_archetype: ArchetypeScore[];
+  by_variant: VariantScore[];
   overall: { precision: number; recall: number; f1: number };
   graduated: boolean;
   failures: string[];           // human-readable reasons graduation failed
@@ -64,15 +98,24 @@ export function scoreCorpus(corpus: CorpusCase[], predictions: CasePrediction[])
     KINDS.map(k => [k, { expected: 0, matched: 0, predicted: 0, precise: 0 }]),
   );
 
+  const byVariant: VariantScore[] = [];
+
   for (const c of corpus) {
     const pred = predById.get(c.id);
+    const v: VariantScore = {
+      id: c.id, archetype: c.archetype, category: c.category, malformed: false, pass: false,
+      expected: c.expected.length, matched: 0, predicted: 0, precise: 0, forbid_violations: 0,
+    };
+    byVariant.push(v);
     // Missing prediction row OR null claims = malformed = FAILURE, never skip.
     if (!pred || pred.claims === null) {
       malformed.push(c.id);
+      v.malformed = true;
       for (const e of c.expected) tally.get(e.kind)!.expected += 1; // still owed
       continue;
     }
     const claims = pred.claims;
+    const violationsBefore = forbidViolations.length;
 
     for (const forbidRe of c.forbid) {
       // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- the pattern comes from the COMMITTED corpus (evals/takes-bootstrap/corpus.jsonl, reviewed in PRs and validated by test/eval-takes-bootstrap.test.ts's regex-compiles check), never from runtime user input; the eval harness is an offline instrument
@@ -90,7 +133,10 @@ export function scoreCorpus(corpus: CorpusCase[], predictions: CasePrediction[])
       const hit = claims.some(cl =>
         cl.kind === e.kind && re.test(cl.claim) && cl.weight >= e.weight_min && cl.weight <= e.weight_max,
       );
-      if (hit) t.matched += 1;
+      if (hit) {
+        t.matched += 1;
+        v.matched += 1;
+      }
     }
 
     for (const cl of claims) {
@@ -98,13 +144,36 @@ export function scoreCorpus(corpus: CorpusCase[], predictions: CasePrediction[])
       if (!kind) continue; // parseClaimsJson already filters; unknown kinds count nowhere
       const t = tally.get(kind)!;
       t.predicted += 1;
+      v.predicted += 1;
       // Precision credit: matches any expected of the same kind by regex
       // (weight range NOT required for precision — a right claim with an
       // off-range weight is a recall miss, not a hallucination).
       // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- corpus-committed pattern, same rationale as the forbid loop above
       const ok = c.expected.some(e => e.kind === kind && new RegExp(e.claim_re, 'i').test(cl.claim));
-      if (ok) t.precise += 1;
+      if (ok) {
+        t.precise += 1;
+        v.precise += 1;
+      }
     }
+    v.forbid_violations = forbidViolations.length - violationsBefore;
+    v.pass = v.matched === v.expected && v.precise === v.predicted && v.forbid_violations === 0;
+  }
+
+  const archetypes = new Map<string, ArchetypeScore>();
+  for (const v of byVariant) {
+    const a = archetypes.get(v.archetype) ?? {
+      archetype: v.archetype, category: v.category, variants: 0, variants_passed: 0, malformed: 0,
+      expected: 0, matched: 0, predicted: 0, precise: 0, forbid_violations: 0,
+    };
+    a.variants += 1;
+    if (v.pass) a.variants_passed += 1;
+    if (v.malformed) a.malformed += 1;
+    a.expected += v.expected;
+    a.matched += v.matched;
+    a.predicted += v.predicted;
+    a.precise += v.precise;
+    a.forbid_violations += v.forbid_violations;
+    archetypes.set(v.archetype, a);
   }
 
   const byKind: KindScore[] = KINDS.map(kind => {
@@ -138,6 +207,8 @@ export function scoreCorpus(corpus: CorpusCase[], predictions: CasePrediction[])
     malformed,
     forbid_violations: forbidViolations,
     by_kind: byKind,
+    by_archetype: [...archetypes.values()],
+    by_variant: byVariant,
     overall: { precision, recall, f1 },
     graduated: failures.length === 0,
     failures,

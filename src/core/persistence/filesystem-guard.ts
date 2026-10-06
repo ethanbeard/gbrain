@@ -3,11 +3,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { OperationError } from '../ops/contract.ts';
 import type { SqlEngine } from './model.ts';
-import { canonicalFilesystemPath, hasManagedRootMarker, recordManagedRoots, registeredManagedRoots, type ManagedRootRecord } from './root-registry.ts';
+import { canonicalFilesystemPath, managedRootMarkerFor, recordManagedRoots, registeredManagedRootRecords, type ManagedRootRecord } from './root-registry.ts';
 
 interface FileCapability { roots: string[]; active: boolean; }
 const active = new AsyncLocalStorage<FileCapability>();
-const managedRoots = new Map<string, Set<string>>();
+const managedRoots = new Map<string, Map<string, string | undefined>>();
 const datastorePaths = new WeakMap<SqlEngine, string>();
 export function managedFilesystemDatastorePath(engine: SqlEngine): string | undefined { return datastorePaths.get(engine); }
 /** Record the selected engine path, never a guessed default from ambient config. */
@@ -34,17 +34,39 @@ export async function refreshManagedFilesystemRoots(engine: SqlEngine, databaseP
   signal?.throwIfAborted();
   if (brain.enabled && databasePath) roots.push({ local_path: databasePath });
   if (brain.enabled) recordManagedRoots(brain.brain_id, roots, brain.mode_epoch == null ? undefined : Number(brain.mode_epoch));
-  managedRoots.set(brain.brain_id, new Set(roots.map(row => resolve(row.local_path))));
+  managedRoots.set(brain.brain_id, new Map(roots.map(row => [resolve(row.local_path), row.source_id])));
 }
 export function hasFilesystemPublication(path: string): boolean {
   const held = active.getStore();
   return held?.active === true && held.roots.some(root => encloses(root, path));
 }
+export interface ManagedFilesystemRoot { root: string; sourceId?: string; evidence: string }
+/** The managed canonical worktree the path is inside (or encloses), with the evidence that marks it. */
+export function managedFilesystemRootFor(path: string): ManagedFilesystemRoot | null {
+  const related = (root: string) => encloses(root, path) || encloses(path, root);
+  const known = [...registeredManagedRootRecords().map(record => ({ root: record.root, sourceId: record.source_id, evidence: 'managed-root registry' })),
+    ...[...managedRoots.values()].flatMap(roots => [...roots].map(([root, sourceId]) => ({ root, sourceId, evidence: 'source binding' })))];
+  const marker = managedRootMarkerFor(path);
+  if (marker) {
+    const sourceId = known.find(entry => entry.sourceId && canonicalFilesystemPath(entry.root) === marker.root)?.sourceId;
+    return { root: marker.root, evidence: marker.marker, ...(sourceId ? { sourceId } : {}) };
+  }
+  const match = known.find(entry => related(entry.root));
+  return match ? { root: match.root, evidence: match.evidence, ...(match.sourceId ? { sourceId: match.sourceId } : {}) } : null;
+}
+/** True when the path is inside (or encloses) a managed canonical worktree. */
+export function isManagedFilesystemPath(path: string): boolean {
+  return managedFilesystemRootFor(path) !== null;
+}
 export function assertManagedFilesystemWrite(path: string): void {
-  const managed = hasManagedRootMarker(path) || registeredManagedRoots().some(root => encloses(root, path) || encloses(path, root))
-    || [...managedRoots.values()].some(roots => [...roots].some(root => encloses(root, path) || encloses(path, root)));
-  if (managed && !hasFilesystemPublication(path)) throw new OperationError('writer_coordinator_required',
-    'This file belongs to a managed canonical worktree.', 'Submit the change through the persistence coordinator.');
+  const managed = managedFilesystemRootFor(path);
+  if (!managed || hasFilesystemPublication(path)) return;
+  // #5279: name the root, its source and the evidence, so a stray ownership file is findable.
+  const error = new OperationError('writer_coordinator_required',
+    `This path belongs to the managed canonical worktree ${managed.root}${managed.sourceId ? ` (source ${managed.sourceId})` : ''}.`,
+    'Submit the change through the persistence coordinator; check the root with gbrain sources writer status.');
+  error.detail = `root=${managed.root} source=${managed.sourceId ?? 'unknown'} evidence=${managed.evidence}`;
+  throw error;
 }
 /** Invalidate inherited async contexts before the owner releases the kernel lock. */
 export async function withFilesystemPublication<T>(roots: string[], fn: () => Promise<T>): Promise<T> {

@@ -206,6 +206,42 @@ describe('bootstrap <subcommand> --help/-h/help never runs the real operation', 
     expect(statSync(receiptPath(home)).mtimeMs).toBe(mtimeBefore);
   });
 
+  // #5488: `harness` was missing from SUBCOMMAND_HELP, so the dispatch's
+  // `Object.hasOwn(SUBCOMMAND_HELP, sub)` guard was false and `--help` after
+  // `bootstrap harness` fell through into the real harness apply. The runner
+  // records every ExecRunner call an unguarded harness would make (claude /
+  // codex / opencode MCP registration, lifecycle hook install); on a clean
+  // fixture zero calls must land and the help text must print.
+  test('harness --help: usage text, exit 0, zero exec calls (#5488)', async () => {
+    const { runner, calls } = makeRunner();
+
+    const r = await capture(() => runBootstrap(['harness', '--workspace', ws, '--help'], { runner }));
+
+    expect(r.result).toBe(0);
+    expect(r.out).toContain('Wire framework-spawned');
+    expect(calls.length).toBe(0);
+  });
+
+  test('harness help (bare word, no dashes): usage text, exit 0, zero exec calls (#5488)', async () => {
+    const { runner, calls } = makeRunner();
+
+    const r = await capture(() => runBootstrap(['harness', '--workspace', ws, 'help'], { runner }));
+
+    expect(r.result).toBe(0);
+    expect(r.out).toContain('Wire framework-spawned');
+    expect(calls.length).toBe(0);
+  });
+
+  test('harness -h: same interception (#5488)', async () => {
+    const { runner, calls } = makeRunner();
+
+    const r = await capture(() => runBootstrap(['harness', '--workspace', ws, '-h'], { runner }));
+
+    expect(r.result).toBe(0);
+    expect(r.out).toContain('Wire framework-spawned');
+    expect(calls.length).toBe(0);
+  });
+
   describe('uninstall --help (isolated home + a real receipt-tracked file that must survive)', () => {
     function seedUninstallFixture(): { uninstallWs: string; isolatedHome: string; dummyCreatedPath: string } {
       const uninstallWs = mkdtempSync(join(tmpdir(), 'gb-subhelp-uninstall-ws-'));

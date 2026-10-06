@@ -8,10 +8,18 @@ import { assertSafeE2eDatabaseUrl } from '../../test/helpers/db-guard.ts';
 import { distribution, type HarnessConfig } from './harness.ts';
 import { keylessBrainEnv } from '../../test/helpers/provider-env.ts';
 import { boundedDiagnostic, diagnosticError, retentionMetadata } from './failure-diagnostics.ts';
+import { FULL_ROBOT_SECONDS, replayEntries, runDigest, runRobotPhase, type RobotRun } from './robot-driver.ts';
+import { shrinkRun } from './shrink.ts';
 
 export interface ValidationOptions {
   engine: 'pglite' | 'postgres'; schedules?: number; operations?: number; seed?: number;
   crashes?: boolean; databaseUrl?: string; manifest?: string;
+  /** Crash-robot time budget in seconds; omitted or 0 skips the phase (the CLI defaults to 300). */
+  robotSeconds?: number;
+  /** Re-run a recorded manifest's failing crash-robot runs (and nothing else). */
+  replay?: string;
+  /** Shrink the first failing crash-robot run of a manifest to a minimal reproducing sequence. */
+  shrink?: string;
 }
 interface Event { event: string; [key: string]: any; }
 export const CRASH_BOUNDARIES = ['admitted', 'prepared', 'before_publication', 'staging_flushed',
@@ -58,6 +66,17 @@ export function spawnWorker(configPath: string, home: string, role: string, args
     async kill() { if (child.exitCode === null) child.kill('SIGKILL'); await child.exited; await reading; } };
 }
 
+/** The failing runs plus the exact command that replays them and the one that shrinks the first. */
+export function robotFailure(failing: RobotRun[], options: ValidationOptions): string {
+  const manifest = options.manifest ?? `.context/persistence-${options.engine}-manifest.json`;
+  const env = options.engine === 'postgres' ? 'DATABASE_URL=<test url> ' : '';
+  const lines = failing.slice(0, 5).map(run => `  ${run.schedule} seed=${run.seed} ${run.fault ? `${run.fault.point}#${run.fault.nth}` : run.process ?? 'no crash'} [${runDigest(run)}]: `
+    + run.violations.slice(0, 3).map(v => `${v.class}: ${v.detail}`).join(' | '));
+  return [`Crash robot found ${failing.length} failing run(s):`, ...lines,
+    `Replay: ${env}bun --no-env-file scripts/persistence/validate.ts --engine=${options.engine} --replay=${manifest}`,
+    `Shrink: ${env}bun --no-env-file scripts/persistence/validate.ts --engine=${options.engine} --shrink=${manifest} (writes ${manifest}.shrunk.json)`].join('\n');
+}
+
 /** Every PostgreSQL phase owns a new database; disk PGLite always runs in children. */
 export async function runValidation(options: ValidationOptions) {
   const counts = { schedules: options.schedules ?? 1000, operations: options.operations ?? 10_000 };
@@ -87,7 +106,9 @@ export async function runValidation(options: ValidationOptions) {
         'src/core/persistence/effect-recovery.ts', 'src/core/persistence/effect-model.ts', 'src/core/persistence/effects.ts',
         'src/core/persistence/coordinator.ts', 'src/core/persistence/consumer.ts',
         'src/core/persistence/journal.ts', 'src/core/persistence/activation.ts', 'src/core/persistence/filesystem-guard.ts',
-        'src/core/persistence/identity.ts', 'src/core/persistence/ownership.ts', 'src/core/pglite-engine.ts', 'src/core/postgres-engine.ts'].map(file =>
+        'src/core/persistence/identity.ts', 'src/core/persistence/ownership.ts', 'src/core/pglite-engine.ts', 'src/core/postgres-engine.ts',
+        'src/core/persistence/fault-points.ts', 'scripts/persistence/ops.ts', 'scripts/persistence/model.ts', 'scripts/persistence/generator.ts',
+        'scripts/persistence/crash-robot.ts', 'scripts/persistence/robot-driver.ts', 'scripts/persistence/shrink.ts'].map(file =>
         [file, createHash('sha256').update(readFileSync(resolve(import.meta.dir, '../..', file))).digest('hex')]));
       let databaseUrl: string | undefined;
       if (admin) {
@@ -101,6 +122,31 @@ export async function runValidation(options: ValidationOptions) {
       const path = join(root, 'config.json'); writeFileSync(path, JSON.stringify(config), { mode: 0o600 }); return { config, path };
     }
     function start(path: string, role: string, ...args: string[]) { const child = spawnWorker(path, home, role, args); children.push(child); return child; }
+    const robotOptions = (extra: Partial<Parameters<typeof runRobotPhase>[0]> = {}) => ({ engine: options.engine, seed: options.seed ?? 5105,
+      seconds: options.robotSeconds ?? 0, scratch, home, admin, databaseUrl: options.databaseUrl, databases,
+      pooledUrl: options.engine === 'postgres' ? process.env.GBRAIN_PGBOUNCER_URL || undefined : undefined,
+      spawn: spawnWorker, track: (child: ReturnType<typeof spawnWorker>) => { children.push(child); }, ...extra });
+    if (options.replay || options.shrink) {
+      const entries = replayEntries((options.replay ?? options.shrink)!, options.engine);
+      if (options.shrink) {
+        manifest.shrink = await shrinkRun(entries.find(e => e.violations.length) ?? entries[0], (run, keep) => runRobotPhase(robotOptions({ replay: [run], ...(keep ? { keep } : {}) })));
+        const shrunkPath = `${resolve(options.shrink)}.shrunk.json`;
+        writeFileSync(shrunkPath, `${JSON.stringify({ engine: options.engine, reproduced: `${manifest.shrink.reproduced}/${manifest.shrink.reruns}`,
+          failing_runs: [manifest.shrink.shrunk] }, null, 2)}\n`);
+        process.stderr.write(`[persistence] shrunk ${manifest.shrink.original.ops} ops to ${manifest.shrink.shrunk.ops?.length}; reproduced ${manifest.shrink.reproduced}/3; ${shrunkPath}\n`
+          + `[persistence] Replay: bun --no-env-file scripts/persistence/validate.ts --engine=${options.engine} --replay=${shrunkPath}\n`);
+        manifest.status = manifest.shrink.accepted ? 'passed' : 'failed'; manifest.full_gate = false; return manifest;
+      }
+      manifest.robot = await runRobotPhase(robotOptions({ replay: entries }));
+      manifest.status = manifest.robot.violations.length ? 'failed' : 'passed'; manifest.full_gate = false;
+      if (manifest.robot.violations.length) throw new Error(robotFailure(manifest.robot.failing_runs, options));
+      return manifest;
+    }
+    if (options.robotSeconds) {
+      manifest.robot = await runRobotPhase(robotOptions());
+      process.stderr.write(`[persistence] ${options.engine}: crash robot ran ${manifest.robot.sequences_x_crash_points} sequence x crash point runs over ${manifest.robot.schedules} schedules\n`);
+      if (manifest.robot.violations.length) throw new Error(robotFailure(manifest.robot.failing_runs, options));
+    }
     if (options.crashes !== false) for (const boundary of CRASH_BOUNDARIES) {
       const { path } = await phase(`crash-${boundary}`); const requestId = randomUUID();
       const child = start(path, 'crash', boundary, requestId);
@@ -149,6 +195,8 @@ export async function runValidation(options: ValidationOptions) {
     manifest.status = 'passed';
     const executedBoundaries = manifest.crash_cases.map((entry: { boundary: string }) => entry.boundary);
     if (options.crashes !== false) assert.deepEqual(executedBoundaries, [...CRASH_BOUNDARIES]);
+    if (manifest.robot) manifest.robot_full_gate = (options.robotSeconds ?? 0) >= FULL_ROBOT_SECONDS && manifest.robot.violations.length === 0
+      && (manifest.robot.lease_bound_seams_skipped ?? []).length === 0 && (manifest.robot.lease_bound_faults_skipped ?? []).length === 0;
     manifest.full_gate = counts.schedules >= 1000 && counts.operations >= 10_000
       && executedBoundaries.length === CRASH_BOUNDARIES.length && CRASH_BOUNDARIES.every((boundary, index) => executedBoundaries[index] === boundary)
       && manifest.crash_cases.every((entry: { staging_cleanup_verified?: boolean }) => entry.staging_cleanup_verified === true)
@@ -207,10 +255,11 @@ export async function runValidation(options: ValidationOptions) {
 }
 if (import.meta.main) {
   const args = new Map(process.argv.slice(2).map(arg => { const [key, ...value] = arg.replace(/^--/, '').split('='); return [key, value.join('=')]; }));
-  for (const key of args.keys()) assert(['engine', 'schedules', 'operations', 'seed', 'no-crashes', 'manifest'].includes(key), `Unknown option: ${key}`);
+  for (const key of args.keys()) assert(['engine', 'schedules', 'operations', 'seed', 'no-crashes', 'manifest', 'robot-seconds', 'replay', 'shrink'].includes(key), `Unknown option: ${key}`);
   const engine = args.get('engine') ?? 'pglite'; assert(engine === 'pglite' || engine === 'postgres');
   const result = await runValidation({ engine, schedules: Number(args.get('schedules') ?? 1000), operations: Number(args.get('operations') ?? 10_000),
     seed: Number(args.get('seed') ?? 5105), crashes: !args.has('no-crashes'), databaseUrl: process.env.DATABASE_URL,
+    robotSeconds: Number(args.get('robot-seconds') ?? 300), replay: args.get('replay') || undefined, shrink: args.get('shrink') || undefined,
     manifest: args.get('manifest') ?? `.context/persistence-${engine}-manifest.json` });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }

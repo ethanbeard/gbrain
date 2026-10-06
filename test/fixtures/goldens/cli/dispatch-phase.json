@@ -8,7 +8,7 @@
         "hasSwitchCase": true,
         "phase": "post-connect",
         "preConnectRules": [],
-        "thinClient": "none",
+        "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
       "agent": {
@@ -31,7 +31,17 @@
       "anomalies": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "(command === 'salience' || command === 'anomalies' || command === 'graph-query' || command === 'whoknows' || command === 'founder') && isThinClient(loadConfig())",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": true,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -214,7 +224,7 @@
         "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -235,7 +245,7 @@
         "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -445,6 +455,13 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "core": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
       "creds": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -540,6 +557,13 @@
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
+      "edge-proposals": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "edges-backfill": {
         "hasSwitchCase": true,
         "phase": "post-connect",
@@ -559,6 +583,25 @@
             "terminates": false,
             "thinClientCheck": false,
             "unconditionalFor": []
+          }
+        ],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
+      "embeddings": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'embeddings'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "embeddings"
+            ]
           }
         ],
         "thinClient": "refuse",
@@ -598,6 +641,25 @@
           }
         ],
         "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
+      "errors": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'errors'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "errors"
+            ]
+          }
+        ],
+        "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
       "eval": {
@@ -702,7 +764,7 @@
         "hasSwitchCase": true,
         "phase": "post-connect",
         "preConnectRules": [],
-        "thinClient": "none",
+        "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
       "extract": {
@@ -764,6 +826,13 @@
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
+      "feedback": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
       "files": {
         "hasSwitchCase": true,
         "phase": "post-connect",
@@ -776,7 +845,7 @@
         "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -795,7 +864,17 @@
       "founder": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "(command === 'salience' || command === 'anomalies' || command === 'graph-query' || command === 'whoknows' || command === 'founder') && isThinClient(loadConfig())",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": true,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -859,7 +938,17 @@
       "graph-query": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "(command === 'salience' || command === 'anomalies' || command === 'graph-query' || command === 'whoknows' || command === 'founder') && isThinClient(loadConfig())",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": true,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -1031,7 +1120,17 @@
       "migrate": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "command === 'migrate' && await (await import('./commands/migrate-graduation.ts')).tryRunMigrateGraduation(args)",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
@@ -1065,6 +1164,25 @@
         "hasSwitchCase": true,
         "phase": "post-connect",
         "preConnectRules": [],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "notices": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'notices'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "notices"
+            ]
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -1125,6 +1243,13 @@
           }
         ],
         "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "pricing": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
       "projections": {
@@ -1424,7 +1549,17 @@
       "salience": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "(command === 'salience' || command === 'anomalies' || command === 'graph-query' || command === 'whoknows' || command === 'founder') && isThinClient(loadConfig())",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": true,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -1469,7 +1604,17 @@
       "serve": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "command === 'serve' && (dbMarkerBrainId() ?? 'host') === 'host'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": false,
+            "thinClientCheck": false,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
@@ -1561,7 +1706,7 @@
         "phase": "post-connect",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1572,10 +1717,21 @@
               "forget",
               "call"
             ]
+          },
+          {
+            "condition": "command === 'sources' && args[0] === 'refresh' && !hasHelpFlag(args) && await (await import('./commands/sources-refresh-delegate.ts')).maybeDelegateSourcesRefresh(loadConfig(), args.slice(1))",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": []
           }
         ],
-        "thinClient": "refuse",
-        "thinClientRoutedSubcommands": []
+        "thinClient": "route-then-refuse",
+        "thinClientRoutedSubcommands": [
+          "shared-skills"
+        ]
       },
       "status": {
         "hasSwitchCase": true,
@@ -1685,7 +1841,7 @@
         "phase": "post-connect",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1741,7 +1897,17 @@
       "transcripts": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "command === 'transcripts' && args[0] === 'recent' && !hasHelpFlag(args) && await (await import('./commands/transcripts.ts')).runDelegatedTranscriptsRecent(args.slice(1))",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
@@ -1781,7 +1947,17 @@
       "whoknows": {
         "hasSwitchCase": true,
         "phase": "post-connect",
-        "preConnectRules": [],
+        "preConnectRules": [
+          {
+            "condition": "(command === 'salience' || command === 'anomalies' || command === 'graph-query' || command === 'whoknows' || command === 'founder') && isThinClient(loadConfig())",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": true,
+            "unconditionalFor": []
+          }
+        ],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       }
@@ -1951,6 +2127,7 @@
       "cache": [
         "stats"
       ],
+      "config": [],
       "jobs": [
         "stats"
       ],
@@ -1961,6 +2138,9 @@
         "modes",
         "stats",
         "tune"
+      ],
+      "sources": [
+        "shared-skills"
       ],
       "takes": [
         "list",

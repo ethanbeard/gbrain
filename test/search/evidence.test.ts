@@ -122,3 +122,10 @@ describe('stampEvidence', () => {
     expect(fixed.create_safety).toBe('exists');
   });
 });
+
+describe('A4-2: OR-relaxed lexical rows are not lexically verified', () => {
+  test('a relaxed keyword hit with a solid score is weak_semantic, not keyword_exact', () => {
+    expect(classifyEvidence(r({ keyword_hit: true, keyword_relaxed: true, base_score: 0.9 }))).toBe('weak_semantic');
+    expect(classifyEvidence(r({ keyword_hit: true, base_score: 0.9 }))).toBe('keyword_exact');
+  });
+});

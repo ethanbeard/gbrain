@@ -23,6 +23,7 @@ import { runImport } from '../src/commands/import.ts';
 import { contentHashLegacy } from '../src/core/utils.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { resolveRepairScope, runRepair } from '../src/core/repair/core.ts';
@@ -201,7 +202,7 @@ for (const kind of backends) {
         let codeSlug = '';
         await importCodeFile(engine, 'lib/legacy.ts', code, { sourceId, noEmbed: true, prepare: async value => {
           codeSlug = value.slug;
-          await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => value.apply(tx)));
+          await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => value.apply(tx), TEST_WRITE_ATTRIBUTION));
           return value.result;
         } });
         await engine.executeRaw('UPDATE pages SET chunker_version=1 WHERE source_id=$1', [sourceId]);

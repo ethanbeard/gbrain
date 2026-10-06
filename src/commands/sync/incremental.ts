@@ -12,13 +12,21 @@ import { createProgress } from '../../core/progress.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
 import { sweepUnsyncableModified, runDeletesPhase } from './deletes.ts';
 import { finishWithoutChanges, finalizeIncrementalSync } from './finalize.ts';
+import { legacyHoldFields, openLegacyHolds, type LegacyHolds } from './holds.ts';
 import { runImportsPhase } from './imports.ts';
 import { preflightIncrementalSync } from './preflight.ts';
 import { runRenamesPhase } from './renames.ts';
 import { createSyncRun, abortUnpersistedPin, registerCheckpointCleanup } from './sync-run.ts';
 
 export async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
-  const pre = await preflightIncrementalSync(engine, opts);
+  // #5988: content refusals are held, not failed; every exit reports the holds.
+  const holds = await openLegacyHolds(engine, opts.sourceId);
+  const result = await runSyncPhases(engine, opts, holds);
+  return holds ? { ...result, ...(await legacyHoldFields(engine, holds)) } : result;
+}
+
+async function runSyncPhases(engine: BrainEngine, opts: SyncOpts, holds: LegacyHolds | null): Promise<SyncResult> {
+  const pre = await preflightIncrementalSync(engine, opts, holds);
   if ('done' in pre) return pre.done;
   const { plan } = pre;
   const { totalChanges, ckpt, pin } = plan;

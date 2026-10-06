@@ -2,14 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
-import { safeLoad } from 'js-yaml';
+import { load as loadYaml } from 'js-yaml';
 
 type Job = {
   'runs-on'?: string;
   strategy?: { matrix: { os?: string[]; target?: string[] } };
 };
 const root = join(import.meta.dir, '../..');
-const load = (name: string) => safeLoad(readFileSync(join(root, '.github/workflows', name), 'utf8')) as { jobs: Record<string, Job> };
+const load = (name: string) => loadYaml(readFileSync(join(root, '.github/workflows', name), 'utf8')) as { jobs: Record<string, Job> };
 const normal = 'ubicloud-standard-16-ubuntu-2404';
 const heavy = 'ubicloud-standard-30-ubuntu-2404';
 const small = 'ubicloud-standard-2-ubuntu-2404';
@@ -36,15 +36,14 @@ describe('CI runner routing', () => {
 
   test('single-process lanes and soaks use 4 vCPUs, pooled lanes 8, and the label-gated heavy suite keeps 30', () => {
     // Measured: a unit shard is one bun process (1.1-1.5 busy cores on average)
-    // and took the same time on 4, 8 and 16 vCPUs; the serial pool and verify
-    // match 16 vCPUs at 8.
-    for (const name of ['test', 'slow-eval-longmemeval', 'slow-brainbench-e2e', 'brainbench', 'slow-entity-resolve-perf', 'admin-browser', 'shared-skills-compatibility']) {
+    // and took the same time on 4, 8 and 16 vCPUs; verify matches 16 vCPUs at 8.
+    for (const name of ['slow-brainbench-e2e', 'brainbench', 'slow-entity-resolve-perf', 'admin-browser', 'shared-skills-compatibility']) {
       expect(load('test.yml').jobs[name]['runs-on'], name).toBe(single);
     }
-    for (const name of ['verify', 'serial-tests']) expect(load('test.yml').jobs[name]['runs-on'], name).toBe(pooled);
+    expect(load('test.yml').jobs.verify['runs-on']).toBe(pooled);
     // E2E files run one bun process at a time against the job's Postgres:
     // full-corpus shard 1 took 668s on 4 vCPUs, 704s on 8 and 741s on 16.
-    for (const name of ['jsonb-parity', 'selected-e2e', 'tier2', 'coverage-full-unit', 'coverage-full-slow', 'coverage-full-e2e']) {
+    for (const name of ['jsonb-parity', 'tier2', 'tier1-backend-matrix', 'coverage-full-unit', 'coverage-full-slow', 'coverage-full-e2e']) {
       expect(load('e2e.yml').jobs[name]['runs-on'], name).toBe(single);
     }
     expect(load('e2e.yml').jobs.tier1['runs-on']).toBe(normal);
@@ -54,6 +53,16 @@ describe('CI runner routing', () => {
     expect(load('persistence-validation.yml').jobs.reconciliation['runs-on']).toBe(single);
     expect(load('persistence-validation.yml').jobs['deployment-matrix']['runs-on']).toBe(pooled);
     expect(load('heavy-tests.yml').jobs.heavy['runs-on']).toBe(heavy);
+  });
+
+  test('Selected E2E shards run on 2 vCPUs; unit shards and the serial pool on 4 (C1, C8; C4 reverted)', () => {
+    // A 25-file E2E sample took 442s on 2 cores vs 455s on 4. Unit shards stay on
+    // 4: on PR #6013 the 2-vCPU cell raised the unit shard mean from 542s to 608s
+    // and made Test the critical path (V-2 revert). The serial shards finish far
+    // off the critical path on 4.
+    expect(load('test.yml').jobs.test['runs-on']).toBe(single);
+    expect(load('e2e.yml').jobs['selected-e2e']['runs-on']).toBe(small);
+    expect(load('test.yml').jobs['serial-tests']['runs-on']).toBe(single);
   });
 
   test('security matrix labels and native platform coverage retain their identities', () => {
@@ -79,7 +88,7 @@ describe('CI runner routing', () => {
 
   test('macOS 26 validation is pinned, time-boxed, label-gated on pull requests and uses no secrets', () => {
     const text = readFileSync(join(root, '.github/workflows/macos-validation.yml'), 'utf8');
-    const workflow = safeLoad(text) as { on: Record<string, unknown>; jobs: Record<string, Job & { 'timeout-minutes'?: number; if?: string }> };
+    const workflow = loadYaml(text) as { on: Record<string, unknown>; jobs: Record<string, Job & { 'timeout-minutes'?: number; if?: string }> };
     expect(Object.keys(workflow.on).sort()).toEqual(['pull_request', 'schedule', 'workflow_dispatch']);
     const job = workflow.jobs['macos-26']!;
     expect(job['runs-on']).toBe('macos-26');
@@ -100,9 +109,9 @@ describe('CI runner routing', () => {
   });
 
   test('actionlint recognizes every configured custom label and watches its configuration', () => {
-    const config = safeLoad(readFileSync(join(root, '.github/actionlint.yaml'), 'utf8')) as { 'self-hosted-runner': { labels: string[] } };
+    const config = loadYaml(readFileSync(join(root, '.github/actionlint.yaml'), 'utf8')) as { 'self-hosted-runner': { labels: string[] } };
     expect(config['self-hosted-runner'].labels.sort()).toEqual([small, report, pooled, normal, heavy, arm].sort());
-    const workflow = safeLoad(readFileSync(join(root, '.github/workflows/actionlint.yml'), 'utf8')) as { on: Record<string, { paths: string[] }> };
+    const workflow = loadYaml(readFileSync(join(root, '.github/workflows/actionlint.yml'), 'utf8')) as { on: Record<string, { paths: string[] }> };
     for (const event of ['push', 'pull_request']) expect(workflow.on[event].paths).toContain('.github/actionlint.yaml');
   });
 });

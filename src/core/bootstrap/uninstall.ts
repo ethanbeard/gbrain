@@ -35,10 +35,23 @@ import { existsSync, lstatSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { configDir } from '../config.ts';
 import { isPathContained, realpathOrResolve } from '../path-confine.ts';
-import { isProcessAlive } from '../pglite-lock.ts';
+import { isProcessAlive, readBootId, readPidNs } from '../pglite-lock.ts';
 import { readReceipt, receiptPath, type InstallReceipt } from './format.ts';
 import { BootstrapError } from './lock.ts';
 import type { ExecRunner } from './repo.ts';
+
+// (#5481 review F1) Captured ONCE at module load — this module is a static
+// top-level import of the doctor CLI's own import graph, so load time tracks
+// real process start closely. A per-call `Date.now() - process.uptime() *
+// 1000` recompute instead drifts if the wall clock is adjusted (NTP
+// correction, VM/container pause-resume) at any point between real process
+// start and whenever a later check actually runs `probeLivePgliteHolder` —
+// pushing the estimate later than the true start and false-flagging a
+// genuinely-self lock as a foreign collision, the exact bug this file exists
+// to fix. Anchoring the estimate at load time instead of check time closes
+// that window: uptime() is already near-zero at load, so the subtraction
+// barely matters, and no later clock jump can retroactively move it.
+const MODULE_LOAD_PROCESS_START_ESTIMATE = Date.now() - process.uptime() * 1000;
 
 // ---------------------------------------------------------------------------
 // Read-only PGLite lock probe (never opens the engine)
@@ -48,6 +61,48 @@ export interface LiveHolder {
   pid: number;
   /** True when the lock file says the holder is `gbrain serve`. */
   serve: boolean;
+  /**
+   * True when `pid` matches THIS process AND the lock's namespace evidence
+   * (`pid_ns`/`boot_id`) also matches THIS process's own (#5481). A bare
+   * numeric pid match is not proof of self-identity: containers/hosts
+   * sharing a mounted PGLite directory can reuse the same namespace-local
+   * pid for a genuinely different process, so pid alone would let a foreign
+   * holder masquerade as self. Mirrors the cross-namespace-incomparable
+   * guard `pglite-lock.ts` already applies at lock-acquisition time. Every
+   * lock this codebase writes stamps both fields (`pglite-lock.ts`), so a
+   * genuine self-lock always has matching evidence when THIS process can
+   * itself read `/proc`. On Linux, self requires POSITIVE VERIFIED
+   * agreement on BOTH markers — each of `pid_ns`/`boot_id` must be non-null
+   * on both the stored lock AND our own current reading, and equal — never
+   * an absence-based free pass. This mirrors `pglite-lock.ts`'s own
+   * lock-acquisition comparability guard exactly (it likewise requires
+   * non-null matching before treating evidence as usable, never accepting
+   * "both sides unreadable" as agreement), so a restricted-`/proc`
+   * environment (where our own markers, or the lock's stored ones, are
+   * unreadable) can NEVER verify self and fails CLOSED (still warns) rather
+   * than risk misclassifying a foreign holder under the same restriction as
+   * self. This means a doctor process whose own `/proc` markers are
+   * unreadable will still see the original #5481 false-positive warning
+   * about its own lock in that narrow case; only environments where
+   * namespace evidence is actually readable get the improved
+   * self-detection. This is a narrower guarantee than a fully verified
+   * cross-host identity check on non-Linux platforms specifically (a
+   * foreign holder reusing this process's pid on a non-Linux host — where
+   * no namespace evidence exists at all — would still read as self);
+   * closing that residual gap would need new cross-platform identity
+   * infrastructure this codebase does not have anywhere, including at
+   * `pglite-lock.ts`'s own lock-acquisition path, and is out of scope for
+   * the doctor false-positive this field fixes. A pid/namespace match ALONE
+   * is also not sufficient: within one boot session a dead process's pid
+   * can be reused by a later, unrelated live process (including this
+   * doctor invocation itself), leaving a genuinely stale legacy lock that
+   * still blocks real database access — `pglite-lock.ts`'s own acquisition
+   * reap logic sees the recycled pid as alive and correctly refuses to
+   * reclaim it. `isSelf` additionally requires the lock's `acquired_at`
+   * (when present) not to predate this process's own start time, since a
+   * process cannot have acquired a lock before it existed.
+   */
+  isSelf: boolean;
 }
 
 /**
@@ -56,10 +111,30 @@ export interface LiveHolder {
  * fallback; only an affirmatively-dead PID reads as dead) without acquiring,
  * reaping, or opening anything. Unreadable/absent lock → null (no live holder
  * provable — uninstall proceeds; a dead holder's stale lock dir is inert).
+ *
+ * `deps` is test-only injection for the namespace-evidence readers and our
+ * own process-start time (default: the real `/proc` readers from
+ * pglite-lock.ts and this module's load-time-anchored estimate, captured
+ * once above rather than recomputed per call); production callers never
+ * pass it.
  */
-export function probeLivePgliteHolder(dataDir: string): LiveHolder | null {
+export function probeLivePgliteHolder(
+  dataDir: string,
+  deps: {
+    readPidNs: () => string | null;
+    readBootId: () => string | null;
+    processStartTime?: () => number;
+  } = { readPidNs, readBootId },
+): LiveHolder | null {
   const lockPath = join(dataDir, '.gbrain-lock', 'lock');
-  let raw: { pid?: unknown; subcommand?: unknown; command?: unknown };
+  let raw: {
+    pid?: unknown;
+    subcommand?: unknown;
+    command?: unknown;
+    pid_ns?: unknown;
+    boot_id?: unknown;
+    acquired_at?: unknown;
+  };
   try {
     raw = JSON.parse(readFileSync(lockPath, 'utf8')) as typeof raw;
   } catch {
@@ -74,7 +149,55 @@ export function probeLivePgliteHolder(dataDir: string): LiveHolder | null {
     const parts = raw.command.trim().split(/\s+/);
     serve = parts[0] === 'serve' || parts[1] === 'serve';
   }
-  return { pid, serve };
+  const lockPidNs = typeof raw.pid_ns === 'string' ? raw.pid_ns : null;
+  const lockBootId = typeof raw.boot_id === 'string' ? raw.boot_id : null;
+  const ourPidNs = deps.readPidNs();
+  const ourBootId = deps.readBootId();
+  // (#5481 review F2/F3/F4/F5) On Linux, self requires POSITIVE VERIFIED
+  // evidence on BOTH markers — each of pid_ns and boot_id must be non-null
+  // on both the stored lock AND our own current reading, and equal. This
+  // mirrors pglite-lock.ts's own lock-acquisition comparability guard
+  // exactly (it likewise requires non-null matching before treating
+  // evidence as usable — see its `comparable` check), rather than an
+  // earlier, looser design here that also accepted "both sides unreadable"
+  // as agreement. That fallback was reverted: it could not distinguish a
+  // restricted-`/proc` SELF lock from a restricted-`/proc` FOREIGN lock (a
+  // different container/host whose own `/proc` is equally masked), so it
+  // failed OPEN exactly where verification is impossible. The doctor now
+  // fails CLOSED in that case — it keeps warning, matching this file's
+  // pre-#5481 behavior, rather than risk silently suppressing a real
+  // collision it cannot actually verify. (This means a doctor process
+  // running with its own `/proc` markers unreadable will still see the
+  // original false-positive warning about its own lock; only environments
+  // where namespace evidence is readable get the improved self-detection.)
+  const verifiedMatch = ourPidNs != null && lockPidNs != null && ourPidNs === lockPidNs
+    && ourBootId != null && lockBootId != null && ourBootId === lockBootId;
+  const namespaceMatches = process.platform !== 'linux' || verifiedMatch;
+  // (#5481 review F6) A pid+namespace match alone is not proof this process
+  // itself acquired the lock: within one boot session a dead process's pid
+  // can be reused by a LATER, unrelated process (including doctor itself).
+  // A genuinely stale legacy lock left behind by the dead process can then
+  // block real database access — pglite-lock.ts's own acquisition-time
+  // legacy-migration reap logic sees `isProcessAlive(pid)` true (because
+  // the recycled pid now belongs to a live process) and correctly refuses
+  // to reap it, so the stale lock keeps blocking connections even though
+  // "self" never actually held it. We cannot ask pglite-lock.ts for its
+  // live in-process handle (this probe is read-only and never acquires
+  // anything), but every lock write stamps `acquired_at`, and a process
+  // cannot have acquired a lock before it existed: if the lock's
+  // `acquired_at` predates OUR OWN process start time, it is provably not
+  // ours, regardless of matching pid/namespace evidence, and this stays a
+  // reportable collision. A missing/unparseable `acquired_at` (a lock
+  // written by older code) is not treated as disqualifying — only a
+  // POSITIVE, verifiable "written before we existed" timestamp overrides a
+  // pid/namespace match.
+  const lockAcquiredAt = typeof raw.acquired_at === 'number' ? raw.acquired_at : null;
+  const ourProcessStartTime = deps.processStartTime?.() ?? MODULE_LOAD_PROCESS_START_ESTIMATE;
+  const ACQUIRED_AT_TOLERANCE_MS = 1000;
+  const acquiredBeforeThisProcessStarted = lockAcquiredAt != null
+    && lockAcquiredAt < ourProcessStartTime - ACQUIRED_AT_TOLERANCE_MS;
+  const isSelf = pid === process.pid && namespaceMatches && !acquiredBeforeThisProcessStarted;
+  return { pid, serve, isSelf };
 }
 
 /** The PGLite data dir for a gbrain home: config.json's database_path when it

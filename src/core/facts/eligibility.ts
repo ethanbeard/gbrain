@@ -51,7 +51,7 @@ const RESCUE_SLUG_PREFIXES = ['meetings/', 'personal/', 'daily/'] as const;
 // deferred pack-aware ELIGIBLE_TYPES to v0.43+; codex outside voice caught
 // it as a blocker — changing the default taxonomy to gbrain-base-v2 while
 // `eligibility.ts:49` hardcodes only gbrain-base's types means post-unify
-// `media` (subtype: article), `tweet`, `atom`, `analysis` pages would
+// `media` (subtype: article), `tweet`, `analysis` pages would
 // silently drop out of facts extraction.
 //
 // `concept` is DELIBERATELY excluded: v0.41.11 documented its `extractable:
@@ -59,6 +59,10 @@ const RESCUE_SLUG_PREFIXES = ['meetings/', 'personal/', 'daily/'] as const;
 // backstop uses hardcoded ELIGIBLE_TYPES" and the pre-existing test suite
 // pins `kind:concept` rejection. Concept extraction stays out of the
 // backstop; the schema-pack flag remains a forward-compatibility marker.
+//
+// `atom` is DELIBERATELY excluded too (#5831): atom pages are a derived
+// digest of pages that already went through the backstop, their facts carry
+// no entity, and consolidate never reads null-entity facts.
 //
 // The union here is safe for both packs:
 //   - gbrain-base brains: all original types still eligible (back-compat)
@@ -71,8 +75,8 @@ const ELIGIBLE_TYPES: PageType[] = [
   // gbrain-base (legacy) types
   'note', 'meeting', 'slack', 'email', 'calendar-event', 'source', 'writing',
   // gbrain-base-v2 canonical types declared extractable in the pack
-  // (concept deliberately omitted — see above)
-  'media', 'tweet', 'atom', 'analysis',
+  // (concept and atom deliberately omitted — see above)
+  'media', 'tweet', 'analysis',
 ];
 
 const MIN_BODY_CHARS = 80;

@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { expandPaths, expandTilde } from '../src/commands/transcripts.ts';
 import { homedir } from 'node:os';
 import { isGrokSessionSidecarStrict } from '../src/core/transcripts/grok.ts';
+import { isClaudeCodeRemoteControlStateFile } from '../src/core/transcripts/claude-code.ts';
 
 const UUID = '123e4567-e89b-42d3-a456-426614174000';
 
@@ -92,6 +93,52 @@ describe('expandPaths grok-sidecar scoping', () => {
     writeFileSync(ph2, '{"p":1}\n');
     expect(isGrokSessionSidecarStrict(ph2)).toBe(false);
     expect(await expandPaths([ph2])).toEqual([ph2]);
+  });
+});
+
+describe('expandPaths Claude Code Remote Control state files (#5597)', () => {
+  const SESSION = '18c0ffee-1234-4321-9999-abcdefabcdef';
+
+  test('the predicate claims the two Remote Control names on either path separator', () => {
+    expect(isClaudeCodeRemoteControlStateFile(`/home/u/.claude/projects/proj/${SESSION}.ccr-tip.json`)).toBe(true);
+    expect(isClaudeCodeRemoteControlStateFile(`C:\\Users\\u\\.claude\\projects\\proj\\bridge-pointer.json`)).toBe(true);
+    // A session file, and a consumer export, are never claimed.
+    expect(isClaudeCodeRemoteControlStateFile(`/home/u/.claude/projects/proj/${SESSION}.jsonl`)).toBe(false);
+    expect(isClaudeCodeRemoteControlStateFile('/home/u/exports/conversations.json')).toBe(false);
+    // Near-miss names stay legitimate.
+    expect(isClaudeCodeRemoteControlStateFile('/home/u/.claude/projects/proj/ccr-tip.json')).toBe(false);
+    expect(isClaudeCodeRemoteControlStateFile('/home/u/.claude/projects/proj/bridge-pointer.jsonl')).toBe(false);
+  });
+
+  test('directory expansion drops ccr-tip.json + bridge-pointer.json and keeps sessions + exports', async () => {
+    const d = tdir();
+    const proj = join(d, '.claude', 'projects', 'proj-slug');
+    mkdirSync(proj, { recursive: true });
+    const session = join(proj, `${SESSION}.jsonl`);
+    writeFileSync(
+      session,
+      JSON.stringify({ sessionId: 's1', type: 'user', message: { role: 'user', content: 'hi' } }) + '\n',
+    );
+    const tip = join(proj, `${SESSION}.ccr-tip.json`);
+    writeFileSync(tip, '{"tip":true}');
+    const bridge = join(proj, 'bridge-pointer.json');
+    writeFileSync(bridge, '{"bridge":true}');
+    const exportJson = join(proj, 'conversations.json');
+    writeFileSync(exportJson, '[]');
+    // Glob order is filesystem order — compare as sets.
+    expect((await expandPaths([proj])).sort()).toEqual([session, exportJson].sort());
+  });
+
+  test('even when named explicitly, a Remote Control state file never imports', async () => {
+    const d = tdir();
+    const proj = join(d, '.claude', 'projects', 'proj-slug');
+    mkdirSync(proj, { recursive: true });
+    const tip = join(proj, `${SESSION}.ccr-tip.json`);
+    writeFileSync(tip, '{"tip":true}');
+    const bridge = join(proj, 'bridge-pointer.json');
+    writeFileSync(bridge, '{"bridge":true}');
+    expect(await expandPaths([tip])).toEqual([]);
+    expect(await expandPaths([bridge])).toEqual([]);
   });
 });
 

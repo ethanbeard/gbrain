@@ -21,6 +21,7 @@
  * gateway-down errors are absorbed into NULL-embedding rows.
  */
 
+import { observationDateLine, observationDateRule, parseExtractedEventDate, type ObservationDate } from '../ai/date-grounding.ts';
 import { chat, embedOne, isAvailable, getEmbeddingModel } from '../ai/gateway.ts';
 import { classifyGlobalLlmError } from '../ai/errors.ts';
 import { stripReasoningBlocks } from '../llm-json.ts';
@@ -28,7 +29,7 @@ import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { resolveModel } from '../model-config.ts';
 import { normalizeModelId } from '../model-id.ts';
-import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
+import type { BrainEngine, NewFact, FactKind, FactAttribution } from '../engine.ts';
 import { normalizeMetricLabel } from './extract-from-fence.ts';
 import { isNullLikeEntity } from './write-single.ts';
 import { isAIInvocationPolicyError } from '../ai/invocation-guard.ts';
@@ -105,6 +106,50 @@ export async function getFactsExtractionPromptAppendix(
   const raw = await engine.getConfig('facts.extraction_prompt_appendix').catch(() => null);
   if (raw == null || raw.trim() === '') return null;
   return raw.trim();
+}
+
+/**
+ * Extraction prompt variants. `extraction.date_grounding` defaults ON for fact
+ * extraction (held-out verdict p2-e2-heldout-2026-10-04: unresolved relative
+ * dates in saved facts 8.95% -> 2.05%, QA non-inferior). `facts.attribution`
+ * defaults ON (held-out verdict p2-e3-heldout: assistant-said QA from saved
+ * facts 44.1% -> 95.8%, user-said non-inferior). For both, `false` / `off` /
+ * `0` opt out.
+ */
+export interface ExtractorVariant {
+  /** Resolve relative dates against the observation date; emit valid_from. */
+  dateGrounding?: boolean;
+  /** Keep assistant-made claims as their own, attributed facts. */
+  attribution?: boolean;
+}
+
+const flagIs = (v: string | null, values: readonly string[]) => v != null && values.includes(v.trim().toLowerCase());
+const FLAG_ON = ['true', 'on', '1'] as const;
+const FLAG_OFF = ['false', 'off', '0'] as const;
+const readFlag = (engine: BrainEngine, key: string) => Promise.resolve().then(() => engine.getConfig(key)).catch(() => null);
+
+export async function getExtractorVariant(engine?: BrainEngine): Promise<ExtractorVariant> {
+  if (!engine) return {};
+  const [grounding, attribution] = await Promise.all([readFlag(engine, 'extraction.date_grounding'), readFlag(engine, 'facts.attribution')]);
+  return { dateGrounding: !flagIs(grounding, FLAG_OFF), attribution: !flagIs(attribution, FLAG_OFF) };
+}
+
+/**
+ * Date grounding for the other extraction prompts. Each defaulted from its own
+ * per-consumer check (preregistration amendment 3, results in
+ * docs/eval/decisions/p2-e2-heldout/): dream synthesis, extract_atoms and
+ * propose_takes passed and follow the fact-extraction default (on unless the
+ * setting is false/off/0); life chronicle events did not clear the
+ * unresolved-phrase criterion and stays on its current prompt unless the
+ * setting is explicitly true.
+ */
+export type DateGroundingConsumer = 'chronicle' | 'synthesis' | 'atoms' | 'takes';
+const OPT_IN_CONSUMERS: ReadonlySet<DateGroundingConsumer> = new Set(['chronicle']);
+
+export async function isConsumerDateGroundingOn(engine: BrainEngine | undefined, consumer: DateGroundingConsumer): Promise<boolean> {
+  if (!engine) return false;
+  const raw = await readFlag(engine, 'extraction.date_grounding');
+  return OPT_IN_CONSUMERS.has(consumer) ? flagIs(raw, FLAG_ON) : !flagIs(raw, FLAG_OFF);
 }
 
 /**
@@ -218,6 +263,13 @@ export interface ExtractInput {
   embedding?: FactEmbeddingSignature | null;
   /** Cap on number of facts returned per turn. Defaults to 10. */
   maxFactsPerTurn?: number;
+  /**
+   * When the turn was written or said (date-grounding.ts). Used only when the
+   * date-grounding variant is on; null = unknown (relative dates kept as written).
+   */
+  observationDate?: ObservationDate | null;
+  /** Prompt variant; undefined → read `extraction.date_grounding` / `facts.attribution` from config. */
+  variant?: ExtractorVariant;
   /** Optional pre-embedding admission selector for extracted fact tiers. */
   notabilityAdmission?: {
     allowed: readonly FactNotability[];
@@ -344,12 +396,35 @@ function renderExtractorSystem(admitsLow: boolean): string {
 const EXTRACTOR_SYSTEM_ADMITS_LOW = renderExtractorSystem(true);
 const EXTRACTOR_SYSTEM_SKIPS_LOW = renderExtractorSystem(false);
 
-/** @internal Exported for the prompt-shape test. */
-export function buildExtractorSystem(admitsLow: boolean): string {
-  return admitsLow ? EXTRACTOR_SYSTEM_ADMITS_LOW : EXTRACTOR_SYSTEM_SKIPS_LOW;
+/** Date-grounding block: the shared rule plus the per-fact event date. */
+const DATE_GROUNDING_BLOCK = [
+  '',
+  observationDateRule(),
+  '- A turn prefixed with its own timestamp ("<speaker> (<ts>): ...") is observed at that timestamp.',
+  '- Add "valid_from" to every fact object: "YYYY-MM-DD" when the claim states or implies the specific date it',
+  '  became true (resolved against the observation date), else null. Never use the observation date as a guess.',
+].join('\n');
+
+/** Speaker block: who asserted a claim, never whether it is true or accepted. */
+const ATTRIBUTION_BLOCK = [
+  '',
+  'Speakers: a claim the assistant made (a recommendation, answer, plan or research result) is its own fact,',
+  'phrased "Assistant recommended …" / "Assistant said …" — never stated as the user\'s claim, never dropped.',
+  'The user accepting it is a separate fact only when the user explicitly accepts it ("User accepted the',
+  'assistant\'s suggestion to …"); rejected or corrected suggestions produce no user fact. A named third',
+  'party\'s claim keeps the speaker\'s name in the fact text.',
+  '- Add "attributed_to" to every fact object: "user" when the user asserted it, "assistant" when the assistant',
+  '  did, "other" for a named third party, null when the speaker is unclear.',
+].join('\n');
+
+/** @internal Exported for the prompt-shape test. Both variants off → the historical prompt, byte-identical. */
+export function buildExtractorSystem(admitsLow: boolean, variant: ExtractorVariant = {}): string {
+  const base = admitsLow ? EXTRACTOR_SYSTEM_ADMITS_LOW : EXTRACTOR_SYSTEM_SKIPS_LOW;
+  return base + (variant.dateGrounding ? DATE_GROUNDING_BLOCK : '') + (variant.attribution ? ATTRIBUTION_BLOCK : '');
 }
 
-const MAX_TURN_TEXT_CHARS = 8000;
+/** Extractor input ceiling; corpus windows (context/corpus-windows.ts) are cut to fit it. */
+export const MAX_TURN_TEXT_CHARS = 8000;
 
 /**
  * #4863 — JSON Schema for the extractor reply, sent as `responseSchema` on
@@ -393,6 +468,25 @@ const FACTS_EXTRACTION_SCHEMA: Record<string, unknown> = {
 };
 const FACTS_RESPONSE_SCHEMA = { name: 'facts_extraction', schema: FACTS_EXTRACTION_SCHEMA };
 
+/**
+ * The variant's response schema: grounding adds a nullable `valid_from`,
+ * attribution a nullable `attributed_to`; both off → the historical schema.
+ */
+function factsResponseSchema(variant: ExtractorVariant): typeof FACTS_RESPONSE_SCHEMA {
+  if (!variant.dateGrounding && !variant.attribution) return FACTS_RESPONSE_SCHEMA;
+  const items = (FACTS_EXTRACTION_SCHEMA.properties as { facts: { items: Record<string, unknown> } }).facts.items;
+  const extra: Record<string, unknown> = {
+    ...(variant.dateGrounding ? { valid_from: { type: ['string', 'null'] } } : {}),
+    ...(variant.attribution ? { attributed_to: { type: ['string', 'null'], enum: ['user', 'assistant', 'other', null] } } : {}),
+  };
+  const variantItems = {
+    ...items,
+    properties: { ...(items.properties as Record<string, unknown>), ...extra },
+    required: [...(items.required as string[]), ...Object.keys(extra)],
+  };
+  return { name: 'facts_extraction', schema: { ...FACTS_EXTRACTION_SCHEMA, properties: { facts: { type: 'array', items: variantItems } } } };
+}
+
 export type ExtractFailureReason =
   | 'chat_unavailable'
   | 'provider_error'
@@ -416,7 +510,7 @@ export type ExtractFactsOutcome =
  * Bounded diagnostic breadcrumb for the message: the cause's CONSTRUCTOR name
  * (validated as a plain identifier — never `.name`, never `.message`) plus
  * the whole-run class `classifyGlobalLlmError` derives from the cause chain
- * (`auth` / `billing` / `rate_limit`, the same vocabulary ingest_log uses).
+ * (`auth` / `billing` / `rate_limit` / `model_not_found`, the same vocabulary ingest_log uses).
  * Both are closed vocabularies with no interpolated provider text, so a 4xx
  * body echoing a key / org id cannot ride through. Defense-in-depth, not a
  * hard boundary: anything unexpected is dropped (never substituted), and a
@@ -515,15 +609,18 @@ export async function extractFactsFromTurnWithOutcome(
   // because those reuse `extractorSystem`. Read AFTER the availability gate —
   // a chat_unavailable early return must not pay config round-trips (#4298
   // resolved the model/gate ordering; these reads sit behind it).
-  const [promptAppendix, junkFilterOn, missingConfidence] = await Promise.all([
+  const [promptAppendix, junkFilterOn, missingConfidence, variant] = await Promise.all([
     getFactsExtractionPromptAppendix(input.engine),
     isJunkFilterEnabled(input.engine),
     getMissingConfidence(input.engine),
+    input.variant ?? getExtractorVariant(input.engine),
   ]);
   const extractorSystem = promptAppendix
-    ? `${buildExtractorSystem(admitsLow)}\n\n${promptAppendix}`
-    : buildExtractorSystem(admitsLow);
-  const userContent = `<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
+    ? `${buildExtractorSystem(admitsLow, variant)}\n\n${promptAppendix}`
+    : buildExtractorSystem(admitsLow, variant);
+  const responseSchema = factsResponseSchema(variant);
+  const dateLine = variant.dateGrounding ? `${observationDateLine(input.observationDate ?? null)}\n` : '';
+  const userContent = `${dateLine}<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
     input.entityHints && input.entityHints.length
       ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, ENTITY_HINTS_CAP).join(', ')}.`
       : ''
@@ -540,7 +637,7 @@ export async function extractFactsFromTurnWithOutcome(
       messages: [{ role: 'user', content: userContent }],
       maxTokens,
       abortSignal: input.abortSignal,
-      responseSchema: FACTS_RESPONSE_SCHEMA,
+      responseSchema,
     });
     // #2113: never checked pre-fix — a truncated response (stopReason
     // 'length', e.g. reasoning tokens eating the cap on mandatory-reasoning
@@ -558,7 +655,7 @@ export async function extractFactsFromTurnWithOutcome(
         messages: [{ role: 'user', content: userContent }],
         maxTokens: effectiveMaxTokens,
         abortSignal: input.abortSignal,
-        responseSchema: FACTS_RESPONSE_SCHEMA,
+        responseSchema,
       });
       if (result.stopReason === 'length') {
         process.stderr.write(
@@ -599,7 +696,7 @@ export async function extractFactsFromTurnWithOutcome(
         messages: [{ role: 'user', content: userContent }],
         maxTokens: effectiveMaxTokens,
         abortSignal: input.abortSignal,
-        responseSchema: FACTS_RESPONSE_SCHEMA,
+        responseSchema,
       });
     } catch (err) {
       if (isAbort(err)) throw err;
@@ -637,6 +734,10 @@ export async function extractFactsFromTurnWithOutcome(
 
   const facts: ExtractedFact[] = [];
   let junkSkipped = 0;
+  // A caller that resolved the brain's signature passes it (or null); otherwise a brain that opted out of embedding
+  // never has its fact text sent to the provider.
+  const { factEmbeddingDisabled } = await import('../embedding-disabled.ts');
+  const embedFacts = input.embedding !== null && (input.embedding !== undefined || !await factEmbeddingDisabled(input.engine));
   for (const candidate of parsedRaw.slice(0, cap)) {
     if (input.abortSignal?.aborted) {
       const e = new Error('aborted');
@@ -672,7 +773,7 @@ export async function extractFactsFromTurnWithOutcome(
     let embedding: Float32Array | null = null;
     let embeddingModel: string | null = null;
     try {
-      if (input.embedding !== null) {
+      if (embedFacts) {
         embeddingModel = input.embedding?.model ?? getEmbeddingModel();
         embedding = await embedOne(factText, { abortSignal: input.abortSignal, inputType: 'document', embeddingModel,
           ...(input.embedding ? { embeddingModel: input.embedding.model, dimensions: input.embedding.dimensions } : {}) });
@@ -718,6 +819,13 @@ export async function extractFactsFromTurnWithOutcome(
       claim_value:  claimValue,
       claim_unit:   claimUnit,
       claim_period: claimPeriod,
+      // Date grounding: a validated extractor-stated event date wins over the
+      // caller's fallback (backstop precedence). Malformed / out-of-range
+      // dates are dropped, never guessed.
+      ...(variant.dateGrounding && parseExtractedEventDate(candidate.valid_from)
+        ? { valid_from: parseExtractedEventDate(candidate.valid_from)! }
+        : {}),
+      ...(variant.attribution && candidate.attributed_to ? { attributed_to: candidate.attributed_to } : {}),
     });
   }
 
@@ -769,6 +877,9 @@ interface RawExtracted {
   value?: number | null;
   unit?: string | null;
   period?: string | null;
+  /** Date-grounding variant: the event date the extractor stated (raw string; validated on use). */
+  valid_from?: string | null;  /** Attribution variant: who asserted the claim; anything outside the three speakers parses as null. */
+  attributed_to?: FactAttribution | null;
 }
 
 /**
@@ -853,6 +964,8 @@ function tryArrayShapeDetailed(s: string): ParsedExtractorShape | null {
         value:  (typeof o.value === 'number' && Number.isFinite(o.value)) ? o.value : null,
         unit:   typeof o.unit === 'string' ? o.unit : null,
         period: typeof o.period === 'string' ? o.period : null,
+        valid_from: typeof o.valid_from === 'string' ? o.valid_from : null,
+        attributed_to: o.attributed_to === 'user' || o.attributed_to === 'assistant' || o.attributed_to === 'other' ? o.attributed_to : null,
       });
     }
     return { facts: out, invalidCandidates };

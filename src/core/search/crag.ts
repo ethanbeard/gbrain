@@ -12,9 +12,11 @@
  *              exact_lookup, exact_title_match, high_vector_match) or the
  *              reranker scored the top at/above the weak-top floor.
  *   moderate — lexically verified top (keyword_exact) but no identity or
- *              calibrated-semantic signal.
+ *              calibrated-semantic signal; or an OR-relaxed keyword top whose
+ *              evidence is corroborated (see `relaxedTopCorroborated`).
  *   weak     — zero results, a reranked top BELOW the weak-top floor
- *              (the #1863 "whole list is low-confidence" shape), or an
+ *              (the #1863 "whole list is low-confidence" shape), an
+ *              uncorroborated OR-relaxed keyword top (keyword_relaxed), or an
  *              unverified weak_semantic top.
  *
  * Consumers: the `query` op attaches the grade (+ query shape) to its
@@ -49,6 +51,8 @@ export interface ConfidenceGrade {
     | 'rerank_top'
     | 'rerank_top_below_floor'
     | 'keyword_exact_top'
+    | 'keyword_relaxed_top'
+    | 'keyword_relaxed_corroborated'
     | 'weak_semantic_top'
     | 'decide_evidence';
   /** Rank-1 evidence label when present (auditability). */
@@ -64,10 +68,107 @@ export interface ConfidenceGrade {
  */
 export const DEFAULT_CRAG_MIN_TOP = 0.2;
 
+/** Rows a relaxed top is corroborated against: the top five a reader is handed. */
+export const RELAXED_CORROBORATION_DEPTH = 5;
+
+// PostgreSQL's `english` text-search stopwords. The keyword arm drops them,
+// so they never decide whether the strict AND query matched.
+const ENGLISH_STOPWORDS = new Set(('i me my myself we our ours ourselves you your yours yourself yourselves he him his himself '
+  + 'she her hers herself it its itself they them their theirs themselves what which who whom this that these those am is are '
+  + 'was were be been being have has had having do does did doing a an the and but if or because as until while of at by for '
+  + 'with about against between into through during before after above below to from up down in out on off over under again '
+  + 'further then once here there when where why how all any both each few more most other some such no nor not only own same '
+  + 'so than too very s t can will just don should now').split(' '));
+
+/**
+ * Inflectional stem, applied identically to query and text, so "founded" and
+ * "founding" or "headquarters" and "headquartered" compare equal. Lighter
+ * than the engine's Snowball stemmer: a miss reads as an unmatched term,
+ * which only ever keeps a grade weak.
+ */
+function stem(word: string): string {
+  if (word.length > 4 && word.endsWith('ies')) return `${word.slice(0, -3)}y`;
+  if (word.length > 4 && /(ss|x|z|ch|sh)es$/.test(word)) return word.slice(0, -2);
+  if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) word = word.slice(0, -1);
+  if (word.length > 5 && word.endsWith('ing')) return word.slice(0, -3);
+  if (word.length > 4 && word.endsWith('ed')) return word.slice(0, -2);
+  return word;
+}
+
+function words(text: string): string[] {
+  return text.normalize('NFKC').split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
+export function contentTerms(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const w of words(text)) {
+    const lower = w.toLowerCase();
+    if (!ENGLISH_STOPWORDS.has(lower)) out.add(stem(lower));
+  }
+  return out;
+}
+
+/**
+ * Name terms: content words written with a capital past the query's first
+ * word (a name such as "Acme Example") or an interior capital ("ARR",
+ * "McKinsey"). Sentence-initial capitalization is not a name signal.
+ */
+function nameTerms(query: string): Set<string> {
+  const out = new Set<string>();
+  words(query).forEach((w, i) => {
+    const lower = w.toLowerCase();
+    if (ENGLISH_STOPWORDS.has(lower)) return;
+    if (/\p{Lu}/u.test(w.slice(1)) || (i > 0 && /^\p{Lu}/u.test(w))) out.add(stem(lower));
+  });
+  return out;
+}
+
+/**
+ * An OR-relaxed keyword top means no single chunk matched every query term.
+ * That happens for two different reasons, and the grade must tell them apart
+ * (gbrain-evals A4, #5919):
+ *
+ *   - the question uses a word the corpus never writes ("Which CITY is Acme
+ *     Example headquartered in?" against "Acme Example is headquartered in
+ *     ..."), while the rest of the question is matched by one chunk; or
+ *   - the asked-about thing is not in the evidence: the entity is matched in
+ *     one chunk and the attribute only in others (a missing attribute), or
+ *     a name in the question appears nowhere (an absent entity).
+ *
+ * Corroborated (graded moderate, not weak) when, over the top
+ * RELAXED_CORROBORATION_DEPTH rows, all of these hold:
+ *
+ *   1. at most one query content term appears in none of the rows;
+ *   2. that unmatched term is not a name term (an unmatched name means the
+ *      question is about something the evidence does not mention);
+ *   3. one row (title plus chunk text) contains every query term matched
+ *      anywhere in the window, and at least two of them, so the matched
+ *      evidence sits together instead of being split across pages.
+ *
+ * Purely lexical by design: relaxed rows only reach fusion when every vector
+ * list is empty, so no cosine or rerank score exists on this path. A
+ * question whose attribute is phrased with words the evidence never uses
+ * ("annual recurring revenue" against "ARR") stays weak: lexically it is
+ * indistinguishable from the attribute being absent.
+ */
+export function relaxedTopCorroborated(results: readonly SearchResult[], query: string): boolean {
+  const asked = contentTerms(query);
+  const rows = results.slice(0, RELAXED_CORROBORATION_DEPTH).map(r => contentTerms(`${r.title ?? ''} ${r.chunk_text ?? ''}`));
+  const matched = [...asked].filter(t => rows.some(row => row.has(t)));
+  const unmatched = [...asked].filter(t => !matched.includes(t));
+  if (unmatched.length > 1 || matched.length < 2) return false;
+  const names = nameTerms(query);
+  if (unmatched.some(t => names.has(t))) return false;
+  return rows.some(row => matched.every(t => row.has(t)));
+}
+
 export function gradeRetrievalConfidence(
   results: SearchResult[],
-  /** `ignoreDecideEvidence`: the deterministic grade (S4's agreement rule excludes the S3-derived input). */
-  opts: { minTopScore?: number; ignoreDecideEvidence?: boolean } = {},
+  /**
+   * `ignoreDecideEvidence`: the deterministic grade (S4's agreement rule excludes the S3-derived input).
+   * `query`: the query text; without it an OR-relaxed top is never corroborated.
+   */
+  opts: { minTopScore?: number; ignoreDecideEvidence?: boolean; query?: string } = {},
 ): ConfidenceGrade {
   if (results.length === 0) return { level: 'weak', reason: 'zero_results' };
   const top = results[0];
@@ -99,7 +200,15 @@ export function gradeRetrievalConfidence(
       : { level: 'weak', reason: 'rerank_top_below_floor', top_evidence: top.evidence, top_rerank_score: top.rerank_score };
   }
 
-  // No reranker: fall back to the T4 evidence contract.
+  // No reranker: fall back to the T4 evidence contract. An OR-relaxed
+  // lexical top matched some query terms, not the query (gbrain-evals A4-2:
+  // 120 of 120 unanswerable questions had one at rank 1); it is moderate
+  // only when the top rows corroborate it (#5919).
+  if (top.keyword_relaxed === true) {
+    return opts.query !== undefined && relaxedTopCorroborated(results, opts.query)
+      ? { level: 'moderate', reason: 'keyword_relaxed_corroborated', top_evidence: top.evidence }
+      : { level: 'weak', reason: 'keyword_relaxed_top', top_evidence: top.evidence };
+  }
   if (top.evidence === 'keyword_exact') {
     return { level: 'moderate', reason: 'keyword_exact_top', top_evidence: top.evidence };
   }

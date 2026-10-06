@@ -133,3 +133,24 @@ describe("recall's page-search arm honors the federated set (#3242 parity)", () 
     expect(slugs).toEqual(['notes/home']);
   });
 });
+
+describe("recall's fact arms honor the federated set too", () => {
+  const factTexts = (res: any): string[] => (res?.facts ?? []).map((f: any) => f.fact);
+  beforeAll(async () => {
+    for (const [fact, source_id] of [['zebra fact in default', 'default'], ['zebra fact in wiki', 'wiki'], ['zebra fact in privsrc', 'privsrc']]) {
+      await engine.insertFact({ fact, kind: 'fact', entity_slug: `zebra-${source_id}`, source: 'test', visibility: 'world' }, { source_id });
+    }
+  });
+
+  test('a no-grant remote caller recalls facts from a federated peer source, never a non-federated one', async () => {
+    const facts = factTexts(await recall().handler(remoteNoGrant(), { since: '1 day ago' }));
+    expect(facts).toContain('zebra fact in default');
+    expect(facts).toContain('zebra fact in wiki');
+    expect(facts).not.toContain('zebra fact in privsrc');
+  });
+
+  test('without a transport-computed set the fact arms stay on the scalar source', async () => {
+    const facts = factTexts(await recall().handler(ctxOf({ remote: true, sourceId: 'default' }), { since: '1 day ago' }));
+    expect(facts).toEqual(['zebra fact in default']);
+  });
+});

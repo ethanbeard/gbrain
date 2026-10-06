@@ -119,6 +119,11 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
    */
   publications: string
   onclose: (connId: number) => void;
+  /**
+   * Called when a pooled or released connection is terminated instead of
+   * reused because its ReadyForQuery status was not idle ('T' or 'E').
+   */
+  onpoisoned: (status: string) => void;
   backoff: boolean | ((attemptNum: number) => number);
   max_lifetime: number | null;
   keep_alive: number | null;

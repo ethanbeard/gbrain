@@ -37,3 +37,16 @@ advances to 7 to trigger the existing re-chunk gate when Git HEAD is unchanged.
 That gate does not force a full walk when new commits are present; use
 `gbrain sync --source <id> --full` to recover all previously affected files in
 an active repository rather than relying on an incremental sync.
+
+## Dart (#3356)
+
+`grammars/tree-sitter-dart.wasm` is the one grammar not taken from the
+`tree-sitter-wasms` npm bundle: that package's Dart build is ABI 15, which the
+pinned `web-tree-sitter@0.22.6` runtime rejects. `scripts/build-dart-wasm.sh`
+regenerates the same upstream grammar at ABI 14 (needs git, npm and podman or
+docker):
+
+```sh
+bash scripts/build-dart-wasm.sh
+bun run check:wasm
+```

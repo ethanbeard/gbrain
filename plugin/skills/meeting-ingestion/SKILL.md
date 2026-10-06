@@ -41,6 +41,7 @@ upstream:
   - meeting-ingestion@fc834ee
   - meeting-gold-standard@fc834ee
   - chronology-guard@fc834ee
+when_to_use: "Use when the user asks: \"meeting transcript\", \"process this meeting\", \"meeting notes\", \"meeting recorder\", \"ingest this recording\"."
 ---
 
 # Meeting Ingestion Skill — Unified Pipeline
@@ -119,8 +120,10 @@ source_url: "..."              # link back to the source platform, if any
   from it into the brain.
 
 Retain the raw transcript when the source provides one: file it as a sidecar
-page (e.g. `meetings/YYYY-MM-DD-{slug}-transcript`) or keep the source file
-reachable, and link it from the meeting page. The transcript is the canonical
+page with `type: source` at `sources/meetings/YYYY-MM-DD-{slug}-transcript`
+(the default pack files raw evidence as `source` under `sources/`; never
+invent `meeting-transcript`, and don't write the `transcript` alias) or keep
+the source file reachable, and link it from the meeting page. The transcript is the canonical
 evidence for every quote and claim check downstream.
 
 **Redact before you retain.** A raw transcript routinely captures pasted
@@ -273,6 +276,14 @@ carries an explicit reason; a bare `- None.` is a dodge, not an answer.
 Quotes are VERBATIM. Write what was said the way it was said — a paraphrase in
 a blockquote is a fabricated quote.
 
+Timeline events (`life/events/`) are extracted from the saved meeting page in
+the background (Life Chronicle, on by default; one paid chat call per page).
+Check the write receipt: `chronicle_backstop.pending: "next_cycle"` means the
+next cycle extracts it (`gbrain dream --phase chronicle` runs it now, paid), and
+`chronicle_backstop.skipped` names the reason and its fix. Never hand-write
+`life/events/` pages; edit the meeting page and extraction updates its events.
+See `docs/guides/life-chronicle.md`.
+
 ### Phase 6: Claim verification + consistency check (gate for every entity write)
 
 Recorder summaries inject false facts: speech-to-text garbles proper nouns,
@@ -415,7 +426,7 @@ Phase 4. An unflagged anonymous label means speaker resolution was skipped.
   quote still shares a long contiguous run of content words, a fabricated one
   does not.
   ```bash
-  gbrain get meetings/{date}-{slug}-transcript   # then locate each quote span
+  gbrain get sources/meetings/{date}-{slug}-transcript   # then locate each quote span
   ```
 - **Prompt checklist (no transcript retained):** re-read the source notes and
   attest that each quote traces to them word-for-word.
@@ -496,6 +507,14 @@ Phase 6, list each flag — the user resolves them, not silence. If any
 checklist item cannot be made to pass, report the meeting as NOT ingested and
 name the failing item.
 
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A contradiction with an existing page blocks ingestion until the user fixes or waives it: show both sources and wait.
+- `add_link` / auto-link reports an error after the meeting page was written: the page is saved but the links are not; list the failed links and add them after fixing slugs.
+- `put_page` returns `revision_conflict` on an attendee page: re-read and merge; never overwrite a person page from an old read.
+
 ## Anti-Patterns
 
 - Creating the meeting page without enriching attendees
@@ -528,3 +547,14 @@ name the failing item.
   transit between them
 - Re-checking substance in the sequence pass (or order in V1–V5) — the axes
   are orthogonal by design
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
+
+- `add_link` → `gbrain link`
+- `chronicle_day` → `gbrain day`
+- `get_timeline` → `gbrain timeline`
+
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

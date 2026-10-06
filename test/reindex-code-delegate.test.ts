@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { parseReindexCodeDelegateArgs } from '../src/commands/reindex-code-delegate.ts';
+import { caught, envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 describe('resident code reindex arguments', () => {
   test('keyless source-scoped recovery stays explicit', () => {
@@ -15,6 +16,7 @@ describe('resident code reindex arguments', () => {
     } catch (error) {
       expect(error).toMatchObject({ code: 'invalid_params' });
       expect((error as Error).message).not.toContain('synthetic-credential-value');
+      expect(JSON.stringify(envelopeFor(error))).not.toContain('synthetic-credential-value');
     }
   });
 
@@ -23,4 +25,11 @@ describe('resident code reindex arguments', () => {
       expect(() => parseReindexCodeDelegateArgs(args)).toThrow();
     });
   }
+
+  test('refusals name the flag usage and offer the reindex-code help', async () => {
+    expectFunnelSuggestions('src/commands/reindex-code-delegate.ts', 'invalid', 4);
+    const env = envelopeFor(await caught(() => parseReindexCodeDelegateArgs(['--workers', '65'])));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'reindex-code', '--help'], next: 'run' } });
+    expect(env.suggestion).toContain('--workers 4');
+  });
 });

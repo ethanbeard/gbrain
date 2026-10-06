@@ -53,13 +53,14 @@ describeDb(`engine-sql prepare parity on ${backend}`, () => {
     else expect(count).toBe(1);
   });
 
-  test("master's executeRaw path keeps its unprepared behavior", async () => {
+  test('executeRaw prepares parameterized statements like converted ones, and never through PgBouncer (#5984)', async () => {
     const marker = `engine_sql_raw_${Date.now()}`;
     const count = await engine.transaction(async (tx) => {
       for (let i = 0; i < 2; i++) await tx.executeRaw(`SELECT $1::int AS v /* ${marker} */`, [i]);
       return preparedMatching(engineSql(tx), marker);
     });
-    expect(count).toBe(0);
+    if (backend === 'pgbouncer') expect(count).toBe(0);
+    else expect(count).toBe(1);
   });
 
   test('a zero-parameter multi-statement string is rejected (extended protocol)', async () => {

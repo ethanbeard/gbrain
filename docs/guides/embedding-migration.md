@@ -118,7 +118,8 @@ even if a custom base URL still serves its old model.
    in one transaction. It rebuilds **all three dim-pinned text-embedding-space
    columns** — `content_chunks.embedding`, `query_cache.embedding`, and
    `facts.embedding` — at the new width, preserving each column's type
-   (`vector` vs `halfvec`) and recreating its HNSW index. Missing any of the
+   (`vector` vs `halfvec`). Their HNSW indexes are not recreated here (see
+   step 7). Missing any of the
    three leaves it silently broken: a narrow `query_cache.embedding` makes
    every cache write and read fail *by design* (the cache swallows errors so
    it can never break search) for a permanent 0% hit rate, and a narrow
@@ -137,6 +138,21 @@ even if a custom base URL still serves its old model.
    path as `embed --facts --stale`, including same-width model swaps and
    facts-only brains. Expired, withdrawn, superseded and audit rows are not
    work. Unknown legacy fact provenance is never inferred from new config.
+   Active takes on live pages are re-embedded in the same drain (their
+   vectors record the model and claim text, and `takes.embedding` is resized
+   with the other text columns on a width change); the plan, `--status`
+   (`takes pending`) and the completion check all count them.
+7. **Build the vector index.** The transition in step 5 restores the btree
+   and partial indexes on `content_chunks.embedding` right away (the re-embed
+   needs them) and records every HNSW index it dropped on the rebuilt text
+   columns, including custom ones, as `deferred_ann_indexes` in the migration marker. After the re-embed drains,
+   the run prints `building vector index after re-embed (search runs unindexed
+   until done)` with progress and builds them one at a time: Postgres uses
+   `CREATE INDEX CONCURRENTLY` (writes continue), PGLite a plain build. Loading
+   vectors before building the graph is several times faster than inserting
+   each vector into a live HNSW index. A `vector` column above 2,000 dimensions
+   (`halfvec` above 4,000) gets no HNSW index (pgvector's cap; exact scans stay correct). The marker
+   clears only after every recorded index exists and is valid.
 
 ## Recovery
 
@@ -149,8 +165,8 @@ re-embedding is started automatically on upgrade. Existing page vectors with a
 matching model and a legacy NULL text hash remain searchable, including after a
 failed migration attempt; this does not relabel vectors from another model.
 
-Stop older GBrain mutation workers before repair; this release does not prove
-mixed-version mutation compatibility. Preserve their durable queued work.
+Stop older GBrain mutation workers before repair; mixed-version mutation is
+not supported. Preserve their durable queued work.
 Select the intended brain using the ordinary global `--brain` option. This
 migration is brain-wide: both `gbrain migrate embeddings` and `gbrain retrieval-upgrade`
 reject `--source` and `--slugs`, including `--flag=value`
@@ -171,13 +187,13 @@ cost cap finite and nonnegative. Values are never truncated or clamped. Pacing
 accepts bare `--pace` (balanced), `--pace=off|gentle|balanced|aggressive`, and
 `--pace-max-concurrency N` or `--pace-max-concurrency=N` with a positive safe
 integer. Empty or unknown pace modes refuse rather than falling back to off.
-Pacing's existing configuration/environment precedence is unchanged.
+Pacing keeps its usual configuration/environment precedence.
 
-Unsuccessful CLI JSON and local `migrate_embeddings` operation envelopes retain
-their existing status and reason fields and add a `recovery` object with the status
+Unsuccessful CLI JSON and local `migrate_embeddings` operation envelopes carry
+their status and reason fields plus a `recovery` object with the status
 command, this guide, and partial-state and authorization cautions. Human stderr
-prints the same guidance after the case-specific advice. The operation remains
-local-only and admin-scoped; its `failed` discriminator is unchanged. Reuse the same
+prints the same guidance after the case-specific advice. The operation is
+local-only and admin-scoped, and reports failure with its `failed` discriminator. Reuse the same
 brain selection when inspecting status; do not blindly retry or reset the migration marker.
 
 | Failure | Action before retrying | Partial state to inspect |
@@ -270,8 +286,8 @@ do that without a separately reviewed reconciliation of all later intent.
 
 After status reports completion, keep the same brain and source selection and
 check content you already know exists. Authorize any provider calls separately;
-a search on an embedded brain can contact its configured provider. In the
-network-isolated keyless fixture used for this release, these exact commands ran
+a search on an embedded brain can contact its configured provider. In a
+network-isolated keyless fixture, these exact commands ran
 against an existing synthetic page:
 
 ```bash
@@ -308,7 +324,9 @@ pages fail to embed), re-run the **same command**: chunks already embedded on
 the target are never re-embedded, the schema/config steps no-op, and the run
 continues where it stopped. An in-flight marker (`embedding_migration.state`
 in DB config) records the target; it is cleared only when the backlog drains
-to zero. Re-running with a DIFFERENT `--to` target while a migration is in
+to zero and the vector indexes are built. A kill during the index build
+resumes with the indexes not yet built; on Postgres an INVALID index left by an
+interrupted concurrent build is dropped and rebuilt. Re-running with a DIFFERENT `--to` target while a migration is in
 flight refuses and names both options: the exact resume command for the
 original target, or the same command with `--retarget` to abandon it
 deliberately (the marker records the superseded target in its history).
@@ -409,5 +427,5 @@ Local providers such as Ollama, llama-server and LM Studio can be explicit
 migration targets. Select the model actually served and its output width;
 changing a provider ID changes the embedding signature and is not proof that
 old vectors are compatible. Do not rewrite stored signatures to bypass the
-re-embed. Removed provider IDs and their former base-URL compatibility paths
-are no longer supported; use a supported recipe and an approved migration.
+re-embed. Retired provider IDs and their base-URL compatibility paths are not
+supported; use a supported recipe and an approved migration.

@@ -83,7 +83,7 @@ describe('import --source-id (#1167)', () => {
 
   // The --json payload reports counts; without a destination field a caller
   // (gstack's memory-ingest is the one in tree — see
-  // test/import-json-stdout.serial.test.ts) cannot tell a routed import from
+  // test/import-json-stdout.test.ts) cannot tell a routed import from
   // one that fell through the resolver to `default`. Both directions are
   // pinned so the field can't be "fixed" by hardcoding either answer.
   async function importPayload(args: string[]): Promise<Record<string, unknown>> {

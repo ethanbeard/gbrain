@@ -19,29 +19,22 @@ import {
 
 const get_recent_salience: Operation = {
   name: 'get_recent_salience',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
   description: GET_RECENT_SALIENCE_DESCRIPTION,
   scope: 'read',
   params: {
-    days: { type: 'number', description: 'Window in days. Default 14.' },
-    limit: { type: 'number', description: 'Max results (default 20, capped at 100).' },
+    days: { type: 'number', description: 'Window in days (default 14).' },
+    limit: { type: 'number', description: 'Max results (default 20).' },
     slugPrefix: {
       type: 'string',
-      description: "Optional slug-prefix filter, e.g. 'personal' or 'wiki/people'.",
+      description: "Slug prefix, e.g. 'wiki/people'.",
     },
     recency_bias: {
       type: 'string',
       enum: ['flat', 'on'],
-      description:
-        "v0.29.1: how to weight recency in the salience score.\n" +
-        "  'flat' (DEFAULT) — v0.29.0 behavior. Every page gets 1/(1+days_old).\n" +
-        "                     Stable, predictable; what most callers want.\n" +
-        "  'on'             — Per-prefix decay map. concepts/originals/writing/\n" +
-        "                     become evergreen (recency component = 0); daily/,\n" +
-        "                     media/x/, chat/ decay aggressively. Use when the\n" +
-        "                     user explicitly biases for recency-aware salience\n" +
-        "                     ('what's been salient lately' vs 'what matters\n" +
-        "                     in this brain regardless of when').",
+      description: 'flat (default) or on (per-prefix decay).',
     },
   },
   handler: async (ctx, p) => {
@@ -68,21 +61,23 @@ const get_recent_salience: Operation = {
 
 const find_anomalies: Operation = {
   name: 'find_anomalies',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
   description: FIND_ANOMALIES_DESCRIPTION,
   scope: 'read',
   params: {
     since: {
       type: 'string',
-      description: 'ISO date YYYY-MM-DD. Default = today (UTC).',
+      description: 'YYYY-MM-DD (default today).',
     },
     lookback_days: {
       type: 'number',
-      description: 'Days of history for the baseline. Default 30.',
+      description: 'Baseline days (default 30).',
     },
     sigma: {
       type: 'number',
-      description: 'Sigma threshold. Default 3.0.',
+      description: 'Threshold (default 3).',
     },
   },
   handler: async (ctx, p) => {

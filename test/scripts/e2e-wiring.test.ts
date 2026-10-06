@@ -1,34 +1,23 @@
 /**
- * G1 (test-gap wave 1) — CI e2e lane wiring pins.
+ * CI E2E lane wiring pins (.github/workflows/e2e.yml).
  *
- * Structural guards over .github/workflows/e2e.yml + scripts/e2e-test-map.ts:
- *   1. The selected-e2e job exists, consumes scripts/select-e2e.ts in its
- *      default file-selection mode, and NOTHING masks the selector's exit
- *      code (exit 2 = git failure must fail the job — fail-loud).
- *   2. The e2e-status aggregate carries the job in `needs` and requires
- *      success — a red selected lane cannot report E2E green.
- *   3. The job passes NO live provider keys, so it is fork-runnable by
- *      construction (service Postgres only) and can never spend tokens.
- *   4. The job's checkout fetches real history (select-e2e diffs
- *      origin/master...HEAD).
- *   5. Every workflow-side EXCLUDE entry is honest: either a file a named
- *      job in this same workflow already runs, or a live-key token spender.
- *   6. Unmapped-file ratchet: every test/e2e/*.test.ts is mapped in
- *      E2E_TEST_MAP, named in the workflow, or grandfathered in
- *      test/fixtures/e2e-unmapped-baseline.txt (shrink-only). A NEW e2e
- *      file must be mapped (preferred) or consciously baselined. The
- *      baseline itself is enforced both ways: a row naming a deleted file
- *      is stale (remove the line), a row that E2E_TEST_MAP or the workflow
- *      already claims is redundant (remove the line), and total length may
- *      never grow past the seeded literal.
+ *   1. prepare-e2e feeds scripts/select-e2e.ts the pull request's changed
+ *      files from the GitHub API (shallow checkout, no git history) and fails
+ *      closed to the whole corpus when the list is incomplete; nothing masks
+ *      the selector's exit code.
+ *   2. The e2e-status aggregate requires the selected lane, which never
+ *      receives live provider keys (fork-runnable, never spends tokens).
+ *   3. Every test/e2e/*.test.ts runs in Selected E2E or is in E2E_EXCLUSIONS
+ *      with a named owning job: a job in this workflow that names the file,
+ *      the tier1-backend-matrix job (scripts/e2e-backend-matrix.txt),
+ *      persistence-validation.yml, or the live-key lanes.
  */
 import { describe, test, expect } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { E2E_EXCLUSIONS, PERSISTENCE_VALIDATION_OWNED, prepareMatrix } from '../../scripts/e2e-matrix.ts';
-import { E2E_TEST_MAP } from '../../scripts/e2e-test-map.ts';
+import { BACKEND_MATRIX_OWNED, E2E_EXCLUSIONS, PERSISTENCE_VALIDATION_OWNED, prepareMatrix } from '../../scripts/e2e-matrix.ts';
 
 const repoRoot = join(import.meta.dir, '..', '..');
 const yml = readFileSync(join(repoRoot, '.github/workflows/e2e.yml'), 'utf8');
@@ -49,17 +38,28 @@ const LIVE_KEY_FILES = new Set([
   'test/e2e/voyage-multimodal.test.ts',
 ]);
 
+/** The job that runs an excluded file instead of Selected E2E, or null when nothing owns it. */
+function owner(file: string, exclusions: Set<string>): string | null {
+  if (!exclusions.has(file)) return 'selected-e2e';
+  if (PERSISTENCE_VALIDATION_OWNED.has(file) && persistenceYml.includes(file)) return 'persistence-validation.yml';
+  if (BACKEND_MATRIX_OWNED.has(file) && jobBlock('tier1-backend-matrix').includes('scripts/e2e-backend-matrix.txt')) return 'tier1-backend-matrix';
+  if (LIVE_KEY_FILES.has(file)) return 'live-key lane';
+  const named = yml.replace(jobBlock('selected-e2e'), '');
+  return named.includes(file) ? 'named job in e2e.yml' : null;
+}
+
 describe('selected-e2e job wiring', () => {
   const job = jobBlock('selected-e2e');
   const prep = jobBlock('prepare-e2e');
 
   test('consumes select-e2e with nothing masking its exit code', () => {
-    expect(prep).toContain('bun scripts/select-e2e.ts');
+    expect(prep).toContain('bun scripts/select-e2e.ts --changed-files');
     expect(job).not.toContain('bun scripts/select-e2e.ts');
     expect(job).toContain('bun scripts/e2e-matrix.ts run');
-    const selectorLine = prep.split('\n').find(l => l.includes('bun scripts/select-e2e.ts'))!;
-    expect(selectorLine).not.toContain('|| true');
-    expect(selectorLine).not.toContain('|| echo');
+    for (const line of prep.split('\n').filter(l => l.includes('bun scripts/select-e2e.ts'))) {
+      expect(line).not.toContain('|| true');
+      expect(line).not.toContain('|| echo');
+    }
     expect(job).not.toContain('continue-on-error');
   });
 
@@ -77,8 +77,11 @@ describe('selected-e2e job wiring', () => {
     }
   });
 
-  test('checkout fetches real history for the master diff', () => {
-    expect(prep).toContain('fetch-depth: 0');
+  test('prepare-e2e classifies from the pull request files API on a shallow checkout', () => {
+    expect(prep).not.toContain('fetch-depth');
+    expect(prep).not.toContain('git fetch');
+    expect(prep).toContain('bash scripts/ci-changed-files.sh');
+    expect(prep).toContain('pull-requests: read');
   });
 
   test('selector emits separate lines so workflow exclusions retain other selected files', () => {
@@ -103,82 +106,88 @@ describe('selected-e2e job wiring', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
 
-  test('every EXCLUDE entry is named by another job here, by persistence-validation.yml, or is a live-key spender', () => {
-    const excluded = [...E2E_EXCLUSIONS];
-    expect(excluded.length).toBeGreaterThan(0);
-    const restOfWorkflow = yml.replace(job, '');
-    for (const f of excluded) {
-      const honest = LIVE_KEY_FILES.has(f) || restOfWorkflow.includes(f) || (PERSISTENCE_VALIDATION_OWNED.has(f) && persistenceYml.includes(f));
-      if (!honest) throw new Error(`EXCLUDE entry not carried by any named job and not a live-key file: ${f}`);
+describe('prepare-e2e changed-file classification', () => {
+  const step = jobBlock('prepare-e2e');
+  const script = (() => {
+    const lines = step.split('\n');
+    const start = lines.findIndex(l => l.trim() === 'run: |');
+    const body: string[] = [];
+    for (const line of lines.slice(start + 1)) {
+      if (line.trim() && !line.startsWith('          ')) break;
+      body.push(line.slice(10));
     }
+    return body.join('\n');
+  })();
+  const all = readdirSync(join(repoRoot, 'test/e2e')).filter(f => f.endsWith('.test.ts')).map(f => `test/e2e/${f}`).sort();
+
+  function select(env: Record<string, string>, ghFiles: string, ghExit = 0): string[] {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-prepare-e2e-'));
+    try {
+      const bin = join(dir, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(dir, 'gh-files'), ghFiles);
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\ncat "${join(dir, 'gh-files')}"\nexit ${ghExit}\n`, { mode: 0o755 });
+      const result = spawnSync('bash', ['-eo', 'pipefail', '-c', script], {
+        cwd: repoRoot, encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: dir, GITHUB_OUTPUT: join(dir, 'out'), FULL_CORPUS: 'false', REPO: 'o/r', PR: '1', ...env },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      return readFileSync(join(dir, 'selected.txt'), 'utf8').split('\n').filter(Boolean);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('a complete doc-only pull request list selects nothing', () => {
+    expect(select({ EVENT: 'pull_request', CHANGED_FILES: '2' }, 'docs/a.md\nREADME.md\n')).toEqual([]);
+  });
+
+  test('a code change selects the whole corpus', () => {
+    expect(select({ EVENT: 'pull_request', CHANGED_FILES: '2' }, 'docs/a.md\nsrc/cli.ts\n')).toEqual(all);
+  });
+
+  test.each([
+    ['a truncated pull request list', { EVENT: 'pull_request', CHANGED_FILES: '3' }, 'docs/a.md\n', 0],
+    ['a capped pull request (3000 files)', { EVENT: 'pull_request', CHANGED_FILES: '3000' }, 'docs/a.md\n', 0],
+    ['an unknown changed-file count', { EVENT: 'pull_request', CHANGED_FILES: '' }, 'docs/a.md\n', 0],
+    ['an API error', { EVENT: 'pull_request', CHANGED_FILES: '1' }, 'docs/a.md\n', 1],
+    ['a capped merge-group compare', { EVENT: 'merge_group', BASE_SHA: 'a', HEAD_SHA: 'b' }, '', 1],
+    ['a push (no pull request context)', { EVENT: 'push' }, 'docs/a.md\n', 0],
+  ] as const)('%s fails closed to the whole corpus', (_label, env, files, exit) => {
+    expect(select(env, files, exit)).toEqual(all);
+  });
+
+  test('a complete doc-only merge-group compare selects nothing', () => {
+    expect(select({ EVENT: 'merge_group', BASE_SHA: 'a', HEAD_SHA: 'b' }, 'docs/a.md\n')).toEqual([]);
   });
 });
 
-/**
- * The CURRENT number of baseline entries. NEVER raise this number; when the
- * baseline shrinks (a file gets mapped or deleted), lower this constant IN
- * THE SAME COMMIT (the module-size ratchet's no-stale-slack convention).
- */
-const BASELINE_SEEDED_LENGTH = 126;
+describe('e2e file ownership', () => {
+  const files = readdirSync(join(repoRoot, 'test/e2e')).filter(f => f.endsWith('.test.ts')).map(f => `test/e2e/${f}`);
 
-describe('e2e file claim ratchet', () => {
-  const mapped = new Set(Object.values(E2E_TEST_MAP).flat());
-  const baselineEntries = readFileSync(join(repoRoot, 'test/fixtures/e2e-unmapped-baseline.txt'), 'utf8')
-    .split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-  const baseline = new Set(baselineEntries);
-
-  test('every e2e file is mapped, workflow-named, or grandfathered (shrink-only baseline)', () => {
-    const files = readdirSync(join(repoRoot, 'test/e2e'))
-      .filter(f => f.endsWith('.test.ts'))
-      .map(f => `test/e2e/${f}`);
+  test('every e2e file runs in Selected E2E or names the job that owns it', () => {
     expect(files.length).toBeGreaterThan(150);
-    const orphans = files.filter(f => !mapped.has(f) && !yml.includes(f) && !E2E_EXCLUSIONS.has(f) && !baseline.has(f));
-    if (orphans.length > 0) {
-      throw new Error(
-        `new e2e file(s) with no PR-time claim — map them in scripts/e2e-test-map.ts ` +
-        `(preferred) or consciously add to test/fixtures/e2e-unmapped-baseline.txt:\n` +
-        orphans.join('\n'),
-      );
-    }
-    // Map entries must point at real files (typo guard — a registry-walking
-    // matrix seeded with wrong names silently matches nothing).
-    const real = new Set(files);
-    const dangling = [...mapped].filter(f => !real.has(f));
-    expect(dangling).toEqual([]);
+    const unowned = files.filter(f => owner(f, E2E_EXCLUSIONS) === null);
+    if (unowned.length) throw new Error(`excluded from Selected E2E with no owning job (add the file to a named job, or drop it from E2E_EXCLUSIONS):\n${unowned.join('\n')}`);
   });
 
-  test('no stale baseline entries: every row names an existing e2e file', () => {
-    const stale = baselineEntries.filter(f => !existsSync(join(repoRoot, f)));
-    if (stale.length > 0) {
-      throw new Error(
-        `baseline row(s) name deleted e2e file(s) — remove the line from ` +
-        `test/fixtures/e2e-unmapped-baseline.txt (the ratchet only shrinks):\n` +
-        stale.join('\n'),
-      );
-    }
+  test('every exclusion names an existing file', () => {
+    expect([...E2E_EXCLUSIONS].filter(f => !files.includes(f))).toEqual([]);
   });
 
-  test('no redundant baseline entries: a mapped or workflow-named file must leave the baseline', () => {
-    const redundant = baselineEntries.filter(f => mapped.has(f) || yml.includes(f) || E2E_EXCLUSIONS.has(f));
-    if (redundant.length > 0) {
-      throw new Error(
-        `baseline row(s) already claimed by E2E_TEST_MAP or the workflow — ` +
-        `remove the line from test/fixtures/e2e-unmapped-baseline.txt ` +
-        `(mapped ⇒ off the baseline):\n` +
-        redundant.join('\n'),
-      );
-    }
+  test('a file excluded without an owning job fails the ownership check', () => {
+    const fixture = 'test/e2e/fixture-unowned.test.ts';
+    expect(owner(fixture, new Set([...E2E_EXCLUSIONS, fixture]))).toBeNull();
+    expect(owner(fixture, E2E_EXCLUSIONS)).toBe('selected-e2e');
   });
 
-  test('baseline is shrink-only (seeded length ratchet)', () => {
-    expect(baselineEntries.length).toBeLessThanOrEqual(BASELINE_SEEDED_LENGTH);
-  });
-
-  test('select-e2e fail-closed behavior has its own behavioral suite', () => {
-    // Cross-reference, not duplication: the ALL-on-uncertainty + exit-2
-    // semantics are behaviorally pinned in test/select-e2e.test.ts.
-    const behavioral = readFileSync(join(repoRoot, 'test/select-e2e.test.ts'), 'utf8');
-    expect(behavioral).toContain('select-e2e');
+  test('backend-matrix files are owned by the tier1-backend-matrix job, which e2e-status requires', () => {
+    for (const file of BACKEND_MATRIX_OWNED) expect(owner(file, E2E_EXCLUSIONS), file).not.toBeNull();
+    const matrix = jobBlock('tier1-backend-matrix');
+    expect(matrix).toContain('GBRAIN_CI_REQUIRE_PGBOUNCER');
+    expect(matrix).toContain('pgbouncer:');
+    expect(jobBlock('e2e-status')).toContain('needs.tier1-backend-matrix.result');
   });
 });

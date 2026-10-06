@@ -35,6 +35,7 @@ upstream: company-brainify@fc834ee
 # skill edits IN PLACE — it does not create new pages there, except the
 # deletion-log entry under daily/ required by data-loss-gate Step 4.
 brain_first: true
+when_to_use: "Use when the user asks: \"company brain\", \"team brain\", \"brainify\", \"sanitize the brain\", \"share my brain with the team\"."
 ---
 
 # company-brainify — Personal → Team-Brain Sanitization
@@ -674,6 +675,14 @@ Three artifacts:
 3. **The deletion log entry** (post-purge only) — appended to the PERSONAL
    brain's `daily/notes/YYYY-MM-DD.md` (never the shared repo) per
    data-loss-gate Step 4.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A bulk redaction or delete needs the data-loss-gate card; if the CLI exits 3 or asks for confirmation, stop and show the user the recoverability card first.
+- The retrieval-first scope scan is empty with a degraded notice: keyword-only search under-counts sensitive pages. Keep the structural pass and tell the user the scan was keyword-only.
+- `forget` / `put_page` returns `write_pending` (exit 10): poll `gbrain write-request <request_id>`; do not report a page sanitized until its receipt commits.
 
 ## Anti-Patterns
 

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -30,9 +30,39 @@ const invalidControls = [
   ['--dim', '8', '--dim', '16'], ['--', '--facts'],
 ];
 
+const routes = [['migrate', 'embeddings'], ['retrieval-upgrade']];
+const invalidInvocation = (route: string[], narrowing: string[]) => {
+  const flag = narrowing[0].split('=')[0];
+  const controls = [['--to', 'openai:text-embedding-3-large'], ['--dim', '8'], ['--yes'], ['--max-cost-usd', '1']]
+    .filter(([name]) => name !== flag).flat();
+  return { flag, argv: [...route, ...controls, '--json', ...narrowing] };
+};
+const cliRejection = (argv: string[]) => {
+  const { rest } = parseGlobalFlags(argv);
+  return migrationCliArgumentError(rest[0], rest.slice(1), argv);
+};
+const rejectionClasses = (route: string[]) => {
+  const classes = new Map<string, string[]>();
+  for (const narrowing of invalidControls) {
+    const { argv } = invalidInvocation(route, narrowing);
+    const error = cliRejection(argv)!;
+    const key = `${error.message.split(error.flag).join('<flag>')} ${parseGlobalFlags(argv).rest.length}`;
+    if (!classes.has(key)) classes.set(key, narrowing);
+  }
+  return [...classes.values()];
+};
+
 test.each(invalidControls.map(args => [args.join(' '), args] as const))('direct migration parser rejects %s', (_label, args) => {
   expect(() => parseMigrateEmbeddingsFlags([...args])).toThrow();
 });
+
+test.each(routes.flatMap(route => invalidControls.map(narrowing => [`${route.join(' ')} ${narrowing.join(' ')}`, route, narrowing] as const)))(
+  'the CLI entry rejects gbrain %s from its argv before dispatch', (_label, route, narrowing) => {
+    const { flag, argv } = invalidInvocation(route, narrowing);
+    const error = cliRejection(argv);
+    expect(error?.flag).toBe(flag);
+    if (['--source', '--slugs'].includes(flag)) expect(error?.message).toContain(`unknown flag ${flag}`);
+  });
 
 test('the shared migration contract preserves supported pacing, globals and exact numeric values', () => {
   expect(parseMigrateEmbeddingsFlags(['--to', MODEL, '--dim', '8', '--batch-size', '1', '--max-cost-usd', '0.25',
@@ -183,29 +213,43 @@ test('both actual migration CLI routes reject unsupported or malformed controls 
       }
       const snapshot = async () => Promise.all(['pages', 'content_chunks', 'facts', 'config', 'gbrain_cycle_locks'].map(table =>
         engine.executeRaw(`SELECT to_jsonb(t) AS row FROM ${table} t ORDER BY to_jsonb(t)::text`)));
+      const fileState = (dir = data): string[] => readdirSync(dir).sort().flatMap(name => {
+        const path = join(dir, name);
+        const stat = statSync(path, { bigint: true });
+        return [`${path} ${stat.size} ${stat.mtimeNs} ${stat.ctimeNs}`, ...(stat.isDirectory() ? fileState(path) : [])];
+      });
       const before = await snapshot();
       await engine.disconnect();
-      for (const route of [['migrate', 'embeddings'], ['retrieval-upgrade']]) {
-        for (const narrowing of invalidControls) {
-          const flag = narrowing[0].split('=')[0];
-          const controls = [['--to', 'openai:text-embedding-3-large'], ['--dim', '8'], ['--yes'], ['--max-cost-usd', '1']]
-            .filter(([name]) => name !== flag).flat();
-          const child = Bun.spawn([process.execPath, '--preload', preload, cliPath, ...route,
-            ...controls, '--json', ...narrowing], {
+      for (const route of routes) {
+        for (const narrowing of rejectionClasses(route)) {
+          const { flag, argv } = invalidInvocation(route, narrowing);
+          const untouched = fileState();
+          const child = Bun.spawn([process.execPath, '--preload', preload, cliPath, ...argv], {
             cwd: home, env, stdout: 'pipe', stderr: 'pipe',
           });
           const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-          expect(code).toBe(1);
-          expect(JSON.parse(stdout)).toMatchObject({ status: 'error', reason: 'invalid_flag' });
+          expect(code).toBe(2); // usage error (agent contract v1 A3); legacy keys kept, v1 envelope added
+          expect(JSON.parse(stdout)).toMatchObject({ status: 'error', reason: 'invalid_flag', code: 'unknown_flag' });
           if (['--source', '--slugs'].includes(flag)) expect(stderr).toContain(`unknown flag ${flag}`);
           else expect(stderr).toContain(flag);
           expect(stderr).not.toContain('PGLite');
           expect(existsSync(calls)).toBe(false);
           expect(readFileSync(join(data, 'config.json'), 'utf8')).toBe(config);
-          await engine.connect(database as never);
-          expect(await snapshot()).toEqual(before);
-          await engine.disconnect();
+          expect(fileState()).toEqual(untouched);
         }
+        await engine.connect(database as never);
+        expect(await snapshot()).toEqual(before);
+        for (const narrowing of [['--facts'], ['--dim', '0']]) {
+          const child = Bun.spawn([process.execPath, '--preload', preload, cliPath, ...invalidInvocation(route, narrowing).argv], {
+            cwd: home, env, stdout: 'pipe', stderr: 'pipe',
+          });
+          const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+          expect({ code, envelope: JSON.parse(stdout).code }).toEqual({ code: 2, envelope: 'unknown_flag' });
+          expect(stderr).toContain(narrowing[0]);
+          expect(stderr).not.toContain('PGLite');
+        }
+        expect(await snapshot()).toEqual(before);
+        await engine.disconnect();
         for (const supported of [
           ['--dry-run', '--pace=gentle', '--pace-max-concurrency=2', '--quiet', '--progress-json', '--progress-interval=0', '--brain=host'],
           ['--dry-run', '--pace', '--pace-max-concurrency', '3', '--quiet'], ['--status'], ['--help'],

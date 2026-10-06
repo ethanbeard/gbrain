@@ -41,6 +41,7 @@ import { drainProjections } from '../src/commands/projections.ts';
 import { projectionBacklog } from '../src/core/page-state/projections.ts';
 import { checkProjectionReadiness } from '../src/commands/doctor/checks/projection-readiness.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -48,6 +49,7 @@ import { runExtractConversationFactsCore } from '../src/commands/extract-convers
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import { postUpgradeRecoveryBanner } from '../src/commands/doctor/upgrade-banner.ts';
 import { runRemediate, runRemediationPlan } from '../src/commands/doctor/remediate.ts';
+import { approvedRemediateArgs } from './helpers/remediate-approval.ts';
 import { AUTO_REPAIR_REGISTRY } from '../src/core/repair/registry.ts';
 import { HOOK_EVENTS, runHook } from '../src/commands/hook.ts';
 import { CORPUS_INGESTED_SUFFIX, runMaintenanceSweep } from '../src/core/sweep.ts';
@@ -101,7 +103,7 @@ async function prefixExpire(engine: BrainEngine, ctx: OperationContext, slug: st
     await tx.executeRaw('UPDATE persistence_requests SET completed_at=now(), consumer_version=NULL WHERE request_id=$1::uuid', [receipt.request_id]);
     await tx.executeRaw(`UPDATE facts SET expired_at=now(), row_num=NULL WHERE source_id='default' AND source_markdown_slug=$1
       AND source LIKE 'cli:extract-conversation-facts%' AND expired_at IS NULL`, [slug]);
-  }));
+  }, TEST_WRITE_ATTRIBUTION));
 }
 
 for (const backend of testBackends()) {
@@ -129,7 +131,7 @@ for (const backend of testBackends()) {
             SELECT s.incarnation,p.slug,p.knowledge_revision,CASE WHEN p.slug LIKE 'notes/backlog-%' AND right(p.slug,1) IN ('0','2','4','6','8') THEN 'rebuild_failed' ELSE 'protocol_activation' END
             FROM pages p JOIN sources s ON s.id=p.source_id
             WHERE p.source_id='default' AND p.deleted_at IS NULL ON CONFLICT(source_incarnation,slug) DO UPDATE SET revision=EXCLUDED.revision,reason=EXCLUDED.reason`);
-        }));
+        }, TEST_WRITE_ATTRIBUTION));
         const queued = (await projectionBacklog(engine)).pending;
         expect(queued).toBe(152);
         const cooling = (await engine.executeRaw<{ n: number }>("SELECT count(*)::int AS n FROM page_projection_jobs WHERE reason='rebuild_failed'"))[0].n;
@@ -191,7 +193,9 @@ for (const backend of testBackends()) {
         const liveAtoms = async () => (await engine.executeRaw<{ n: number }>("SELECT count(*)::int AS n FROM pages WHERE type='atom' AND deleted_at IS NULL"))[0].n;
         const activeFacts = async () => (await engine.executeRaw<{ n: number }>("SELECT count(*)::int AS n FROM facts WHERE source_markdown_slug='conversations/expired' AND expired_at IS NULL"))[0].n;
         const untouched = async () => { expect(await liveAtoms()).toBe(30); expect(await activeFacts()).toBe(0); };
-        const previews = { 'google-file-modes': 'gbrain repair google-file-modes', 'stale-atoms': 'gbrain repair stale-atoms', 'extractor-facts': 'gbrain repair extractor-facts' };
+        const previews = { 'google-file-modes': 'gbrain repair google-file-modes', 'stale-atoms': 'gbrain repair stale-atoms', 'extractor-facts': 'gbrain repair extractor-facts',
+          'captured-facts': 'gbrain repair captured-facts', 'loop-facts': 'gbrain repair loop-facts', 'orphan-children': 'gbrain repair orphan-children', 'failed-writes': 'gbrain repair failed-writes',
+          frontmatter: 'gbrain repair frontmatter' };
 
         // The post-upgrade banner names both findings with the kind's read-only preview.
         const banner = await postUpgradeRecoveryBanner(engine, 'host');
@@ -218,7 +222,7 @@ for (const backend of testBackends()) {
         expect(planText).not.toMatch(/gbrain repair (stale-atoms|extractor-facts) --apply/);
 
         // gbrain doctor --remediate --include-repairs never runs them; each finding says explicit_kind_required with the preview.
-        const run = JSON.parse((await capture(() => runRemediate(engine, ['--remediate', '--yes', '--include-repairs', '--no-embed', '--max-usd', '0', '--json']))).out) as {
+        const run = JSON.parse((await capture(async () => runRemediate(engine, await approvedRemediateArgs(engine, ['--remediate', '--yes', '--include-repairs', '--no-embed', '--max-usd', '0', '--json'])))).out) as {
           repairs?: Array<{ kind: string }>; findings: Array<{ check_id: string; class: string; repair_kind?: string; command?: string }> };
         expect((run.repairs ?? []).map(r => r.kind).filter(kind => kind in previews)).toEqual([]);
         expect(run.findings.filter(f => f.class === 'explicit_kind_required').map(f => [f.check_id, f.repair_kind, f.command])).toEqual([
@@ -311,7 +315,7 @@ for (const backend of testBackends()) {
           writeFileSync(join(root, 'TODOS.md'), '# Todos\n\n- keep the mirror pullable\n');
           mkdirSync(join(root, 'journal'));
           for (const day of ['2026-09-29', '2026-09-30']) writeFileSync(join(root, 'journal', `${day}.md`), `# ${day}\n\nA journal entry without frontmatter.\n`);
-          git('init', '-q'); commit('upstream');
+          git('init', '-q'); git('config', 'gc.auto', '0'); git('config', 'maintenance.auto', 'false'); commit('upstream');
           const tracked = () => git('status', '--porcelain', '--untracked-files=no');
 
           await registerLocalWriter(engine, 'cli');
@@ -340,7 +344,7 @@ for (const backend of testBackends()) {
           expect(worktreeManifest(root).digest).toBe(stored.digest);
 
           // A database-only tag makes the page's canonical form differ from its bytes; an upstream edit then syncs database-only.
-          await engine.transaction(tx => withCoordinatedWrite(tx, [id], () => tx.addTag('todos', 'kept-in-brain', { sourceId: id })));
+          await engine.transaction(tx => withCoordinatedWrite(tx, [id], () => tx.addTag('todos', 'kept-in-brain', { sourceId: id }), TEST_WRITE_ATTRIBUTION));
           writeFileSync(join(root, 'TODOS.md'), '# Todos\n\n- keep the mirror pullable\n- and syncing\n');
           commit('upstream edit');
           const next = await performManagedSync(engine, { sourceId: id, noPull: true, noEmbed: true, noExtract: true });

@@ -129,6 +129,48 @@ describe('defaultExtractor truncation retry (#3763)', () => {
   });
 });
 
+// ─── per-call timeout scales with the output cap (#5771) ────────────
+
+describe('defaultExtractor per-call timeout scales with maxTokens (#5771)', () => {
+  const input = {
+    pagePath: 'companies/acme-example',
+    pageBody: 'I bet Acme doubles ARR by Q4. They ship weekly.',
+    existingTakes: [],
+  };
+
+  async function timeoutsFor(extra: { maxTokens?: number; retryMaxTokens?: number }): Promise<number[]> {
+    const timeouts: number[] = [];
+    const realTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = ((ms: number) => {
+      timeouts.push(ms);
+      return realTimeout.call(AbortSignal, ms);
+    }) as typeof AbortSignal.timeout;
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      return calls === 1 ? chatResult('[{"claim_text":"Acme dou', 'length') : chatResult(GOOD_JSON, 'end');
+    });
+    try {
+      await defaultExtractor({ ...input, ...extra });
+    } finally {
+      AbortSignal.timeout = realTimeout;
+    }
+    return timeouts;
+  }
+
+  test('base call keeps 90s; the default 4096 retry gets 180s', async () => {
+    expect(await timeoutsFor({})).toEqual([90_000, 180_000]);
+  });
+
+  test('a large configured retry cap is bounded at the 300s gateway ceiling, not 90s', async () => {
+    expect(await timeoutsFor({ retryMaxTokens: 12_000 })).toEqual([90_000, 300_000]);
+  });
+
+  test('small caps never drop below the 90s floor', async () => {
+    expect(await timeoutsFor({ maxTokens: 256, retryMaxTokens: 256 })).toEqual([90_000, 90_000]);
+  });
+});
+
 // ─── phase-level dead-lane halt ─────────────────────────────────────
 
 interface CapturedSql { sql: string; params: unknown[] }

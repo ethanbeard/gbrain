@@ -23,6 +23,7 @@
  * embedding similarity. See `[CDX-4]` in the plan.
  */
 
+import { normalizeChainSlots } from './relational-chain.ts';
 import { createHash } from 'crypto';
 import { CR_MODES, type CRMode } from '../types.ts';
 import { getFtsLanguage } from '../fts-language.ts';
@@ -358,6 +359,27 @@ export interface ModeBundle {
    */
   relational_rerank_pin: number;
   /**
+   * Multi-relation planner: questions that chain 2-3 typed relations ("who
+   * founded the companies Alice invested in?") walk typed hop chains
+   * (relational-plan.ts + relational-chain.ts). Also routes keyless `recall`
+   * relational questions through the relational arm. Override: per-call
+   * SearchOpts.relationalPlanner → `search.relational_planner` → bundle.
+   */
+  relational_planner: boolean;
+  /**
+   * Typed one-hop walks read edges stored from either page's side by the
+   * relation's type signature (opt-in; `null` follows `relational_planner`). Override:
+   * per-call SearchOpts.relationalOrientOneHop → `search.relational_orient_onehop`.
+   */
+  relational_orient_onehop: boolean | null;
+  /**
+   * Chain slots: when a multi-hop chain fired, up to this many chain rows
+   * (answers, then their evidence pages) lead page 1. 0 = only the single
+   * page-1 evidence slot. Override: per-call SearchOpts.relationalChainSlots →
+   * `search.relational_chain_slots` (0..10).
+   */
+  relational_chain_slots: number;
+  /**
    * Ranker wave (Phase E2, Cat 13) — arm-confidence-weighted fusion of the
    * LEXICAL arms (arm-confidence.ts). When the keyword arm's scale-free
    * confidence `margin_ratio = top / (top + second)` over its returned rows
@@ -457,6 +479,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relational_retrieval_depth: 2,
     // Ranker wave (R1) — relational rows re-pinned above reranked text rows (0 = off).
     relational_rerank_pin: DEFAULT_RELATIONAL_RERANK_PIN,
+    // Multi-hop planner: relational retrieval is off in this tier, so the planner is too.
+    relational_planner: false,
+    relational_orient_onehop: false,
+    relational_chain_slots: 10,
     autocut_jump: 0.2,
     autocut_min_top: 0.35,
     autocut_min_keep: 1,
@@ -519,6 +545,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relational_retrieval_depth: 2,
     // Ranker wave (R1) — relational rows re-pinned above reranked text rows (0 = off).
     relational_rerank_pin: DEFAULT_RELATIONAL_RERANK_PIN,
+    // Multi-hop planner ON, one-hop orientation opt-in: docs/eval/decisions/p7-heldout-2026-10-05.
+    relational_planner: true,
+    relational_orient_onehop: false,
+    relational_chain_slots: 10,
     autocut_jump: 0.2,
     autocut_min_top: 0.35,
     autocut_min_keep: 1,
@@ -581,6 +611,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relational_retrieval_depth: 2,
     // Ranker wave (R1) — relational rows re-pinned above reranked text rows (0 = off).
     relational_rerank_pin: DEFAULT_RELATIONAL_RERANK_PIN,
+    // Multi-hop planner ON, one-hop orientation opt-in: docs/eval/decisions/p7-heldout-2026-10-05.
+    relational_planner: true,
+    relational_orient_onehop: false,
+    relational_chain_slots: 10,
     autocut_jump: 0.2,
     autocut_min_top: 0.35,
     autocut_min_keep: 1,
@@ -646,6 +680,9 @@ export interface SearchKeyOverrides {
   relationalRetrieval?: boolean;
   relational_retrieval_depth?: number;
   relational_rerank_pin?: number;
+  relational_planner?: boolean;
+  relational_orient_onehop?: boolean | null;
+  relational_chain_slots?: number;
   // Ranker wave (Phase E2) — keyword-arm confidence floor override (null = off; (0, 1]).
   keyword_arm_confidence_floor?: number | null;
   // Ranker wave (Phase E3) — metadata boost gate override (`always` | `lexical`).
@@ -710,6 +747,9 @@ export interface SearchPerCallOpts {
   relational_retrieval_depth?: number;
   // Ranker wave — relational rerank pin per-call override (0 = off; [0, 10]).
   relational_rerank_pin?: number;
+  relational_planner?: boolean;
+  relational_orient_onehop?: boolean | null;
+  relational_chain_slots?: number;
   // Ranker wave (Phase E2) — keyword-arm confidence floor per-call override (null = off; (0, 1]).
   keyword_arm_confidence_floor?: number | null;
   // Ranker wave (Phase E3) — metadata boost gate per-call override (`always` | `lexical`).
@@ -815,6 +855,9 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     relationalRetrieval: pick('relationalRetrieval'),
     relational_retrieval_depth: pick('relational_retrieval_depth'),
     relational_rerank_pin: pick('relational_rerank_pin'),
+    relational_planner: pick('relational_planner'),
+    relational_orient_onehop: pick('relational_orient_onehop'),
+    relational_chain_slots: pick('relational_chain_slots'),
     keyword_arm_confidence_floor: pick('keyword_arm_confidence_floor'),
     metadata_boost_gate: pick('metadata_boost_gate'),
     resolved_mode,
@@ -865,7 +908,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
  * reorder or add a knob without bumping a constant — a hash collision would
  * mean stale cache rows silently reading the wrong shape.
  */
-export const KNOBS_HASH_VERSION = 29;
+export const KNOBS_HASH_VERSION = 30;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -1156,6 +1199,11 @@ export function knobsHash(
     // System One (append-only, emitted only when a decide slot is not off, so
     // the all-off key is unchanged and needs no version bump).
     ...(ctx?.decide ? [`dec=${ctx.decide}`] : []),
+    // Multi-hop planner (append-only, emitted only when on, so every
+    // planner-off key is unchanged and needs no version bump).
+    ...(knobs.relational_planner ? ['rp=1'] : []),
+    ...(knobs.relational_orient_onehop ?? knobs.relational_planner ? ['ro=1'] : []),
+    ...(knobs.relational_planner && knobs.relational_chain_slots ? [`rcs=${knobs.relational_chain_slots}`] : []),
   ];
   // #5691 (append-only, no version bump): only a non-empty query prefix adds
   // a part, so every row written without one keeps its key.
@@ -1382,6 +1430,13 @@ export function loadOverridesFromConfig(
     const n = normalizeRelationalRerankPin(rrp);
     if (n !== undefined) out.relational_rerank_pin = n;
   }
+  // Multi-hop planner + one-hop orientation (booleans; anything else falls through).
+  const rp = parseBoolKnob(get('search.relational_planner'));
+  if (rp !== undefined) out.relational_planner = rp;
+  const roh = parseBoolKnob(get('search.relational_orient_onehop'));
+  if (roh !== undefined) out.relational_orient_onehop = roh;
+  const rcs = normalizeChainSlots(get('search.relational_chain_slots'));
+  if (rcs !== undefined) out.relational_chain_slots = rcs;
   // Ranker wave (Phase E2) — keyword-arm confidence floor: the literal
   // `off`/`null` pins the knob off (null); a number in (0, 1] is the floor;
   // anything else falls through to the bundle. ONE range contract with the
@@ -1450,6 +1505,9 @@ export const KNOB_CONFIG_KEY: Readonly<Record<keyof ModeBundle, string>> = Objec
   relationalRetrieval: 'search.relational_retrieval',
   relational_retrieval_depth: 'search.relational_retrieval_depth',
   relational_rerank_pin: 'search.relational_rerank_pin',
+  relational_planner: 'search.relational_planner',
+  relational_orient_onehop: 'search.relational_orient_onehop',
+  relational_chain_slots: 'search.relational_chain_slots',
   keyword_arm_confidence_floor: 'search.keyword_arm_confidence_floor',
   metadata_boost_gate: 'search.metadata_boost_gate',
 });
@@ -1524,4 +1582,13 @@ export async function loadSearchModeConfig(
     ...(aliasTokenHop !== undefined ? { aliasTokenHop } : {}),
     ...(decide ? { decide } : {}),
   };
+}
+
+/** `true`/`1`/`on` → true, `false`/`0`/`off` → false, anything else (or unset) → undefined. */
+function parseBoolKnob(v: string | undefined): boolean | undefined {
+  if (v === undefined) return undefined;
+  const l = v.trim().toLowerCase();
+  if (l === 'true' || l === '1' || l === 'on') return true;
+  if (l === 'false' || l === '0' || l === 'off') return false;
+  return undefined;
 }

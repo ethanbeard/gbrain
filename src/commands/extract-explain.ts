@@ -26,6 +26,8 @@ export async function runExtractExplain(
   engine: BrainEngine,
   args: string[],
 ): Promise<void> {
+  // `gbrain extract mentions --explain <name|slug>` explains a mention, not an extractable kind.
+  if (args[0] === 'mentions') return (await import('./extract-mentions-explain.ts')).runExtractMentionsExplain(engine, args);
   const json = args.includes('--json');
   // --explain consumes the NEXT positional arg as the kind.
   const explainIdx = args.indexOf('--explain');

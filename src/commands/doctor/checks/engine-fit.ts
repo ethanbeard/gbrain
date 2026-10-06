@@ -10,8 +10,9 @@
  *     the SAME reason for the SAME brain_id count (diagnose/refused rows and
  *     cross-brain rows never sum toward one threshold).
  *
- * Both remediations are guidance text, never a hardcoded run_command —
- * `gbrain migrate --to supabase` needs a --url only the operator has.
+ * pglite_scale's fix is the read-only graduation plan (`gbrain migrate --to
+ * postgres --plan --json`, which proposes a target when none is given) and
+ * names the stay-on-PGLite alternative, `gbrain mcp expose`.
  */
 
 import type { BrainEngine } from '../../../core/engine.ts';
@@ -20,6 +21,9 @@ import { readReceipts } from '../../../core/db-repair-receipts.ts';
 
 /** Pages-only, warn-only (CEO-review E2 pinned semantics). */
 export const PGLITE_SCALE_PAGE_THRESHOLD = 1000;
+
+/** The read-only graduation plan pglite_scale points at. */
+export const PGLITE_SCALE_PLAN_ARGV = ['gbrain', 'migrate', '--to', 'postgres', '--plan', '--json'];
 
 export async function pgliteScaleCheck(engine: BrainEngine): Promise<Check | null> {
   if (engine.kind !== 'pglite') return null;
@@ -32,7 +36,13 @@ export async function pgliteScaleCheck(engine: BrainEngine): Promise<Check | nul
         message:
           `PGLite brain has ${stats.page_count} pages (threshold ${PGLITE_SCALE_PAGE_THRESHOLD}). ` +
           `Postgres gives faster search and concurrent access at this size. ` +
-          `Move when ready: gbrain migrate --to supabase --url <postgres-conn> (the postgres-adopt skill walks it).`,
+          `Preview the move (read-only): gbrain migrate --to postgres --plan --json; or stay on PGLite and share it with other machines: gbrain mcp expose.`,
+        fix: {
+          argv: PGLITE_SCALE_PLAN_ARGV, consent: [], actor: 'agent', requires_exclusive: false,
+          verify: { argv: ['gbrain', 'doctor', '--only', 'pglite_scale', '--json'] }, docs: 'docs/guides/move-to-postgres.md',
+          why: `At ${stats.page_count} pages Postgres searches faster and serves several machines at once. The plan is read-only: it lists what moves, what stays, the blockers and the exact run command (export the user's Postgres URL as GBRAIN_TARGET_URL and add --url-env GBRAIN_TARGET_URL; without one it proposes a target). Staying on PGLite is fine too: \`gbrain mcp expose\` shares this brain without moving it.`,
+          user_message: `Your brain has ${stats.page_count} pages, the size where Postgres gets faster and lets several machines share it. Should I preview a move to Postgres (nothing changes yet), or keep it on this computer and share it over MCP with gbrain mcp expose?`,
+        },
       };
     }
     return { name: 'pglite_scale', status: 'ok', message: `PGLite at ${stats.page_count} pages — comfortable below the ${PGLITE_SCALE_PAGE_THRESHOLD}-page threshold` };

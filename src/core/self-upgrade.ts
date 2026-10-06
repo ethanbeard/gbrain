@@ -28,7 +28,10 @@
 
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { gbrainPath } from './config.ts';
+import { gbrainPath, isConfigTruthy } from './config.ts';
+import { isValidTimeZone } from './cycle/cycle-date.ts';
+import { isValidConfig as isValidQuietHoursWindow } from './minions/quiet-hours.ts';
+import { evaluateBunFloor, type HostBun, type TargetFloor } from './bun-floor.ts';
 import { acquirePackLock, type PackLockOpts } from './schema-pack/pack-lock.ts';
 import { isNewerVersion, isValidVersionString, parseSemver, semverGt, semverLte } from './semver.ts';
 
@@ -70,6 +73,7 @@ export type SelfUpgradeAction =
   | 'busy'
   | 'outside_quiet_hours'
   | 'unsupported_install'
+  | 'unsupported_runtime'
   | 'notify'
   | 'apply';
 
@@ -174,6 +178,28 @@ export function decideSelfUpgrade(inp: DecideSelfUpgradeInputs): SelfUpgradeDeci
     return { action: 'unsupported_install', reason: 'install method cannot self-update', ...base };
   }
   return { action: 'apply', reason: `auto-upgrading ${inp.currentVersion} -> ${inp.latestVersion}`, ...base };
+}
+
+/**
+ * Runtime gate for an `apply` on an install that runs the target on the host's
+ * Bun (every method but `binary`, which carries its own runtime). Holds the
+ * upgrade when the target's `engines.bun` floor is above the host's Bun, or
+ * when either could not be read: once swapped, every command refuses at
+ * startup (the relaunched daemon included, before it can reconcile the
+ * breadcrumb) and an unattended host has nothing that upgrades Bun (#5855).
+ * The target is NOT recorded known-bad, so the first tick after the cause
+ * clears applies it. Pure.
+ */
+export function gateOnTargetRuntime(
+  decision: SelfUpgradeDecision,
+  target: TargetFloor,
+  host: HostBun | null,
+): SelfUpgradeDecision {
+  if (decision.action !== 'apply') return decision;
+  const verdict = evaluateBunFloor(target, host, decision.latest);
+  if (verdict.ok) return decision;
+  const retry = verdict.kind === 'unreadable' ? ' The next quiet-hours tick retries.' : '';
+  return { ...decision, action: 'unsupported_runtime', reason: `${verdict.auditReason}${retry}` };
 }
 
 /**
@@ -451,12 +477,18 @@ export type BreadcrumbTransition = 'applied' | 'failed' | null;
  * via attribution). Called by the relaunched binary:
  *
  *   - No breadcrumb → nothing to do.
- *   - breadcrumb === currentVersion → the swap+relaunch worked. Clear it and
- *     record `last_applied_version`. (`applied`)
- *   - breadcrumb !== currentVersion → we're NOT the attempted version (the new
- *     binary crashed on launch and the supervisor relaunched the old one, or a
- *     stale breadcrumb). Record the attempted version in `failed_versions` so
- *     `decideSelfUpgrade` never retries it, and clear the breadcrumb. (`failed`)
+ *   - currentVersion >= breadcrumb → the swap+relaunch worked. The swap
+ *     installs whatever is current at swap time (`git pull`, `bun update`,
+ *     `releases/latest`), so a release published after the update check lands
+ *     a NEWER version than the breadcrumb names (#5813). Clear it, record
+ *     `last_applied_version`, and drop `failed_versions` entries at or below
+ *     the running version: `decideSelfUpgrade` only acts on a strictly newer
+ *     release, so they can never be targeted again. (`applied`)
+ *   - otherwise → we're NOT at the attempted version (the new binary crashed
+ *     on launch and the supervisor relaunched the old one, or a stale
+ *     breadcrumb, or an unparseable version). Record the attempted version in
+ *     `failed_versions` so `decideSelfUpgrade` never retries it, and clear the
+ *     breadcrumb. (`failed`)
  *
  * Pure: returns the next state + the transition; the caller persists + audits.
  */
@@ -468,9 +500,20 @@ export function reconcileBreadcrumb(
   const attempting = state.attempting_version;
   if (!attempting) return { state, transition: null };
 
-  if (attempting === currentVersion) {
+  const running = parseSemver(currentVersion);
+  const attempted = parseSemver(attempting);
+  if (attempting === currentVersion || (running && attempted && semverLte(attempted, running))) {
     delete state.attempting_version;
     state.last_applied_version = currentVersion;
+    if (state.failed_versions) {
+      // Unparseable entries stay: there is no ordering to prove them superseded.
+      const stillBad = state.failed_versions.filter((v) => {
+        const t = parseSemver(v);
+        return !t || !running || semverGt(t, running);
+      });
+      if (stillBad.length > 0) state.failed_versions = stillBad;
+      else delete state.failed_versions;
+    }
     return { state, transition: 'applied' };
   }
 
@@ -494,12 +537,166 @@ function normalizeMode(raw: unknown): SelfUpgradeMode | null {
  * onto the hot path. Env (`GBRAIN_SELF_UPGRADE_MODE`) is the operator / CI
  * escape hatch.
  */
+/** The `GBRAIN_SELF_UPGRADE_MODE` override, when it names a valid mode. */
+export function selfUpgradeModeEnvOverride(): SelfUpgradeMode | null {
+  return normalizeMode(process.env.GBRAIN_SELF_UPGRADE_MODE);
+}
+
 export function resolveSelfUpgradeMode(
   cfg: { self_upgrade?: { mode?: string } } | null | undefined,
 ): SelfUpgradeMode {
-  const env = normalizeMode(process.env.GBRAIN_SELF_UPGRADE_MODE);
+  const env = selfUpgradeModeEnvOverride();
   if (env) return env;
   const fromCfg = normalizeMode(cfg?.self_upgrade?.mode);
   if (fromCfg) return fromCfg;
   return 'notify';
+}
+
+// ── `gbrain config set self_upgrade.<leaf>` (file plane) ─────────────────────
+
+const QUIET_HOURS_DEFAULT_START = 23;
+const QUIET_HOURS_DEFAULT_END = 8;
+
+/** The autopilot silent channel's quiet-hours window: configured bounds, else
+ * 23:00-08:00 in the system timezone. `config set self_upgrade.quiet_hours`
+ * validates against the same resolution. */
+export function resolveQuietHoursWindow(
+  qh: SelfUpgradeState['quiet_hours'],
+): { start: number; end: number; tz: string } {
+  return {
+    start: qh?.start ?? QUIET_HOURS_DEFAULT_START,
+    end: qh?.end ?? QUIET_HOURS_DEFAULT_END,
+    tz: qh?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  };
+}
+
+/** Every `self_upgrade.*` leaf `gbrain config set` accepts. All of them route
+ * to ~/.gbrain/config.json: each reader (the cli.ts startup check, the
+ * autopilot channel, doctor) reads the file plane only, so a DB-plane write
+ * would be accepted and never read (#5489). */
+export const SELF_UPGRADE_CONFIG_LEAVES = [
+  'mode',
+  'mode_prompted',
+  'quiet_hours',
+  'failed_versions',
+  'attempting_version',
+  'last_check_ts',
+  'last_applied_version',
+] as const satisfies readonly (keyof SelfUpgradeState)[];
+
+export type SelfUpgradeConfigLeaf = (typeof SELF_UPGRADE_CONFIG_LEAVES)[number];
+
+export type SelfUpgradeConfigParse =
+  | { ok: true; value: SelfUpgradeState[SelfUpgradeConfigLeaf] }
+  | { ok: false; error: string };
+
+export function isSelfUpgradeConfigLeaf(leaf: string): leaf is SelfUpgradeConfigLeaf {
+  return (SELF_UPGRADE_CONFIG_LEAVES as readonly string[]).includes(leaf);
+}
+
+/** Normalize to the 4-segment form (`0.57.1` -> `0.57.1.0`): the upgrade
+ * machinery compares stored versions to the 4-segment latest by string, so a
+ * shorter spelling would be stored and never match. */
+function parseVersionLeaf(raw: string): string | null {
+  const tuple = parseSemver(raw.trim());
+  return tuple ? tuple.join('.') : null;
+}
+
+function isHour(n: unknown): n is number {
+  return Number.isInteger(n) && (n as number) >= 0 && (n as number) <= 23;
+}
+
+function parseQuietHours(raw: string): SelfUpgradeConfigParse {
+  const shape = 'a JSON object like {"start":23,"end":8,"tz":"America/New_York"}';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, error: `must be ${shape}` };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, error: `must be ${shape}` };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const unknownKeys = Object.keys(obj).filter((k) => k !== 'start' && k !== 'end' && k !== 'tz');
+  if (unknownKeys.length > 0) {
+    return { ok: false, error: `accepts only start, end and tz (got ${unknownKeys.join(', ')})` };
+  }
+  const out: { start?: number; end?: number; tz?: string } = {};
+  for (const k of ['start', 'end'] as const) {
+    if (obj[k] === undefined) continue;
+    if (!isHour(obj[k])) return { ok: false, error: `${k} must be an integer hour 0-23 (got ${JSON.stringify(obj[k])})` };
+    out[k] = obj[k];
+  }
+  if (obj.tz !== undefined) {
+    if (typeof obj.tz !== 'string' || !isValidTimeZone(obj.tz)) {
+      return { ok: false, error: `tz must be a valid IANA timezone (got ${JSON.stringify(obj.tz)})` };
+    }
+    out.tz = obj.tz;
+  }
+  // Validate what the autopilot reader will evaluate (defaults filled in) with
+  // the reader's own rule: a window evaluateQuietHours rejects is no window at
+  // all, so auto mode would never find a quiet hour to upgrade in.
+  if (!isValidQuietHoursWindow(resolveQuietHoursWindow(out))) {
+    return { ok: false, error: `start and end must differ (missing bounds default to ${QUIET_HOURS_DEFAULT_START} and ${QUIET_HOURS_DEFAULT_END})` };
+  }
+  return { ok: true, value: out };
+}
+
+function parseFailedVersions(raw: string): SelfUpgradeConfigParse {
+  const trimmed = raw.trim();
+  let items: unknown[];
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) throw new Error('not an array');
+      items = parsed;
+    } catch {
+      return { ok: false, error: 'must be a JSON array of versions or a comma-separated list' };
+    }
+  } else {
+    items = trimmed === '' ? [] : trimmed.split(',');
+  }
+  const versions: string[] = [];
+  for (const item of items) {
+    const v = typeof item === 'string' ? parseVersionLeaf(item) : null;
+    if (!v) return { ok: false, error: `entries must be versions like 0.57.1.0 (got ${JSON.stringify(item)})` };
+    if (!versions.includes(v)) versions.push(v);
+  }
+  return { ok: true, value: versions };
+}
+
+/**
+ * Parse the raw `gbrain config set self_upgrade.<leaf> <value>` string into
+ * the typed value the file-plane readers expect. Refuses anything a reader
+ * would silently ignore (an unknown mode reads as `notify`).
+ */
+export function parseSelfUpgradeConfigValue(leaf: SelfUpgradeConfigLeaf, raw: string): SelfUpgradeConfigParse {
+  switch (leaf) {
+    case 'mode': {
+      const mode = normalizeMode(raw.trim());
+      return mode ? { ok: true, value: mode } : { ok: false, error: `must be auto, notify or off (got '${raw}')` };
+    }
+    case 'mode_prompted': {
+      if (isConfigTruthy(raw)) return { ok: true, value: true };
+      if (['false', '0', 'no', 'off'].includes(raw.trim().toLowerCase())) return { ok: true, value: false };
+      return { ok: false, error: `must be true or false (got '${raw}')` };
+    }
+    case 'quiet_hours':
+      return parseQuietHours(raw);
+    case 'failed_versions':
+      return parseFailedVersions(raw);
+    case 'attempting_version':
+    case 'last_applied_version': {
+      const v = parseVersionLeaf(raw);
+      return v ? { ok: true, value: v } : { ok: false, error: `must be a version like 0.57.1.0 (got '${raw}')` };
+    }
+    case 'last_check_ts': {
+      const t = raw.trim();
+      const n = /^\d+$/.test(t) ? Number(t) : NaN;
+      return Number.isSafeInteger(n)
+        ? { ok: true, value: n }
+        : { ok: false, error: `must be epoch milliseconds, an integer >= 0 (got '${raw}')` };
+    }
+  }
 }

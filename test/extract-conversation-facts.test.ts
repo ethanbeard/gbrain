@@ -36,6 +36,7 @@ import {
   DEFAULT_SEGMENT_MAX_MESSAGES,
   SEGMENT_TEXT_CHAR_LIMIT,
   MAX_PAGE_BODY_BYTES,
+  MAX_PAGE_SEGMENT_GAP_MINUTES,
   TERMINAL_AUDIT_SOURCE,
   NON_EXTRACTABLE_AUDIT_SOURCE,
   PER_SEGMENT_SOURCE_PREFIX,
@@ -533,6 +534,46 @@ describe('runExtractConversationFactsCore', () => {
     expect(result.pages_processed).toBe(1);
     expect(result.facts_inserted).toBe(0);
     expect(result.segments_processed).toBeGreaterThanOrEqual(1);
+  });
+
+  test('#5918 a page\'s conversation_segment_gap_minutes frontmatter sets its segmentation gap', async () => {
+    // Four messages, 40 minutes apart in the middle: the 30-minute default
+    // splits them in two; the page's own 60-minute gap keeps one segment.
+    const body = [
+      fmt('Alice Example', '2024-05-01', '9:00 AM', 'Kickoff for the widget-co pilot.'),
+      fmt('Bob Demo', '2024-05-01', '9:05 AM', 'I will draft the plan.'),
+      fmt('Alice Example', '2024-05-01', '9:45 AM', 'Plan received, looks good.'),
+      fmt('Bob Demo', '2024-05-01', '9:50 AM', 'Shipping it Friday.'),
+    ].join('\n');
+    const put = (slug: string, frontmatter: Record<string, unknown>) => engine.putPage(slug, {
+      type: 'conversation', title: 'Custom gap', compiled_truth: body, timeline: '', frontmatter,
+    });
+    const segmentsFor = async (slug: string, sinceIso?: string) => (await runExtractConversationFactsCore(engine, {
+      sourceId: 'default', slug, dryRun: true, sleepMs: 0, ...(sinceIso ? { sinceIso } : {}),
+    })).segments_processed;
+
+    await put('conversations/custom-gap', { conversation_segment_gap_minutes: 60 });
+    expect(await segmentsFor('conversations/custom-gap')).toBe(1);
+    expect(await segmentsFor('conversations/custom-gap', '2024-05-01T08:00:00Z')).toBe(1);
+    await put('conversations/default-gap', {});
+    expect(await segmentsFor('conversations/default-gap')).toBe(2);
+
+    const warnings: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = (c: string) => { warnings.push(String(c)); return true; };
+    try {
+      for (const bad of [0, -5, 1.5, '60', MAX_PAGE_SEGMENT_GAP_MINUTES + 1]) {
+        warnings.length = 0;
+        await put('conversations/bad-gap', { conversation_segment_gap_minutes: bad });
+        expect(await segmentsFor('conversations/bad-gap')).toBe(2);
+        const warning = warnings.find(w => w.includes('conversation_segment_gap_minutes'));
+        expect(warning).toContain(`ignoring frontmatter conversation_segment_gap_minutes=${JSON.stringify(bad)}`);
+        expect(warning).toContain(`a whole number of minutes from 1 to ${MAX_PAGE_SEGMENT_GAP_MINUTES}`);
+        expect(warning).toContain('rerun gbrain extract-conversation-facts --slug conversations/bad-gap');
+      }
+    } finally {
+      (process.stderr as unknown as { write: unknown }).write = origWrite;
+    }
   });
 
   test('#5364 speaker objects preserve provenance and isolate same-slug sources', async () => {

@@ -131,7 +131,9 @@ inspect findings without re-running the probe.
 
 ## Cost model
 
-Default judge is `claude-haiku-4-5` at ~$1/Mtok in, $5/Mtok out. With
+The judge resolves `--judge` > `models.eval.contradictions_judge` > the utility
+model tier > `GBRAIN_CONTRADICTIONS_JUDGE_MODEL`; the figures below assume a
+small model such as `claude-haiku-4-5` at ~$1/Mtok in, $5/Mtok out. With
 the default truncation at 1500 chars per pair (`--max-pair-chars`), ~500 input + 80 output
 tokens per judge call. Budget cap defaults to $5 in TTY / $1 non-TTY.
 
@@ -170,6 +172,13 @@ recorded-time `fallback` reaches the judge as `(date unknown)` and leaves
 the text-date pre-filter in charge. A temporal verdict needs two different
 times: same-date or undated value conflicts are contradictions. Claims about
 two entities whose names merely look alike are never contradictions.
+
+Prompt v4 asks two questions before any verdict: do both statements give a
+value for the same attribute of the same entity (if not, nothing conflicts),
+and is there evidence of two different times? It tells the judge never to
+order two values by their size, the kind of document, or which statement is
+listed first, and that a negative claim about one party ("Fund A is not
+leading") and a positive claim about another ("Fund B is leading") agree.
 
 The trajectory substrate builds on the same signal:
 `gbrain eval trajectory <entity>` shows the chronological typed-claim

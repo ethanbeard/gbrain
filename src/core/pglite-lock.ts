@@ -21,7 +21,14 @@ export class PgliteBusyError extends Error {
   }
 }
 export class LiveServeLockError extends PgliteBusyError {
-  constructor(message: string) { super(message, 'live_serve'); this.name = 'LiveServeLockError'; }
+  /** The live serve holding the lock, for the two-step recovery plan (A7 `exclusiveFix`). */
+  readonly ownerPid?: number;
+  readonly ownerTransport?: 'stdio' | 'http';
+  constructor(message: string, owner: { pid?: number; transport?: 'stdio' | 'http' } = {}) {
+    super(message, 'live_serve'); this.name = 'LiveServeLockError';
+    this.ownerPid = owner.pid;
+    this.ownerTransport = owner.transport;
+  }
 }
 
 export interface LockHandle {
@@ -34,6 +41,8 @@ export interface LockHandle {
   /** A dead legacy holder was encountered during protocol migration. */
   reaped?: boolean;
   nativeLock?: NativeLockHandle;
+  /** Epoch ms when this process took the lock (diagnostic). */
+  acquiredAt?: number;
 }
 
 interface LockMetadata {
@@ -60,10 +69,10 @@ function isServeCommand(metadata: LockMetadata): boolean {
 function readMetadata(lockDir: string): LockMetadata | null {
   try { return JSON.parse(readFileSync(join(lockDir, LOCK_FILE), 'utf8')); } catch { return null; }
 }
-function readPidNs(): string | null {
+export function readPidNs(): string | null {
   try { return readlinkSync('/proc/self/ns/pid'); } catch { return null; }
 }
-function readBootId(): string | null {
+export function readBootId(): string | null {
   try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { return null; }
 }
 
@@ -172,19 +181,42 @@ export interface LockHolderInfo {
 }
 /** Read-only compatibility seam for engine-free IPC delegation and status. */
 export function inspectLockHolder(dataDir: string | undefined): LockHolderInfo {
-  const lockDir = getLockDir(dataDir);
-  if (!lockDir || !existsSync(lockDir)) return { held: false };
-  const metadata = readMetadata(lockDir);
-  if (!metadata) return { held: true };
-  const pid = typeof metadata.pid === 'number' ? metadata.pid : undefined;
-  if (pid !== undefined && !isProcessAlive(pid)) return { held: false, pid };
-  return { held: true, pid, serve: isServeCommand(metadata),
-    subcommand: typeof metadata.subcommand === 'string' ? metadata.subcommand : undefined };
+  return inspectHolderMetadata(dataDir).holder;
 }
-export interface LockPeekResult { held: boolean; isServe?: boolean; pid?: number; }
+function inspectHolderMetadata(dataDir: string | undefined): { holder: LockHolderInfo; metadata: LockMetadata | null } {
+  const lockDir = getLockDir(dataDir);
+  if (!lockDir || !existsSync(lockDir)) return { holder: { held: false }, metadata: null };
+  const metadata = readMetadata(lockDir);
+  if (!metadata) return { holder: { held: true }, metadata };
+  const pid = typeof metadata.pid === 'number' ? metadata.pid : undefined;
+  if (pid !== undefined && !isProcessAlive(pid)) return { holder: { held: false, pid }, metadata };
+  return { holder: { held: true, pid, serve: isServeCommand(metadata),
+    subcommand: typeof metadata.subcommand === 'string' ? metadata.subcommand : undefined }, metadata };
+}
+export interface LockPeekResult {
+  held: boolean; isServe?: boolean; pid?: number;
+  /** The holder is `gbrain serve --http` (read from its recorded argv). */
+  http?: boolean;
+  /** Epoch ms the holder recorded at acquisition. */
+  acquiredAt?: number;
+}
 export function peekLock(dataDir: string | undefined): LockPeekResult {
-  const holder = inspectLockHolder(dataDir);
-  return { held: holder.held, isServe: holder.serve, pid: holder.pid };
+  const { holder, metadata } = inspectHolderMetadata(dataDir);
+  if (!holder.held || !holder.serve || !metadata) return { held: holder.held, isServe: holder.serve, pid: holder.pid };
+  const args = Array.isArray(metadata.argv) ? metadata.argv : (metadata.command ?? '').split(/\s+/);
+  return { held: true, isServe: true, pid: holder.pid, http: args.includes('--http'),
+    ...(typeof metadata.acquired_at === 'number' ? { acquiredAt: metadata.acquired_at } : {}) };
+}
+/**
+ * The lock this process itself holds on `dataDir`, from in-memory state only
+ * (no file access while this process holds no lock at all).
+ */
+export function heldLockFor(dataDir: string | undefined): LockHandle | null {
+  if (!dataDir || retainedOwners.size === 0) return null;
+  let lockDir: string;
+  try { lockDir = getLockDir(canonicalPath(dataDir)); } catch { return null; }
+  for (const owner of retainedOwners) if (owner.acquired && owner.lockDir === lockDir) return owner;
+  return null;
 }
 /** Compatibility with repair quarantine markers from older releases. */
 export function msSinceLastReap(dataDir: string | undefined): number | null {
@@ -217,7 +249,9 @@ function startHeartbeat(path: string, ownerToken: string): ReturnType<typeof set
 function busy(lockDir: string): PgliteBusyError {
   const metadata = readMetadata(lockDir);
   if (metadata && isServeCommand(metadata) && isProcessAlive(metadata.pid!)) {
-    return new LiveServeLockError(`GBrain's local database is already open through \`gbrain serve\` (MCP, PID ${metadata.pid ?? 'unknown'}). Use the live serve's IPC/MCP tools or stop it before opening this PGLite datastore. Never remove a live holder's lock.`);
+    const args = Array.isArray(metadata.argv) ? metadata.argv : (metadata.command ?? '').split(/\s+/);
+    return new LiveServeLockError(`GBrain's local database is already open through \`gbrain serve\` (MCP, PID ${metadata.pid ?? 'unknown'}). Use the live serve's IPC/MCP tools or stop it before opening this PGLite datastore. Never remove a live holder's lock.`,
+      { pid: metadata.pid, transport: args.includes('--http') ? 'http' : 'stdio' });
   }
   return new PgliteBusyError(`GBrain: Timed out waiting for PGLite data-dir lock at ${lockDir}. Retry after the holder finishes. Stop all older GBrain processes before upgrading this datastore's lock protocol; unreadable legacy ownership is never stolen. Never remove a live holder's lock. This lock is separate from \`gbrain sync --break-lock\`.`);
 }
@@ -267,7 +301,7 @@ export async function acquireLock(dataDir: string | undefined, opts: { timeoutMs
           command: process.argv.slice(1).join(' '), argv: process.argv.slice(1), subcommand: parseGlobalFlags(process.argv.slice(2)).rest[0],
           owner_token: ownerToken, protocol, pid_ns: readPidNs(), boot_id: readBootId() });
         const result = { lockDir, acquired: true, lockPath, ownerToken, reaped, nativeLock,
-          heartbeat: startHeartbeat(lockPath, ownerToken) };
+          heartbeat: startHeartbeat(lockPath, ownerToken), acquiredAt: now };
         retainedOwners.add(result);
         accepted = true;
         return result;
@@ -281,6 +315,36 @@ export async function acquireLock(dataDir: string | undefined, opts: { timeoutMs
     if (performance.now() >= deadline) throw busy(lockDir);
     await delay(Math.min(25, deadline - performance.now()), undefined, { signal: opts.signal });
   }
+}
+
+/**
+ * Engine graduation: take only the stable sibling kernel lock of `dataDir`,
+ * without creating the data dir or its metadata (the path may hold a
+ * graduation tombstone file, or nothing while the datastore sits at its
+ * moved-aside path). `lockDir` names where the datastore's metadata now
+ * lives so release and a later move retarget it correctly.
+ */
+export async function acquireKernelLockOnly(dataDir: string, opts: { lockDir: string; timeoutMs?: number; signal?: AbortSignal }): Promise<LockHandle> {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2 ** 31 - 1) throw new RangeError('Invalid PGLite lock timeout');
+  const kernelPath = getPgliteKernelLockPath(dataDir)!;
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    opts.signal?.throwIfAborted();
+    const nativeLock = await tryAcquireNativeLock(kernelPath);
+    if (nativeLock) {
+      const result: LockHandle = { lockDir: opts.lockDir, acquired: true, nativeLock, acquiredAt: Date.now() };
+      retainedOwners.add(result);
+      return result;
+    }
+    if (performance.now() >= deadline) throw busy(getLockDir(canonicalPath(dataDir)));
+    await delay(Math.min(25, deadline - performance.now()), undefined, { signal: opts.signal });
+  }
+}
+
+/** The metadata dir `acquireLock` uses for `dataDir`; a held handle for that datastore carries it as `lockDir`. */
+export function pgliteLockDirFor(dataDir: string): string {
+  return getLockDir(canonicalPath(dataDir));
 }
 
 /** Metadata removal is optional; kernel release is mandatory and never unlinks. */

@@ -14,13 +14,13 @@
  *  - D11 preflight: explicit bad --embedding-dimensions refuses BEFORE touching disk
  *
  * Picker interactive flow (real TTY) is covered by the real-PTY serial test
- * at test/init-picker-pty.serial.test.ts (keyless provider choice plus a
+ * at test/init-picker-pty.test.ts (keyless provider choice plus a
  * non-default search mode, driven through a true pseudo-terminal). This file
  * stays piped-stdin on purpose: it exercises the NON-TTY branches.
  *
  * Lane: slow. Run: `bash scripts/run-slow-tests.sh test/init-fresh-pglite.slow.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -286,6 +286,33 @@ describe('v0.37 T12 — D9 --no-embedding deferred-setup mode', () => {
     expect(cfg.embedding_disabled).toBe(true);
     // Mutually exclusive with embedding_model being set.
     expect(cfg.embedding_model).toBeUndefined();
+  }, 120000);
+
+  test('init human output without a terminal: ONE first-run bundle, no separate writeback ask, no bare registration, no made-up fact', async () => {
+    const home = makeTempHome();
+    try {
+      const r = await runCli(['init', '--pglite', '--no-embedding'], { gbrainHome: home, env: {} });
+      expect(r.exitCode).toBe(0);
+      const out = r.stdout;
+      // Exactly one [AGENT] block carries the bundle, with the writeback decision and one relay.
+      const bundle = out.slice(out.indexOf('[first_run_decisions]'));
+      expect(out.match(/\[first_run_decisions\]/g)).toHaveLength(1);
+      expect(bundle).toContain('(id: writeback)');
+      expect(bundle).toContain('(run: gbrain config set memory.auto_writeback salient)');
+      expect(bundle).toContain('default: salient');
+      expect(out.match(/Reply 'defaults'/g)).toHaveLength(1);
+      // The old separate writeback banner/[AGENT] ask and the skills pointer are gone.
+      expect(out).not.toContain('Ambient memory writeback is available');
+      expect(out + r.stderr).not.toContain('Ask me to run');
+      expect(out + r.stderr).not.toContain('recommended skill(s) not installed yet');
+      // No bare-binary registration and no fabricated user fact.
+      expect(out).not.toContain('claude mcp add gbrain -- gbrain serve');
+      expect(out).not.toContain('dark mode');
+      expect(out).not.toContain('people/me');
+      expect(out).toContain('gbrain remember "gbrain install check" --provenance install-check');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   }, 120000);
 
   test('gbrain import refuses with config-set hint after --no-embedding init', async () => {

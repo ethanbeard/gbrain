@@ -8,6 +8,7 @@ import type { OperationContext } from '../src/core/ops/contract.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { timelineOperations } from '../src/core/ops/timeline.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 
 const root = mkdtempSync(join(tmpdir(), 'gbrain-timeline-identity-'));
@@ -72,7 +73,7 @@ test('public timeline replay survives page removal and recreation without touchi
   await submit('delete_page', { slug, expected_revision: (await engine.readPageSnapshot(slug, { sourceId }))!.revision });
   await disposePersistenceConsumer(engine);
   // Model later purge without removing durable receipts or source authority.
-  await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.deletePage(slug, { sourceId })));
+  await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.deletePage(slug, { sourceId }), TEST_WRITE_ATTRIBUTION));
   expect(await engine.readPageSnapshot(slug, { sourceId })).toBeNull();
   expect(await operation.handler(ctx, params)).toEqual(first);
   await expect(operation.handler(ctx, { ...params, summary: 'Altered retry' })).rejects.toMatchObject({ code: 'idempotency_conflict' });

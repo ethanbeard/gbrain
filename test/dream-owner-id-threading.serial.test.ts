@@ -96,8 +96,9 @@ describe('privateQueueOwnerJobId === job.id threading', () => {
       signal: new AbortController().signal,
     });
     expect(result.status).toBe('ok');
-    expect(capturedOpts.length).toBe(1);
-    expect(capturedOpts[0].privateQueueOwnerJobId).toBe(43);
+    // #4578: one runCycle call per maintenance phase; every call carries the owner id.
+    expect(capturedOpts.length).toBe(realCycle.MAINTENANCE_PHASES.length);
+    for (const opts of capturedOpts) expect(opts.privateQueueOwnerJobId).toBe(43);
   });
 
   test('the dream-phase wrapper (makePhaseHandler) threads its job id into runCycle', async () => {

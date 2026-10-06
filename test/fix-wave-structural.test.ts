@@ -216,7 +216,7 @@ describe('v0.42.20.0 — background-work registry drains every sink before disco
 
   test('#4284 caller timeout retains ownership while the actual close drains under its watchdog', () => {
     const pglite = surfaceFileSource('pglite-engine', 'src/core/pglite-engine.ts');
-    const closeStart = pglite.indexOf('private async _closeInternal()');
+    const closeStart = pglite.indexOf('private async _closeInternal(');
     const armIdx = pglite.indexOf("label: 'pglite-disconnect-watchdog'", closeStart);
     const stopIdx = pglite.indexOf('for (const stop of this._beforeDisconnect) await stop()', closeStart);
     const drainIdx = pglite.indexOf('await drainBackgroundWorkBeforeDisconnect()', closeStart);

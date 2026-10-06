@@ -6,6 +6,7 @@ import { git, gitFixture } from './helpers/git-publication.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 const fixtures: ReturnType<typeof gitFixture>[] = [];
+const caseInsensitiveFs = (() => { const probe = gitFixture(); try { return probe.caseInsensitive; } finally { probe.cleanup(); } })();
 function fixture() { const f = gitFixture(); fixtures.push(f); return f; }
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
 
@@ -90,9 +91,8 @@ test('native path lookup fixes existing aliases but never folds POSIX case-disti
   published(f, f.caseInsensitive ? 'Notes/new.md' : 'notes/new.md', 'New\n');
 });
 
-test('native ambiguous aliases refuse instead of picking one hardlink name', async () => {
+test.skipIf(!caseInsensitiveFs)('native ambiguous aliases refuse instead of picking one hardlink name', async () => {
   const f = fixture();
-  if (!f.caseInsensitive) return;
   writeFileSync(join(f.root, 'Notes', 'Old.md'), 'Native\n');
   linkSync(join(f.root, 'Notes', 'Old.md'), join(f.root, 'Notes', 'Other.md'));
   const before = git(f.root, 'rev-parse', 'HEAD');
@@ -100,9 +100,8 @@ test('native ambiguous aliases refuse instead of picking one hardlink name', asy
   expect(git(f.root, 'rev-parse', 'HEAD')).toBe(before);
 });
 
-test('case-distinct directories retain separate files and staged changes', async () => {
+test.skipIf(caseInsensitiveFs)('case-distinct directories retain separate files and staged changes', async () => {
   const f = fixture();
-  if (f.caseInsensitive) return;
   mkdirSync(join(f.root, 'notes'));
   for (const directory of ['Notes', 'notes']) writeFileSync(join(f.root, directory, 'page.md'), `Before ${directory}\n`);
   git(f.root, 'add', '.'); git(f.root, '-c', 'core.hooksPath=', 'commit', '-m', 'Distinct paths');

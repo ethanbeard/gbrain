@@ -25,6 +25,7 @@ tools:
   - file_upload
 mutating: true
 upstream: data-research@fc834ee
+when_to_use: "Use when the user asks: \"research\", \"track\", \"extract from email\", \"investor updates\", \"donations\"."
 ---
 
 # Data Research
@@ -116,6 +117,14 @@ Three example recipes ship with GBrain (see `~/.gbrain/recipes/`):
 2. **expense-tracker** — extract amounts, recipients, platforms from receipt emails (subscriptions, services, recurring charges)
 3. **company-updates** — extract revenue, users, key metrics from portfolio company update emails
 
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `file_upload` is refused for a path outside the allowed root (remote callers are confined): ask the user to upload from the brain host or pass the content inline.
+- `put_page` / `add_timeline_entry` returns `revision_conflict` or `write_pending`: re-read and merge for the first; poll `gbrain write-request <request_id>` for the second.
+- An extraction source rate-limits (`rate_limited`): back off for the stated delay and keep the cursor; log the gap instead of guessing the missing rows.
+
 ## Anti-Patterns
 
 - Trusting LLM working memory for amounts after batch processing (use extraction integrity rule)
@@ -140,3 +149,14 @@ Each entry links to its raw source. Running totals at the bottom of each section
 ## Conventions
 
 References `skills/conventions/quality.md` for citation and back-linking rules.
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
+
+- `add_link` → `gbrain link`
+- `file_upload` → `gbrain call file_upload <params_json>`
+- `put_raw_data` → `gbrain call put_raw_data <params_json>`
+
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

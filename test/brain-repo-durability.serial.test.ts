@@ -242,6 +242,50 @@ describe('hardenBrainRepo', () => {
     expect(readFileSync(log, 'utf-8')).toBe('small\n');
     expect(statSync(log).mode & 0o077).toBe(0);
   });
+
+  test('#5436 — core.hooksPath=.githooks: hook is excluded via info/exclude and stays untracked', async () => {
+    git(work, 'config', 'core.hooksPath', '.githooks');
+    await harden({ verify: false });
+    const hookPath = join(work, '.githooks', 'post-commit');
+    expect(existsSync(hookPath)).toBe(true);
+    const exclude = readFileSync(join(work, '.git', 'info', 'exclude'), 'utf-8');
+    expect(exclude).toContain('.githooks/post-commit');
+    // Ignored → the hook never shows up as untracked in git status.
+    const st = git(work, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks/post-commit');
+    expect(st).toBe('');
+  });
+
+  test('#5436 — re-harden repairs the exclusion for a hook installed before the fix', async () => {
+    git(work, 'config', 'core.hooksPath', '.githooks');
+    await harden({ verify: false });
+    const exclude = join(work, '.git', 'info', 'exclude');
+    writeFileSync(exclude, readFileSync(exclude, 'utf-8').replace('.githooks/post-commit\n', ''));
+    expect(git(work, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks/post-commit')).toBe('?? .githooks/post-commit');
+    await harden({ verify: false });
+    expect(readFileSync(exclude, 'utf-8').split('\n').filter(line => line === '.githooks/post-commit')).toHaveLength(1);
+    expect(git(work, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks/post-commit')).toBe('');
+  });
+
+  test('#5436 — a hooks dir outside the working tree gets no exclude entry', async () => {
+    const outside = join(root, 'shared-hooks');
+    git(work, 'config', 'core.hooksPath', outside);
+    await harden({ verify: false });
+    expect(existsSync(join(outside, 'post-commit'))).toBe(true);
+    expect(readFileSync(join(work, '.git', 'info', 'exclude'), 'utf-8')).not.toContain('post-commit');
+  });
+
+  test('#5436 — a hooksPath whose repo path contains ".git" (site.github.io) is still excluded', async () => {
+    const weird = join(root, 'site.github.io', 'repo');
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'clone', '-q', bare, weird], { stdio: 'ignore' });
+    git(weird, 'config', 'user.email', 't@t.t');
+    git(weird, 'config', 'user.name', 'tester');
+    git(weird, 'config', 'core.hooksPath', 'myhooks');
+    await hardenBrainRepo({ repoPath: weird, sourceId: 'wiki', pat: PAT, installCron: false, verify: false });
+    const exclude = readFileSync(join(weird, '.git', 'info', 'exclude'), 'utf-8');
+    expect(exclude).toContain('myhooks/post-commit');
+    const st = git(weird, 'status', '--porcelain', '--untracked-files=all', '--', 'myhooks/post-commit');
+    expect(st).toBe('');
+  });
 });
 
 describe('unhardenBrainRepo', () => {

@@ -18,6 +18,7 @@ import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { localHostId, revokeLocalWriter } from '../src/core/persistence/identity.ts';
 import { submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { readJournalLimits } from '../src/core/persistence/limits.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../src/core/markdown.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests } from '../src/core/ai/gateway.ts';
@@ -26,12 +27,23 @@ import { withEnv } from './helpers/with-env.ts';
 import { withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { testBackends } from './helpers/test-backends.ts';
+import { rawProvenanceCheck } from '../src/commands/doctor/checks/core-health.ts';
+import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
+import { testWaitMs } from './helpers/wait-for.ts';
 
 const backends = testBackends();
 const engines: BrainEngine[] = [];
 const dataDir = mkdtempSync(join(tmpdir(), 'gbrain-maintenance-db-'));
 let closePostgres: (() => Promise<void>) | undefined;
+let restoreWriteWait: () => void = () => {};
+// Cases that drive a publication into write_pending on purpose wait a short
+// budget; every case that must commit keeps the production 5s.
+async function pendingWait<T>(run: () => Promise<T>): Promise<T> {
+  const restore = __setMaintenanceWriteWaitForTests(testWaitMs(500));
+  try { return await run(); } finally { restore(); }
+}
 beforeAll(async () => {
+  restoreWriteWait = __setMaintenanceWriteWaitForTests(5_000);
   configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: {} });
   if (backends.includes('pglite')) {
     const engine = new PGLiteEngine();
@@ -43,6 +55,7 @@ beforeAll(async () => {
   }
 }, 120_000);
 afterAll(async () => {
+  restoreWriteWait();
   for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
   await closePostgres?.(); resetGateway(); rmSync(dataDir, { recursive: true, force: true });
 });
@@ -257,7 +270,7 @@ for (const change of ['derived', 'semantic'] as const) {
       const lock = (await acquireWorktree((await getWorktreeBinding(engine, sourceId))!, 5000))!;
       expect(lock).not.toBeNull();
       try {
-        await expect(runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 })).rejects.toMatchObject({ code: 'write_pending' });
+        await expect(pendingWait(() => runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 }))).rejects.toMatchObject({ code: 'write_pending' });
         await disposePersistenceConsumer(engine);
       } finally { await lock.release(); }
       const row = (await claimNextWrite(engine, localHostId()))!;
@@ -266,7 +279,7 @@ for (const change of ['derived', 'semantic'] as const) {
         await tx.executeRaw(change === 'derived'
           ? 'UPDATE facts SET embedding=embedding,embedded_at=now() WHERE source_id=$1'
           : "UPDATE facts SET fact=fact||' changed' WHERE source_id=$1", [sourceId]);
-      }));
+      }, TEST_WRITE_ATTRIBUTION));
       const outcome = await publishMutation(engine, row, prepared, localHostId());
       expect(outcome.state).toBe(change === 'derived' ? 'committed' : 'conflict');
       expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND consolidated_at IS NOT NULL', [sourceId]))
@@ -315,7 +328,7 @@ test('paused owner retains an admitted consolidation and a fresh process publish
     const lock = (await acquireWorktree(binding, 5000))!;
     expect(lock).not.toBeNull();
     try {
-      await expect(runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 })).rejects.toMatchObject({ code: 'write_pending' });
+      await expect(pendingWait(() => runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 }))).rejects.toMatchObject({ code: 'write_pending' });
       await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [binding.worktree_id]);
       await disposePersistenceConsumer(engine);
       expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND consolidated_at IS NOT NULL', [sourceId])).toHaveLength(0);
@@ -396,7 +409,7 @@ for (const failure of ['commit', 'withdrawal'] as const) {
       const lock = (await acquireWorktree(binding, 5000))!;
       expect(lock).not.toBeNull();
       try {
-        await expect(runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 })).rejects.toMatchObject({ code: 'write_pending' });
+        await expect(pendingWait(() => runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 }))).rejects.toMatchObject({ code: 'write_pending' });
         await disposePersistenceConsumer(engine);
       } finally { await lock.release(); }
       const row = (await claimNextWrite(engine, localHostId()))!;
@@ -451,11 +464,12 @@ test('managed synthesis drives real children and publishes repaired provenance p
         const opts = { brainDir: root, sourceId, dryRun: false, inputFile: transcript, date: '2026-09-20' };
         const binding = (await getWorktreeBinding(engine, sourceId))!;
         const completion = await engine.getConfig('dream.synthesize.last_completion_ts');
-        const pending = await runPhaseSynthesize(engine, { ...opts, yieldDuringPhase: async () => {
+        const pending = await pendingWait(() => runPhaseSynthesize(engine, { ...opts, yieldDuringPhase: async () => {
           const rows = await engine.executeRaw("SELECT id FROM minion_jobs WHERE status='completed' AND data->>'source_id'=$1 LIMIT 1", [sourceId]);
           if (rows.length) await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [binding.worktree_id]);
-        } });
-        expect(pending.status).toBe('fail');
+        } }));
+        expect(pending.status).toBe('warn');
+        expect(pending.details.publish_pending).toBe(1);
         expect(await engine.getConfig('dream.synthesize.last_completion_ts')).toBe(completion);
         const retainedCalls = calls;
         await disposePersistenceConsumer(engine);
@@ -514,6 +528,41 @@ for (const managed of [true, false]) test(`#5733: ${managed ? 'managed' : 'unman
         expect(page.page.frontmatter).toMatchObject({ dream_generated: true, dream_cycle_date: '2026-02-03', dream_created_cycle_date: '2026-02-03' });
         expect(parseMarkdown(readFileSync(join(root, 'wiki/personal/patterns/stamped.md'), 'utf8')).frontmatter)
           .toMatchObject({ dream_generated: true, dream_cycle_date: '2026-02-03' });
+      });
+    } finally { __setChatTransportForTests(null); }
+  });
+}, 90_000);
+
+for (const managed of [true, false]) test(`#5884: ${managed ? 'managed' : 'unmanaged'} patterns output passes raw_provenance${managed ? ' on every run that rewrites it' : ''}`, async () => {
+  await fixture(async (engine, sourceId, root) => {
+    for (let i = 0; i < 3; i++) await seed(engine, sourceId, `wiki/personal/reflections/example-${i}`);
+    await engine.setConfig('dream.patterns.enabled', 'true');
+    await engine.setConfig('models.dream.patterns', 'anthropic:claude-sonnet-4-6');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    if (managed) await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    let calls = 0;
+    __setChatTransportForTests(async opts => {
+      calls++;
+      const write = calls % 2 === 1;
+      return { text: write ? '' : 'Saved the pattern.', blocks: write ? [{ type: 'tool-call', toolCallId: `pattern-write-${calls}`, toolName: 'brain_put_page', input: {
+        slug: 'wiki/personal/patterns/traced', content: `---\ntitle: Traced pattern\ntype: note\n---\nA recurring theme, run ${calls}, in [[wiki/personal/reflections/example-0]].`,
+      } }] : [{ type: 'text', text: 'Saved the pattern.' }], stopReason: write ? 'tool_calls' : 'end',
+      usage: { input_tokens: 100, output_tokens: 100, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: opts.model!, providerId: 'anthropic' };
+    });
+    try {
+      await withEnv({ ANTHROPIC_API_KEY: 'sk-test-maintenance' }, async () => {
+        for (const cycleDate of managed ? ['2026-02-03', '2026-02-04'] : ['2026-02-03']) {
+          const result = await runPhasePatterns(engine, { brainDir: root, sourceId, dryRun: false, once: true, cycleDate });
+          expect(result.details.patterns_written).toBe(1);
+          const page = (await engine.readPageSnapshot('wiki/personal/patterns/traced', { sourceId }))!;
+          expect(page.page.compiled_truth).toContain(`run ${calls - 1}`);
+          expect(page.page.frontmatter).toMatchObject({ dream_generated: true, raw_trace_exempt: true,
+            raw_trace_exempt_reason: 'derived from reflections under wiki/personal/reflections/; raw traces live on the cited reflection pages' });
+          expect(await rawProvenanceCheck(engine)).toMatchObject({ name: 'raw_provenance', status: 'ok' });
+        }
+        expect(parseMarkdown(readFileSync(join(root, 'wiki/personal/patterns/traced.md'), 'utf8')).frontmatter)
+          .toMatchObject({ raw_trace_exempt: true });
       });
     } finally { __setChatTransportForTests(null); }
   });

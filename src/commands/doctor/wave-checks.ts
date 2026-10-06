@@ -101,6 +101,28 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async (engine, scope) => (await import('./checks/connector-holds.ts')).connectorHeldItemsCheck(engine, scope.sourceIds),
   },
   {
+    id: 'git_held_files', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Held file paths are host-local; remote callers see held counts on sync results, get_page and search.',
+    count: d => Number(d.held ?? 0),
+    impact: 'Some Git source files are held instead of imported, so their pages are missing or keep an older revision',
+    run: async (engine, scope) => (await import('./checks/git-holds.ts')).gitHeldFilesCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'frontmatter_repairable', resolution: 'repair', registration: 'doctor.ts',
+    hostOnly: 'The scan reads source checkouts on the brain host, and the frontmatter repair rewrites files there (explicit-only).',
+    count: d => Number(d.repairable ?? 0),
+    impact: 'Some source files have frontmatter gbrain reads only by quoting or interpreting it',
+    run: async (engine, scope) => { const { frontmatterRepairableCheck } = await import('./checks/frontmatter-repairable.ts'); return perSource(scope, id => frontmatterRepairableCheck(engine, id)); },
+  },
+  {
+    id: 'frontmatter_hook', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Pre-commit hooks live in the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'An installed frontmatter pre-commit hook predates this release and checks working-tree files instead of staged content',
+    instruction: 'Refresh it on the brain host with `gbrain frontmatter install-hook --force` (add `--source <id>` for one source); only the gbrain hook script is rewritten.',
+    run: async (engine, scope) => (await import('./checks/frontmatter-hook.ts')).frontmatterHookCheck(engine, scope.sourceIds),
+  },
+  {
     id: 'orphan_persistence_bindings', resolution: 'repair', registration: 'wave',
     hostOnly: 'Bindings of removed sources are brain-wide persistence bookkeeping outside any source scope.',
     count: d => Number(d.count ?? 0),
@@ -183,6 +205,20 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     impact: 'Some conversation-extractor facts were expired by the pre-v0.60.11.0 canonical projection and recall no longer returns them',
     run: async (engine, scope) => (await import('./checks/extractor-facts.ts')).extractorFactsCheck(engine, scope.sourceIds),
   },
+  {
+    id: 'captured_facts_active', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Classifying captured facts reads harness transcripts and the session corpus on the brain host; the repair is explicit-only.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some active facts were captured from gbrain\'s own model sessions or from pasted text before v0.60.30.0',
+    run: async (engine, scope) => (await import('./checks/captured-facts.ts')).capturedFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'loop_facts_drift', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Retiring closed-loop commitment facts is a host-side, explicit-only repair.',
+    count: d => Number(d.drifted ?? 0),
+    impact: 'Some closed commitment loops still have an active commitment fact, so recall keeps the finished promise',
+    run: async (engine, scope) => (await import('./checks/loop-facts.ts')).loopFactsDriftCheck(engine, scope.sourceIds),
+  },
 ];
 
 /** A check that could not run reports unknown, never ok. */
@@ -207,6 +243,12 @@ export async function runWaveChecks(engine: BrainEngine, opts: WaveScope & { onl
     findings.push({ spec, check, state: checkHealthUnknown(check) ? 'unknown' : check.status === 'ok' ? 'ok' : 'finding' });
   }
   return findings;
+}
+
+/** The one source a finding names (`details.source_ids` of length 1), so its repair command can say `--source <id>`. */
+export function findingSource(finding: Pick<WaveFinding, 'check'>): string | undefined {
+  const ids = finding.check.details?.source_ids;
+  return Array.isArray(ids) && ids.length === 1 && typeof ids[0] === 'string' ? ids[0] : undefined;
 }
 
 /** The repair kind that clears a wave finding, when its resolution is `repair`. */

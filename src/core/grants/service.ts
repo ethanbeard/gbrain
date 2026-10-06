@@ -27,7 +27,7 @@ export interface GrantMutationOptions {
   servingBrainId?: string;
 }
 export interface GrantMutationResult { before: ClientGrant; after: ClientGrant; revision: number; dryRun: boolean }
-const PATCH_FIELDS = new Set<keyof GrantPatch>(['scopes', 'sourceId', 'federatedRead', 'boundSlugPrefixes', 'allowedOperations', 'boundTools', 'boundSourceId', 'boundBrainId', 'delegatedSlugPrefixes', 'delegatedNamespace', 'boundMaxConcurrent', 'budgetUsdPerDay', 'surface', 'surfaceSetBy', 'tokenTtlSeconds', 'profile', 'repairReasons']);
+const PATCH_FIELDS = new Set<keyof GrantPatch>(['scopes', 'sourceId', 'federatedRead', 'sourcesNone', 'takesHolders', 'boundSlugPrefixes', 'allowedOperations', 'boundTools', 'boundSourceId', 'boundBrainId', 'delegatedSlugPrefixes', 'delegatedNamespace', 'boundMaxConcurrent', 'budgetUsdPerDay', 'surface', 'surfaceSetBy', 'tokenTtlSeconds', 'profile', 'repairReasons']);
 export function assertGrantPatch(patch: GrantPatch): void {
   for (const key of Object.keys(patch)) {
     if (!PATCH_FIELDS.has(key as keyof GrantPatch)) throw new GrantError('invalid_grant', `Unknown grant field: ${key}`);
@@ -80,7 +80,7 @@ export async function rescopeClientGrantInTransaction(db: GrantDatabase, clientI
   const sql = query(db);
   const rows = await sql`SELECT * FROM oauth_clients WHERE client_id = ${clientId} FOR UPDATE`;
   if (!rows.length) throw new GrantError('client_not_found', `No OAuth client found with id "${clientId}"`);
-  if (!('grant_revision' in rows[0])) throw new GrantError('grant_schema_required', 'Run gbrain apply-migrations --yes before changing client grants');
+  if (!('grant_revision' in rows[0]) || !('takes_holders' in rows[0])) throw new GrantError('grant_schema_required', 'Run gbrain apply-migrations --yes before changing client grants');
   const before = grantFromRow(rows[0]);
   if (opts.expectedRevision !== undefined && before.revision !== opts.expectedRevision) {
     throw new GrantError('grant_conflict', `Grant changed (expected revision ${opts.expectedRevision}, current ${before.revision}); review a fresh preview`);
@@ -101,6 +101,7 @@ export async function rescopeClientGrantInTransaction(db: GrantDatabase, clientI
     changes.scopes = [...new Set([...before.scopes, 'agent'])];
   }
   const after: ClientGrant = { ...before, ...changes, revision: before.revision + 1, repairReasons: [] };
+  if (changes.sourceId != null && changes.sourcesNone === undefined) after.sourcesNone = false;
   after.boundBrainId = normalizeGrantBrain(after.boundBrainId);
   validateClientGrant(after, await grantValidationContext(db, opts.servingBrainId));
   if (JSON.stringify({ ...after, revision: before.revision }) === JSON.stringify(before)) {
@@ -118,6 +119,8 @@ export async function persistGrant(sql: SqlQuery, before: ClientGrant, after: Cl
       UPDATE oauth_clients SET
         scope = ${after.scopes.join(' ')}, source_id = ${after.sourceId},
         federated_read = ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.federatedRead)}::text::jsonb)),
+        source_grant = ${after.sourcesNone === true ? 'none' : null},
+        takes_holders = CASE WHEN ${after.takesHolders == null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.takesHolders ?? [])}::text::jsonb)) END,
         bound_slug_prefixes = CASE WHEN ${after.boundSlugPrefixes === null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.boundSlugPrefixes ?? [])}::text::jsonb)) END,
         allowed_operations = CASE WHEN ${after.allowedOperations === null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.allowedOperations ?? [])}::text::jsonb)) END,
         bound_tools = CASE WHEN ${after.boundTools === null} THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(after.boundTools ?? [])}::text::jsonb)) END,

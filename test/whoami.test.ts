@@ -126,6 +126,47 @@ describe('whoami op contract', () => {
     expect(result.federated_read).toEqual(['canonical-brain']);
   });
 
+  // The verifier-set principal wins over the id prefix: hand-provisioned OAuth
+  // client ids need not start with gbrain_cl_, and a legacy token may be named
+  // like one. The prefix-only tests above/below pin the no-principal fallback.
+  test('principal oauth_client reports oauth even when the client id has no gbrain_cl_ prefix', async () => {
+    const auth: AuthInfo = {
+      token: 'gbrain_at_xxx',
+      clientId: 'research-custom-client',
+      principal: { kind: 'oauth_client', id: 'research-custom-client' },
+      clientName: 'Research client',
+      scopes: ['read', 'write'],
+      expiresAt: 1234567890,
+      sourceId: 'research',
+      allowedSources: ['research', 'default'],
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result).toMatchObject({
+      transport: 'oauth',
+      client_id: 'research-custom-client',
+      client_name: 'Research client',
+      expires_at: 1234567890,
+      source_id: 'research',
+      federated_read: ['research', 'default'],
+    });
+    expect(result.token_name).toBeUndefined();
+  });
+
+  test('principal legacy_token reports legacy even when the token name looks like an OAuth client id', async () => {
+    const auth: AuthInfo = {
+      token: 'legacy-token',
+      clientId: 'gbrain_cl_lookalike',
+      principal: { kind: 'legacy_token', id: '00000000-0000-4000-8000-000000000001' },
+      clientName: 'gbrain_cl_lookalike',
+      scopes: ['read'],
+      expiresAt: 999999999,
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    // Agent contract v1 (F2): additive config-plane `readiness`.
+    expect(result).toMatchObject({ transport: 'legacy', token_name: 'gbrain_cl_lookalike', scopes: ['read'], expires_at: null });
+    expect(Array.isArray(result.readiness)).toBe(true);
+  });
+
   test('legacy transport (token name as clientId, no gbrain_cl_ prefix)', async () => {
     const auth: AuthInfo = {
       token: 'legacy-token',

@@ -7,7 +7,7 @@
  * stallWatchdogMs), the same pattern as the stdio lifecycle tests.
  *
  * The real worker mechanics are covered by test/process-watchdog.test.ts
- * (pure + env) and test/process-watchdog.serial.test.ts (spawned processes).
+ * (pure + env) and test/process-watchdog-harness.test.ts (spawned processes).
  */
 import { describe, test, expect } from 'bun:test';
 import { runServe, type ServeOptions } from '../src/commands/serve.ts';

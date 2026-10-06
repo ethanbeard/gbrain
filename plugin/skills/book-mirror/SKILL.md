@@ -13,6 +13,7 @@ writes_pages: true
 writes_to:
   - media/books/
 upstream: book-mirror@fc834ee
+when_to_use: "Use when the user asks: \"personalized version of this book\", \"mirror this book\", \"two-column book analysis\", \"apply this book to my life\", \"how does this book apply to me\"."
 ---
 
 # book-mirror — Personalized Chapter-by-Chapter Book Analysis
@@ -594,6 +595,14 @@ The full behavior contract is documented in the body sections above; this sectio
 ## Output Format
 
 The skill's output shape is documented inline in the body sections above (see "Output", "Brain page format", or equivalent). The literal section header here exists for the conformance test (`test/skills-conformance.test.ts`).
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- The CLI stops for cost confirmation (exit 3, or a non-TTY refusal without `--yes`): relay the per-chapter estimate and wait for the user's agreement before adding `--yes`.
+- A paid run stops with `no_pricing` under a user cost cap: look up the model's per-token rate, tell the user, and after they agree ask the brain host's operator to run `gbrain pricing set <model> --input <usd-per-1M> --output <usd-per-1M>`; then retry.
+- Exit 1 with `chapters_failed > 0`: the finished chapters are kept; re-run the same command to retry only the failed ones and tell the user how many chapters are still missing.
 
 ## Anti-Patterns
 

@@ -201,6 +201,15 @@ fi
 rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged "$LOG_DIR"/shard-*.lastkb "$LOG_DIR"/shard-*.lastprogress "$LOG_DIR"/shard-*.start "$LOG_DIR"/shard-*.end "$LOG_DIR"/shard-*.watchdog "$LOG_DIR"/shard-*.assigned "$LOG_DIR"/shard-*.hbsum 2>/dev/null
 : > "$FAILURES_LOG"
 : > "$SUMMARY_FILE"
+# Executed-test receipts (X2): on by default for this loop, under
+# .context/test-receipts (cleared per run) unless GBRAIN_TEST_RECEIPT_DIR names
+# another directory. `bun scripts/ci-executed-counts.ts --head-dir <dir>`
+# reads them; the shard and serial runners each write their own.
+if [ "$DRY_RUN" = "0" ] && [ -z "${GBRAIN_TEST_RECEIPT_DIR:-}" ] && [ "$LOG_DIR" = ".context/test-shards" ]; then
+  rm -rf .context/test-receipts
+  GBRAIN_TEST_RECEIPT_DIR=.context/test-receipts
+fi
+receipts_init unit || exit 2
 
 # ──────────────────────────────────────────────────────────────────────────
 # Resolve `timeout` command. macOS without coreutils has neither; we degrade
@@ -294,12 +303,12 @@ for i in $(seq 1 "$N"); do
     date +%s > "$LOG_DIR/shard-$i.start"
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" --signal=TERM --kill-after="${SHARD_KILL_AFTER}s" "${SHARD_TIMEOUT}s" \
-        env SHARD="$i/$N" \
+        env SHARD="$i/$N" GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1
       rc=$?
     else
-      env SHARD="$i/$N" \
+      env SHARD="$i/$N" GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1 &
       pid=$!
@@ -820,7 +829,7 @@ SERIAL_FILES_COUNT=0
 SERIAL_FILES_COUNT=$(find test -name '*.serial.test.ts' -not -path 'test/e2e/*' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$SERIAL_FILES_COUNT" -gt 0 ]; then
   echo "════════════ serial pass ($SERIAL_FILES_COUNT files) ════════════"
-  bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
+  GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
   SERIAL_RC=$?
   cat "$LOG_DIR/serial.log"
   if [ "$SERIAL_RC" != "0" ]; then
@@ -895,23 +904,33 @@ if [ "$TOTAL_RC" != "0" ] && [ "${RESCUE_COUNT:-0}" -gt 0 ]; then
   grep '\.serial\.test\.ts$' "$OOM_RESCUE_LIST" > "$LOG_DIR/oom-rescue-serial.txt" || true
   RESCUE_RC=0
   : > "$RESCUE_LOG"
-  run_rescue() { # $1 = per-invocation timeout seconds; rest = test-file args
-    local t="$1"; shift
+  # Each rescue invocation writes its own receipt (kind=rescue), which
+  # supersedes the killed or failed attempt for the files it re-ran.
+  run_rescue() { # $1 = per-invocation timeout seconds; $2 = receipt lane; $3 = receipt tag; rest = test-file args
+    local t="$1" lane="$2" tag="$3" rc=0 primary_lane="$TEST_RECEIPT_LANE"
+    shift 3
+    TEST_RECEIPT_LANE="$lane"
+    receipt_begin rescue "$tag" "" "" "" "$@"
+    TEST_RECEIPT_LANE="$primary_lane"
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" --signal=TERM --kill-after="${SHARD_KILL_AFTER}s" "${t}s" \
-        bun test --max-concurrency 1 --timeout=60000 "$@" >> "$RESCUE_LOG" 2>&1
+        bun test --max-concurrency 1 --timeout=60000 ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$@" >> "$RESCUE_LOG" 2>&1 || rc=$?
     else
-      bun test --max-concurrency 1 --timeout=60000 "$@" >> "$RESCUE_LOG" 2>&1
+      bun test --max-concurrency 1 --timeout=60000 ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$@" >> "$RESCUE_LOG" 2>&1 || rc=$?
     fi
+    receipt_end "$rc"
+    return "$rc"
   }
   if [ -s "$LOG_DIR/oom-rescue-batch.txt" ]; then
     # shellcheck disable=SC2046
-    run_rescue "$RESCUE_TIMEOUT" $(cat "$LOG_DIR/oom-rescue-batch.txt") || RESCUE_RC=1
+    run_rescue "$RESCUE_TIMEOUT" unit batch $(cat "$LOG_DIR/oom-rescue-batch.txt") || RESCUE_RC=1
   fi
   if [ -s "$LOG_DIR/oom-rescue-serial.txt" ]; then
+    rescue_idx=0
     while IFS= read -r serial_file; do
       [ -n "$serial_file" ] || continue
-      run_rescue 300 "$serial_file" || RESCUE_RC=1
+      rescue_idx=$((rescue_idx + 1))
+      run_rescue 300 serial "file$rescue_idx" "$serial_file" || RESCUE_RC=1
     done < "$LOG_DIR/oom-rescue-serial.txt"
   fi
   cat "$RESCUE_LOG"

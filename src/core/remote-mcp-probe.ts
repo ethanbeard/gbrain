@@ -11,7 +11,8 @@
  * Each function returns a discriminated `{ok: true, ...}` / `{ok: false, error}`
  * so callers can render the error reason consistently. Network errors surface
  * as `network` reason; HTTP non-2xx surfaces as `http` with status. Auth
- * errors get their own `auth` reason for clean rendering.
+ * errors get their own `auth` reason for clean rendering, and a /token 429
+ * gets `rate_limited` with the server's Retry-After.
  */
 
 import { anySignal } from './abort-check.ts';
@@ -21,8 +22,45 @@ type ProbeFailure<Reason extends string> = {
   reason: Reason;
   status?: number;
   kind?: 'timeout' | 'aborted';
+  /** Seconds the server asked the caller to wait (Retry-After), when it said. */
+  retry_after_s?: number;
+  /** A status-only `gbrain serve --http` answered 503: its `serve_status_only` envelope. */
+  status_only?: Record<string, unknown>;
   message: string;
 };
+
+/**
+ * A 503 from a status-only `gbrain serve --http` carries a `serve_status_only`
+ * envelope (why, fix, user_message); any other body is not one. Consumes the
+ * body only for a 503.
+ */
+async function statusOnlyFailure(res: Response, label: string): Promise<ProbeFailure<'http'> | null> {
+  if (res.status !== 503) return null;
+  let body: unknown;
+  try { body = await res.json(); } catch { return null; }
+  if (!body || typeof body !== 'object' || (body as { code?: unknown }).code !== 'serve_status_only') return null;
+  const env = body as Record<string, unknown>;
+  const retryAfter = parseRetryAfterSeconds(res.headers.get('retry-after'));
+  return {
+    ok: false, reason: 'http', status: 503, status_only: env, ...(retryAfter !== undefined ? { retry_after_s: retryAfter } : {}),
+    message: `${label} answered 503: the gbrain server is in status-only mode. ${typeof env.why === 'string' ? env.why : ''}`.trim(),
+  };
+}
+
+/** Longest Retry-After honoured; a larger value is clamped to it. */
+const MAX_RETRY_AFTER_S = 24 * 60 * 60;
+
+/**
+ * Parse a Retry-After header (delta-seconds or HTTP-date, RFC 9110 §10.2.3)
+ * into whole seconds, clamped to [0, MAX_RETRY_AFTER_S]. Unparseable → undefined.
+ */
+export function parseRetryAfterSeconds(value: string | null, now = Date.now()): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const seconds = /^\d+$/.test(trimmed) ? Number(trimmed) : Math.ceil((Date.parse(trimmed) - now) / 1000);
+  if (Number.isNaN(seconds)) return undefined;
+  return Math.min(Math.max(seconds, 0), MAX_RETRY_AFTER_S);
+}
 
 function networkFailure(label: string, error: unknown, signal: AbortSignal): ProbeFailure<'network'> {
   if (signal.aborted) {
@@ -67,6 +105,8 @@ export async function discoverOAuth(
   try {
     const res = await fetch(url, { signal });
     if (!res.ok) {
+      const statusOnly = await statusOnlyFailure(res, 'OAuth discovery');
+      if (statusOnly) return statusOnly;
       await res.body?.cancel().catch(() => {});
       return { ok: false, reason: 'http', status: res.status, message: `OAuth discovery returned ${res.status} for ${url}` };
     }
@@ -90,8 +130,9 @@ export async function discoverOAuth(
 
 /**
  * POST <token_endpoint> with grant_type=client_credentials. Returns the
- * access_token + expires_in on success. 401 → reason=auth; other non-2xx
- * → reason=http; network → reason=network.
+ * access_token + expires_in on success. 401 → reason=auth; 429 →
+ * reason=rate_limited (+ retry_after_s); other non-2xx → reason=http;
+ * network → reason=network.
  */
 export interface TokenResponse {
   access_token: string;
@@ -105,7 +146,7 @@ export async function mintClientCredentialsToken(
   clientId: string,
   clientSecret: string,
   opts: { scope?: string; timeoutMs?: number; signal?: AbortSignal } = {},
-): Promise<{ ok: true; token: TokenResponse } | ProbeFailure<'network' | 'http' | 'auth' | 'parse' | 'config'>> {
+): Promise<{ ok: true; token: TokenResponse } | ProbeFailure<'network' | 'http' | 'auth' | 'rate_limited' | 'parse' | 'config'>> {
   if (!clientId) return { ok: false, reason: 'config', message: 'client_id is required' };
   if (!clientSecret) return { ok: false, reason: 'config', message: 'client_secret is required' };
 
@@ -129,7 +170,20 @@ export async function mintClientCredentialsToken(
       await res.body?.cancel().catch(() => {});
       return { ok: false, reason: 'auth', status: res.status, message: `OAuth /token returned ${res.status} — check client_id and client_secret` };
     }
+    if (res.status === 429) {
+      // The host's /token limiter spent this caller's mint budget. Discovery
+      // already answered, so this is neither a discovery nor a network fault.
+      await res.body?.cancel().catch(() => {});
+      const retryAfter = parseRetryAfterSeconds(res.headers.get('retry-after'));
+      return {
+        ok: false, reason: 'rate_limited', status: 429,
+        ...(retryAfter !== undefined ? { retry_after_s: retryAfter } : {}),
+        message: `OAuth /token returned 429 (rate-limited by the server${retryAfter !== undefined ? `; retry in ${retryAfter}s` : ''})`,
+      };
+    }
     if (!res.ok) {
+      const statusOnly = await statusOnlyFailure(res, 'OAuth /token');
+      if (statusOnly) return statusOnly;
       await res.body?.cancel().catch(() => {});
       return { ok: false, reason: 'http', status: res.status, message: `OAuth /token returned ${res.status}` };
     }

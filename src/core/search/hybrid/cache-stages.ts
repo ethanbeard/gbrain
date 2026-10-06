@@ -5,6 +5,7 @@
  * returns false), so on the production path only resolveCacheSearchMode and
  * semanticCacheSkipped run.
  */
+import { normalizeChainSlots } from '../relational-chain.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { HybridSearchMeta, SearchResult } from '../../types.ts';
 import { type HybridSearchOpts, cacheScopeKey, filterResultsByCallerScope } from '../hybrid.ts';
@@ -81,6 +82,10 @@ export async function resolveCacheSearchMode(engine: BrainEngine, opts: HybridSe
       expansion_variant_budget: normalizeExpansionVariantBudget(opts?.expansionVariantBudget),
       // Ranker wave — threaded here too so knobsHash's `rrp=` part reflects the per-call pin.
       relational_rerank_pin: normalizeRelationalRerankPin(opts?.relationalRerankPin),
+      // Multi-hop planner — threaded here too so knobsHash's `rp=`/`ro=` parts reflect per-call values.
+      relational_planner: typeof opts?.relationalPlanner === 'boolean' ? opts.relationalPlanner : undefined,
+      relational_orient_onehop: typeof opts?.relationalOrientOneHop === 'boolean' ? opts.relationalOrientOneHop : undefined,
+      relational_chain_slots: normalizeChainSlots(opts?.relationalChainSlots),
       // Ranker wave (Phase E2) — threaded here too so knobsHash's `kacf=` part reflects the per-call floor.
       keyword_arm_confidence_floor: normalizeKeywordArmConfidenceFloor(opts?.keywordArmConfidenceFloor),
       // Ranker wave (Phase E3) — threaded here too so knobsHash's `mbg=` part reflects the per-call gate.

@@ -1,12 +1,13 @@
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 
 export function withManagedFixtureWrite<T>(
   engine: BrainEngine,
   sourceIds: string[],
   write: (tx: BrainEngine) => Promise<T>,
 ): Promise<T> {
-  return engine.transaction(tx => withCoordinatedWrite(tx, sourceIds, () => write(tx)));
+  return engine.transaction(tx => withCoordinatedWrite(tx, sourceIds, () => write(tx), TEST_WRITE_ATTRIBUTION));
 }
 
 export function createManagedFixtureSource(

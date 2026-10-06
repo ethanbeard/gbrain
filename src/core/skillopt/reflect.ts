@@ -242,6 +242,7 @@ export async function runOneShotRewrite(opts: ReflectOpts): Promise<OneShotRewri
       cacheSystem: true,
       abortSignal: opts.abortSignal,
       purpose: SKILLOPT_PURPOSE.optimizer,
+      allowFallback: false,
     });
   } catch (err) {
     if (isSkilloptMustAbort(err)) throw err;
@@ -287,6 +288,7 @@ async function callReflect(
       cacheSystem: true, // D11
       abortSignal: opts.abortSignal,
       purpose: SKILLOPT_PURPOSE.optimizer,
+      allowFallback: false,
     });
   } catch (err) {
     if (isSkilloptMustAbort(err)) throw err;

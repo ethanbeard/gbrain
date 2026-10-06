@@ -17,7 +17,7 @@ import { describe, it, expect } from 'bun:test';
 import { execFileSync, spawnSync } from 'child_process';
 import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join, resolve } from 'path';
+import { dirname, join, resolve } from 'path';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const SHARD_SH = resolve(REPO_ROOT, 'scripts/run-unit-shard.sh');
@@ -87,8 +87,10 @@ describe('run-unit-shard.sh timeout multiplier reach', () => {
 function runGroupedFixture(count: number, mode = 'pass', shard = '') {
   const root = mkdtempSync(join(tmpdir(), 'gbrain-unit-groups-test-'));
   try {
-    for (const dir of ['scripts', 'test', 'bin', 'calls']) mkdirSync(join(root, dir));
+    for (const dir of ['scripts', 'scripts/lib', 'test', 'bin', 'calls']) mkdirSync(join(root, dir));
     copyFileSync(SHARD_SH, join(root, 'scripts/run-unit-shard.sh'));
+    // The runner sources the shared lib (receipt helpers) — stage it too.
+    copyFileSync(join(dirname(SHARD_SH), 'lib/test-env.sh'), join(root, 'scripts/lib/test-env.sh'));
     const files = Array.from({ length: count }, (_, i) => `test/case-${String(i).padStart(4, '0')}.test.ts`);
     for (const file of files) writeFileSync(join(root, file), '');
     for (const file of ['ignored.slow.test.ts', 'ignored.serial.test.ts']) writeFileSync(join(root, 'test', file), '');

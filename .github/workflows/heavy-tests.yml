@@ -44,11 +44,15 @@ jobs:
     # label. Works for all three trigger types (labeled, synchronize, reopened)
     # because `contains(labels.*.name, ...)` reads the live label set, not the
     # event payload's `label.name` (which is only populated for `labeled`).
+    # Named exception (docs/TESTING.md#event-parity): label-gated on pull requests;
+    # the nightly Heavy Tests schedule and manual dispatch always run it.
     if: |
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
     runs-on: ubicloud-standard-30-ubuntu-2404
-    timeout-minutes: 30
+    # 75: tests/heavy/graduation_10k.sh builds the 10k-page history fixture
+    # on a cold cache (~18 min) before graduating it.
+    timeout-minutes: 75
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -59,7 +63,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -74,6 +78,14 @@ jobs:
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: bun-cache-${{ runner.os }}-
       - run: bun install --frozen-lockfile
+      # The 10k graduation fixture is cached as a PGLite data-dir tarball keyed
+      # by the fixture sources (scripts/persistence/graduation-fixture.ts
+      # verifies its own key; a stale entry is rebuilt, never reused).
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.cache/gbrain-graduation-fixtures
+          key: graduation-fixtures-${{ runner.os }}-${{ hashFiles('scripts/persistence/graduation-fixture.ts', 'scripts/persistence/history-fixture.ts', 'src/core/schema-migrations/**') }}
+          restore-keys: graduation-fixtures-${{ runner.os }}-
 
       - name: Run heavy tests
         env:
@@ -83,19 +95,12 @@ jobs:
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
         run: bun run test:heavy
 
-      # Agent-bootstrap offline Docker e2e [A7] — placeholder registration.
-      # The networkless cold-machine container test (interview → render →
-      # verify with a fake gh) lands with the bootstrap doors task at
-      # tests/docker/bootstrap-e2e.sh. Gated on file existence so this stays
-      # a visible no-op until then. It runs at heavy cadence (nightly +
-      # `heavy-tests` label) by design — never in the PR shard matrix.
-      - name: Bootstrap offline Docker e2e (placeholder)
-        run: |
-          if [ -f tests/docker/bootstrap-e2e.sh ]; then
-            bash tests/docker/bootstrap-e2e.sh
-          else
-            echo "SKIP: tests/docker/bootstrap-e2e.sh not present yet — placeholder until the bootstrap doors task lands."
-          fi
+      # Agent-bootstrap offline Docker e2e [A7]: the networkless cold-machine
+      # container test (interview → render → verify with a fake gh). It runs
+      # at heavy cadence (nightly + `heavy-tests` label) by design, never in
+      # the PR shard matrix. No existence guard: a missing script fails red.
+      - name: Bootstrap offline Docker e2e
+        run: bash tests/docker/bootstrap-e2e.sh
 
       # The heavy runner writes per-script logs to ~/.gbrain/audit/ on every
       # run. Upload those + the rss workload JSON on failure for triage
@@ -120,24 +125,31 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-  # Real-agent door e2e: drives the ACTUAL `claude` + `codex` + `hermes` +
-  # `grok` + `opencode` binaries (no PATH shims) against a real gbrain over
-  # MCP. These pay real API
-  # cost and need the binaries installed + authed, which a stock GitHub runner
-  # does NOT have — so the tests self-SKIP (describe.skipIf on binary/auth) and
-  # the job is a clean no-op here. It exists so a self-hosted /
-  # manually-provisioned runner WITH authed claude/codex/hermes (and
-  # ANTHROPIC/OPENAI creds) actually exercises the real binaries. Heavy cadence
-  # only (nightly + `real-agent-e2e` label + dispatch); NEVER the PR shard
-  # matrix.
+  # Real-agent door e2e: drives the ACTUAL `claude` + `codex` binaries (plus
+  # `hermes`/`grok`/`opencode` when a provisioned runner has them; their
+  # dedicated jobs below are the owners on stock runners) against a real gbrain
+  # over MCP. bootstrap-real-claude/codex run in no other job.
+  #
+  # Two postures, chosen by the Credential gate step:
+  #   - ANTHROPIC_API_KEY and OPENAI_API_KEY secrets set: install the pinned
+  #     claude-code and codex builds (same pins as plugin-doors), pass the keys
+  #     through the test preload (GBRAIN_TEST_KEEP_PROVIDER_KEYS=1, codex reads
+  #     CODEX_API_KEY), and fail unless the live Claude and live Codex door
+  #     tests each executed.
+  #   - Either secret empty: a visible ::warning:: + step summary saying zero
+  #     real-agent tests executed, never a silent green.
+  # Heavy cadence only (nightly + `real-agent-e2e` label + dispatch); NEVER
+  # the PR shard matrix.
   real-agent-e2e:
-    name: Real-agent door e2e (skips without authed binaries)
+    name: Real-agent door e2e (live claude + codex when keyed)
+    # Named exception (docs/TESTING.md#event-parity): label-gated on pull requests;
+    # the nightly Heavy Tests schedule and manual dispatch always run it.
     if: |
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
     runs-on: ubicloud-standard-16-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       # Open the hermes/grok opt-in doors here so binary/auth absence — not
       # the opt-in var — is what skips (same posture as the claude/codex
@@ -152,6 +164,9 @@ jobs:
       GROK_VERSION: "1.0.4"
       # Same posture for opencode: a provisioned runner's version pin.
       OPENCODE_VERSION: "1.18.18"
+      # Same pins as plugin-doors; update both jobs together.
+      CODEX_NPM_VERSION: "0.147.0"
+      CLAUDE_NPM_VERSION: "2.1.233"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
@@ -166,38 +181,81 @@ jobs:
           restore-keys: bun-cache-${{ runner.os }}-
       - run: bun install --frozen-lockfile
 
-      # Reference the door tests; run only the ones present (a door may land
-      # in a sibling PR). Missing binary/auth → the file self-skips, so a
-      # stock runner reports a green no-op rather than failing.
-      - name: Run real-agent door tests
+      - name: Credential gate (visible skip without provider secrets)
+        id: keys
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          files=()
-          for f in \
+          missing=()
+          [ -n "$ANTHROPIC_API_KEY" ] || missing+=(ANTHROPIC_API_KEY)
+          [ -n "$OPENAI_API_KEY" ] || missing+=(OPENAI_API_KEY)
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "keyed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "keyed=false" >> "$GITHUB_OUTPUT"
+          setcmds=$(printf 'gh secret set %s; ' "${missing[@]}")
+          echo "::warning::Real-agent door e2e executed 0 live claude/codex tests — empty secret(s): ${missing[*]}. Why: only the repo owner can set secrets. Fix (owner-only): ${setcmds%; } then re-check with: gh workflow run heavy-tests.yml --ref master (or label a PR real-agent-e2e)." >&2
+          {
+            echo "## Real-agent door e2e: 0 live tests executed"
+            echo "Empty secret(s): ${missing[*]}. bootstrap-real-claude and bootstrap-real-codex run in no other job, so this run is not real-agent coverage."
+            echo ""
+            echo "- Why: only the repo owner can set secrets."
+            echo "- Fix (owner-only): \`${setcmds%; }\`"
+            echo "- Re-check: \`gh workflow run heavy-tests.yml --ref master\`, or add the \`real-agent-e2e\` label to a PR."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install codex + claude (pinned npm versions, refuse on drift)
+        if: steps.keys.outputs.keyed == 'true'
+        timeout-minutes: 10
+        run: |
+          npm install -g "@openai/codex@$CODEX_NPM_VERSION" "@anthropic-ai/claude-code@$CLAUDE_NPM_VERSION"
+          codex_v=$(codex --version)
+          printf '%s' "$codex_v" | grep -qF "$CODEX_NPM_VERSION" || { echo "::error::codex version drift — expected $CODEX_NPM_VERSION in: $codex_v (re-pin deliberately)" >&2; exit 1; }
+          claude_v=$(claude --version)
+          printf '%s' "$claude_v" | grep -qF "$CLAUDE_NPM_VERSION" || { echo "::error::claude version drift — expected $CLAUDE_NPM_VERSION in: $claude_v (re-pin deliberately)" >&2; exit 1; }
+
+      # Missing binary/auth → the door files self-skip. Keyed runs then refuse
+      # green unless each live door actually executed.
+      - name: Run real-agent door tests
+        env:
+          ANTHROPIC_API_KEY: ${{ steps.keys.outputs.keyed == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+          CODEX_API_KEY: ${{ steps.keys.outputs.keyed == 'true' && secrets.OPENAI_API_KEY || '' }}
+          GBRAIN_TEST_KEEP_PROVIDER_KEYS: ${{ steps.keys.outputs.keyed == 'true' && '1' || '' }}
+          KEYED: ${{ steps.keys.outputs.keyed }}
+        run: |
+          EXIT=0
+          # --timeout: real-agent turns are slow (live claude/codex).
+          bun test --timeout=600000 \
             test/e2e/bootstrap-real-claude.serial.test.ts \
             test/e2e/bootstrap-real-codex.serial.test.ts \
             test/e2e/install-real-hermes.serial.test.ts \
             test/e2e/install-real-grok.serial.test.ts \
-            test/e2e/install-real-opencode.serial.test.ts; do
-            [ -f "$f" ] && files+=("$f")
+            test/e2e/install-real-opencode.serial.test.ts > real-agent-doors.txt 2>&1 || EXIT=$?
+          tail -80 real-agent-doors.txt
+          if [ "$EXIT" -ne 0 ]; then exit "$EXIT"; fi
+          if [ "$KEYED" != "true" ]; then exit 0; fi
+          ok=1
+          for door in 'bootstrap real Claude Code door' 'bootstrap real-codex door'; do
+            if ! grep -qF "(pass) $door" real-agent-doors.txt; then
+              echo "::error::Keyed run executed no passing '$door' test. Why: the secrets are set but the live door self-skipped (binary or auth not detected). Fix: read real-agent-doors.txt above for the skip reason, then gh workflow run heavy-tests.yml --ref <branch>." >&2
+              ok=0
+            fi
           done
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "SKIP: no real-agent door test files present yet."
-            exit 0
-          fi
-          echo "Running: ${files[*]}"
-          # --timeout: real-agent turns are slow (live claude/codex); the door
-          # tests self-skip without authed binaries so this is a no-op elsewhere.
-          bun test --timeout=600000 "${files[@]}"
+          [ "$ok" -eq 1 ]
 
   # Hermes door e2e: unlike real-agent-e2e above (best-effort, self-skipping),
   # this job PROVISIONS the real hermes binary itself — pinned installer digest,
   # non-interactive auth + model pin — and then requires the door tests to
   # actually execute. It pays real API cost, so it stays label-gated at heavy
   # cadence (nightly + `real-agent-e2e`/`heavy-tests` label + dispatch); NEVER
-  # the PR shard matrix. Loud-fail throughout: a runner that cannot install or
-  # auth hermes fails this job rather than skipping.
+  # the PR shard matrix. Loud-fail on install, payload and version drift; an
+  # empty ANTHROPIC_API_KEY secret is a visible, tracked skip (Preconditions).
   hermes-door:
     name: Hermes door e2e (credentialed, real binary, loud-fail)
+    # Named exception (docs/TESTING.md#event-parity): label-gated on pull requests;
+    # the nightly Heavy Tests schedule and manual dispatch always run it.
     if: |
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
@@ -251,7 +309,9 @@ jobs:
       - name: Install hermes (pinned installer digest)
         timeout-minutes: 15
         run: |
-          curl -fsSL --retry 3 -o hermes-install.sh https://raw.githubusercontent.com/NousResearch/hermes-agent/95d42656021a22f20201c618a67da07a618d16f3/scripts/install.sh
+          # raw.githubusercontent.com answers 429 to shared runner IPs at times (runs 2026-09-28, 2026-10-04);
+          # long spaced retries ride it out (curl honors Retry-After).
+          curl -fsSL --retry 6 --retry-delay 30 --retry-all-errors -o hermes-install.sh https://raw.githubusercontent.com/NousResearch/hermes-agent/95d42656021a22f20201c618a67da07a618d16f3/scripts/install.sh
           if ! echo "$HERMES_INSTALL_SHA256  hermes-install.sh" | sha256sum -c -; then
             echo "::error::hermes installer digest drift — re-pin deliberately: update HERMES_INSTALL_SHA256 + HERMES_VERSION in this workflow and docs/mcp/HERMES-CLI-PIN.md after reviewing upstream changes" >&2
             exit 1
@@ -300,24 +360,23 @@ jobs:
             exit 1
           fi
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            # Split posture: schedule/dispatch stay LOUD-FAIL — the owner is
-            # the audience there and owns the secret. A pull_request run's
-            # audience is a PR author who cannot fix repo secrets (fork PRs
-            # never receive them at all), and a permanently-red check trains
-            # reviewers to ignore this door — so on PRs the missing paid leg
-            # is a VISIBLE SKIP (warning + job summary), never a silent green.
-            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-              echo "paid=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::hermes door PAID LEG SKIPPED — ANTHROPIC_API_KEY secret is empty (owner-only fix: gh secret set ANTHROPIC_API_KEY). Installer digest + payload + version pins verified; no hermes turn ran." >&2
-              {
-                echo "## Hermes door: paid leg skipped"
-                echo "ANTHROPIC_API_KEY secret is empty — installer digest, payload, and version pins verified, but no hermes turn ran."
-                echo "The nightly schedule stays loud-fail until the owner sets the secret."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "::error::ANTHROPIC_API_KEY secret is empty — this scheduled/dispatched run cannot cover the hermes door without it (owner-only fix: gh secret set ANTHROPIC_API_KEY)" >&2
-            exit 1
+            # Visible skip on every event: the owner has approved setting the
+            # secret (GBRA-47 D-1) and only the owner can set it, so a red job
+            # here would only repeat that fact every night. The skip is never
+            # read as green: "Run hermes door tests" ends `skipped`, which
+            # nightly-watch matches against the `known-skipped` row in
+            # .github/nightly-known-red.tsv and keeps the incident open.
+            echo "paid=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::hermes door PAID LEG SKIPPED — ANTHROPIC_API_KEY secret is empty. Why: only the repo owner can set secrets. Fix (owner-only): gh secret set ANTHROPIC_API_KEY. Installer digest + payload + version pins verified; no hermes turn ran. Tracked as known-skipped in .github/nightly-known-red.tsv." >&2
+            {
+              echo "## Hermes door: paid leg skipped (known-skipped)"
+              echo "ANTHROPIC_API_KEY secret is empty — installer digest, payload, and version pins verified, but no hermes turn ran."
+              echo ""
+              echo "- Why: only the repo owner can set secrets."
+              echo "- Fix (owner-only): \`gh secret set ANTHROPIC_API_KEY\`, then delete the hermes row from \`.github/nightly-known-red.tsv\`."
+              echo "- Tracking: nightly-watch keeps this workflow's incident open while the row matches; this run is not green coverage."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           echo "paid=true" >> "$GITHUB_OUTPUT"
 
@@ -430,6 +489,8 @@ jobs:
   # stays deterministic while the canary tracks what users actually run.
   grok-door:
     name: Grok door e2e (real binary, keyless-first)
+    # Named exception with a recorded decision (docs/TESTING.md#event-parity): no
+    # covering scheduled run until the XAI_API_KEY secret exists (posture above).
     if: |
       (github.event_name == 'pull_request' &&
         contains(github.event.pull_request.labels.*.name, 'real-agent-e2e')) ||
@@ -668,6 +729,8 @@ jobs:
   # weight.
   plugin-doors:
     name: Plugin doors (codex + claude, install tier)
+    # Named exception (docs/TESTING.md#event-parity): label-gated on pull requests;
+    # the nightly Heavy Tests schedule and manual dispatch always run it.
     if: |
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
@@ -719,7 +782,10 @@ jobs:
             exit 1
           fi
 
+      # Runs even when the Codex door failed, so one door's red never hides
+      # the other's result.
       - name: Claude plugin door (install tier — expected shape enforced)
+        if: ${{ !cancelled() }}
         run: |
           EXIT=0
           bun test --timeout=600000 test/e2e/claude-plugin-install-real.serial.test.ts -t 'VALIDATE' > claude-plugin-door.txt 2>&1 || EXIT=$?
@@ -741,6 +807,8 @@ jobs:
   #
   opencode-door:
     name: opencode door e2e (${{ matrix.lane }})
+    # Named exception (docs/TESTING.md#event-parity): label-gated on pull requests;
+    # the nightly Heavy Tests schedule and manual dispatch always run it.
     if: |
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
@@ -968,6 +1036,8 @@ jobs:
   # (OPENCODE-CLI-PIN.md §Pin-refresh cadence), never a gate.
   opencode-door-canary:
     name: opencode door canary (latest, keyless, non-gating)
+    # Named exception (docs/TESTING.md#event-parity): a schedule-only, non-gating
+    # canary of the latest opencode; the pinned door lane above is the gate.
     if: github.event_name == 'schedule'
     runs-on: ubicloud-standard-16-ubuntu-2404
     timeout-minutes: 20

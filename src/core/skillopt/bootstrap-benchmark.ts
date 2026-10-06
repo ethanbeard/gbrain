@@ -132,6 +132,7 @@ export async function runBootstrap(opts: BootstrapOpts): Promise<BootstrapResult
         maxTokens: skilloptOutputCap(optimizerModel, 500),
         cacheSystem: true,
         purpose: SKILLOPT_PURPOSE.optimizer,
+        allowFallback: false,
       });
       if (result.stopReason === 'length') {
         skipped += 1;
@@ -252,6 +253,7 @@ export async function runBootstrapFromSkill(opts: BootstrapFromSkillOpts): Promi
     maxTokens: skilloptOutputCap(optimizerModel, Math.min(8000, Math.max(4000, taskCount * 220))),
     cacheSystem: true,
     purpose: SKILLOPT_PURPOSE.optimizer,
+    allowFallback: false,
   });
 
   const { generated, skipped } = parseSkillBenchmarkJsonl(result.text, skillName, result.stopReason === 'length');

@@ -27,6 +27,7 @@ tools:
 mutating: false
 writes_pages: false
 upstream: context-audit@fc834ee
+when_to_use: "Use when the user asks: \"context audit\", \"context diet\", \"system prompt audit\", \"prompt compression\", \"reduce context size\"."
 ---
 
 # context-audit — Token Hygiene for the Always-Loaded Context Stack
@@ -198,6 +199,14 @@ Sorted by token savings, descending — except contradictions, which are called
 out first regardless of size (they cost correctness, not just tokens). Every
 row carries evidence (a quote or line reference) and names WHERE the fix
 belongs: source file, answer bank/template, memory store, or a new skill.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain eval cross-modal` exits 1 (FAIL): fix the flagged weaknesses and re-run; do not deliver a failed audit as passing.
+- No judge model or provider key is configured: say the audit ran structure-only and name the missing key; do not fabricate scores.
+- A paid multi-model audit hits `no_pricing` or a cost cap: fall back to the default single cheap judge and tell the user why.
 
 ## Anti-Patterns
 

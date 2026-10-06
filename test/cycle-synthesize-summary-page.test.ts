@@ -41,6 +41,9 @@ async function renderSummary(writtenSlugs: string[]): Promise<{ body: string; ma
     },
     // #4506 dual-write suppressor reads this knob; default-on path.
     getConfig: async (_key: string) => null,
+    // The summary write runs in a maintenance transaction; the stub is its own transaction engine.
+    executeRaw: async () => [],
+    transaction: async <T>(fn: (tx: BrainEngine) => Promise<T>) => fn(engine),
   } as unknown as BrainEngine;
   try {
     await writeSummaryPage(

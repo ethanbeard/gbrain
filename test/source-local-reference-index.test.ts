@@ -23,3 +23,8 @@ test('source-local reference indexes enforce page and metadata bounds', () => {
   expect(() => buildSourceLocalReferenceIndex(Array.from({ length: 100_001 }, () => ({ slug: 'notes/one', title: 'One' })))).toThrow('100,000');
   expect(() => buildSourceLocalReferenceIndex([{ slug: 'notes/large', title: 'x'.repeat(16 * 1024 ** 2) }])).toThrow('16 MiB');
 });
+
+test('an oversized source names its page count and how to split it', () => {
+  expect(() => buildSourceLocalReferenceIndex(Array.from({ length: 100_001 }, () => ({ slug: 'notes/one', title: 'One' }))))
+    .toThrow(expect.objectContaining({ code: 'request_too_large', suggestion: expect.stringContaining('The source has 100001 pages') }));
+});

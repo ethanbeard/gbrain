@@ -16,7 +16,7 @@
  *
  * Lane: serial. Run: `bash scripts/run-serial-tests.sh test/bootstrap-harness-lifecycle.serial.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -210,7 +210,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
     expect(result).toBe(0);
     // real smoke against the live serve — identity round-tripped over bearer
     expect(out).toMatch(/smoke test:/);
-    expect(out).toMatch(/"engine": "pglite"/);
+    expect(out).toMatch(/"engine":"pglite"/); // C2: tool results are compact JSON
     // the sandbox held: nothing touched the operator's real user scope
     expect(out).not.toContain(`${process.env.HOME}/.claude/settings.json`);
 

@@ -7,12 +7,12 @@
  * Fails when: the real 3.2 parser stops flagging the #5810 shape, a guard
  * fixture leaks into the scan, a failure loses its FAIL file:line / Why / Fix
  * / See lines, or a missing parser stops being a one-line skip (exit 2 under
- * GBRAIN_BASH32_REQUIRE=1).
+ * GBRAIN_TEST_BASH32_REQUIRE=1).
  * Seams: GBRAIN_GUARD_ROOT (fixture tree), GBRAIN_BASH32 (parser binary; a
  * shim here), GBRAIN_BASH32_DOCKER (docker CLI). The real-parser cases run
  * when bash 3.2 is reachable without a network pull (stock /bin/bash, or the
  * pinned image already present) and are mandatory under
- * GBRAIN_BASH32_REQUIRE=1, which the CI step sets.
+ * GBRAIN_TEST_BASH32_REQUIRE=1, which the CI step sets.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
@@ -55,7 +55,7 @@ exit 0
 function run(guardRoot: string, env: Record<string, string> = {}) {
   return spawnSync('bash', [SCRIPT], {
     encoding: 'utf8',
-    env: { ...process.env, GBRAIN_BASH32: '', GBRAIN_BASH32_REQUIRE: '', GBRAIN_GUARD_ROOT: guardRoot, ...env },
+    env: { ...process.env, GBRAIN_BASH32: '', GBRAIN_BASH32_REQUIRE: '', GBRAIN_TEST_BASH32_REQUIRE: '', GBRAIN_GUARD_ROOT: guardRoot, ...env },
   });
 }
 
@@ -97,14 +97,22 @@ describe('check-bash32.sh reporting (parser shim)', () => {
     expect(skipped.stdout.trim().split('\n')).toEqual([
       '- bash 3.2 parse: skipped (no bash 3.x at /bin/bash and no docker CLI; install Docker or set GBRAIN_BASH32 to a bash 3.2 binary)',
     ]);
-    const required = run(join(root, 'tree'), { ...noDocker, GBRAIN_BASH32_REQUIRE: '1' });
+    const required = run(join(root, 'tree'), { ...noDocker, GBRAIN_TEST_BASH32_REQUIRE: '1' });
     expect(required.status).toBe(2);
-    expect(required.stderr).toContain('GBRAIN_BASH32_REQUIRE=1 forbids skipping');
+    expect(required.stderr).toContain('GBRAIN_TEST_BASH32_REQUIRE=1 forbids skipping');
+  });
+
+  it('refuses the pre-rename GBRAIN_BASH32_REQUIRE with the rename line instead of ignoring it', () => {
+    write('tree/a.sh', 'echo a\n');
+    const r = run(join(root, 'tree'), { GBRAIN_BASH32: shim(), GBRAIN_BASH32_REQUIRE: '1' });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('GBRAIN_BASH32_REQUIRE was renamed to GBRAIN_TEST_BASH32_REQUIRE');
+    expect(r.stderr).toContain('Fix: unset GBRAIN_BASH32_REQUIRE && export GBRAIN_TEST_BASH32_REQUIRE=1');
   });
 });
 
 function realParserReachable(): boolean {
-  if (process.env.GBRAIN_BASH32_REQUIRE === '1') return true;
+  if (process.env.GBRAIN_TEST_BASH32_REQUIRE === '1') return true;
   const native = spawnSync('/bin/bash', ['-c', 'echo "${BASH_VERSINFO[0]}"'], { encoding: 'utf8' });
   if (native.stdout?.trim() === '3') return true;
   return spawnSync('docker', ['image', 'inspect', IMAGE], { stdio: 'ignore' }).status === 0;

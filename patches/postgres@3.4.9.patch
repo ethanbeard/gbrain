@@ -1,5 +1,5 @@
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..be36dfd08e084c7f1c181e42cd1c57d5213e3293 100644
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..e5800bca79ea3e5d638176bcdfa6124dbb94e18b 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -78,6 +78,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -81,7 +81,15 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..be36dfd08e084c7f1c181e42cd1c57d5
      if (initial)
        return reconnect()
  
-@@ -564,10 +579,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -533,6 +548,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function ReadyForQuery(x) {
++    connection.status = x[5]
+     if (query) {
+       if (errorResponse) {
+         query.retried
+@@ -564,10 +580,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
          return fetchArrayTypes()
        }
  
@@ -96,7 +104,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..be36dfd08e084c7f1c181e42cd1c57d5
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -580,7 +597,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -580,7 +598,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        ? !connection.reserved.release && x[5] === 73 // I
          ? ending
            ? terminate()
@@ -106,7 +114,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..be36dfd08e084c7f1c181e42cd1c57d5
        : ending
          ? terminate()
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9dc0c7a2303941079f2c3c4e668105444a8ef1af 100644
+index f09c61c7e998f411560b95c9a8e1ed6a97972c11..c72e4135627296dd00179e30d02094d591047267 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
 @@ -200,40 +200,134 @@ function Postgres(a, b) {
@@ -189,7 +197,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9dc0c7a2303941079f2c3c4e66810544
 +      if (!busy) {
 +        if (releasing) {
 +          c.reserved = null
-+          onopen(c)
++          onopen(c, true)
 +        } else {
 +          move(c, reserved)
 +        }
@@ -309,10 +317,14 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9dc0c7a2303941079f2c3c4e66810544
      }
    }
  
-@@ -399,6 +497,11 @@ function Postgres(a, b) {
+@@ -398,7 +496,14 @@ function Postgres(a, b) {
+     move(c, ended)
    }
  
-   function onopen(c) {
+-  function onopen(c) {
++  function onopen(c, released) {
++    if (c.status && c.status !== 73 && (released || options.max !== 1)) // not I
++      return poisoned(c)
 +    if (ending) {
 +      while (queries.length)
 +        queries.shift().reject(Errors.connection('CONNECTION_ENDED', options))
@@ -321,8 +333,20 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9dc0c7a2303941079f2c3c4e66810544
      if (queries.length === 0)
        return move(c, open)
  
-@@ -420,10 +523,20 @@ function Postgres(a, b) {
+@@ -418,12 +523,32 @@ function Postgres(a, b) {
+       : move(c, full)
+   }
  
++  function poisoned(c) {
++    if (c.queue === ended)
++      return
++    move(c, ended)
++    try {
++      options.onpoisoned && options.onpoisoned(String.fromCharCode(c.status))
++    } catch (_) {}
++    c.terminate()
++  }
++
    function onclose(c, e) {
      move(c, closed)
 +    const reservation = c.reserved
@@ -343,6 +367,14 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9dc0c7a2303941079f2c3c4e66810544
    }
  }
  
+@@ -491,6 +616,7 @@ function parseOptions(a, b) {
+     onnotice        : o.onnotice,
+     onnotify        : o.onnotify,
+     onclose         : o.onclose,
++    onpoisoned      : o.onpoisoned,
+     onparameter     : o.onparameter,
+     socket          : o.socket,
+     transform       : parseTransform(o.transform || { undefined: undefined }),
 diff --git a/cjs/src/query.js b/cjs/src/query.js
 index 45327f2fabcdbf8f8ec5020675012c310c04fee6..1d092504ac1ce1fdac78cb0c4ef3a8aa957676e4 100644
 --- a/cjs/src/query.js
@@ -400,7 +432,7 @@ index 8438f5da92cf7637d98a33491d75c75b1c817c25..c444310ff87b0ac81fd19cd3170a0ba6
        const out = xs[index++]
  
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..617335d1b039866e86cd63872eeaf9ef7039a13c 100644
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..9a61cd9dcc9772e843842284e516641cb55178d0 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -78,6 +78,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -482,7 +514,15 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..617335d1b039866e86cd63872eeaf9ef
      if (initial)
        return reconnect()
  
-@@ -564,10 +579,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -533,6 +548,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function ReadyForQuery(x) {
++    connection.status = x[5]
+     if (query) {
+       if (errorResponse) {
+         query.retried
+@@ -564,10 +580,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
          return fetchArrayTypes()
        }
  
@@ -497,7 +537,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..617335d1b039866e86cd63872eeaf9ef
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -580,7 +597,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -580,7 +598,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        ? !connection.reserved.release && x[5] === 73 // I
          ? ending
            ? terminate()
@@ -507,7 +547,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..617335d1b039866e86cd63872eeaf9ef
        : ending
          ? terminate()
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..4c9192680a0da45fe13e1f06f1d8d05dcbe5a8a1 100644
+index c7fba3dace20173f4cb13f3f138bb6d213b43683..e9af339e13ee79e38d13fe82733ed17dc7529b46 100644
 --- a/src/index.js
 +++ b/src/index.js
 @@ -200,40 +200,134 @@ function Postgres(a, b) {
@@ -590,7 +630,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..4c9192680a0da45fe13e1f06f1d8d05d
 +      if (!busy) {
 +        if (releasing) {
 +          c.reserved = null
-+          onopen(c)
++          onopen(c, true)
 +        } else {
 +          move(c, reserved)
 +        }
@@ -710,10 +750,14 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..4c9192680a0da45fe13e1f06f1d8d05d
      }
    }
  
-@@ -399,6 +497,11 @@ function Postgres(a, b) {
+@@ -398,7 +496,14 @@ function Postgres(a, b) {
+     move(c, ended)
    }
  
-   function onopen(c) {
+-  function onopen(c) {
++  function onopen(c, released) {
++    if (c.status && c.status !== 73 && (released || options.max !== 1)) // not I
++      return poisoned(c)
 +    if (ending) {
 +      while (queries.length)
 +        queries.shift().reject(Errors.connection('CONNECTION_ENDED', options))
@@ -722,8 +766,20 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..4c9192680a0da45fe13e1f06f1d8d05d
      if (queries.length === 0)
        return move(c, open)
  
-@@ -420,10 +523,20 @@ function Postgres(a, b) {
+@@ -418,12 +523,32 @@ function Postgres(a, b) {
+       : move(c, full)
+   }
  
++  function poisoned(c) {
++    if (c.queue === ended)
++      return
++    move(c, ended)
++    try {
++      options.onpoisoned && options.onpoisoned(String.fromCharCode(c.status))
++    } catch (_) {}
++    c.terminate()
++  }
++
    function onclose(c, e) {
      move(c, closed)
 +    const reservation = c.reserved
@@ -744,6 +800,14 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..4c9192680a0da45fe13e1f06f1d8d05d
    }
  }
  
+@@ -491,6 +616,7 @@ function parseOptions(a, b) {
+     onnotice        : o.onnotice,
+     onnotify        : o.onnotify,
+     onclose         : o.onclose,
++    onpoisoned      : o.onpoisoned,
+     onparameter     : o.onparameter,
+     socket          : o.socket,
+     transform       : parseTransform(o.transform || { undefined: undefined }),
 diff --git a/src/query.js b/src/query.js
 index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..96967780bdb55671bdcdda0fd0bb6e718e0a0e78 100644
 --- a/src/query.js
@@ -801,10 +865,22 @@ index c4ef97164f057db99dce1b9af3401dbb1af37e31..8fba891b879e8f5c7fdb03ea05907536
        const out = xs[index++]
  
 diff --git a/types/index.d.ts b/types/index.d.ts
-index 13c3432f761e2c2ee5b7dc1bdafe93e49f993dc7..5d8903e3246e1f596e717019db76e87008b25bfc 100644
+index 13c3432f761e2c2ee5b7dc1bdafe93e49f993dc7..19103a998359c7277cd966c246cf245aedec4297 100644
 --- a/types/index.d.ts
 +++ b/types/index.d.ts
-@@ -605,7 +605,7 @@ declare namespace postgres {
+@@ -119,6 +119,11 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
+    */
+   publications: string
+   onclose: (connId: number) => void;
++  /**
++   * Called when a pooled or released connection is terminated instead of
++   * reused because its ReadyForQuery status was not idle ('T' or 'E').
++   */
++  onpoisoned: (status: string) => void;
+   backoff: boolean | ((attemptNum: number) => number);
+   max_lifetime: number | null;
+   keep_alive: number | null;
+@@ -605,7 +610,7 @@ declare namespace postgres {
      writable(): Promise<Writable>;
  
      execute(): this;
@@ -813,7 +889,7 @@ index 13c3432f761e2c2ee5b7dc1bdafe93e49f993dc7..5d8903e3246e1f596e717019db76e870
  
      /**
       * @deprecated `.stream` has been renamed to `.forEach`
-@@ -659,6 +659,7 @@ declare namespace postgres {
+@@ -659,6 +664,7 @@ declare namespace postgres {
    | Fragment[]
  
    interface UnsafeQueryOptions {
@@ -821,7 +897,7 @@ index 13c3432f761e2c2ee5b7dc1bdafe93e49f993dc7..5d8903e3246e1f596e717019db76e870
      /**
       * When executes query as prepared statement.
       * @default false
-@@ -717,10 +718,11 @@ declare namespace postgres {
+@@ -717,10 +723,11 @@ declare namespace postgres {
      begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
@@ -834,7 +910,7 @@ index 13c3432f761e2c2ee5b7dc1bdafe93e49f993dc7..5d8903e3246e1f596e717019db76e870
      savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
-@@ -728,6 +730,7 @@ declare namespace postgres {
+@@ -728,6 +735,7 @@ declare namespace postgres {
    }
  
    interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {

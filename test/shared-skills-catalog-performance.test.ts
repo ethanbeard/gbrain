@@ -10,6 +10,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { activateSharedSkillPersistence } from '../src/core/persistence/skill-activation.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { getSharedSkill, listSharedSkills } from '../src/core/shared-skills/catalog.ts';
 import { normalizeSkillFiles, skillMetadata } from '../src/core/shared-skills/manifest.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -52,7 +53,7 @@ test.skipIf(process.env.GBRAIN_TEST_SHARED_SKILLS_BENCHMARK !== '1')('measure se
             await tx.executeRaw(`INSERT INTO shared_skill_revisions(source_id,source_incarnation,pack_id,name,revision,metadata,files,policy_epoch,request_id)
               SELECT 'default',$1::uuid,'benchmark',r.name,r.revision,r.metadata,r.files,'legacy-prose',$3::uuid
               FROM jsonb_to_recordset($2::text::jsonb) AS r(name text,revision uuid,metadata jsonb,files jsonb)`, [source.incarnation, JSON.stringify(rows), randomUUID()]);
-          });
+          }, TEST_WRITE_ATTRIBUTION);
         });
         const rssBefore = process.memoryUsage().rss;
         calls = 0;

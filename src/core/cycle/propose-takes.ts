@@ -37,6 +37,8 @@
  * phase can run hermetically in unit tests without touching the gateway.
  */
 
+import { observationDateLine, observationDateRule, resolveObservationDate, type ObservationDate } from '../ai/date-grounding.ts';
+import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, CYCLE_DEADLINE_RESERVE_MS, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { defaultTimeoutMsFor } from '../minions/handler-timeouts.ts';
@@ -194,6 +196,15 @@ export type ProposeTakesExtractor = (input: {
   retryMaxTokens?: number;
   /** #5425: include EXTRACT_TAKES_ATTRIBUTION_RULES (opt-in). */
   attributionRules?: boolean;
+  /**
+   * extraction.date_grounding: resolve relative deadlines ("by Q3", "in 18
+   * months") against the page's observation date. Prompt-only; the
+   * idempotency key (prompt_version) is unchanged so enabling it never
+   * reprocesses pages.
+   */
+  dateGrounding?: boolean;
+  /** The page's observation date (date-grounding.ts), null when undated. */
+  observationDate?: ObservationDate | null;
 }) => Promise<ProposedTake[]>;
 
 export interface ProposeTakesOpts extends BasePhaseOpts {
@@ -351,8 +362,11 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
   return rows;
 }
 
-/** Per-call wall-clock timeout for the extractor LLM call. */
+/** Per-call wall-clock timeout for the extractor LLM call at the base cap. */
 const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
+/** Ceiling for the scaled timeout: the gateway's own chat default
+ *  (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) bounds the call regardless. */
+const EXTRACTOR_CALL_TIMEOUT_MAX_MS = 300_000;
 
 /**
  * #3763 — output caps for the extractor call. A stopReason 'length' response
@@ -372,6 +386,20 @@ const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
  */
 export const PROPOSE_TAKES_MAX_TOKENS = 2048;
 export const PROPOSE_TAKES_RETRY_MAX_TOKENS = 4096;
+
+/**
+ * Wall-clock timeout for one extractor call, scaled with its output cap
+ * (#5771). A flat 90s sized for the 2048-token base call starved the
+ * truncation retry: at a configured retry_max_tokens of 12000 a dense page's
+ * retry needs well over 90s to generate, so it timed out every cycle and the
+ * page was re-billed (base call + aborted retry) forever with no tombstone.
+ * 90s per PROPOSE_TAKES_MAX_TOKENS of output, floored at 90s, capped at
+ * EXTRACTOR_CALL_TIMEOUT_MAX_MS.
+ */
+function extractorCallTimeoutMs(maxTokens: number): number {
+  const scaled = Math.ceil((EXTRACTOR_CALL_TIMEOUT_MS * maxTokens) / PROPOSE_TAKES_MAX_TOKENS);
+  return Math.min(EXTRACTOR_CALL_TIMEOUT_MAX_MS, Math.max(EXTRACTOR_CALL_TIMEOUT_MS, scaled));
+}
 
 /**
  * #3763 — halt streak for a dead extractor lane. When EVERY extractor call in
@@ -394,6 +422,12 @@ export const EXTRACTOR_FAILURE_HALT_STREAK = 5;
  * then, the production extractor returns whatever the stub LLM produces —
  * empirically often a sparse list or [].
  */
+/** Prompt flags read once per phase run: #5425 attribution rules and extraction.date_grounding. */
+async function takesPromptFlags(engine: BrainEngine): Promise<{ attributionRules: boolean; dateGrounding: boolean }> {
+  const attributionRules = String(await Promise.resolve(engine.getConfig?.('dream.propose_takes.attribution_rules')).catch(() => null) ?? '').trim() === 'true';
+  return { attributionRules, dateGrounding: await isConsumerDateGroundingOn(engine, 'takes') };
+}
+
 export async function defaultExtractor(
   input: Parameters<ProposeTakesExtractor>[0],
 ): Promise<ProposedTake[]> {
@@ -401,6 +435,9 @@ export async function defaultExtractor(
     ? EXTRACT_TAKES_PROMPT.replace('For each gradeable claim,', `${EXTRACT_TAKES_ATTRIBUTION_RULES}For each gradeable claim,`)
     : EXTRACT_TAKES_PROMPT)
     .replace('{EXISTING_TAKES_JSON}', JSON.stringify(input.existingTakes, null, 2))
+    .replace('PAGE PROSE:\n', input.dateGrounding
+      ? `${observationDateRule()}\n${observationDateLine(input.observationDate ?? resolveObservationDate({ slug: input.pagePath }))}\n\nPAGE PROSE:\n`
+      : 'PAGE PROSE:\n')
     .replace('{PAGE_BODY}', input.pageBody);
 
   // #4494: per-run configurable caps (dream.propose_takes.max_tokens /
@@ -416,11 +453,13 @@ export async function defaultExtractor(
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
+  // The bound scales with maxTokens so an escalated or configured larger cap
+  // gets time to generate what it allows.
   const call = (maxTokens: number) => gatewayChat({
     messages: [{ role: 'user', content: prompt }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
     maxTokens,
-    abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
+    abortSignal: AbortSignal.timeout(extractorCallTimeoutMs(maxTokens)),
   });
   let result = await call(baseMaxTokens);
 
@@ -682,7 +721,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
     }
 
     const extractor = opts.extractor ?? defaultExtractor;
-    const attributionRules = String(await Promise.resolve(engine.getConfig?.('dream.propose_takes.attribution_rules')).catch(() => null) ?? '').trim() === 'true';
+    const { attributionRules, dateGrounding } = await takesPromptFlags(engine);
     const promptVersion = opts.promptVersion ?? `${PROPOSE_TAKES_PROMPT_VERSION}${attributionRules ? PROPOSE_TAKES_ATTRIBUTION_PROMPT_SUFFIX : ''}`;
     const pageLimit = opts.pageLimit ?? 100;
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
@@ -888,7 +927,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           // #4494: configurable output caps (see resolution above).
           maxTokens: extractorMaxTokens,
           retryMaxTokens: extractorRetryMaxTokens,
-          attributionRules,
+          attributionRules, dateGrounding,
         });
       } catch (err) {
         result.llm_calls_failed += 1;

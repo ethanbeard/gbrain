@@ -134,6 +134,10 @@
         "name": "sync_failures"
       },
       {
+        "category": "brain",
+        "name": "managed_sync_backlog"
+      },
+      {
         "category": "meta",
         "name": "slug_fallback_audit"
       },
@@ -186,6 +190,10 @@
         "name": "pglite_leftovers"
       },
       {
+        "category": "ops",
+        "name": "graduation_interrupted"
+      },
+      {
         "category": "meta",
         "name": "default_source_local_path"
       },
@@ -204,6 +212,14 @@
       {
         "category": "brain",
         "name": "embedding_key_source"
+      },
+      {
+        "category": "ops",
+        "name": "harness_wiring"
+      },
+      {
+        "category": "meta",
+        "name": "agent_contract"
       },
       {
         "category": "ops",
@@ -248,6 +264,18 @@
       {
         "category": "brain",
         "name": "parked_effects"
+      },
+      {
+        "category": "ops",
+        "name": "worktree_refresh_stuck"
+      },
+      {
+        "category": "ops",
+        "name": "managed_guard_schema_drift"
+      },
+      {
+        "category": "ops",
+        "name": "publication_refusals"
       },
       {
         "category": "meta",
@@ -300,6 +328,14 @@
       {
         "category": "brain",
         "name": "embedding_migration_state"
+      },
+      {
+        "category": "ops",
+        "name": "chat_fallback_chain"
+      },
+      {
+        "category": "meta",
+        "name": "behavior_changes"
       },
       {
         "category": "brain",
@@ -359,6 +395,14 @@
       },
       {
         "category": "brain",
+        "name": "git_held_files"
+      },
+      {
+        "category": "ops",
+        "name": "frontmatter_hook"
+      },
+      {
+        "category": "brain",
         "name": "orphan_persistence_bindings"
       },
       {
@@ -388,6 +432,18 @@
       {
         "category": "brain",
         "name": "extractor_facts_expired"
+      },
+      {
+        "category": "brain",
+        "name": "captured_facts_active"
+      },
+      {
+        "category": "brain",
+        "name": "loop_facts_drift"
+      },
+      {
+        "category": "brain",
+        "name": "extraction_date_grounding"
       },
       {
         "category": "brain",
@@ -458,6 +514,10 @@
         "name": "frontmatter_integrity"
       },
       {
+        "category": "brain",
+        "name": "frontmatter_repairable"
+      },
+      {
         "category": "meta",
         "name": "eval_capture"
       },
@@ -491,7 +551,23 @@
       },
       {
         "category": "ops",
+        "name": "global_maintenance_timeouts"
+      },
+      {
+        "category": "ops",
         "name": "legacy_job_authority"
+      },
+      {
+        "category": "ops",
+        "name": "legacy_token_grant_shape"
+      },
+      {
+        "category": "ops",
+        "name": "legacy_token_grant_drift"
+      },
+      {
+        "category": "ops",
+        "name": "legacy_token_null_scope"
       },
       {
         "category": "ops",
@@ -512,6 +588,10 @@
       {
         "category": "ops",
         "name": "canonical_content_writes"
+      },
+      {
+        "category": "ops",
+        "name": "shared_skills_sources"
       },
       {
         "category": "ops",
@@ -546,6 +626,10 @@
         "name": "db_only_collector_collision"
       },
       {
+        "category": "brain",
+        "name": "git_convergence"
+      },
+      {
         "category": "ops",
         "name": "decide_health"
       },
@@ -554,8 +638,44 @@
         "name": "unlinked_facts"
       },
       {
+        "category": "brain",
+        "name": "edge_validity"
+      },
+      {
+        "category": "brain",
+        "name": "auto_chronicle"
+      },
+      {
+        "category": "brain",
+        "name": "chronicle_config_invalid"
+      },
+      {
+        "category": "brain",
+        "name": "auto_chronicle_default_on"
+      },
+      {
+        "category": "brain",
+        "name": "facts_drain"
+      },
+      {
+        "category": "brain",
+        "name": "fact_take_vectors"
+      },
+      {
         "category": "ops",
-        "name": "chat_fallback_chain_inert"
+        "name": "planner_stats_stale"
+      },
+      {
+        "category": "meta",
+        "name": "retrieval_feedback_health"
+      },
+      {
+        "category": "meta",
+        "name": "revision_backfill"
+      },
+      {
+        "category": "brain",
+        "name": "core_memory"
       },
       {
         "category": "ops",

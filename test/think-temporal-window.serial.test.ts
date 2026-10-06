@@ -70,6 +70,16 @@ describe('temporal-window parsing', () => {
 });
 
 describe('effective-date policy', () => {
+  test('effective date strings must be real calendar days', () => {
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2026-02-31' })).toBeNull();
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2026-02-28' })).toBe(Date.UTC(2026, 1, 28, 12));
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2024-02-29' })).toBe(Date.UTC(2024, 1, 29, 12));
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '2023-02-29' })).toBeNull();
+    const year50 = new Date(12 * 3600_000);
+    year50.setUTCFullYear(50, 0, 1);
+    expect(resolvePageDateMs({ slug: 'undated', effective_date: '0050-01-01' })).toBe(year50.getTime());
+  });
+
   const result = (slug: string, effective_date: string | null): SearchResult => ({
     slug, effective_date, page_id: 1, title: slug, type: 'note', chunk_text: '',
     chunk_source: 'compiled_truth', chunk_id: 1, chunk_index: 0, score: 1, stale: false,

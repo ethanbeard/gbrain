@@ -108,3 +108,26 @@ test('an already authenticated connector session drains later retained recovery 
     expect((await session.page('gh/acme-example/app/1'))?.compiled_truth).toContain('Updated organization after interruption');
   }
 }), 120_000);
+
+test('a blocked retained recovery waits the configured write wait, not a fixed five seconds', async () => withEnv({ ...env, GBRAIN_WRITE_WAIT_MS: '250' }, async () => {
+  for (const engine of engines) {
+    const f = await boundSource(engine, githubConfig);
+    const config = parseGitHubSourceConfig(githubConfig, f.dir);
+    await runGitHubSync(engine, f.id, config, options, githubFetch());
+    await disposePersistenceConsumer(engine);
+    const crash = await standaloneConnector(engine, f, githubConfig, true);
+    expect(crash.stdout).toContain('CONNECTOR_AFTER_PUBLICATION_BEFORE_COMMIT');
+    const path = join(f.dir, 'gh/acme-example/app/1.md');
+    const published = readFileSync(path, 'utf8');
+    writeFileSync(path, `${published}\nOperator edit blocks the recovery.\n`);
+    try {
+      const started = performance.now();
+      const failure = await beginConnectorSync(engine, f.id, 'github', config, options).then(() => null, (e: { code?: string }) => e);
+      expect(failure?.code).toBe('recovery_required');
+      expect(performance.now() - started).toBeLessThan(4_000);
+    } finally {
+      await disposePersistenceConsumer(engine);
+      writeFileSync(path, published);
+    }
+  }
+}), 120_000);

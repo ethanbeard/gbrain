@@ -254,9 +254,10 @@ function normaliseDefault(d: string | null): string | null {
 export function diffSnapshots(
   pg: SchemaSnapshot,
   pglite: SchemaSnapshot,
-  opts: { allowlistPgOnlyTables: string[] },
+  opts: { allowlistPgOnlyTables: string[]; allowlistPgliteOnlyTables?: string[] },
 ): SchemaDiff {
   const allowlist = new Set(opts.allowlistPgOnlyTables);
+  const pgliteOnly = new Set(opts.allowlistPgliteOnlyTables ?? []);
   const diff: SchemaDiff = {
     tablesMissingInPGLite: [],
     tablesUnexpectedlyInPGLite: [],
@@ -302,7 +303,7 @@ export function diffSnapshots(
   // reviewer can decide.
   for (const [table, pgliteCols] of pglite) {
     if (!pg.has(table)) {
-      diff.tablesUnexpectedlyInPGLite.push(table);
+      if (!pgliteOnly.has(table)) diff.tablesUnexpectedlyInPGLite.push(table);
       continue;
     }
     if (allowlist.has(table)) continue;

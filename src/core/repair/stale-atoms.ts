@@ -26,9 +26,11 @@ import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import type { WriteRequest } from '../persistence/model.ts';
-import { OperationError, type OperationContext } from '../ops/contract.ts';
+import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { authorizeWrite } from '../persistence/authority.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { preparePageMutation } from '../persistence/page-prepare.ts';
 import { maintenancePreflight, submitMaintenanceIntent } from '../persistence/prepared-maintenance.ts';
 import { bumpAtomGeneration, managedAtomCompletedSql } from '../persistence/atom-maintenance.ts';
@@ -174,7 +176,7 @@ async function retireStaleAtom(ctx: OperationContext, atom: StaleAtom): Promise<
     }
     return { applied: true, outcome: 'retired' };
   }
-  const retired = await engine.transaction(async tx => {
+  const retired = await maintenanceTransaction(engine, async tx => {
     await tx.lockPageKeys([{ sourceId: atom.source_id, slug: atom.slug }, { sourceId: atom.source_id, slug: atom.origin_slug }]);
     if (!sameAtom((await staleAtoms(tx, [atom.source_id], atom.id))[0], atom)) return false;
     await tx.createVersion(atom.slug, { sourceId: atom.source_id });
@@ -194,14 +196,21 @@ async function stampRetirement(tx: BrainEngine, atom: StaleAtom): Promise<void> 
 }
 
 /** Preparer for `managed_maintenance_retire_stale_atoms`: rechecks the atom's class under its and its origin's page locks, then retires it. */
+const staleAtomsPreviewFix = (sourceId: string) => readFix('Previews the stale-atoms repair without changing anything.',
+  { argv: ['gbrain', 'repair', 'stale-atoms', '--source', sourceId, '--json'] });
+
 export async function prepareStaleAtomRetirement(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const atom = row.intent!.atom as StaleAtom;
   if (!atom || atom.slug !== row.slug || atom.source_id !== row.source_id || atom.id !== Number(row.page_id)) {
-    throw new OperationError('invalid_params', 'The stale atom retirement intent does not name its atom.');
+    throw opError('invalid_params', 'The stale atom retirement intent does not name its atom.',
+      `Request ${row.request_id} for ${row.slug} in source ${row.source_id} does not name the atom it retires, so nothing changed. Preview the repair again and apply the new preview after the user approves.`,
+      { fix: staleAtomsPreviewFix(row.source_id) });
   }
   const unchanged = async (db: BrainEngine) => {
     if (!sameAtom((await staleAtoms(db, [row.source_id], atom.id))[0], atom)) {
-      throw new OperationError('revision_conflict', 'The stale atom or its source page changed since the preview.');
+      throw opError('revision_conflict', 'The stale atom or its source page changed since the preview.',
+        `Atom ${row.slug} in source ${row.source_id} or its source page changed after the preview, so request ${row.request_id} retired nothing. Preview the repair again and apply the new preview after the user approves.`,
+        { fix: staleAtomsPreviewFix(row.source_id) });
     }
   };
   await unchanged(engine);

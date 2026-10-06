@@ -13,6 +13,7 @@ import { rescopeClientGrant } from '../core/grants/service.ts';
 import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { VERSION } from '../version.ts';
+import { mountAdminApiKeys } from './serve-http-api-keys.ts';
 import { mountAdminClients } from './serve-http-clients.ts';
 import { mountAdminRegistration } from './serve-http-registration.ts';
 import { parseAdminGrantRequest, grantHttpStatus, GRANT_TOKEN_IMPLICATIONS, mountAdminGrantDiscovery, mountAdminGrantEdits } from './serve-http-grants.ts';
@@ -62,6 +63,43 @@ export function openAdminSseStream(res: AdminSseResponse): void {
  * Falls back to `[]` on any SQL error (pre-v0.38 brains where the v82-v84
  * tables/columns don't yet exist).
  */
+/** The `/admin/api/health-indicators` body; SQL lives here so tests pin the served query. */
+export async function queryHealthIndicators(engine: BrainEngine): Promise<{
+  expiring_soon: number; error_rate: string; pending_writes: number;
+  oldest_pending_write_age_seconds: number; pending_writes_later_failed: number;
+}> {
+  const sql = sqlQueryForEngine(engine);
+  const now = Math.floor(Date.now() / 1000);
+  const [expiring] = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE token_type = 'access' AND expires_at BETWEEN ${now} AND ${now + 86400}`;
+  // Excluded from the error numerator: success, success_with_warnings
+  // (a warn-mode success) and accepted_pending (#5249: an admitted write
+  // still in flight; its eventual failure is counted separately below);
+  // denied_after_list stays counted — a denied call IS a failure signal.
+  // surface_change is an OPERATION value (audit rows carry
+  // status='success'), so audit rows are excluded from BOTH counts —
+  // they are records of operator/self actions, not traffic.
+  const [errors] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE status NOT IN ('success', 'success_with_warnings', 'accepted_pending') AND operation != 'surface_change' AND created_at > now() - interval '24 hours'`;
+  const [total] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE operation != 'surface_change' AND created_at > now() - interval '24 hours'`;
+  const errorRate = (total as any).count > 0 ? ((errors as any).count / (total as any).count * 100).toFixed(1) : '0';
+  // #5249/O-CEO-14: pending writes are tracked apart from the error rate —
+  // how many are still in flight, how old the oldest is, and how many
+  // reported as pending in the last 24 hours later ended without committing.
+  const [pending] = await sql`SELECT count(*)::int AS count,
+    COALESCE(floor(extract(epoch FROM now() - min(created_at))), 0)::int AS oldest_age_seconds
+    FROM persistence_requests WHERE state IN ('queued', 'running', 'recovering')`;
+  const [laterFailed] = await sql`SELECT count(DISTINCT r.id)::int AS count FROM mcp_request_log l
+    JOIN persistence_requests r ON r.request_id::text = l.params->>'write_request_id'
+    WHERE l.status = 'accepted_pending' AND l.created_at > now() - interval '24 hours'
+      AND r.state IN ('conflict', 'failed', 'cancelled')`;
+  return {
+    expiring_soon: (expiring as any).count,
+    error_rate: `${errorRate}%`,
+    pending_writes: (pending as any).count,
+    oldest_pending_write_age_seconds: (pending as any).oldest_age_seconds,
+    pending_writes_later_failed: (laterFailed as any).count,
+  };
+}
+
 export interface AgentClientSpend {
   client_id: string;
   client_name: string;
@@ -297,20 +335,7 @@ function mountAdminOverviewApi(app: Express, ctx: ServeHttpContext): void {
 
   app.get('/admin/api/health-indicators', requireAdmin, async (_req: Request, res: Response) => {
     try {
-      const now = Math.floor(Date.now() / 1000);
-      const [expiring] = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE token_type = 'access' AND expires_at BETWEEN ${now} AND ${now + 86400}`;
-      // Excluded from the error numerator: success and success_with_warnings
-      // (a warn-mode success); denied_after_list stays counted — a denied
-      // call IS a failure signal. surface_change is an OPERATION value (audit
-      // rows carry status='success'), so audit rows are excluded from BOTH
-      // counts — they are records of operator/self actions, not traffic.
-      const [errors] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE status NOT IN ('success', 'success_with_warnings') AND operation != 'surface_change' AND created_at > now() - interval '24 hours'`;
-      const [total] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE operation != 'surface_change' AND created_at > now() - interval '24 hours'`;
-      const errorRate = (total as any).count > 0 ? ((errors as any).count / (total as any).count * 100).toFixed(1) : '0';
-      res.json({
-        expiring_soon: (expiring as any).count,
-        error_rate: `${errorRate}%`,
-      });
+      res.json(await queryHealthIndicators(engine));
     } catch {
       res.status(503).json({ error: 'service_unavailable' });
     }
@@ -551,45 +576,7 @@ function mountAdminKeyApi(app: Express, ctx: ServeHttpContext): void {
     }
   });
 
-  // Legacy API keys (access_tokens table)
-  app.get('/admin/api/api-keys', requireAdmin, async (_req: Request, res: Response) => {
-    try {
-      const keys = await sql`
-        SELECT id, name, created_at, last_used_at,
-          CASE WHEN revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status
-        FROM access_tokens ORDER BY created_at DESC
-      `;
-      res.json(keys);
-    } catch (e) {
-      res.status(503).json({ error: 'service_unavailable' });
-    }
-  });
-
-  app.post('/admin/api/api-keys', requireAdmin, express.json(), async (req: Request, res: Response) => {
-    try {
-      const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
-      const { generateToken, hashToken } = await import('../core/utils.ts');
-      const token = generateToken('gbrain_');
-      const hash = hashToken(token);
-      const id = (await import('crypto')).randomUUID();
-      await sql`INSERT INTO access_tokens (id, name, token_hash) VALUES (${id}, ${name}, ${hash})`;
-      res.json({ name, token, id });
-    } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
-    }
-  });
-
-  app.post('/admin/api/api-keys/revoke', requireAdmin, express.json(), async (req: Request, res: Response) => {
-    try {
-      const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
-      await sql`UPDATE access_tokens SET revoked_at = now() WHERE name = ${name} AND revoked_at IS NULL`;
-      res.json({ revoked: true });
-    } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
-    }
-  });
+  mountAdminApiKeys(app, requireAdmin, engine);
 }
 
 function mountAdminClientApi(app: Express, ctx: ServeHttpContext): void {

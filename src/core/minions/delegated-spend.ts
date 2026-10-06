@@ -31,7 +31,7 @@ export function maximumInvocationCents(call: AIInvocation): number | null {
   return Math.ceil((call.maxInputTokens! * Math.max(p.input * 2, p.read, p.write) + call.maxOutputTokens! * p.output) / 100) / 100;
 }
 
-function actualCents(call: AIInvocation, usage: AIInvocationUsage | null): number | null {
+export function actualCents(call: AIInvocation, usage: AIInvocationUsage | null): number | null {
   const p = prices(call);
   if (!p || !usage) return null;
   const values = [usage.inputTokens, usage.outputTokens, usage.cacheReadTokens ?? 0, usage.cacheWriteTokens ?? 0];
@@ -58,5 +58,5 @@ export function withDelegatedSpend<T>(engine: BrainEngine, snapshot: DelegationS
         [hold.reservationId, usage === null ? 'provider_usage_unknown' : 'pricing_unknown'],
       );
     } };
-  }, run);
+  }, run, { inherit: true });
 }

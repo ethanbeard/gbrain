@@ -3,10 +3,11 @@ import { resolve } from 'node:path';
 import type { BrainEngine } from '../core/engine.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { finishCliTeardown, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
-import { isThinClient, loadConfig, toEngineConfig } from '../core/config.ts';
+import { isThinClient, loadConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { loadMounts } from '../core/brain-registry.ts';
-import { OperationError } from '../core/ops/contract.ts';
+import { opError } from '../core/ops/contract.ts';
+import { readFix } from '../core/ops/op-fix.ts';
 import { maybeDelegateLocalAdministration, persistenceConfigForBrain } from '../core/persistence/local-client.ts';
 import { runPersistenceAdministration } from '../core/persistence/administration.ts';
 import type { PersistenceAdminOperation } from '../core/persistence/admin-contract.ts';
@@ -87,7 +88,31 @@ in private local files. CLI is the trusted administration lane; stdio stays remo
 A revoked CLI cannot replace itself through a running owner. Stop that owner and
 explicitly register --replace locally to authorize a new principal.`;
 
+/**
+ * The brain-host preconditions of every local administration command: a
+ * configured brain, reached locally (an ordinary remote token is not
+ * administration authority).
+ */
+export function adminHostConfig<T extends GBrainConfig>(config: T | null | undefined, brainId: string, what: string, command: string): T {
+  if (!config) throw opError('invalid_params', 'No brain is configured. Run gbrain init first.',
+    `No brain ${brainId} is configured under this GBRAIN_HOME. Run the command on the brain host with its GBRAIN_HOME; creating a brain here with gbrain init is the user's decision.`,
+    { fix: readFix('Reports which config and brain this machine resolves, read-only.', { argv: ['gbrain', 'doctor', '--json'] }) });
+  if (isThinClient(config)) throw opError('permission_denied', `${what} runs locally on the selected brain host; an ordinary remote token is not administration authority.`,
+    `This install reaches brain ${brainId} through a remote token. Ask the user to run the same gbrain ${command} command in a terminal on the machine that hosts the brain.`,
+    { fix: { argv: ['gbrain', 'whoami', '--json'], consent: [], actor: 'agent', why: 'Shows which remote brain and principal this install uses, read-only.', requires_exclusive: false,
+      user_message: `${what} has to run on the machine that hosts this brain. Please run the same command in a terminal there.` } });
+  return config;
+}
+
 type Group = 'writer' | 'local-writer';
+const GROUP_ARGV: Record<Group, string[]> = { writer: ['gbrain', 'sources', 'writer'], 'local-writer': ['gbrain', 'auth', 'local-writer'] };
+const BARE_FLAGS = ['--json', '--dry-run', '--replace', '--probe', '--confirm-quiesced', '--self-transfer', '--cleanup-dead-local-locks', '--shared-skills'];
+/** A CLI usage refusal: the exact usage in the suggestion, the group's help as the read-only fix. */
+function invalid(group: Group, message: string, suggestion: string) {
+  return opError('invalid_params', message, suggestion, {
+    fix: readFix(`Prints every ${GROUP_ARGV[group].slice(1).join(' ')} form with its flags.`, { argv: [...GROUP_ARGV[group], '--help'] }),
+  });
+}
 export function parsePersistenceAdminArgs(group: Group, args: string[]): {
   operation: PersistenceAdminOperation; params: Record<string, unknown>; brain?: string; json: boolean;
 } {
@@ -107,17 +132,19 @@ export function parsePersistenceAdminArgs(group: Group, args: string[]): {
     if (!token.startsWith('-')) { positional.push(token); continue; }
     const equal = token.indexOf('=');
     const flag = equal < 0 ? token : token.slice(0, equal);
-    if (seen.has(flag)) throw new OperationError('invalid_params', `Duplicate option ${flag}.`);
+    if (seen.has(flag)) throw invalid(group, `Duplicate option ${flag}.`, `Pass ${flag} once; for a list, give one comma-separated value (e.g. --scopes read,write).`);
     seen.add(flag);
-    if (['--json', '--dry-run', '--replace', '--probe', '--confirm-quiesced', '--self-transfer', '--cleanup-dead-local-locks', '--shared-skills'].includes(flag)) {
-      if (equal >= 0) throw new OperationError('invalid_params', `${flag} does not accept a value.`);
+    if (BARE_FLAGS.includes(flag)) {
+      if (equal >= 0) throw invalid(group, `${flag} does not accept a value.`, `Write ${flag} on its own (no =value); leave it out to keep it off.`);
       if (flag === '--json') json = true;
       else params[flag.slice(2).replaceAll('-', '_')] = true;
       continue;
     }
-    if (flag !== '--brain' && !values[flag]) throw new OperationError('invalid_params', `Unknown administration option: ${flag}.`);
+    if (flag !== '--brain' && !values[flag]) throw invalid(group, `Unknown administration option: ${flag}.`,
+      `Remove ${flag}; the accepted options are --brain, ${Object.keys(values).join(', ')} and the bare flags ${BARE_FLAGS.join(', ')}.`);
     const value = equal >= 0 ? token.slice(equal + 1) : args[++i];
-    if (value === undefined || value.startsWith('--')) throw new OperationError('invalid_params', `${flag} requires a value.`);
+    if (value === undefined || value.startsWith('--')) throw invalid(group, `${flag} requires a value.`,
+      `Give ${flag} its value right after it, as ${flag} <value> or ${flag}=<value>.`);
     if (flag === '--brain') { brain = value; continue; }
     const key = values[flag];
     params[key] = arrays.has(key) ? value.split(',').map(part => part.trim()).filter(Boolean)
@@ -135,12 +162,15 @@ export function parsePersistenceAdminArgs(group: Group, args: string[]): {
     else if (verb === 'unlock') operation = 'writer_unlock';
     else if (verb === 'transfer') {
       const phase = positional.shift();
-      if (phase !== 'prepare' && phase !== 'accept') throw new OperationError('invalid_params', 'Transfer requires prepare or accept.');
+      if (phase !== 'prepare' && phase !== 'accept') throw invalid(group, 'Transfer requires prepare or accept.',
+        'Run gbrain sources writer transfer prepare on the current owner host first, then gbrain sources writer transfer accept on the successor with the epoch and manifest prepare printed.');
       operation = phase === 'prepare' ? 'writer_transfer_prepare' : 'writer_transfer_accept';
-    } else throw new OperationError('invalid_params', 'Writer administration requires status, retry-effects, claim, activate, deactivate, transfer, lock, or unlock.');
+    } else throw invalid(group, 'Writer administration requires status, retry-effects, claim, activate, deactivate, transfer, lock, or unlock.',
+      `Name the action after gbrain sources writer${verb ? ` instead of ${verb}` : ''}; start with gbrain sources writer status --json, which changes nothing.`);
     const source = positional.shift();
     if (source !== undefined) {
-      if (params.source_id !== undefined) throw new OperationError('invalid_params', 'Specify the source once.');
+      if (params.source_id !== undefined) throw invalid(group, 'Specify the source once.',
+        `Name the source either as the argument after the action or with --source, not both (here ${source} and ${String(params.source_id)}).`);
       params.source_id = source;
     }
   } else {
@@ -148,9 +178,11 @@ export function parsePersistenceAdminArgs(group: Group, args: string[]): {
     if (verb === 'list') operation = 'local_writer_list';
     else if (verb === 'register') { operation = 'local_writer_register'; params.lane = positional.shift(); }
     else if (verb === 'revoke') { operation = 'local_writer_revoke'; params.id = positional.shift(); }
-    else throw new OperationError('invalid_params', 'Local writer administration requires list, register, or revoke.');
+    else throw invalid(group, 'Local writer administration requires list, register, or revoke.',
+      `Name the action after gbrain auth local-writer${verb ? ` instead of ${verb}` : ''}: list (read-only), register cli|stdio, or revoke followed by a writer id from list.`);
   }
-  if (positional.length) throw new OperationError('invalid_params', `Unexpected argument: ${positional[0]}.`);
+  if (positional.length) throw invalid(group, `Unexpected argument: ${positional[0]}.`,
+    `Remove ${positional[0]}; this action takes at most one positional argument, and every other value goes after its flag.`);
   return { operation, params, brain, json };
 }
 
@@ -163,9 +195,8 @@ export async function runPersistenceAdminCli(group: Group, args: string[], conne
   try {
     const parsed = parsePersistenceAdminArgs(group, args);
     const brainId = resolveBrainId(parsed.brain ?? getCliOptions().brain);
-    const config = persistenceConfigForBrain(loadConfig(), brainId, brainId === 'host' ? [] : loadMounts());
-    if (!config) throw new OperationError('invalid_params', 'No brain is configured. Run gbrain init first.');
-    if (isThinClient(config)) throw new OperationError('permission_denied', 'Writer administration runs locally on the selected brain host; an ordinary remote token is not administration authority.');
+    const config = adminHostConfig(persistenceConfigForBrain(loadConfig(), brainId, brainId === 'host' ? [] : loadMounts()), brainId,
+      'Writer administration', GROUP_ARGV[group].slice(1).join(' '));
     const delegated = connected ? { handled: false as const } : await maybeDelegateLocalAdministration(parsed.operation, parsed.params, config,
       { timeoutMs: getCliOptions().timeoutMs ?? undefined });
     let result: unknown;

@@ -104,11 +104,10 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
   reverse-writes on the composite key; `validateSourceId` before any `source_id` path join.
 - **One canonical chat-pricing table.** All paid-cloud chat/completion prices live ONCE in
   `src/core/model-pricing.ts` (`CANONICAL_PRICING` + `canonicalLookup`). Every other table
-  (`anthropic-pricing.ts`'s `ANTHROPIC_PRICING`, `takes-quality-eval/pricing.ts`'s
-  `MODEL_PRICING`, the contradictions/cross-modal/skillopt cost views) is a DERIVED view, never
-  a hand-copied duplicate — so cross-table price drift is structurally impossible. Update a
-  price in `model-pricing.ts` only; each consumer keeps its own key allowlist + miss policy
-  (fail-closed vs warn-only vs null), not its own numbers. Pinned by `test/model-pricing.test.ts`
+  (`anthropic-pricing.ts`'s `ANTHROPIC_PRICING`, the contradictions/cross-modal/skillopt cost
+  views) is a DERIVED view, never a hand-copied duplicate — so cross-table price drift is
+  structurally impossible (takes-quality reads `pricing.overrides`, then canonical). Update a
+  price in `model-pricing.ts` only; each consumer keeps its own miss policy, not its own numbers. Pinned by `test/model-pricing.test.ts`
   (drift guard asserts each view equals canonical). Embeddings price separately in
   `embedding-pricing.ts` (different unit).
 - **Module-size ratchet.** `scripts/module-size-limits.tsv` pins per-file line ceilings
@@ -217,8 +216,8 @@ routing eval evidence, and shared conventions.
 Durable facts and preferences belong in shared memory with provenance. Transient
 task state, credentials, local configuration, and harness activation state do not.
 Automatic capture is opt-in. Withdrawal is not physical erasure. Remote
-`put_page` does not extract graph links inline: stdio has best-effort startup/idle
-sweeps; HTTP needs explicit maintenance or authorized `add_link`. Configured
+`put_page` links plain mentions of existing visible pages post-commit (`links`
+effect); typed edges need the stdio sweep, maintenance or `add_link`. Configured
 providers can receive text, and Markdown export is not a full database backup.
 Read [memory boundaries](docs/guides/memory-boundaries.md).
 
@@ -303,16 +302,17 @@ checkpoint resume, or DB-contention-aware pace mode.
 ## Version locations (single source of truth: `VERSION` file)
 
 Every release updates the required version stamps in the table below.
-Update TODOS only when filing new work, not to rewrite old entries. Keep these in sync. `/ship` enforces this via Step 12's idempotency check (VERSION vs
-package.json drift), but the canonical list lives here so future runs and
-the auto-update agent know where to look.
+`bun run release:restamp` rewrites all of them, renumbers the branch's own
+schema migrations after master's and runs the auto-derived regenerations;
+run it when the PR is next to merge ([how](docs/RELEASING.md#release-restamp)).
+Update TODOS only when filing new work. `/ship`'s Step 12 idempotency check
+catches VERSION vs package.json drift; the canonical list lives here.
 
 **Version format is mandatory: `MAJOR.MINOR.PATCH.MICRO` (four numeric
 segments, dot-separated, no leading `v`).** Every new release MUST use the
-4-segment form. The `.MICRO` slot is the dot-suffix follow-up channel: when
-a release ships its commit subject ahead of its VERSION bump (e.g. PR #795
-landing as `v0.31.4` without bumping the file), the corrective ship lands
-as `0.31.4.1` rather than churning the patch number to `0.31.5`. Suffixes
+4-segment form. The `.MICRO` slot is the dot-suffix follow-up channel: a
+release whose commit subject shipped ahead of its VERSION bump is corrected
+as `0.31.4.1`, not by churning the patch number to `0.31.5`. Suffixes
 like `-fixwave` are still allowed as needed (`0.31.1.1-fixwave`), but the
 four numeric segments are required first. Historical 3-segment versions
 (`0.31.3`, `0.22.1`) remain valid in `git log` and migration filenames

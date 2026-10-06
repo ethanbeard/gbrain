@@ -1,13 +1,17 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { isThinClient } from '../config.ts';
-import { OperationError, type OperationContext } from '../ops/contract.ts';
+import { opError, OperationError, type OperationContext } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { getWorktreeBinding } from '../persistence/ownership.ts';
 import { checkedContentRoot, inventorySkillpack, sameInventory, type PackInventory } from './setup-files.ts';
 import { contentSetupKey, installPackagedSharedSkills, setupSharedBrainContent, type SharedContentReceipt } from './setup.ts';
 import type { DatabaseContentExportReceipt } from './migration-export.ts';
 import { inspectSharedMemberMigration, type SharedMemberMigration } from './migration-members.ts';
-import { sharedSkillSourcePolicy } from './setup-source-policy.ts';
+import { sharedSkillSourcePolicyOrPreserve } from './setup-source-policy.ts';
+import { INVENTORY_LIMIT_CEILINGS, readInventoryLimits, type InventoryLimits } from './inventory-limits.ts';
+import { SHARED_SKILL_LIMITS } from './model.ts';
 
 export type MigrationPublication = 'disabled' | 'prose_only' | 'consent_required';
 export interface SharedMigrationStage {
@@ -24,6 +28,19 @@ export interface SharedSourceMigration {
   stages: SharedMigrationStage[];
   status: 'complete' | 'action_required' | 'conflict' | 'planned';
   member_installations?: SharedMemberMigration[];
+  parked?: SharedSourceParked;
+}
+/**
+ * A source whose pack exceeds an inventory bound. Later runs skip it without
+ * re-inventorying (the migration completes instead of going partial) until the
+ * configured bounds change, the source opts out, or
+ * `gbrain sources shared-skills <id> on` releases it.
+ */
+export interface SharedSourceParked {
+  limit: string;
+  limits: InventoryLimits;
+  reason: string;
+  parked_at: string;
 }
 export interface SharedMigrationReport {
   version: 1;
@@ -40,6 +57,26 @@ export function migrationCheckpointKey(sourceId: string, incarnation: string): s
   return `shared_skills.migration.v1.${sourceId}.${incarnation}`;
 }
 
+const sameLimits = (a: InventoryLimits, b: InventoryLimits): boolean =>
+  (Object.keys(INVENTORY_LIMIT_CEILINGS) as Array<keyof InventoryLimits>).every(name => a[name] === b[name]);
+
+export function parkedReason(sourceId: string, parked: SharedSourceParked): string {
+  const ceiling = INVENTORY_LIMIT_CEILINGS[parked.limit.split('.').pop() as keyof InventoryLimits];
+  return `payload_too_large: ${parked.reason} Parked: this source is skipped, not retried, and the rest of the migration completes. `
+    + `Raise the bound (gbrain config set ${parked.limit} <n>, at most ${ceiling}), opt the source out (gbrain sources shared-skills ${sourceId} off), `
+    + `or shrink the pack and release it (gbrain sources shared-skills ${sourceId} on); then run gbrain apply-migrations --migration 0.53.0 --yes. `
+    + 'See docs/guides/shared-brain-skills.md#oversized-skill-packs.';
+}
+
+/** The digest an operator echoes to accept a reviewed inventory change (#5476): the sorted path/hash list. */
+export function inventoryDigest(hashes: Record<string, string>): string {
+  return createHash('sha256').update(JSON.stringify(Object.keys(hashes).sort().map(path => [path, hashes[path]]))).digest('hex');
+}
+
+function changedInventoryPaths(before: Record<string, string>, after: Record<string, string>): string[] {
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(path => before[path] !== after[path]).sort();
+}
+
 export async function legacyPublication(ctx: OperationContext): Promise<MigrationPublication> {
   const dbValue = await ctx.engine.getConfig('mcp.publish_skills');
   const value = dbValue === null ? ctx.config.mcp?.publish_skills : dbValue;
@@ -48,8 +85,11 @@ export async function legacyPublication(ctx: OperationContext): Promise<Migratio
   return 'consent_required';
 }
 
-export async function runSharedSkillsMigration(ctx: OperationContext, options: { dryRun?: boolean } = {}): Promise<SharedMigrationReport> {
-  if (ctx.remote !== false) throw new OperationError('permission_denied', 'Shared-skills migration requires the trusted local host.');
+export async function runSharedSkillsMigration(ctx: OperationContext, options: { dryRun?: boolean; acceptReviewedInventory?: Record<string, string> } = {}): Promise<SharedMigrationReport> {
+  if (ctx.remote !== false) {
+    throw opError('permission_denied', 'Shared-skills migration requires the trusted local host.',
+      'The shared-skills migration runs only from gbrain apply-migrations on the brain host; a remote connection cannot run it.');
+  }
   const dryRun = options.dryRun ?? ctx.dryRun;
   const report: SharedMigrationReport = { version: 1, brain_id: null, dry_run: dryRun, status: dryRun ? 'planned' : 'complete', sources: [], pending_actions: [], permission_changes: [] };
   if (isThinClient(ctx.config)) {
@@ -59,19 +99,27 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
   }
   const [brain] = await ctx.engine.executeRaw<{ brain_id: string; enabled: boolean; skill_bundles_enabled: boolean }>(
     'SELECT brain_id,enabled,skill_bundles_enabled FROM persistence_brain WHERE singleton=1');
-  if (!brain) throw new OperationError('writer_not_initialized', 'Apply the shared-skills schema before migrating content.');
+  if (!brain) {
+    throw opError('writer_not_initialized', 'Apply the shared-skills schema before migrating content.',
+      'This brain has no persistence identity yet, so the shared-skills schema is not applied. Preview the pending migrations with the command in fix, then apply them.',
+      { fix: readFix('Lists the pending schema migrations without applying them.', { argv: ['gbrain', 'apply-migrations', '--dry-run', '--json'] }) });
+  }
   report.brain_id = brain.brain_id;
   const publication = await legacyPublication(ctx);
+  const limits = await readInventoryLimits(ctx.engine);
   const roots = await ctx.engine.executeRaw<{ id: string; incarnation: string; local_path: string | null }>('SELECT id,incarnation,local_path FROM sources WHERE NOT archived ORDER BY id');
   const fallback = await ctx.engine.getConfig('sync.repo_path');
   for (const source of roots) {
-    const sourcePolicy = await sharedSkillSourcePolicy(ctx.engine, source.id).catch(error => ({ mode: 'preserve_files' as const,
-      reason: error instanceof OperationError ? `${error.code}: ${error.message}` : 'profile_incompatible: the source writeback policy could not be verified; no repository changes were attempted.' }));
+    const sourcePolicy = await sharedSkillSourcePolicyOrPreserve(ctx.engine, source.id);
     const contentCheckpoint = await ctx.engine.getConfig(contentSetupKey(source.id, source.incarnation));
     if (contentCheckpoint && !dryRun && sourcePolicy.mode === 'content') {
       let content: SharedContentReceipt;
       try { content = JSON.parse(contentCheckpoint); }
-      catch { throw new OperationError('local_conflict', 'A content setup checkpoint is malformed; preserve it for review.'); }
+      catch {
+        throw opError('local_conflict', 'A content setup checkpoint is malformed; preserve it for review.',
+          `The content setup checkpoint for source ${source.id} is not valid JSON. Show it to the user and ask how to proceed; do not delete it.`,
+          { fix: readFix('Prints the saved content setup checkpoint.', { argv: ['gbrain', 'config', 'get', contentSetupKey(source.id, source.incarnation)] }) });
+      }
       if (content.owned_root && content.stage !== 'complete') {
         const resumed = await setupSharedBrainContent({ ...ctx, sourceId: source.id }, { sourceId: source.id });
         if (resumed.root) source.local_path = resumed.root;
@@ -105,19 +153,52 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
     try {
       if (checkpoint) prior = JSON.parse(checkpoint);
       row.root = checkedContentRoot(row.root);
-      if (!existsSync(row.root)) throw new OperationError('local_conflict', 'The registered canonical root is missing.');
-      row.inventory = inventorySkillpack(row.root);
-      if (prior && (prior.source_incarnation !== source.incarnation || prior.root !== row.root)) throw new OperationError('local_conflict', 'The source root changed since migration inventory.');
+      if (!existsSync(row.root)) {
+        throw opError('local_conflict', 'The registered canonical root is missing.',
+          `Source ${source.id}'s registered root ${row.root} does not exist. Restore it (from its Git remote or backup), then run the migration again.`);
+      }
+      if (prior?.parked && prior.root === row.root && sameLimits(prior.parked.limits, limits)) {
+        row.inventory = prior.inventory;
+        row.parked = prior.parked;
+        await pending('inventory', parkedReason(source.id, row.parked));
+        continue;
+      }
+      row.inventory = inventorySkillpack(row.root, limits);
+      if (prior && (prior.source_incarnation !== source.incarnation || prior.root !== row.root)) {
+        // #5569: an inventory that never completed has nothing to preserve, so it is taken again at the current root.
+        if (prior.stages?.some(stage => stage.stage === 'inventory' && stage.status === 'complete')) {
+          throw opError('local_conflict', 'The source root changed since migration inventory.',
+            `Source ${source.id} was recreated or moved since its migration inventory was taken; review the checkpoint with the user before continuing the migration.`);
+        }
+        prior = null;
+      }
       if (prior?.inventory && (!row.inventory || !sameInventory(prior.inventory.hashes, row.inventory.hashes))) {
         const original = { ...prior.inventory.hashes }, current = { ...row.inventory?.hashes };
         delete original['skillpack.json']; delete current['skillpack.json'];
         const [sealed] = await ctx.engine.executeRaw<{ manifest_hash: string }>('SELECT manifest_hash FROM shared_skill_packs WHERE source_id=$1 AND source_incarnation=$2::uuid', [source.id, source.incarnation]);
-        if (!row.inventory || !sameInventory(original, current) || sealed?.manifest_hash !== row.inventory.hashes['skillpack.json']) {
+        const digest = row.inventory ? inventoryDigest(row.inventory.hashes) : null;
+        if ((!row.inventory || !sameInventory(original, current) || sealed?.manifest_hash !== row.inventory.hashes['skillpack.json'])
+          && (digest === null || options.acceptReviewedInventory?.[source.id] !== digest)) {
+          const changed = changedInventoryPaths(prior.inventory.hashes, row.inventory?.hashes ?? {});
           row.inventory = prior.inventory;
-          throw new OperationError('local_conflict', 'Files changed since migration inventory; preserve edits and review the checkpoint before retrying.');
+          throw opError('local_conflict', `Files changed since migration inventory; preserve edits and review the checkpoint before retrying. Changed: ${changed.slice(0, 20).join(', ')}${changed.length > 20 ? ` and ${changed.length - 20} more` : ''}.`
+            + (digest ? ` After the user reviews these changes, accept exactly this inventory with gbrain apply-migrations --migration 0.53.0 --accept-reviewed-inventory ${source.id}=${digest} --yes.` : ''),
+            `Skill files under ${row.root} changed since the migration inventory. Keep the edits and review them with the user; only after they agree, accept the reviewed inventory with the command in the message (a later edit changes the digest and is refused again).`);
         }
       }
+      // A-NEW-4: one canonical adoption writes one SKILL.md per declared skill plus skillpack.json.
+      if (row.inventory && row.inventory.names.length + 1 > SHARED_SKILL_LIMITS.packFiles) {
+        await pending('inventory', `payload_too_large: source ${source.id} declares ${row.inventory.names.length} skills, but one canonical adoption publishes at most ${SHARED_SKILL_LIMITS.packFiles} files (one SKILL.md per skill plus skillpack.json). `
+          + `Split the pack across sources or remove skills from skillpack.json, then run gbrain apply-migrations --migration 0.53.0 --yes. See docs/guides/shared-brain-skills.md#oversized-skill-packs.`);
+        continue;
+      }
     } catch (error) {
+      if (error instanceof OperationError && error.code === 'payload_too_large' && error.detail) {
+        row.inventory = prior?.inventory ?? null;
+        row.parked = { limit: error.detail, limits, reason: error.message, parked_at: prior?.parked?.parked_at ?? new Date().toISOString() };
+        await pending('inventory', parkedReason(source.id, row.parked));
+        continue;
+      }
       await pending('inventory', error instanceof OperationError ? error.message : 'The source pack cannot be inventoried safely; inspect its manifest and declared files.', true);
       continue;
     }
@@ -146,7 +227,7 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
       if (!dryRun) {
         try {
           await installPackagedSharedSkills(ctx, source.id, ['README.md', 'LICENSE'].filter(path => existsSync(join(row.root!, path))));
-          row.inventory = inventorySkillpack(row.root);
+          row.inventory = inventorySkillpack(row.root, limits);
         } catch (error) {
           await pending('projection', error instanceof OperationError ? `${error.code}: ${error.message}` : 'Pack initialization failed; inspect the canonical receipt before retrying.');
           continue;
@@ -157,7 +238,10 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
         continue;
       }
     }
-    if (!row.inventory) throw new OperationError('catalog_unavailable', 'Committed pack inventory could not be verified.');
+    if (!row.inventory) {
+      throw opError('catalog_unavailable', 'Committed pack inventory could not be verified.',
+        `Source ${source.id}'s pack inventory is missing, so its catalog adoption cannot be checked. Inspect the per-source stages with gbrain apply-migrations --migration 0.53.0 --dry-run --json.`);
+    }
     if (!dryRun) {
       try {
         const [pack] = await ctx.engine.executeRaw<{ manifest_hash: string }>('SELECT manifest_hash FROM shared_skill_packs WHERE source_id=$1 AND source_incarnation=$2::uuid', [source.id, source.incarnation]);
@@ -169,9 +253,13 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
         if (!complete) {
           const { adoptSharedSkillpack } = await import('./catalog.ts');
           const result = await adoptSharedSkillpack(ctx, source.id, { expected_hashes: row.inventory.hashes });
-          if (result.receipts.some(receipt => (receipt.write_request as { state?: string } | undefined)?.state !== 'committed')) throw new OperationError('publication_pending', 'The catalog adoption is accepted but not fully committed. Retry the durable requests before marking this stage complete.');
+          const open = result.receipts.map(receipt => receipt.write_request as { state?: string; request_id?: string } | undefined).find(request => request?.state !== 'committed');
+          if (open) {
+            throw opError('publication_pending', 'The catalog adoption is accepted but not fully committed. Retry the durable requests before marking this stage complete.',
+              `Inspect request ${open.request_id ?? 'receipts'} first; rerunning the migration resumes the same durable request (same request_id), never a second adoption.`);
+          }
         }
-        row.inventory = inventorySkillpack(row.root);
+        row.inventory = inventorySkillpack(row.root, limits);
       } catch (error) {
         await pending('projection', error instanceof OperationError ? `${error.code}: ${error.message}` : 'Catalog adoption failed; retry after inspecting the canonical publication receipt.');
         continue;
@@ -194,7 +282,7 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
       try {
         checkedContentRoot(hostDir);
         const entries = readdirSync(hostDir);
-        complete = entries.length <= 256 && entries.every(name => !existsSync(join(hostDir, name, 'SKILL.md')) || declared.has(name));
+        complete = entries.length <= limits.max_files && entries.every(name => !existsSync(join(hostDir, name, 'SKILL.md')) || declared.has(name));
       } catch { complete = false; }
     }
     if (!complete) report.pending_actions.push('Host-global catalog assignment is pending. Review a dedicated content pack root with skillpack.json (brain_resident:true) and declared skills; never register the application checkout. After approval, register it with `gbrain sources add shared-skills --path <reviewed-pack-root> --force --no-federated`. Inspect `gbrain sources writer status --json` before deliberate ownership changes; follow skills/migrations/v0.53.0.0.md for action-specific --admin-intent and reviewed --expected-state claim/activation steps. Quiescence is a separate prerequisite, not administration authority. Preview `gbrain apply-migrations --migration 0.53.0 --dry-run --json`, then apply with --yes only when those stages are approved. Original files and grants are unchanged; unmanifested or undeclared skills require explicit review.');

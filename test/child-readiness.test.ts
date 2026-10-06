@@ -28,9 +28,9 @@ describe('selected child readiness protocol', () => {
   test('defaults are bounded and compatible version skew is diagnostic', () => {
     expect(CHILD_READINESS_TIMEOUT_MS).toBe(20_000);
     expect(CHILD_READINESS_MAX_BYTES).toBe(64 * 1024);
-    expect(parseChildReadiness(JSON.stringify(reply))).toEqual({ version: VERSION, versionSkew: false });
+    expect(parseChildReadiness(JSON.stringify(reply))).toEqual({ version: VERSION, versionSkew: false, features: reply.features });
     expect(parseChildReadiness(JSON.stringify({ ...reply, version: '0.0.1' })))
-      .toEqual({ version: '0.0.1', versionSkew: true });
+      .toEqual({ version: '0.0.1', versionSkew: true, features: reply.features });
   });
 
   test('completed malformed, missing-feature and wrong-major replies are permanent and redacted', () => {
@@ -65,7 +65,7 @@ describe('selected child readiness protocol', () => {
   test('invokes the actual selected path with spaces and hidden command', async () => {
     await fixture(`if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(['jobs','child-readiness','--json'])) process.exit(3);
       console.log(${JSON.stringify(JSON.stringify(reply))});`, async (invocation) => {
-      expect(await checkChildReadiness({ invocation, tiniPath: '' })).toEqual({ version: VERSION, versionSkew: false });
+      expect(await checkChildReadiness({ invocation, tiniPath: '' })).toEqual({ version: VERSION, versionSkew: false, features: reply.features });
     });
   });
 
@@ -164,7 +164,7 @@ describe('selected child readiness protocol', () => {
       await fixture(`import {writeFileSync} from 'node:fs';
         writeFileSync(process.argv[1]+'.pid',String(process.pid));
         setInterval(()=>{},1000);`, async (invocation) => {
-        await expect(checkChildReadiness({ invocation, tiniPath, timeoutMs: 500 })).rejects.toThrow('timed out');
+        await expect(checkChildReadiness({ invocation, tiniPath, timeoutMs: 2500 })).rejects.toThrow('timed out; no jobs were admitted');
         const pid = Number(readFileSync(invocation.argsPrefix[0] + '.pid', 'utf8'));
         try {
           process.kill(pid, 0);
@@ -215,7 +215,7 @@ describe('selected child readiness protocol', () => {
       chmodSync(executable, 0o700);
       expect(await checkChildReadiness({
         invocation: { cmd: 'selected-example', argsPrefix: [] }, tiniPath: detectTini(), env: { PATH: dir },
-      })).toEqual({ version: VERSION, versionSkew: false });
+      })).toEqual({ version: VERSION, versionSkew: false, features: reply.features });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

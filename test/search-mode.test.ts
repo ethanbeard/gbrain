@@ -88,6 +88,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       relational_retrieval_depth: 2,
       // ranker wave (R1) — relational rerank pin, 3 in every bundle (0 = off).
       relational_rerank_pin: 3,
+      relational_planner: false,
+      relational_orient_onehop: false,
+      relational_chain_slots: 10,
       // ranker wave (Phase E2) — keyword-arm confidence floor OFF in every bundle until the Cat 13 receipt.
       keyword_arm_confidence_floor: null,
       // ranker wave (Phase E3) — metadata boost gate `lexical` in every bundle since the Cat 13 held-out receipt (`always` = pre-wave pipeline).
@@ -131,6 +134,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       relational_retrieval_depth: 2,
       // ranker wave (R1) — relational rerank pin, 3 in every bundle (0 = off).
       relational_rerank_pin: 3,
+      relational_planner: true,
+      relational_orient_onehop: false,
+      relational_chain_slots: 10,
       // ranker wave (Phase E2) — keyword-arm confidence floor OFF in every bundle until the Cat 13 receipt.
       keyword_arm_confidence_floor: null,
       // ranker wave (Phase E3) — metadata boost gate `lexical` in every bundle since the Cat 13 held-out receipt (`always` = pre-wave pipeline).
@@ -172,6 +178,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       relational_retrieval_depth: 2,
       // ranker wave (R1) — relational rerank pin, 3 in every bundle (0 = off).
       relational_rerank_pin: 3,
+      relational_planner: true,
+      relational_orient_onehop: false,
+      relational_chain_slots: 10,
       // ranker wave (Phase E2) — keyword-arm confidence floor OFF in every bundle until the Cat 13 receipt.
       keyword_arm_confidence_floor: null,
       // ranker wave (Phase E3) — metadata boost gate `lexical` in every bundle since the Cat 13 held-out receipt (`always` = pre-wave pipeline).
@@ -494,7 +503,9 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
-    expect(KNOBS_HASH_VERSION).toBe(29);
+    // 29→30 (#5889): exact-title-first title-arm order + weight-A remote
+    // title predicate reorder rows for identical knobs; version-only.
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -532,7 +543,7 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
-    expect(KNOBS_HASH_VERSION).toBe(29);
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('#4352 follow-up: excludePrivate true vs false produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -748,7 +759,7 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 29 (…; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 evb= expansion variant budget fold)', () => {
+  test('KNOBS_HASH_VERSION is 30 (…; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 evb= expansion variant budget fold)', () => {
     // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
     // variant fusion reorders rows for identical knobs; null hashes as legacy.
     // v=29 ALSO carries rrp= (relational rerank pin, ranker wave R1) — same
@@ -757,7 +768,7 @@ describe('v0.42.3.0 — autocut knobs', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
-    expect(KNOBS_HASH_VERSION).toBe(29);
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('bundle defaults: autocut off in every bundle (ranker wave rule R2), jump 0.20 kept for operators who re-enable it', () => {
@@ -1091,6 +1102,35 @@ describe('ranker wave (R1) — relational_rerank_pin knob (relational rows bypas
     expect(one).not.toBe(dflt);
     expect(one).not.toBe(off);
     // The pin rides KNOBS_HASH_VERSION 29 together with evb= — no separate bump.
-    expect(KNOBS_HASH_VERSION).toBe(29);
+    expect(KNOBS_HASH_VERSION).toBe(30);
+  });
+});
+
+describe('multi-hop planner knobs (relational_planner, relational_orient_onehop)', () => {
+  test('balanced and tokenmax ship the planner on (held-out verdict); conservative off; one-hop orientation opt-in everywhere', () => {
+    expect(MODE_BUNDLES.conservative.relational_planner).toBe(false);
+    for (const m of ['balanced', 'tokenmax'] as const) expect(MODE_BUNDLES[m].relational_planner).toBe(true);
+    for (const m of ['conservative', 'balanced', 'tokenmax'] as const) expect(MODE_BUNDLES[m].relational_orient_onehop).toBe(false);
+  });
+
+  test('config booleans parse; garbage falls through', () => {
+    expect(loadOverridesFromConfig({ 'search.relational_planner': 'true' }).relational_planner).toBe(true);
+    expect(loadOverridesFromConfig({ 'search.relational_planner': 'off' }).relational_planner).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.relational_planner': 'maybe' }).relational_planner).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.relational_orient_onehop': '0' }).relational_orient_onehop).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.relational_chain_slots': '3' }).relational_chain_slots).toBe(3);
+    expect(loadOverridesFromConfig({ 'search.relational_chain_slots': '11' }).relational_chain_slots).toBeUndefined();
+  });
+
+  test('knobsHash: planner off ignores chain slots; on folds slots and orientation in', () => {
+    const dflt = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const explicitOn = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_planner: true, relational_orient_onehop: false } }));
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_planner: false } }));
+    const offSlots = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_planner: false, relational_chain_slots: 3 } }));
+    const onSlots = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { relational_chain_slots: 0 } }));
+    const orient = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { relational_orient_onehop: true } }));
+    expect(explicitOn).toBe(dflt);
+    expect(offSlots).toBe(off);
+    expect(new Set([dflt, off, onSlots, orient]).size).toBe(4);
   });
 });

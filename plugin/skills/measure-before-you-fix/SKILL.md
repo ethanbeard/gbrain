@@ -20,6 +20,7 @@ mutating: false
 writes_pages: false
 writes_to: []
 upstream: measure-before-you-fix@fc834ee
+when_to_use: "Use when the user asks: \"keeps timing out\", \"ETIMEDOUT\", \"why is this data stale\", \"freshness alert\", \"wedged\"."
 ---
 
 # Measure Before You Fix
@@ -128,6 +129,13 @@ directly.
   running before believing it (`ps` for the worker; check the launch flag;
   `gbrain jobs list` for queued work).
 - "Already up to date" in the step output. That step is not your bottleneck.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain doctor` warns or fails: record the exact check and threshold before declaring the system unhealthy; the doctor's 24h/72h sync-freshness thresholds may differ from a cron monitor's.
+- `gbrain sources status` shows held items or `lock_busy`: that is the measured cause; fix it and re-measure instead of raising timeouts.
 
 ## Anti-Patterns
 

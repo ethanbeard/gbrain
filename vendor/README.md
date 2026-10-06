@@ -29,7 +29,10 @@ postinstall mutation of another package's node_modules is needed. The patch
 file remains the auditable source of the delta, not an installation hook.
 
 The patch adds abort-aware reservation, reserved/transaction-owner discard,
-CancelRequest settlement tracking and ownership/pipeline fences. Cancellation
+CancelRequest settlement tracking and ownership/pipeline fences. It also
+terminates, instead of reusing, a pooled connection or released reservation
+whose last ReadyForQuery status is not idle, and reports each discard through
+the `onpoisoned(status)` option (#5730). Cancellation
 must settle or retire the connection before another query can own it. This
 is necessary for worker admission, query timeout and lease-release safety.
 See issues #5466 and #5560 and `test/e2e/persistence-chaos.test.ts`.

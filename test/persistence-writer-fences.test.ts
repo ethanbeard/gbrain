@@ -15,6 +15,7 @@ import { hardenBrainRepo } from '../src/core/brain-repo-durability.ts';
 import { recordManagedRoots, registeredManagedRoots } from '../src/core/persistence/root-registry.ts';
 import { assertManagedFilesystemWrite, withFilesystemPublication } from '../src/core/persistence/filesystem-guard.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -34,7 +35,7 @@ beforeAll(async () => {
     await engine.executeRaw('DELETE FROM sources WHERE id=$1', [sourceId]);
     await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::text::jsonb)',
       [sourceId, root, JSON.stringify({ managed_clone: true, remote_url: 'https://example.com/brain.git' })]);
-    await engine.executeRaw("INSERT INTO sources(id,name,archived,archive_expires_at) VALUES($1,$1,true,now()-interval '1 hour')", [`${sourceId}-expired`]);
+    await engine.executeRaw("INSERT INTO sources(id,name,archived,archived_at,archive_expires_at) VALUES($1,$1,true,now()-interval '4 days',now()-interval '1 hour')", [`${sourceId}-expired`]);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
   }
 }, 120_000);
@@ -84,10 +85,10 @@ test('free-text aliases and sync checkpoints require an authorized publication t
     await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], async () => {
       await tx.executeRaw("UPDATE sources SET last_commit='owned' WHERE id=$1", [sourceId]);
       await tx.executeRaw('INSERT INTO page_aliases(source_id,alias_norm,slug) VALUES($1,$2,$3)', [sourceId, 'example alias', 'notes/example']);
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [sourceId]))[0].last_commit).toBe('owned');
     await expect(engine.executeRaw("UPDATE sources SET last_commit='after-capability' WHERE id=$1", [sourceId])).rejects.toThrow('writer_coordinator_required');
-    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('DELETE FROM page_aliases WHERE source_id=$1', [sourceId])));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('DELETE FROM page_aliases WHERE source_id=$1', [sourceId]), TEST_WRITE_ATTRIBUTION));
   }
 });
 

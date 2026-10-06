@@ -19,22 +19,10 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const GET_RECENT_SALIENCE_DESCRIPTION =
-  "Returns readable pages recently touched and ranked by activity salience and recency. " +
-  "Unrestricted local reads include deterministic 0..1 emotional_weight, take density, and recency decay. " +
-  "Holder-restricted reads count only permitted active takes, use zero emotional_weight, " +
-  "and select recent pages by updated_at; unrestricted local reads retain take-driven touches. " +
-  "Use this when the user asks what's been going on, what's notable, what's hot, " +
-  "anything crazy happening, or for any open-ended 'current state' question " +
-  "about themselves or their work. Do NOT run a semantic search for these — " +
-  "salience surfaces what's unusual without needing a search term.";
+  "Recently touched pages ranked by salience. Use this when the user asks what's been going on, what's notable, anything crazy happening. Do NOT run a semantic search for these.";
 
 export const FIND_ANOMALIES_DESCRIPTION =
-  "Returns statistical anomalies in recent page activity, grouped by cohort " +
-  "(tag or type). Use this for questions about what stood out, what's unusual, " +
-  "or what changed recently. Returns explanatory cohorts (e.g. '15 pages tagged " +
-  "wedding touched on 2026-04-28, baseline 0.3/day') so you can speak about " +
-  "patterns the user wouldn't have searched for. Cohort kinds: tag, type. " +
-  "Year cohort is deferred to a later release.";
+  "Anomalies in recent page activity, grouped by cohort (tag or type) against a baseline. Use for what stood out, what's unusual or changed. Cohort kinds: tag, type.";
 
 export const FIND_EXPERTS_DESCRIPTION =
   "Answers 'who in my brain knows about <topic>'. Returns ranked person/company " +
@@ -58,49 +46,13 @@ export const GET_RECENT_TRANSCRIPTS_DESCRIPTION =
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const LIST_PAGES_DESCRIPTION =
-  "List pages with optional filters. " +
-  "For 'what's recent / what did I touch this week' questions, use list_pages " +
-  "with sort=updated_desc instead of semantic search. " +
-  "Default 50 rows; remote callers are capped at 100 (local CLI callers' explicit " +
-  "limits are honored). A result with exactly `limit` rows may be truncated. " +
-  "For exhaustive listing, page with sort=updated_asc + " +
-  "updated_after=<last row's updated_at> until a page returns fewer rows than the limit.";
+  "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows (remote max 100); a full page may be truncated: continue with updated_after + updated_after_slug from the last row.";
 
 export const QUERY_DESCRIPTION =
-  "Hybrid search with vector + keyword + multi-query expansion. " +
-  "Prefer `query` for concept / synonym / landscape questions ('all the X that " +
-  "do Y', 'the landscape of Z') — expansion recovers synonym- and " +
-  "outcome-phrased matches a single embedding misses. Still top-K, and the " +
-  "default count when `limit` is omitted depends on the configured search " +
-  "mode (10 conservative / 25 balanced / 50 tokenmax — see the `limit` param " +
-  "description); pass `limit` explicitly for a stable count regardless of " +
-  "mode. When the answer needs the surrounding conversation or section, pass " +
-  "`return_unit` ('page' / 'section' / 'window') to get that evidence in one call " +
-  "instead of get_page per hit; conversation pages already come back whole by default (return_unit " +
-  "'auto'; 'chunk' opts out). For exhaustive enumeration use list_pages; for exact known tokens " +
-  "`search` is cheaper (no expansion LLM call). " +
-  "For personal/emotional questions ('what's going on with me', 'anything notable', " +
-  "'how am I feeling'), prefer get_recent_salience, find_anomalies, or " +
-  "get_recent_transcripts. Semantic search returns polished pages and misses " +
-  "recent activity bursts. Do NOT assume words like 'crazy', 'notable', or 'big' " +
-  "mean impressive — they often mean difficult or emotionally charged.";
+  "Hybrid search plus multi-query expansion for concept or landscape questions (expansion recovers synonym-phrased matches). Still top-K; return_unit returns whole sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no expansion LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent` on the host. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. fields: \"full\" adds diagnostics.";
 
 export const SEARCH_DESCRIPTION =
-  "Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. " +
-  "Best for exact known tokens, names, and structured-field lookups. A populated " +
-  "result set is NOT proof of coverage — for concept / synonym / landscape " +
-  "questions use `query` (adds multi-query expansion); for exhaustive " +
-  "enumeration use list_pages pagination. " +
-  "Pass `return_unit` ('window' / 'section' / 'page') for whole evidence instead of chunks; " +
-  "conversation pages already come back whole by default (return_unit 'auto'; 'chunk' opts out). " +
-  "For personal/emotional questions, " +
-  "prefer get_recent_salience or find_anomalies — they surface activity bursts " +
-  "without needing a search term. " +
-  "For code-symbol questions (callers, callees, definitions, blast radius), use " +
-  "code_callers / code_callees / code_def / code_refs instead — those return " +
-  "structural graph data, not text chunks. " +
-  "For agent memory reads (saved facts + budget-packed retrieval), prefer the " +
-  "`recall` verb.";
+  "Cheap hybrid search (vector + keyword), no LLM expansion, top 20: for exact tokens, names, field values. Results are NOT proof of coverage: concepts or landscape, use `query`; exhaustive lists, list_pages. return_unit returns whole sections or conversations. Personal: get_recent_salience; saved facts: recall. fields: \"full\" adds diagnostics.";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // v0.32.6 — contradiction probe MCP surface (M3)
@@ -119,7 +71,7 @@ export const FIND_CONTRADICTIONS_DESCRIPTION =
   "`gbrain eval suspected-contradictions` for that.";
 
 export const FIND_TRAJECTORY_DESCRIPTION =
-  "v0.35.4 — return the chronological claim trajectory for an entity (typed " +
+  "Return the chronological claim trajectory for an entity (typed " +
   "metric values over time, plus auto-detected regressions and narrative drift). " +
   "Use this when the user asks 'how has Acme's MRR trended', 'show me what " +
   "alice-example said about runway over time', 'is this founder consistent', " +
@@ -148,7 +100,7 @@ export const FIND_TRAJECTORY_DESCRIPTION =
 export const CODE_CALLERS_DESCRIPTION =
   "BEFORE editing any function, run code_callers with the symbol name to find " +
   "every caller (the people who'd be affected by your change). Returns direct " +
-  "callers from the v0.20+ tree-sitter call graph. Use during plan-mode to size " +
+  "callers from the tree-sitter call graph. Use during plan-mode to size " +
   "the change. Defaults to source-scoped; for multi-source brains pass source_id " +
   "or all_sources=true. " +
   "Returns: `{symbol, count, callers: [{from_symbol_qualified, to_symbol_qualified, edge_type, resolved}]}`. " +
@@ -190,33 +142,10 @@ export const CODE_REFS_DESCRIPTION =
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const LIST_SKILLS_DESCRIPTION =
-  "List the skills this agent's brain publishes. A skill is a named prose " +
-  "instruction set (NOT executable code) that teaches you how to do a task " +
-  "using this server's other tools. Returns a flat catalog — each entry has a " +
-  "name, one-line description, triggers (phrasings that should invoke it), and " +
-  "`usable_tools` / `unavailable_tools` (which tools the skill calls that you " +
-  "CAN vs CANNOT call given this server + your access). To actually use a skill, " +
-  "call get_skill with its name, read the returned prose, and follow it — calling " +
-  "the correspondingly-named tools on THIS server. The response also carries an " +
-  "`instructions` envelope explaining this protocol. On a shared brain, use " +
-  "schema_version:2 for source-qualified identities, immutable revisions, " +
-  "pagination and complete declared requirements. Only authorized sources and " +
-  "owner-approved file classes are visible; pre-migration servers retain their " +
-  "legacy prose catalog. Read-scope; published only when the brain owner enabled mcp.publish_skills.";
+  "Skills: prose instruction sets (NOT executable code) for tasks with this server's tools, with triggers, usable_tools and unavailable_tools. Use one via get_skill.";
 
 export const GET_SKILL_DESCRIPTION =
-  "Fetch one skill's full instructions by name. Returns `{name, frontmatter " +
-  "(sanitized), body, usable_tools, unavailable_tools, client_guidance}`. The " +
-  "`body` is prose — read it as your operating instructions for this task, and " +
-  "when it says to search / store / look something up, call the same-named MCP " +
-  "tool on THIS server. There is nothing to 'execute' — the value is the " +
-  "instructions plus your tool calls back to this server. Tools listed in " +
-  "`unavailable_tools` won't work for you (not exposed here, or beyond your " +
-  "access) — adapt accordingly. Size-capped; read-scope; requires the owner to " +
-  "have enabled mcp.publish_skills. On a shared brain, pass schema_version:2 " +
-  "with qualified_id and revision from discovery to fetch exact instructions " +
-  "and their approved dependency manifest. get_skill_asset retrieves declared " +
-  "files from that revision as data; downloading never grants execution or tool permissions.";
+  "Fetch a skill's prose and follow it: when it says search or store, call the same-named MCP tool here. There is nothing to execute. unavailable_tools won't work for you.";
 
 /**
  * The load-bearing `instructions` envelope for list_skills. Pinned so the
@@ -238,7 +167,7 @@ export const SKILL_CATALOG_INSTRUCTIONS = {
       "are not callable by you on this server.",
     "For host-repository skills, declared `tools` narrow the usable tools. Valid " +
       "frontmatter without `tools` inherits your available brain tools; `tools: []` permits none. " +
-      "Canonical shared skills use their approved requirements instead.",
+      "Canonical shared skills follow the same rule; their other requirements gate `usable`.",
   ],
 } as const;
 
@@ -256,7 +185,7 @@ export const SKILL_CLIENT_GUIDANCE = {
     "Do not invent tools — only the tools in `usable_tools` are callable by you.",
     "For host-repository skills, declared `tools` narrow this list. Valid frontmatter " +
       "without `tools` inherits your available brain tools; `tools: []` permits none. " +
-      "Canonical shared skills use their approved requirements instead.",
+      "Canonical shared skills follow the same rule; their other requirements gate `usable`.",
     "If `mutating` is true, this skill writes to the brain; confirm before doing so " +
       "if the user hasn't clearly asked for a write.",
   ],
@@ -271,9 +200,4 @@ export const SKILL_CLIENT_GUIDANCE = {
  * test/operations-descriptions.test.ts.
  */
 export const CAPTURE_DESCRIPTION =
-  'Capture a quick note into the brain — the "just remember this" write. Auto-derives a ' +
-  'stable inbox/ slug from the content date + hash (recapturing identical text is ' +
-  'idempotent), merges frontmatter, refuses binary/empty payloads, then delegates to ' +
-  'put_page (inheriting its fences and provenance stamping). Prefer capture for quick ' +
-  'notes and put_page when you need to control the slug, type, or an existing page\'s ' +
-  'content. For structured facts about entities, prefer remember.';
+  "Quick note (\"just remember this\"): auto-slugged under inbox/ by date + content hash, so recapturing is idempotent. Use put_page to control slug or type; remember for facts about entities.";

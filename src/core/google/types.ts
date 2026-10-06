@@ -80,6 +80,16 @@ export interface GoogleSourceState {
   gmail_fail_counts?: Record<string, number>;
   /** Fix wave 4: connector item holds (src/core/connectors/item-holds.ts). */
   item_holds?: unknown;
+  /**
+   * #5868: threads whose loop a grace window withheld, keyed by thread id
+   * (src/core/google/loop-catchup.ts). Separate from `item_holds`: never a
+   * failure, never counted by doctor `connector_held_items` or `waiting`.
+   */
+  loop_grace_holds?: Record<string, LoopGraceHold>;
+  /** #5868: one-shot 14-day grace-hold backfill done (set after a non-aborted sweep). */
+  loop_grace_backfill_done?: boolean;
+  /** #5867: managed-source 30-day loops_extract catch-up progress. */
+  loops_catchup?: LoopsCatchupState;
   calendar_sync_token: string | null;
   /**
    * Calendar id `calendar_sync_token` was minted for. A token is only valid
@@ -118,6 +128,33 @@ export function deriveSourceId(account: string): string {
     .slice(0, 32)
     .replace(/-+$/, '');
   return id || 'gmail';
+}
+
+/**
+ * #5868: one grace-held thread. `spec` is the loop its last detection would
+ * open at `due_ms`; `rev` is the page's newest message id it was computed
+ * from. A backfill seed has neither and is re-fetched once due.
+ */
+export interface LoopGraceHold {
+  due_ms: number;
+  slug: string | null;
+  rev: string | null;
+  spec: {
+    loopType: 'unanswered_inbound' | 'unanswered_outbound';
+    counterpartyEmail: string;
+    summary: string;
+    evidence: Array<{ message_id?: string; page_slug?: string; quote?: string }>;
+    lastActivityMs: number;
+    openedMs: number;
+  } | null;
+}
+
+/** #5867: the managed catch-up's window floor, its one-retry set and its done marker. */
+export interface LoopsCatchupState {
+  version: 1;
+  floor_ms: number;
+  retried: string[];
+  done: boolean;
 }
 
 export interface GmailMessageMeta {

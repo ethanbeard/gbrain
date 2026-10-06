@@ -100,7 +100,9 @@ describe('#3880 structural pins — all-source local_path selections filter arch
   const sites: Array<{ file: string; patched: number }> = [
     { file: 'src/commands/sync/run.ts', patched: 1 },
     { file: 'src/core/brain-writer.ts', patched: 1 },
-    { file: 'src/commands/doctor/checks/extraction-sync.ts', patched: 3 },
+    { file: 'src/commands/doctor/checks/extraction-sync.ts', patched: 2 },
+    // sync_freshness's loader (loadSyncFreshnessSources) moved here from extraction-sync.ts.
+    { file: 'src/core/source-health.ts', patched: 2 },
     { file: 'src/commands/frontmatter-install-hook.ts', patched: 1 },
     { file: 'src/commands/sources-harden.ts', patched: 1 },
   ];

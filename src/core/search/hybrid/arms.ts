@@ -181,7 +181,12 @@ export async function buildRelationalList(req: HybridRequest): Promise<SearchRes
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
       takesHoldersAllowList: opts?.takesHoldersAllowList,
-      onMeta: opts?.onRelationalMeta,
+      planner: resolvedMode.relational_planner,
+      orientOneHop: resolvedMode.relational_orient_onehop ?? resolvedMode.relational_planner,
+      onMeta: (m) => {
+        if (m.plan) req.relationalPlan = m.plan;
+        opts?.onRelationalMeta?.(m);
+      },
     });
   }
   return relationalList;

@@ -17,9 +17,10 @@
  *   alias_hit          — query exactly matched the page's declared chosen name
  *   exact_title_match  — query is a phrase in the page title (title boost fired)
  *   high_vector_match  — base (pre-boost) score >= HIGH_MATCH_FLOOR
- *   keyword_exact      — surfaced by a lexical arm (keyword/title FTS,
- *                        keyword_hit=true) with a solid score (#3783 — a solid
- *                        blended score alone no longer earns this label)
+ *   keyword_exact      — surfaced by a strict lexical arm (keyword/title FTS,
+ *                        keyword_hit=true, not keyword_relaxed) with a solid
+ *                        score (#3783 — a solid blended score alone no longer
+ *                        earns this label)
  *   weak_semantic      — everything else (low-confidence tail)
  *
  * create_safety:
@@ -80,8 +81,11 @@ export function classifyEvidence(r: SearchResult, opts: EvidenceOpts = {}): Evid
   // a solid blended score lied to the agent about WHY it matched. Rows
   // without the flag (incl. legacy cached rows) honestly degrade to
   // weak_semantic — create_safety 'unknown', the safe look-closer direction.
+  // gbrain-evals A4-2: an OR-relaxed lexical row (keyword_relaxed, the
+  // zero-strict-recall fallback) matched some query terms, not the query, so
+  // it is not lexically verified.
   const base = typeof r.base_score === 'number' ? r.base_score : r.score;
-  if (r.keyword_hit === true && Number.isFinite(base) && base >= SOLID_MATCH_FLOOR) {
+  if (r.keyword_hit === true && r.keyword_relaxed !== true && Number.isFinite(base) && base >= SOLID_MATCH_FLOOR) {
     return 'keyword_exact';
   }
   return 'weak_semantic';

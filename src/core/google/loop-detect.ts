@@ -17,7 +17,11 @@
  *  - list mail (List-Unsubscribe) never opens loops
  *  - self-threads (all participants are my addresses) never open loops
  *  - CC-only inbound does not owe a reply (must be in To:)
- *  - outbound without a question mark is FYI, not an ask
+ *  - outbound without a question mark is FYI, not an ask; a question mark
+ *    inside a link (?id=42) is not a question
+ *  - my acknowledgement-only reply ("Thanks!", "Got it") to a question is
+ *    not an answer: it neither closes the reply-owed loop nor flips the turn
+ *    ("Will do" is a commitment and still counts as the reply)
  *  - suppressed senders/threads (gbrain loops mute) never open NEW loops;
  *    existing loops keep their state
  *  - grace windows: inbound 24h, outbound 72h — fresh mail is not a loop yet;
@@ -48,6 +52,8 @@ export interface ThreadLoopSpec {
   summary: string;
   evidence: LoopEvidence[];
   lastActivityMs: number;
+  /** When the obligation began: the oldest message in the trailing run that carries it. */
+  openedMs: number;
 }
 
 export interface ThreadLoopVerdict {
@@ -63,6 +69,12 @@ export interface ThreadLoopVerdict {
    * counterparty was most impatient).
    */
   close: Array<'unanswered_inbound' | 'unanswered_outbound'>;
+  /**
+   * #5868: a grace window withheld this loop. It opens at `untilMs` with
+   * `spec` unless the thread changes first; the sweep records it as a grace
+   * hold because Gmail history never re-lists a quiet thread.
+   */
+  held?: { untilMs: number; spec: ThreadLoopSpec };
 }
 
 function isMine(m: GmailMessageMeta, myAddresses: Set<string>): boolean {
@@ -71,6 +83,24 @@ function isMine(m: GmailMessageMeta, myAddresses: Set<string>): boolean {
 
 function ageHours(ms: number, now: Date): number {
   return (now.getTime() - ms) / 3_600_000;
+}
+
+const URL_RE = /\b(?:https?:\/\/|www\.)\S+/gi;
+
+/** A question mark outside any link. */
+export function asksQuestion(text: string): boolean {
+  return text.replace(URL_RE, '').includes('?');
+}
+
+const ACK_ONLY_RE =
+  /^(?:(?:thanks|thank you|thx|ty|many thanks|thanks so much|thank you so much|got it|noted|received|ack|ok|okay|sounds good|cheers)[\s!.,]*)+$/i;
+const SIGN_OFF_NAME_RE = /(?:,\s*|\s+[-–—]\s*)\p{Lu}[\p{Ll}.]{0,19}[\s!.]*$/u;
+
+/** A short reply that only acknowledges ("Thanks!", "Got it, thanks.", "Thanks, Bob!"). */
+export function isAcknowledgementOnly(text: string): boolean {
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length === 0 || t.length > 60) return false;
+  return ACK_ONLY_RE.test(t) || ACK_ONLY_RE.test(t.replace(SIGN_OFF_NAME_RE, ''));
 }
 
 function quote(m: GmailMessageMeta): string {
@@ -102,9 +132,23 @@ export function detectThreadLoop(
   // could exclude it without silencing that person entirely. And they must
   // not CLOSE one either: a calendar invite is not a reply, so letting it
   // flip the turn would silently answer a real outbound loop.
-  const substantive = messages.filter(
-    (m) => !isNoiseSender(m.fromAddress) && !isCalendarSystemMail(m),
-  );
+  // My acknowledgement-only reply to their question is not an answer: drop
+  // it so the turn stays theirs and the reply-owed loop neither closes nor
+  // restarts its clock. An acknowledgement of a message that asked nothing
+  // ("Here is the deck" / "Thanks!") still counts as the reply it is.
+  const substantive: GmailMessageMeta[] = [];
+  let theirQuestionPending = false;
+  for (const m of messages) {
+    if (isNoiseSender(m.fromAddress) || isCalendarSystemMail(m)) continue;
+    if (!isMine(m, myAddresses)) {
+      theirQuestionPending = asksQuestion(m.bodyText);
+    } else if (theirQuestionPending && isAcknowledgementOnly(m.bodyText)) {
+      continue;
+    } else {
+      theirQuestionPending = false;
+    }
+    substantive.push(m);
+  }
   if (substantive.length === 0) return { open: [], close: [] };
 
   const last = substantive[substantive.length - 1];
@@ -149,45 +193,43 @@ export function detectThreadLoop(
     if (!inTo) return { open: [], close };
     if (threadSuppressed || suppressions?.senders.has(last.fromAddress)) return { open: [], close };
     const owedSince = run.find((m) => m.to.some((a) => myAddresses.has(a))) ?? last;
-    if (ageHours(owedSince.internalDateMs, now) < INBOUND_GRACE_HOURS) return { open: [], close };
-    return {
-      open: [
-        {
-          loopType: 'unanswered_inbound',
-          // No age in the stored summary — it would freeze at detection time
-          // and lie on the trust-critical surface; readers render age from
-          // last_activity_at.
-          summary: `Reply owed to ${last.fromAddress}: "${subject}"`,
-          counterpartyEmail: last.fromAddress,
-          evidence: [{ message_id: last.id, quote: quote(last) }],
-          lastActivityMs: last.internalDateMs,
-        },
-      ],
-      close,
+    const spec: ThreadLoopSpec = {
+      loopType: 'unanswered_inbound',
+      // No age in the stored summary — it would freeze at detection time
+      // and lie on the trust-critical surface; readers render age from
+      // last_activity_at.
+      summary: `Reply owed to ${last.fromAddress}: "${subject}"`,
+      counterpartyEmail: last.fromAddress,
+      evidence: [{ message_id: last.id, quote: quote(last) }],
+      lastActivityMs: last.internalDateMs,
+      openedMs: owedSince.internalDateMs,
     };
+    if (ageHours(owedSince.internalDateMs, now) < INBOUND_GRACE_HOURS) {
+      return { open: [], close, held: { untilMs: owedSince.internalDateMs + INBOUND_GRACE_HOURS * 3_600_000, spec } };
+    }
+    return { open: [spec], close };
   }
 
   // ── Last word is mine: am I waiting on them? ──
-  // No question mark → FYI/forward, not an ask.
-  if (!last.bodyText.includes('?')) return { open: [], close };
+  // No question mark outside a link → FYI/forward, not an ask.
+  if (!asksQuestion(last.bodyText)) return { open: [], close };
   const recipients = last.to.filter((a) => !myAddresses.has(a));
   if (recipients.length === 0) return { open: [], close };
   const counterparty = recipients[0];
   if (threadSuppressed || suppressions?.senders.has(counterparty)) return { open: [], close };
-  const askedSince = run.find((m) => m.bodyText.includes('?')) ?? last;
-  if (ageHours(askedSince.internalDateMs, now) < OUTBOUND_GRACE_HOURS) return { open: [], close };
-  return {
-    open: [
-      {
-        loopType: 'unanswered_outbound',
-        counterpartyEmail: counterparty,
-        summary: `Waiting on ${counterparty}: "${subject}"`,
-        evidence: [{ message_id: last.id, quote: quote(last) }],
-        lastActivityMs: last.internalDateMs,
-      },
-    ],
-    close,
+  const askedSince = run.find((m) => asksQuestion(m.bodyText)) ?? last;
+  const spec: ThreadLoopSpec = {
+    loopType: 'unanswered_outbound',
+    counterpartyEmail: counterparty,
+    summary: `Waiting on ${counterparty}: "${subject}"`,
+    evidence: [{ message_id: last.id, quote: quote(last) }],
+    lastActivityMs: last.internalDateMs,
+    openedMs: askedSince.internalDateMs,
   };
+  if (ageHours(askedSince.internalDateMs, now) < OUTBOUND_GRACE_HOURS) {
+    return { open: [], close, held: { untilMs: askedSince.internalDateMs + OUTBOUND_GRACE_HOURS * 3_600_000, spec } };
+  }
+  return { open: [spec], close };
 }
 
 // Suppression sets are cheap but per-thread queries add up on a backfill;
@@ -235,7 +277,7 @@ export async function applyThreadLoopVerdict(
   myAddresses: Set<string>,
   pageSlug: string | null,
   now: Date = new Date(),
-): Promise<void> {
+): Promise<ThreadLoopVerdict> {
   const suppressions = await suppressionsFor(engine, sourceId);
   // One verdict, two lanes: `close` is the turn-flip set (suppression- and
   // grace-independent — only a genuine reply closes, and only the answered
@@ -249,29 +291,57 @@ export async function applyThreadLoopVerdict(
     await closeThreadLoops(engine, sourceId, thread.threadId, 'reply_detected', toClose);
   }
 
-  for (const spec of verdict.open) {
-    let counterpartySlug: string | null = null;
-    try {
-      const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
-      const resolved = await resolveEntitySlugWithSource(engine, sourceId, spec.counterpartyEmail);
-      // Only alias-exact/high-confidence resolutions count — a slugify
-      // fallback would fabricate a person that doesn't exist.
-      if (resolved && resolved.source !== 'fallback_slugify') counterpartySlug = resolved.slug;
-    } catch {
-      /* resolution is best-effort */
-    }
-    await upsertOpenLoop(engine, {
-      sourceId,
-      dedupKey: `thread:${thread.threadId}:${spec.loopType}`,
-      loopType: spec.loopType,
-      counterpartySlug,
-      counterpartyEmail: spec.counterpartyEmail,
-      summary: spec.summary,
-      evidence: spec.evidence.map((e) => ({ ...e, ...(pageSlug ? { page_slug: pageSlug } : {}) })),
-      threadId: thread.threadId,
-      pageSlug,
-      detector: 'deterministic_thread',
-      lastActivityAt: new Date(spec.lastActivityMs).toISOString(),
-    });
+  for (const spec of verdict.open) await upsertThreadLoop(engine, sourceId, thread.threadId, spec, pageSlug);
+  return verdict;
+}
+
+/**
+ * #5868: opens a grace-held loop whose deadline passed on an unchanged
+ * thread, from the spec its last detection produced. Suppressions are
+ * re-read so a mute added during the hold still withholds the open.
+ */
+export async function openDueGraceHold(
+  engine: BrainEngine,
+  sourceId: string,
+  threadId: string,
+  spec: ThreadLoopSpec,
+  pageSlug: string | null,
+): Promise<boolean> {
+  const suppressions = await suppressionsFor(engine, sourceId);
+  if (suppressions.threads.has(threadId) || suppressions.senders.has(spec.counterpartyEmail)) return false;
+  await upsertThreadLoop(engine, sourceId, threadId, spec, pageSlug);
+  return true;
+}
+
+async function upsertThreadLoop(
+  engine: BrainEngine,
+  sourceId: string,
+  threadId: string,
+  spec: ThreadLoopSpec,
+  pageSlug: string | null,
+): Promise<void> {
+  let counterpartySlug: string | null = null;
+  try {
+    const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
+    const resolved = await resolveEntitySlugWithSource(engine, sourceId, spec.counterpartyEmail);
+    // Only alias-exact/high-confidence resolutions count — a slugify
+    // fallback would fabricate a person that doesn't exist.
+    if (resolved && resolved.source !== 'fallback_slugify') counterpartySlug = resolved.slug;
+  } catch {
+    /* resolution is best-effort */
   }
+  await upsertOpenLoop(engine, {
+    sourceId,
+    dedupKey: `thread:${threadId}:${spec.loopType}`,
+    loopType: spec.loopType,
+    counterpartySlug,
+    counterpartyEmail: spec.counterpartyEmail,
+    summary: spec.summary,
+    evidence: spec.evidence.map((e) => ({ ...e, ...(pageSlug ? { page_slug: pageSlug } : {}) })),
+    threadId,
+    pageSlug,
+    detector: 'deterministic_thread',
+    lastActivityAt: new Date(spec.lastActivityMs).toISOString(),
+    openedAt: new Date(spec.openedMs).toISOString(),
+  });
 }

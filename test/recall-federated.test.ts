@@ -196,7 +196,12 @@ describe('recall federated grants (D1b)', () => {
     const remember = operationsByName['remember'];
     await remember.handler(
       ctx({ remote: true, sourceId: 'aurora-workspace' }),
-      { fact: 'Pending marker QQF8', provenance: 'recall-federated test', visibility: 'world' },
+      // Consolidation reads (source, entity) buckets, so only a fact with an entity is pending backlog (#5831).
+      { fact: 'Pending marker QQF8', provenance: 'recall-federated test', visibility: 'world', entity: 'people/pending-example' },
+    );
+    await remember.handler(
+      ctx({ remote: true, sourceId: 'proj-widget' }),
+      { fact: 'Pending marker QQF9', provenance: 'recall-federated test', visibility: 'world', entity: 'people/pending-example' },
     );
     const a = await engine.countUnconsolidatedFacts('aurora-workspace');
     const b = await engine.countUnconsolidatedFacts('proj-widget');

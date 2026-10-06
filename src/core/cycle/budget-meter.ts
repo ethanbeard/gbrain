@@ -34,6 +34,7 @@ import { canonicalLookup, type ModelPricing } from '../model-pricing.ts';
 import type { BrainEngine } from '../engine.ts';
 import { splitProviderModelId } from '../model-id.ts';
 import { overrideFor, type PricingOverrides } from '../budget/reservation-cost.ts';
+import { pricingSetCommand } from '../budget/no-pricing.ts';
 // Re-exported beside loadAllowUnpriced so meter call sites read both knobs from one module.
 export { loadPricingOverrides } from '../budget/budget-tracker.ts';
 
@@ -189,8 +190,9 @@ export class BudgetMeter {
         process.stderr.write(
           `[budget] BUDGET_METER_NO_PRICING: model "${estimate.modelId}" has no canonical pricing. ` +
           (this.opts.allowUnpriced
-            ? `Budget gate disabled for this model (dream.budget.allow_unpriced=true).\n`
-            : `Metering it at the Sonnet-tier fallback rate; set dream.budget.allow_unpriced=true to bypass.\n`),
+            ? `Budget gate disabled for this model (dream.budget.allow_unpriced=true). `
+            : `Metering it at the Sonnet-tier fallback rate; set dream.budget.allow_unpriced=true to bypass. `) +
+          `To meter its real price, look it up and register it: ${pricingSetCommand(estimate.modelId, 'chat')}\n`,
         );
       }
     }

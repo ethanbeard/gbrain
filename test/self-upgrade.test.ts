@@ -9,6 +9,7 @@ import {
   clearUpdateCache,
   decideSelfUpgrade,
   formatMarker,
+  gateOnTargetRuntime,
   isCacheFresh,
   isSnoozeActive,
   parseMarker,
@@ -20,7 +21,10 @@ import {
   writeSnooze,
   writeUpdateCache,
   type DecideSelfUpgradeInputs,
+  type SelfUpgradeAction,
+  type SelfUpgradeState,
 } from '../src/core/self-upgrade.ts';
+import type { HostBun, TargetFloor } from '../src/core/bun-floor.ts';
 
 function baseInputs(over: Partial<DecideSelfUpgradeInputs> = {}): DecideSelfUpgradeInputs {
   return {
@@ -119,6 +123,33 @@ describe('decideSelfUpgrade — pure branches', () => {
     });
     test('gate order: known_bad beats idle/quiet gates', () => {
       expect(auto({ failedVersions: ['0.43.0'], idle: false }).action).toBe('known_bad');
+    });
+
+    test('#5855: an apply is held when the target Bun floor is above the host Bun, or either is unknown', () => {
+      const bun = (version: string): HostBun => ({ label: 'bun on PATH', path: '/opt/bun', version });
+      const floor = (f: string): TargetFloor => ({ ok: true, floor: f, version: null });
+      const cases: Array<{ target: TargetFloor; host: HostBun | null; action: SelfUpgradeAction; reason?: string[] }> = [
+        { target: floor('1.4.0'), host: bun('1.4.2'), action: 'apply' },
+        { target: floor('1.4.0'), host: bun('1.4.0'), action: 'apply' },
+        { target: floor('1.4.0'), host: bun('1.4.0+5a1b2c3'), action: 'apply' },
+        { target: floor('1.4.0'), host: bun('1.5.0-canary.2'), action: 'apply' },
+        { target: floor('1.4.0'), host: bun('1.4.0-canary.9'), action: 'unsupported_runtime', reason: ['gbrain 0.43.0 requires Bun >=1.4.0', 'bun on PATH is 1.4.0-canary.9'] },
+        { target: floor('1.4.0'), host: bun('1.3.14'), action: 'unsupported_runtime', reason: ['gbrain 0.43.0 requires Bun >=1.4.0', 'bun on PATH is 1.3.14', 'Fix: bun upgrade, then gbrain upgrade'] },
+        { target: { ok: false, failedRead: '`git fetch` in the source clone failed' }, host: bun('1.4.2'), action: 'unsupported_runtime', reason: ['Could not read the Bun floor of gbrain 0.43.0', 'The next quiet-hours tick retries'] },
+        { target: floor('1.4.0'), host: null, action: 'unsupported_runtime', reason: ['could not run `bun --version` on PATH'] },
+      ];
+      for (const c of cases) {
+        const d = gateOnTargetRuntime(auto(), c.target, c.host);
+        expect(d.action, JSON.stringify(c)).toBe(c.action);
+        expect(d.latest).toBe('0.43.0');
+        for (const fragment of c.reason ?? []) expect(d.reason).toContain(fragment);
+        expect(d.reason).not.toContain('/opt/bun');
+      }
+    });
+
+    test('#5855: the runtime gate leaves a non-apply decision unchanged', () => {
+      const busy = auto({ idle: false });
+      expect(gateOnTargetRuntime(busy, { ok: true, floor: '9.0.0', version: null }, null)).toEqual(busy);
     });
   });
 });
@@ -262,6 +293,44 @@ describe('reconcileBreadcrumb', () => {
     const r = reconcileBreadcrumb({ attempting_version: '0.43.0', failed_versions: ['0.43.0', '0.41.0'] }, '0.42.0');
     expect(r.state.failed_versions?.filter((v) => v === '0.43.0').length).toBe(1);
   });
+  test('unparseable running version → failed (no ordering to trust)', () => {
+    const r = reconcileBreadcrumb({ attempting_version: '0.43.0' }, 'dev');
+    expect(r.transition).toBe('failed');
+    expect(r.state.failed_versions).toEqual(['0.43.0']);
+  });
+  // #5813: the swap installs whatever is current at swap time (git pull, bun
+  // update, releases/latest), so the relaunched binary can be NEWER than the
+  // version the breadcrumb recorded from the update cache.
+  const appliedCases: Array<{ name: string; su: SelfUpgradeState; running: string; failed: string[] | undefined }> = [
+    { name: 'running newer than attempted', su: { attempting_version: '0.60.22.0' }, running: '0.60.25.0', failed: undefined },
+    {
+      name: 'prunes known-bad entries at or below the running version',
+      su: { attempting_version: '0.60.22.0', failed_versions: ['0.59.2.0', '0.60.25.0', '0.60.30.0'] },
+      running: '0.60.25.0',
+      failed: ['0.60.30.0'],
+    },
+    {
+      name: 'exact match prunes too and keeps unparseable entries',
+      su: { attempting_version: '0.43.0', failed_versions: ['0.41.0', 'not-a-version'] },
+      running: '0.43.0',
+      failed: ['not-a-version'],
+    },
+    {
+      name: 'pruning every entry drops the key',
+      su: { attempting_version: '0.60.22.0', failed_versions: ['0.59.2.0', '0.60.8.0'] },
+      running: '0.60.25.0',
+      failed: undefined,
+    },
+  ];
+  for (const c of appliedCases) {
+    test(`applied: ${c.name}`, () => {
+      const r = reconcileBreadcrumb(c.su, c.running);
+      expect(r.transition).toBe('applied');
+      expect(r.state.attempting_version).toBeUndefined();
+      expect(r.state.last_applied_version).toBe(c.running);
+      expect(r.state.failed_versions).toEqual(c.failed);
+    });
+  }
 });
 
 describe('resolveSelfUpgradeMode', () => {

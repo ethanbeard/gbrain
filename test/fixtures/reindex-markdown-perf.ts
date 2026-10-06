@@ -38,7 +38,7 @@ if (mode === 'trace') {
       };
       const executeRaw = tx.executeRaw;
       tx.executeRaw = async function<R = Record<string, unknown>>(this: BrainEngine, ...args: Parameters<BrainEngine['executeRaw']>): Promise<R[]> {
-        if (args[0].trim().toUpperCase().startsWith('ANALYZE ')) statistics = true;
+        if (/^ANALYZE\b/i.test(args[0].trim())) statistics = true;
         return await executeRaw.apply(this, args) as R[];
       };
       const result = await fn(tx);

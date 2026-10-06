@@ -10,6 +10,7 @@ import { claimWorktree } from '../../src/core/persistence/ownership.ts';
 import { activateSharedSkillPersistence } from '../../src/core/persistence/skill-activation.ts';
 import { declarePersistenceProtocol } from '../../src/core/persistence/protocol.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from '../../test/helpers/write-attribution.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { sha256 } from '../../src/core/persistence/digest.ts';
 import { normalizeSkillFiles, skillMetadata } from '../../src/core/shared-skills/manifest.ts';
@@ -114,7 +115,7 @@ export async function createLifecycleFixture(options: { root: string; size: numb
         }
         await tx.executeRaw(`INSERT INTO shared_skill_packs(source_id,source_incarnation,pack_id,revision,manifest,manifest_hash)
           VALUES('default',$1::uuid,$2,$3::uuid,$4::text::jsonb,$5)`, [source.incarnation, PACK_ID, randomUUID(), JSON.stringify(manifest), sha256(manifestContent)]);
-      });
+      }, TEST_WRITE_ATTRIBUTION);
     });
     const seed = { count: seeded.length, elapsed_ms: performance.now() - started, canonical_fixture_bytes: canonicalBytes,
       manifest_bytes: Buffer.byteLength(manifestContent), mode: 'matching filesystem and sealed projection fixtures seeded directly; NOT a measured canonical publication' };

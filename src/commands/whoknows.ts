@@ -39,6 +39,7 @@ import type { PageReadPolicy } from '../core/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { PageType, SearchResult } from '../core/types.ts';
 import { hybridSearch } from '../core/search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../core/search/internal-breadth.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 
@@ -192,6 +193,7 @@ export async function findExperts(
   //    v0.34.1 (#861, D3): thread source-scope so an authenticated MCP
   //    client only ranks experts within its accessible sources.
   const results: SearchResult[] = await hybridSearch(engine, opts.topic, {
+    ...INTERNAL_BREADTH_SEARCH_OPTS,
     types,
     limit: innerLimit,
     salience: 'off',
@@ -318,6 +320,10 @@ export async function runWhoknows(
     return;
   }
   if ('error' in parsed) {
+    if (args.includes('--json')) {
+      const { exitCliError, usageError } = await import('../cli/cli-error.ts');
+      exitCliError(usageError(`gbrain whoknows: ${parsed.error}`, 'Pass the topic as the positional argument, e.g. gbrain whoknows "lab automation" --json.'), 'whoknows', { json: true });
+    }
     console.error(`gbrain whoknows: ${parsed.error}`);
     console.error(HELP);
     process.exit(2);

@@ -179,7 +179,7 @@ export function createEmbedStallWatchdog(opts: {
  * the CLI wrapper exits the process.
  */
 export function assertEmbedNotStalled(result: {
-  reason?: 'stall_timeout';
+  reason?: string;
   embedded: number;
 }): void {
   if (result.reason !== 'stall_timeout') return;

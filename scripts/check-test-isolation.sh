@@ -33,6 +33,10 @@
 #  be added — the allow-list shrinks over time, never grows.
 #
 # Usage: scripts/check-test-isolation.sh [TARGET_DIR]
+#        scripts/check-test-isolation.sh --as-parallel FILE...
+#   --as-parallel lints the named files (serial ones included) as if they
+#   ran in the parallel pool: the check a *.serial.test.ts file must pass
+#   before it rejoins the unit lane (scripts/serial-files.tsv).
 # Exit:  0 when clean, 1 when un-allow-listed violations found.
 
 set -euo pipefail
@@ -42,6 +46,12 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
 
+AS_PARALLEL=0
+if [ "${1:-}" = "--as-parallel" ]; then
+  AS_PARALLEL=1
+  shift
+  [ "$#" -gt 0 ] || { echo "Usage: scripts/check-test-isolation.sh --as-parallel FILE..." >&2; exit 2; }
+fi
 TARGET_DIR="${1:-test}"
 # When scanning the default root, also lint evals/**/*.test.ts — those files
 # are collected into the CI matrix (scripts/test-shard.sh) and must obey the
@@ -82,10 +92,14 @@ is_allowlisted() {
 
 # Find non-serial unit test files (excluding test/e2e). Portable across
 # bash 3.2 (macOS default) and bash 4+; no mapfile.
+if [ "$AS_PARALLEL" = 1 ]; then
+  FILE_LIST="$(printf '%s\n' "$@")"
+else
 FILE_LIST="$(find "$TARGET_DIR" $EXTRA_DIRS -name '*.test.ts' \
   -not -name '*.serial.test.ts' \
   -not -path "*/e2e/*" \
   -type f 2>/dev/null | sort)"
+fi
 
 ENV_MUTATION_PATTERN='process\.env\.[A-Za-z_][A-Za-z_0-9]*[[:space:]]*=[^=]|process\.env\[[^]]+\][[:space:]]*=[^=]|delete[[:space:]]+process\.env\.|delete[[:space:]]+process\.env\[|Object\.assign[[:space:]]*\([[:space:]]*process\.env|Reflect\.set[[:space:]]*\([[:space:]]*process\.env'
 MODULE_MOCK_PATTERN='mock\.module[[:space:]]*\('

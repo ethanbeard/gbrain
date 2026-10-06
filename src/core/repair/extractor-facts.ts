@@ -49,7 +49,8 @@ import type { BrainEngine } from '../engine.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import type { WriteRequest } from '../persistence/model.ts';
 import { VERSION } from '../../version.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { parseFactsFence } from '../facts-fence.ts';
 import { digest } from '../persistence/digest.ts';
 import { isTerminal } from '../persistence/model.ts';
@@ -61,9 +62,13 @@ import { maintenancePreflight, submitDatabaseMaintenanceIntent } from '../persis
 import { compareWriterVersions, recentWriterVersions, writerVersionLabel } from '../persistence/writer-versions.ts';
 import { clearApprovedSet, loadApprovedSet, previewChangedError, previewHash, saveApprovedSet } from '../persistence/preview-approval.ts';
 import { afterCursor, type RepairHandler, type RepairItem, type RepairItemOutcome, type RepairListing, type RepairPlan, type RepairScope } from './core.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 export const EXTRACTOR_FACTS_INTENT = 'managed_maintenance_restore_extractor_facts';
 export const EXTRACTOR_FACTS_SOURCE_PREFIX = 'cli:extract-conversation-facts';
+const extractorPreviewFix = (sourceId: string) => readFix('Previews the extractor-facts repair without changing anything.',
+  { argv: ['gbrain', 'repair', 'extractor-facts', '--source', sourceId, '--json'] });
+
 /** The first release whose canonical projection leaves fenceless extractor facts alone. */
 export const EXTRACTOR_FACTS_FIX_VERSION = '0.60.11.0';
 
@@ -316,7 +321,7 @@ export const extractorFactsRepair: RepairHandler = {
     const { page, hash, last } = entry as PageItem;
     const result = await managedPersistenceEnabled(ctx.engine)
       ? await restoreManaged(ctx.engine, ctx.config, page, hash)
-      : await ctx.engine.transaction(async tx => {
+      : await maintenanceTransaction(ctx.engine, async tx => {
         await tx.lockPageKeys([{ sourceId: page.source_id, slug: page.slug }]);
         return restorePageFacts(tx, page, false);
       });
@@ -394,10 +399,16 @@ export async function prepareExtractorFactsRestore(engine: BrainEngine, row: Wri
   const intent = row.intent as { page?: ExtractorFactsPage; preview_hash?: unknown } | null;
   const page = intent?.page;
   if (!page || page.source_id !== row.source_id || page.slug !== row.slug || typeof intent?.preview_hash !== 'string' || !Array.isArray(page.facts)) {
-    throw new OperationError('invalid_params', 'The extractor facts restore intent does not name its page.');
+    throw opError('invalid_params', 'The extractor facts restore intent does not name its page.',
+      `Request ${row.request_id} for ${row.slug} in source ${row.source_id} does not name the page and preview it restores, so nothing changed. Preview the repair again and apply the new preview after the user approves.`,
+      { fix: extractorPreviewFix(row.source_id) });
   }
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
-  if (!snapshot || snapshot.page.id !== Number(row.page_id)) throw new OperationError('page_identity_changed', 'The conversation page was deleted or replaced before its facts were restored.');
+  if (!snapshot || snapshot.page.id !== Number(row.page_id)) {
+    throw opError('page_identity_changed', 'The conversation page was deleted or replaced before its facts were restored.',
+      `Conversation page ${row.slug} in source ${row.source_id} was deleted or replaced after the preview, so request ${row.request_id} restored nothing. Preview the repair again; it reflects the current pages.`,
+      { fix: extractorPreviewFix(row.source_id) });
+  }
   await authorizeWrite(engine, row.authority, 'submit_job', row.slug);
   return { observedRevision: snapshot.revision, noop: true,
     validate: async tx => { await authorizeWrite(tx, row.authority, 'submit_job', row.slug); },

@@ -7,17 +7,24 @@
  * src/commands/doctor/registry.ts and src/core/doctor-categories.ts.
  */
 
+import { embedBackfillFix } from '../../../core/embed-consent.ts';
 import * as db from '../../../core/db.ts';
+import { loadConfig } from '../../../core/config.ts';
+import { isSupabasePoolerUrl } from '../../../core/connection-manager.ts';
 import { LATEST_VERSION } from '../../../core/migrate.ts';
 import { schemaVersionHealth } from '../../../core/schema-version-health.ts';
 import { pgvectorCheck, pagesUpsertArbiterCheck, linkSourceCheckConstraintCheck } from './core-health.ts';
 import { pgliteScaleCheck } from './engine-fit.ts';
 import { checkParkedEffects } from './parked-effects.ts';
+import { checkManagedGuardSchemaDrift, checkPublicationRefusals } from './managed-guard.ts';
+import { checkWorktreeRefreshStuck } from './worktree-refresh.ts';
 import { checkPersistenceCapacity } from './persistence-capacity.ts';
 import { checkPostgresCancellationDriver } from './postgres-cancellation.ts';
 import { checkProjectionReadiness } from './projection-readiness.ts';
 import type { Check } from '../../doctor.ts';
 import { connectedEngine, type DoctorContext, type DoctorEntry } from '../context.ts';
+import { embeddingsDisabled } from '../../../core/embedding-disabled.ts';
+import { checkError, infoCheck, keylessEnablementFix } from '../check-fix.ts';
 
 async function runPgvector(ctx: DoctorContext): Promise<Check[]> {
   const { progress } = ctx;
@@ -38,7 +45,9 @@ async function runPgvector(ctx: DoctorContext): Promise<Check[]> {
 
   // 4a-bis. Managed write capacity (#5470) and parked postcommit effects (#5612).
   progress.heartbeat('persistence_capacity');
-  checks.push(await checkPersistenceCapacity(engine), await checkParkedEffects(engine));
+  checks.push(await checkPersistenceCapacity(engine), await checkParkedEffects(engine), await checkWorktreeRefreshStuck(engine));
+  // #5983/#5974: schema drift on guarded tables and writes the database refused.
+  checks.push(await checkManagedGuardSchemaDrift(engine), await checkPublicationRefusals(engine));
 
   // 4a-ter. #4613: links_link_source_check shape — a ledger-current brain
   // whose CHECK reverted to the pre-v114 allowlist rejects every kebab
@@ -65,6 +74,9 @@ export const pgvectorEntry: DoctorEntry = {
     'text_projection_readiness',
     'persistence_capacity',
     'parked_effects',
+    'worktree_refresh_stuck',
+    'managed_guard_schema_drift',
+    'publication_refusals',
     'links_link_source_check',
     'pglite_scale',
   ],
@@ -143,6 +155,7 @@ async function runRls(ctx: DoctorContext): Promise<Check[]> {
           message: `RLS enabled on ${tables.length - exempt.length}/${tables.length} public tables${suffix}`,
         });
       } else {
+        const exposure = await publicSchemaExposure(sql);
         const names = gaps.join(', ');
         // Double-escape " inside identifiers so a pathological table name
         // like `weird"table` renders as `"weird""table"` in the remediation
@@ -155,23 +168,32 @@ async function runRls(ctx: DoctorContext): Promise<Check[]> {
         const exemptInfo = exempt.length > 0
           ? ` (${exempt.length} other table(s) explicitly exempt.)`
           : '';
-        checks.push({
-          name: 'rls',
-          status: 'fail',
-          message:
-            `${gaps.length} table(s) WITHOUT Row Level Security: ${names}.${exemptInfo} ` +
-            `Fix: ${fixes} ` +
-            `If a table should stay readable by the anon key on purpose, see docs/guides/rls-and-you.md for the GBRAIN:RLS_EXEMPT comment escape hatch.`,
-        });
+        const fixTail = `Fix: ${fixes} ` +
+          `If a table should stay readable by the anon key on purpose, see docs/guides/rls-and-you.md for the GBRAIN:RLS_EXEMPT comment escape hatch.`;
+        const gapLine = `${gaps.length} table(s) WITHOUT Row Level Security: ${names}.${exemptInfo} `;
+        checks.push(exposure
+          ? { name: 'rls', status: 'fail', message: `${gapLine}The public schema may be served to the anon key (${exposure}). ${fixTail}` }
+          : { name: 'rls', status: 'warn', message: `${gapLine}No PostgREST exposure detected (no anon, authenticated, authenticator or service_role role; not a Supabase URL), so this is a warning: enable RLS before putting PostgREST or a similar API in front of the public schema. ${fixTail}` });
       }
     } catch {
-      checks.push({ name: 'rls', status: 'warn', message: 'Could not check RLS status' });
+      checks.push(checkError('rls', 'check RLS status'));
     }
   }
   return checks;
 }
 
 export const rlsEntry: DoctorEntry = { name: 'rls', emits: ['rls'], run: runRls };
+
+/** PostgREST role conventions or a Supabase host mean the public schema may be reachable with the anon key; null when neither is present. */
+async function publicSchemaExposure(sql: ReturnType<typeof db.getConnection>): Promise<string | null> {
+  const roles = await sql`SELECT rolname FROM pg_roles
+    WHERE rolname IN ('anon', 'authenticated', 'authenticator', 'service_role') ORDER BY rolname`;
+  if (roles.length > 0) return `PostgREST role(s) present: ${(roles as unknown as Array<{ rolname: string }>).map(r => r.rolname).join(', ')}`;
+  const url = loadConfig()?.database_url ?? '';
+  let host = '';
+  try { host = new URL(url.replace(/^postgres(ql)?:\/\//, 'http://')).hostname; } catch { /* no parsable URL */ }
+  return /(^|\.)supabase\.(co|com)$/i.test(host) || isSupabasePoolerUrl(url) ? 'Supabase database URL' : null;
+}
 
 async function runSchemaVersion(ctx: DoctorContext): Promise<Check[]> {
   const { progress } = ctx;
@@ -225,11 +247,11 @@ async function runSchemaVersion(ctx: DoctorContext): Promise<Check[]> {
           });
         }
       } catch {
-        checks.push({ name: 'schema_columns', status: 'warn', message: 'Could not verify live schema columns' });
+        checks.push(checkError('schema_columns', 'verify live schema columns'));
       }
     }
   } catch {
-    checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
+    checks.push(checkError('schema_version', 'check schema version'));
   }
   ctx.schemaVersion = schemaVersion;
   return checks;
@@ -302,11 +324,7 @@ async function runRlsEventTrigger(ctx: DoctorContext): Promise<Check[]> {
         });
       }
     } catch {
-      checks.push({
-        name: 'rls_event_trigger',
-        status: 'warn',
-        message: 'Could not check RLS event trigger',
-      });
+      checks.push(checkError('rls_event_trigger', 'check RLS event trigger'));
     }
   }
   return checks;
@@ -326,6 +344,12 @@ async function runEmbeddings(ctx: DoctorContext): Promise<Check[]> {
   // 8. Embedding health
   progress.heartbeat('embeddings');
   try {
+    // A keyless brain has no embedding backlog to drain: recommending a paid
+    // catch-up there would send the agent into a refusal.
+    if (await embeddingsDisabled(engine)) {
+      checks.push(infoCheck('embeddings', 'Not applicable: embeddings are disabled on this brain (keyword search keeps working).', 'disabled_by_choice', keylessEnablementFix()));
+      return checks;
+    }
     const health = await engine.getHealth();
     const pct = (health.embed_coverage * 100).toFixed(0);
     // Coverage + missing now share one source (the stored vector over
@@ -342,15 +366,26 @@ async function runEmbeddings(ctx: DoctorContext): Promise<Check[]> {
     } catch {
       // Config read is best-effort; the coverage numbers stand alone.
     }
+    // The backlog's fix is the catch-up drain: a plain `embed --stale` stops
+    // at its 30-minute budget, which on a large brain leaves most of the
+    // backlog behind (52k documents: 51,910 chunks after one run).
+    const backlog = health.missing_embeddings;
+    const fix = 'gbrain embed --stale --catch-up';
+    const backlogDetails = { code: 'embedding_backlog', backlog, fix, requires_user_approval: 'paid embedding calls',
+      docs: 'docs/operations/backfill-pacing.md#large-brain-deadlines' };
+    const fixText = `Fix: ${fix} (runs until the backlog is empty; a plain gbrain embed --stale stops after its 30-minute budget). ` +
+      'It makes paid embedding calls: confirm with the user unless embedding spend is already approved.';
     if (health.embed_coverage >= 0.9) {
-      checks.push({ name: 'embeddings', status: 'ok', message: `${pct}% coverage, ${health.missing_embeddings} missing${carveOut}` });
+      checks.push(backlog > 0
+        ? { name: 'embeddings', status: 'ok', message: `${pct}% coverage, ${backlog} missing${carveOut}. Backlog: ${backlog} chunk(s) without embeddings. ${fixText}`, details: backlogDetails, fix: embedBackfillFix({ backlog, verifyCheck: 'embeddings' }) }
+        : { name: 'embeddings', status: 'ok', message: `${pct}% coverage, ${backlog} missing${carveOut}` });
     } else if (health.embed_coverage > 0) {
-      checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage, ${health.missing_embeddings} missing. Run: gbrain embed --stale${carveOut}` });
+      checks.push({ name: 'embeddings', status: 'warn', message: `${pct}% coverage, ${backlog} missing${carveOut}. Backlog: ${backlog} chunk(s) without embeddings. ${fixText}`, details: backlogDetails, fix: embedBackfillFix({ backlog, verifyCheck: 'embeddings' }) });
     } else {
-      checks.push({ name: 'embeddings', status: 'warn', message: `No embeddings yet. Run: gbrain embed --stale${carveOut}` });
+      checks.push({ name: 'embeddings', status: 'warn', message: `No embeddings yet${carveOut}. Backlog: ${backlog} chunk(s) without embeddings. ${fixText}`, details: backlogDetails, fix: embedBackfillFix({ backlog, verifyCheck: 'embeddings' }) });
     }
   } catch {
-    checks.push({ name: 'embeddings', status: 'warn', message: 'Could not check embedding health' });
+    checks.push(checkError('embeddings', 'check embedding health'));
   }
   return checks;
 }

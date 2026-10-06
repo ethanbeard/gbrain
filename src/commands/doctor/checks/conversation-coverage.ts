@@ -10,8 +10,9 @@
  * `gbrain conversation-parser scan <slug>`.
  */
 import type { BrainEngine } from '../../../core/engine.ts';
-import { ALLOWED_TYPES } from '../../../core/facts/conversation-types.ts';
+import { ALLOWED_TYPES, isConversationFactsEligiblePage, requireParseableConversationFlag } from '../../../core/facts/conversation-types.ts';
 import type { Check } from '../../doctor.ts';
+import { checkError } from '../check-fix.ts';
 
 export async function computeConversationFormatCoverageCheck(
   engine: BrainEngine,
@@ -25,9 +26,11 @@ export async function computeConversationFormatCoverageCheck(
     // PageFilters supports singular `type` only; iterate the allowed types
     // and cap at ~50/each to land at ~200 total max.
     const sample: import('../../../core/types.ts').Page[] = [];
+    // #5330: sample only pages the extractor would claim.
+    const strict = await requireParseableConversationFlag(engine);
     for (const t of allowedTypes) {
       const slice = await engine.listPages({ limit: 50, type: t as import('../../../core/types.ts').PageType });
-      sample.push(...slice);
+      sample.push(...slice.filter(page => isConversationFactsEligiblePage(page, allowedTypes, strict)));
     }
     if (sample.length === 0) {
       return {
@@ -78,10 +81,6 @@ export async function computeConversationFormatCoverageCheck(
       message: `${sample.length} pages: ${breakdown}`,
     };
   } catch (err) {
-    return {
-      name,
-      status: 'warn',
-      message: `Could not check conversation format coverage: ${(err as Error)?.message ?? String(err)}`,
-    };
+    return checkError(name, 'check conversation format coverage', err);
   }
 }

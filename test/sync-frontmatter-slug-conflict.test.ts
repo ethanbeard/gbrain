@@ -57,6 +57,8 @@ test('a frontmatter slug that conflicts with its path is named in sync output an
     await engine.executeRaw("INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,'{}')", [id, root]);
     await claimWorktree(engine, id, root);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    // #5988: sync holds such a file by default; sync.holds=fail keeps the fail-closed receipt this pins.
+    await engine.setConfig('sync.holds', 'fail');
     try {
       const result = await performManagedSync(engine, { sourceId: id, noPull: true, noEmbed: true, noExtract: true });
       expect(result).toMatchObject({ status: 'blocked_by_failures', managedWrite: { write_error: 'invalid_params', message: expected } });
@@ -71,6 +73,7 @@ test('a frontmatter slug that conflicts with its path is named in sync output an
       const receipt = await operations.find(op => op.name === 'get_write_request')!.handler(ctx, { request_id: requestId });
       expect(receipt).toMatchObject({ request_id: requestId, state: 'failed', write_error: 'invalid_params', write_error_message: expected });
     } finally {
+      await engine.unsetConfig('sync.holds');
       await disposePersistenceConsumer(engine);
       await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
     }

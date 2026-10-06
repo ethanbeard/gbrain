@@ -1,5 +1,5 @@
 /**
- * Fixture for test/process-watchdog.serial.test.ts. Spawned via `bun`.
+ * Fixture for test/process-watchdog-harness.test.ts. Spawned via `bun`.
  *
  * Usage: bun watchdog-harness.ts <mode> <deadlineMs> <graceMs>
  *   starve-with    — install the watchdog, then starve the event loop forever.
@@ -22,9 +22,20 @@
  *   stall-dispose  — install, dispose immediately, then genuinely starve past
  *                    stall+grace. A disposed watchdog must never kill.
  *
+ * Progress-aware deadline modes (large-brain sync, F4d) — argv[5] is the
+ * progress window in ms:
+ *   progress-with   — install a progress-aware watchdog, then keep reporting
+ *                     forward progress (noteForwardProgress every 25ms) for
+ *                     4x the deadline. Must NOT be stopped; prints COMPLETED.
+ *   progress-stalls — report progress for half the deadline, then idle (loop
+ *                     responsive, no progress). Must be SIGTERMed one window
+ *                     after the last progress note, after printing the
+ *                     STOP-NOTICE stop notice on stdout.
+ *
  * Safety net: the busy loop self-exits after 8s so a failed test kill can't hang CI.
  */
 import { installProcessWatchdog, installLoopStallWatchdog } from '../../src/core/process-watchdog.ts';
+import { noteForwardProgress } from '../../src/core/forward-progress.ts';
 
 const mode = process.argv[2] ?? 'starve-with';
 const deadlineMs = Number(process.argv[3] ?? 300);
@@ -70,6 +81,19 @@ if (mode.startsWith('stall-')) {
   const t0 = Date.now();
   while (Date.now() - t0 < 8000) { /* spin — no await, no yield */ }
   process.stdout.write('SURVIVED\n'); // must NOT print under stall-with
+  process.exit(0);
+}
+
+if (mode.startsWith('progress-')) {
+  const progressWindowMs = Number(process.argv[5] ?? 400);
+  installProcessWatchdog({ deadlineMs, graceMs, label: 'test-wd', progressWindowMs, stopNotice: 'STOP-NOTICE' });
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const t0 = Date.now();
+  const progressFor = mode === 'progress-with' ? deadlineMs * 4 : deadlineMs / 2;
+  while (Date.now() - t0 < progressFor) { noteForwardProgress(); await sleep(25); }
+  if (mode === 'progress-with') { process.stdout.write('COMPLETED\n'); process.exit(0); }
+  while (Date.now() - t0 < 8000) await sleep(25);
+  process.stdout.write('SURVIVED\n');
   process.exit(0);
 }
 

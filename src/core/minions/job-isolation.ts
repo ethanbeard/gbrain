@@ -36,8 +36,9 @@
 import { accessSync, constants, readdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
-import { UnrecoverableError } from './types.ts';
+import { JobDeferredError, UnrecoverableError } from './types.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
+import { SpendGroupRefusedError, type SpendRefusalEnvelope } from './spend-authorization.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 import { basename, delimiter, resolve } from 'node:path';
 
@@ -90,7 +91,7 @@ export function childConfigurationError(reason: typeof CHILD_CONFIGURATION_REASO
   return new LocalConfigurationError(reason, `${messages[reason]} Verify worker and child readiness, then restart. See docs/guides/minions-fix.md#configuration-blocked.`);
 }
 
-export type ChildErrorKind = 'unrecoverable' | 'rate_lease' | 'generic' | 'local_configuration';
+export type ChildErrorKind = 'unrecoverable' | 'rate_lease' | 'deferred' | 'generic' | 'local_configuration';
 
 export type ChildOutcome =
   | { outcome: 'success'; result: unknown }
@@ -99,7 +100,10 @@ export type ChildOutcome =
       errorKind: ChildErrorKind;
       message: string;
       stack?: string;
-      lease?: { key: string; active: number; max: number };
+      lease?: { key: string; active: number; max: number; retryInMs?: number };
+      /** A group spend refusal's envelope (code, fix, group amounts). */
+      spend?: SpendRefusalEnvelope;
+      deferral?: { reason: string; retryInMs: number };
       protocolVersion?: number;
       reasonCode?: typeof CHILD_CONFIGURATION_REASONS[number];
     };
@@ -119,8 +123,11 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
       outcome: 'error',
       errorKind: 'rate_lease',
       message: err.message,
-      lease: { key: err.key, active: err.active, max: err.max },
+      lease: { key: err.key, active: err.active, max: err.max, ...(err.retryInMs !== undefined ? { retryInMs: err.retryInMs } : {}) },
     };
+  }
+  if (err instanceof JobDeferredError) {
+    return { outcome: 'error', errorKind: 'deferred', message: err.message, deferral: { reason: err.reason, retryInMs: err.retryInMs } };
   }
   if (err instanceof UnrecoverableError) {
     return {
@@ -128,6 +135,7 @@ export function encodeHandlerError(err: unknown): ChildOutcome {
       errorKind: 'unrecoverable',
       message: err.message,
       ...(err.stack ? { stack: err.stack } : {}),
+      ...(err instanceof SpendGroupRefusedError ? { spend: err.envelope } : {}),
     };
   }
   const message = err instanceof Error ? err.message : String(err);
@@ -146,10 +154,13 @@ export function reconstructHandlerError(o: Extract<ChildOutcome, { outcome: 'err
     return childConfigurationError(o.reasonCode);
   }
   if (o.errorKind === 'rate_lease' && o.lease) {
-    return new RateLeaseUnavailableError(o.lease.key, o.lease.active, o.lease.max);
+    return new RateLeaseUnavailableError(o.lease.key, o.lease.active, o.lease.max, o.lease.retryInMs);
   }
   if (o.errorKind === 'unrecoverable') {
-    return new UnrecoverableError(o.message);
+    return o.spend ? new SpendGroupRefusedError(o.spend) : new UnrecoverableError(o.message);
+  }
+  if (o.errorKind === 'deferred' && o.deferral && Number.isFinite(o.deferral.retryInMs)) {
+    return new JobDeferredError(String(o.deferral.reason), o.message, o.deferral.retryInMs);
   }
   const err = new Error(o.message);
   if (o.stack) {
@@ -196,8 +207,11 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
       return encodeHandlerError(childConfigurationError(o.reasonCode));
     }
     const rawLease = (o as { lease?: unknown }).lease as
-      | { key?: unknown; active?: unknown; max?: unknown }
+      | { key?: unknown; active?: unknown; max?: unknown; retryInMs?: unknown }
       | undefined;
+    const rawSpend = (o as { spend?: unknown }).spend as { code?: unknown; message?: unknown; group?: unknown } | undefined;
+    const spendValid = rawSpend != null && typeof rawSpend === 'object' && typeof rawSpend.code === 'string'
+      && typeof rawSpend.message === 'string' && rawSpend.group != null && typeof rawSpend.group === 'object';
     const leaseValid =
       rawLease != null &&
       typeof rawLease.key === 'string' &&
@@ -205,9 +219,12 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
       Number.isFinite(rawLease.max as number);
     // rate_lease without a valid lease payload degrades to generic — same
     // policy as the errorKind whitelist.
+    const rawDeferral = (o as { deferral?: unknown }).deferral as { reason?: unknown; retryInMs?: unknown } | undefined;
+    const deferralValid = rawDeferral != null && typeof rawDeferral.reason === 'string' && Number.isFinite(rawDeferral.retryInMs as number);
     const errorKind =
       kind === 'unrecoverable' ? 'unrecoverable'
       : kind === 'rate_lease' && leaseValid ? 'rate_lease'
+      : kind === 'deferred' && deferralValid ? 'deferred'
       : 'generic';
     return {
       outcome: 'error',
@@ -217,7 +234,12 @@ export function parseChildOutcome(raw: string, size: number, maxBytes = CHILD_OU
         ? { stack: (o as { stack: string }).stack }
         : {}),
       ...(errorKind === 'rate_lease' && leaseValid
-        ? { lease: { key: rawLease.key as string, active: rawLease.active as number, max: rawLease.max as number } }
+        ? { lease: { key: rawLease.key as string, active: rawLease.active as number, max: rawLease.max as number,
+          ...(Number.isFinite(rawLease.retryInMs as number) && (rawLease.retryInMs as number) >= 0 ? { retryInMs: rawLease.retryInMs as number } : {}) } }
+        : {}),
+      ...(errorKind === 'unrecoverable' && spendValid ? { spend: rawSpend as SpendRefusalEnvelope } : {}),
+      ...(errorKind === 'deferred' && deferralValid
+        ? { deferral: { reason: rawDeferral.reason as string, retryInMs: rawDeferral.retryInMs as number } }
         : {}),
     };
   }
@@ -427,6 +449,29 @@ export function killProcessGroup(pid: number, signal: 'SIGTERM' | 'SIGKILL'): bo
       const sigName = signal.replace(/^SIG/, '');
       const res = spawnSync('/bin/kill', ['-s', sigName, '--', `-${pid}`], { stdio: 'ignore' });
       return res.status === 0;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * #5062: does any process remain in group `pgid`? Liveness, not
+ * `ChildProcess.killed` (which flips as soon as a signal is SENT), drives
+ * SIGTERM→SIGKILL escalation and confirmed termination. Same /bin/kill
+ * fallback as killProcessGroup for runtimes that reject negative pids.
+ */
+export function processGroupAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return false;
+    if (code === 'EPERM') return true;
+    try {
+      return spawnSync('/bin/kill', ['-s', '0', '--', `-${pgid}`], { stdio: 'ignore' }).status === 0;
     } catch {
       return false;
     }

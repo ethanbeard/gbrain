@@ -21,6 +21,7 @@
 import type { OperationContext } from './../operations.ts';
 import type { FactRow } from './../engine.ts';
 import { effectiveConfidence } from './decay.ts';
+import { collapseHotFacts } from './capture-dedup.ts';
 
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_TOP_K = 10;
@@ -153,24 +154,27 @@ export async function getBrainHotMemoryMeta(
   // local → all rows.
   const visibility = ctx.remote === false ? undefined : ['world'] as ('world' | 'private')[];
 
-  let rows: FactRow[] = [];
+  // #5888 V2: over-fetch so collapsing duplicates still fills topK.
+  let fetched: FactRow[] = [];
   if (sessionId) {
-    rows = await ctx.engine.listFactsBySession(sourceId, sessionId, {
-      activeOnly: true, limit: topK, visibility,
+    fetched = await ctx.engine.listFactsBySession(sourceId, sessionId, {
+      activeOnly: true, limit: topK * 3, visibility, fingerprint: true,
     });
   }
   // If no session-scoped rows, fall back to recent across the source.
-  if (rows.length === 0) {
-    rows = await ctx.engine.listFactsSince(sourceId, new Date(Date.now() - 24 * 60 * 60 * 1000), {
-      activeOnly: true, limit: topK, visibility,
+  if (fetched.length === 0) {
+    fetched = await ctx.engine.listFactsSince(sourceId, new Date(Date.now() - 24 * 60 * 60 * 1000), {
+      activeOnly: true, limit: topK * 3, visibility, fingerprint: true,
     });
   }
-  if (rows.length === 0) {
+  if (fetched.length === 0) {
     store({ expiresAt: Date.now() + ttl, payload: undefined });
     return undefined;
   }
 
-  // Sort by effective confidence (decayed) before truncating.
+  // One representative per (fingerprint, entity) group, then sort by
+  // effective confidence (decayed) before truncating.
+  let rows = await collapseHotFacts(ctx.engine, sourceId, fetched);
   const now = new Date();
   rows.sort((a, b) => effectiveConfidence(b, now) - effectiveConfidence(a, now));
   rows = rows.slice(0, topK);
@@ -187,6 +191,7 @@ export async function getBrainHotMemoryMeta(
         // weight HIGH-tier facts in their context budget.
         notability: r.notability,
         entity_slug: r.entity_slug,
+        ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}),
         valid_from: r.valid_from.toISOString(),
         // v0.45.7 ambient recall: recording time, so delta's "new facts since my
         // last wake" filters on WHEN the fact was learned, not its semantic
@@ -196,6 +201,7 @@ export async function getBrainHotMemoryMeta(
         // in) rides the pack/delta projections instead of being recall-only.
         context: r.context ?? null,
         confidence: Number(effectiveConfidence(r, now).toFixed(3)),
+        ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
       })),
     },
   };

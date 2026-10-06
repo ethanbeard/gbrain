@@ -21,6 +21,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { PageType, TimelineInput } from '../types.ts';
 import type { ResolverContext } from '../resolvers/interface.ts';
 import { SlugRegistry } from './slug-registry.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -301,7 +302,7 @@ export class BrainWriter {
     let report: ValidationReport | null = null;
 
     const strictSourceId = this.sourceId;
-    const txResult = await this.engine.transaction(async (txEngine) => {
+    const txResult = await maintenanceTransaction(this.engine, async (txEngine) => {
       const tx = new WriteTxImpl(txEngine, ctx, strictSourceId);
       const result = await fn(tx);
 

@@ -45,6 +45,19 @@ import type { VolunteeredPage } from './volunteer.ts';
 export const RECALL_NEEDED_DEADLINE_MS = 250;
 /** The fired search starts only when this much of the IPC server budget is left. */
 export const RECALL_FIRE_MIN_REMAINING_MS = 150;
+
+/**
+ * The two wall-clock windows S6 runs inside: its own decision deadline and the
+ * IPC server budget a fire must leave room in. Production uses the constants;
+ * `__setRecallDeadlinesForTests` widens them so a loaded test runner cannot
+ * turn a decision into `late`, and returns the restore.
+ */
+let deadlines = { decisionMs: RECALL_NEEDED_DEADLINE_MS, serverBudgetMs: TURN_CONTEXT_SERVER_BUDGET_MS };
+export function __setRecallDeadlinesForTests(next: { decisionMs: number; serverBudgetMs: number }): () => void {
+  const prev = deadlines;
+  deadlines = next;
+  return () => { deadlines = prev; };
+}
 export const RECALL_FIRE_LIMIT = 3;
 /** The fired search must finish this long before the server budget ends (response write headroom). */
 export const RECALL_RESPONSE_MARGIN_MS = 40;
@@ -94,7 +107,7 @@ export async function startRecallNeeded(
   const base = { cfg, policy, state, sessionRef, sourceId: opts.sourceId };
   if (policy.effective === 'off') return { ...base, skipped: policy.inactive };
   if (policy.effective === 'shadow' && !sampled(policy.shadowSample)) return null;
-  const deadlineMs = stageDeadlineMs(createQueryBudget(RECALL_NEEDED_DEADLINE_MS, opts.startedAt), cfg.timeoutMs);
+  const deadlineMs = stageDeadlineMs(createQueryBudget(deadlines.decisionMs, opts.startedAt), cfg.timeoutMs);
   if (deadlineMs === null) return { ...base, skipped: 'late' };
   const call = runDecide(
     { slot: 'recall_needed', callSite: 'turn_context', state, questions: [recallNeededQuestion()], deadlineMs, provider: policy.provider, lane: 'hot' },
@@ -172,7 +185,7 @@ async function decideRecall(
   pending: Promise<RecallNeededPrepared | null>,
   ctx: RecallApplyContext,
 ): Promise<RecallNeededApplied | null> {
-  const s6End = ctx.startedAt + RECALL_NEEDED_DEADLINE_MS;
+  const s6End = ctx.startedAt + deadlines.decisionMs;
   const safePending = pending.catch(() => null);
   const prepared = await settleBy(safePending, s6End);
   const reflex = recallReflex([...ctx.pointers, ...ctx.volunteered]);
@@ -237,7 +250,7 @@ async function decideRecall(
   let reason: string | undefined;
   if (j.outcome === 'suppress') window = { pointers: [], volunteered: [] };
   if (j.outcome === 'fire') {
-    const budgetEnd = ctx.startedAt + TURN_CONTEXT_SERVER_BUDGET_MS;
+    const budgetEnd = ctx.startedAt + deadlines.serverBudgetMs;
     const fired = budgetEnd - Date.now() < RECALL_FIRE_MIN_REMAINING_MS ? LATE : await fireRetrieval(engine, prepared, ctx, budgetEnd - RECALL_RESPONSE_MARGIN_MS);
     if (fired === LATE) reason = 'late';
     else if (fired.length === 0) reason = 'no_candidates';

@@ -18,7 +18,8 @@ import { existsSync } from 'node:fs';
 
 import { VERSION } from '../../version.ts';
 import type { BrainEngine } from '../engine.ts';
-import { loadAllSources } from '../sources-load.ts';
+import { loadAllSources, parseSourceConfig, type SourceRow } from '../sources-load.ts';
+import { connectorAuthorities, type ConnectorAuthority } from '../persistence/connector-authority.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import { realpathOrResolve } from '../path-confine.ts';
 import { resolveBrainId } from '../brain-resolver.ts';
@@ -35,6 +36,8 @@ import {
   loadBackupStatus,
   saveBackupStatus,
   currentBackupEvidence,
+  isVerifiedRecoverable,
+  assetBlocksRecovery,
   BACKUP_VERIFICATION_MAX_AGE_MS,
   BACKUP_RECOVERY_SCOPE,
   type BackupAssetVerdict,
@@ -64,11 +67,59 @@ function pushAsset(assets: BackupAssetVerdict[], a: BackupAssetVerdict): void {
   assets.push(a);
 }
 
+/**
+ * #5505: an API connector's pages come from the provider, not from Git. A
+ * connector_database source (managed, unbound) has no canonical files at all;
+ * an unmanaged connector's non-Git (or missing) directory is a Markdown cache.
+ * Both are recovered by a full re-sync from the provider, so they are an info
+ * row and never an unrecoverable repository that keeps the check in warn.
+ * `gbrain export` is not offered: `gbrain sync --source <id>` on a Google or
+ * GitHub source runs the connector sync, which rebuilds pages from the provider
+ * and never reads a Markdown dump, so an export is an archive for that source,
+ * not a restore path.
+ */
+function connectorAsset(id: string, connectorDatabase: boolean): BackupAssetVerdict {
+  return {
+    kind: 'connector',
+    id,
+    state: 'info',
+    detail: (connectorDatabase
+      ? 'API connector source (connector_database): pages are imported from the provider API straight into the database. '
+      : 'API connector source: its local directory only caches the provider API as Markdown and is not a git repository. ') +
+      "Recover by re-syncing from the provider (within the source's configured history window).",
+    fix_argv: ['gbrain', 'sync', '--source', id, '--full'],
+  };
+}
+
+/** A bound connector's root must be a canonical checkout, so it stays a repo verdict. */
+function notARepoAsset(row: SourceRow, authority: ConnectorAuthority | undefined): BackupAssetVerdict {
+  return authority === 'unmanaged'
+    ? connectorAsset(row.id, false)
+    : { kind: 'source_repo', id: row.id, state: 'unknown', detail: 'not_a_git_repo', fix_argv: null };
+}
+
 function yieldLoop(): Promise<void> {
   return new Promise((r) => setTimeout(r, 0));
 }
 
 /** null = the count could not be established (engine down / schema quirk). */
+/** E7: live pages + active facts, and the brain's first source/page timestamp. Null when unreadable. */
+async function brainMaturity(engine: BrainEngine): Promise<BackupStatus['maturity'] | undefined> {
+  try {
+    const [row] = await engine.executeRaw<{ pages: number; facts: number; since: string | Date | null }>(
+      `SELECT (SELECT COUNT(*)::int FROM pages WHERE deleted_at IS NULL) AS pages,
+              (SELECT COUNT(*)::int FROM facts WHERE expired_at IS NULL) AS facts,
+              LEAST((SELECT MIN(created_at) FROM sources), (SELECT MIN(created_at) FROM pages)) AS since`,
+    );
+    const items = Number(row?.pages) + Number(row?.facts);
+    if (!row || !Number.isFinite(items)) return undefined;
+    const sinceMs = row.since ? new Date(row.since).getTime() : NaN;
+    return { items, since: Number.isFinite(sinceMs) ? new Date(sinceMs).toISOString() : null };
+  } catch {
+    return undefined;
+  }
+}
+
 async function countLivePages(engine: BrainEngine): Promise<number | null> {
   try {
     const rows = await engine.executeRaw<{ n: number }>(
@@ -142,6 +193,10 @@ export async function computeBackupCoverage(
   let degraded = false;
   try {
     const rows = await loadAllSources(engine);
+    const authorities = await connectorAuthorities(
+      engine,
+      rows.filter((r) => !r.archived).map((r) => ({ id: r.id, kind: parseSourceConfig(r.config).kind })),
+    );
     const byRoot = new Map<string, { ids: string[]; dbOnly: boolean }>();
     let skippedOverCap = 0;
     // Root discovery is itself a git subprocess — memoize per local_path, count
@@ -151,12 +206,17 @@ export async function computeBackupCoverage(
     let discoveries = 0;
     for (const row of rows) {
       if (row.archived) continue;
+      if (authorities.get(row.id) === 'connector_database') {
+        pushAsset(assets, connectorAsset(row.id, true)); // local_path, if any, is not canonical
+        continue;
+      }
       if (!row.local_path) continue;
       if (!existsSync(row.local_path)) {
         // The most disk-loss-adjacent state of all: a registered path that is
         // GONE. Surface it (unknown — it may live on another machine or have
-        // moved) instead of silently skipping.
-        pushAsset(assets, {
+        // moved) instead of silently skipping. An unmanaged connector's cache
+        // is rebuilt by its next sweep, so it takes the connector verdict.
+        pushAsset(assets, authorities.get(row.id) === 'unmanaged' ? connectorAsset(row.id, false) : {
           kind: 'source_repo',
           id: row.id,
           state: 'unknown',
@@ -172,7 +232,7 @@ export async function computeBackupCoverage(
         const memo = rootByPath.get(row.local_path)!;
         if (memo === null) {
           // Every source at a known non-repo path gets its own asset row.
-          pushAsset(assets, { kind: 'source_repo', id: row.id, state: 'unknown', detail: 'not_a_git_repo', fix_argv: null });
+          pushAsset(assets, notARepoAsset(row, authorities.get(row.id)));
           continue;
         }
         root = memo;
@@ -188,13 +248,7 @@ export async function computeBackupCoverage(
           rootByPath.set(row.local_path, root);
         } catch {
           rootByPath.set(row.local_path, null);
-          pushAsset(assets, {
-            kind: 'source_repo',
-            id: row.id,
-            state: 'unknown',
-            detail: 'not_a_git_repo',
-            fix_argv: null,
-          });
+          pushAsset(assets, notARepoAsset(row, authorities.get(row.id)));
           continue;
         }
       }
@@ -222,7 +276,11 @@ export async function computeBackupCoverage(
             'db_only dirs configured: those pages are not in git and the DB file is deliberately not backed up. ' +
             'Dump them somewhere OUTSIDE the gitignored dirs (--restore-only is the wrong direction for a backup); ' +
             'run gbrain doctor (undeclared_db_only_pages) for the page-level audit.',
-          fix_argv: ['gbrain', 'export', '--dir', '<backup-dir>'],
+          // One source per dump directory: an unscoped export refuses when two
+          // sources share a slug, and a second dump refuses an occupied dir.
+          // BACKUP_DIR is a placeholder with no shell metacharacters, so a
+          // verbatim paste cannot redirect (`<dir>/x` would truncate `/x`).
+          fix_argv: ['gbrain', 'export', '--source', row.id, '--dir', `BACKUP_DIR/${row.id}`],
         });
       }
     }
@@ -329,9 +387,10 @@ export async function computeBackupCoverage(
     unpushed: assets.filter((a) => a.state === 'unpushed').length,
     failing: assets.filter((a) => a.state === 'failing').length,
     configured_repos: assets.filter(a => a.configured_remote === true).length,
-    recoverable_repos: assets.filter(a => a.state === 'ok' && a.verification?.state === 'verified').length,
+    recoverable_repos: assets.filter(isVerifiedRecoverable).length,
     pages_at_risk: pagesAtRisk,
   };
+  const maturity = assets.some(assetBlocksRecovery) ? await brainMaturity(engine) : undefined;
 
   return currentBackupEvidence({
     schema_version: BACKUP_STATUS_SCHEMA_VERSION,
@@ -345,6 +404,7 @@ export async function computeBackupCoverage(
     ...(degraded ? { degraded: true } : {}),
     ...(remoteBudget ? { remote_check_at: now.toISOString() } : {}),
     recovery_scope: BACKUP_RECOVERY_SCOPE,
+    ...(maturity ? { maturity } : {}),
   }, now.getTime());
 }
 

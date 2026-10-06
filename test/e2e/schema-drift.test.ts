@@ -176,7 +176,8 @@ describe.skipIf(skip)('schema drift: PGLite ↔ Postgres post-initSchema parity 
   }, 30_000);
 
   test('post-initSchema schemas are equivalent (modulo allowlist)', () => {
-    const diff = diffSnapshots(pgSnap, pgliteSnap, { allowlistPgOnlyTables: PG_ONLY_TABLES });
+    // F4b planner-stats accounting is PGLite-only by design (Postgres has autovacuum).
+    const diff = diffSnapshots(pgSnap, pgliteSnap, { allowlistPgOnlyTables: PG_ONLY_TABLES, allowlistPgliteOnlyTables: ['planner_stats_deltas', 'planner_stats_state'] });
     if (!isCleanDiff(diff)) {
       throw new Error(`Schema drift detected:\n${formatDiffForFailure(diff)}`);
     }

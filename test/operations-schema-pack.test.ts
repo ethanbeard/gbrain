@@ -244,7 +244,10 @@ describe('schema_review_orphans', () => {
       );
     }
     const result = await operationsByName.schema_review_orphans!.handler(ctxOf(), { limit: 2 }) as Record<string, unknown>;
-    expect(result.orphan_count).toBe(2);
+    // #5879: limit caps the returned rows; orphan_count is the true total.
+    expect((result.orphans as unknown[]).length).toBe(2);
+    expect(result.orphan_count).toBe(5);
+    expect(result.truncated).toBe(true);
   });
 });
 

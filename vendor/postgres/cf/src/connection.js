@@ -550,6 +550,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function ReadyForQuery(x) {
+    connection.status = x[5]
     if (query) {
       if (errorResponse) {
         query.retried

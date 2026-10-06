@@ -12,6 +12,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { isolatedSharedSkillsEngine } from './helpers/shared-skills-engine.ts';
 import { requirePostgresTestDatabase } from './helpers/test-backends.ts';
@@ -42,7 +43,7 @@ beforeAll(async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SOURCE: undefined, GBR
         editStaleDuringChat = false;
         await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], async () => {
           await tx.executeRaw('UPDATE pages SET compiled_truth=$1 WHERE source_id=$2 AND slug=$3', ['concurrent edit', 'default', chatSlug]);
-        }));
+        }, TEST_WRITE_ATTRIBUTION));
       }
       const claim = text.includes('SNAPSHOT VERSION: NEW') ? 'snapshot version claim' : 'managed bootstrap claim';
       const response = JSON.stringify([{ claim, kind: 'take', weight: 0.7 }]);
@@ -119,7 +120,7 @@ test(`${backend}: managed extraction classifies the pinned snapshot after a sele
   if (!await engine.readPageSnapshot(slug, { sourceId: 'default' })) throw new Error(`missing fixture ${slug}`);
   await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], async () => {
     await tx.putPage(slug, { type: 'concept', title: slug, compiled_truth: BODY, timeline: '', frontmatter: {} }, { sourceId: 'default' });
-  }));
+  }, TEST_WRITE_ATTRIBUTION));
   let submittedContent = '';
   putPage.handler = async (_context, params) => { submittedContent = String(params.content); return { state: 'committed' }; };
   const originalReadPageSnapshot = engine.readPageSnapshot.bind(engine);
@@ -130,7 +131,7 @@ test(`${backend}: managed extraction classifies the pinned snapshot after a sele
       (engine as any).readPageSnapshot = originalReadPageSnapshot;
       await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], async () => {
         await tx.putPage(slug, { type: 'concept', title: slug, compiled_truth: `SNAPSHOT VERSION: NEW\n${BODY}`, timeline: '', frontmatter: {} }, { sourceId: 'default' });
-      }));
+      }, TEST_WRITE_ATTRIBUTION));
       const updated = await originalReadPageSnapshot(slug, { sourceId: 'default' });
       if (!updated) throw new Error(`missing fixture ${slug}`);
       writeFileSync(join(repo, `${slug}.md`), serializePageToMarkdown(updated.page, updated.tags));
@@ -156,7 +157,7 @@ test(`${backend}: managed extraction composes from the DB snapshot when the cano
   const dbBody = `SNAPSHOT VERSION: NEW\n${BODY}`;
   await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], async () => {
     await tx.putPage(slug, { type: 'concept', title: slug, compiled_truth: dbBody, timeline: '', frontmatter: {} }, { sourceId: 'default' });
-  }));
+  }, TEST_WRITE_ATTRIBUTION));
   const newer = await engine.readPageSnapshot(slug, { sourceId: 'default' });
   if (!newer) throw new Error(`missing updated fixture ${slug}`);
   writeFileSync(join(repo, `${slug}.md`), serializePageToMarkdown({ ...newer.page, compiled_truth: `DISK VERSION: STALE\n${BODY}` }, newer.tags));
@@ -184,7 +185,7 @@ test(`${backend}: managed duplicate filtering reads the pinned snapshot takes fe
   const compiledTruth = `${BODY}\n\n## Takes\n\n<!--- gbrain:takes:begin -->\n| # | claim | kind | who | weight | since | source |\n|---|-------|------|-----|--------|-------|--------|\n| 1 | managed bootstrap claim | take | system | 0.7 |  | manual |\n<!--- gbrain:takes:end -->`;
   await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], async () => {
     await tx.putPage(slug, { type: 'concept', title: slug, compiled_truth: compiledTruth, timeline: '', frontmatter: {} }, { sourceId: 'default' });
-  }));
+  }, TEST_WRITE_ATTRIBUTION));
   const snapshot = await engine.readPageSnapshot(slug, { sourceId: 'default' });
   if (!snapshot) throw new Error(`missing fixture ${slug}`);
   writeFileSync(join(repo, `${slug}.md`), serializePageToMarkdown(snapshot.page, snapshot.tags).replace(/managed bootstrap claim/g, 'stale disk claim'));

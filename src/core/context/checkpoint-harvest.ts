@@ -8,12 +8,14 @@
  * Discipline (sweep pass 3, shared fencing):
  *   claim (acquireCorpusClaim, O_EXCL) → `.ingested` re-check under claim →
  *   capability gate THEN kill switch → dream-output guard →
- *   runFactsPipeline under a 60s abort → `signal.aborted` POST-check
+ *   window 1 of the turn-boundary windows (corpus-windows.ts; an existing
+ *   `.progress` means window 1 is done) under a 60s abort → POST-check
  *   (the pipeline returns normally with partial results on abort — an
  *   aborted run writes NOTHING and releases the claim: retryable) →
  *   RECEIPT sidecar (link candidates) → idempotent manifest publish from
  *   the receipt (each slug verified via source-scoped getPage; a link that
- *   resolves to nothing is a lie and is skipped) → `.ingested` LAST.
+ *   resolves to nothing is a lie and is skipped) → `.ingested` LAST, or, when
+ *   windows remain, the receipt is released and the sweep finishes the tail.
  * A transient manifest failure leaves receipt + released claim; the retry
  * re-publishes from the receipt WITHOUT re-extracting (no duplicate spend,
  * no lost links).
@@ -35,13 +37,23 @@ import type { CapabilityReport } from '../capability.ts';
 import { acquireCorpusClaim, CORPUS_CLAIM_SUFFIX, CORPUS_INGESTED_SUFFIX } from '../sweep.ts';
 import { appendCheckpointManifest } from './session-state.ts';
 import { corpusFileSessionId, corpusTextForExtraction, readSegmentLedger, selfCaptureSidecarJson, HARVEST_RECEIPT_SUFFIX } from './corpus-segments.ts';
+import { corpusFileStat, readCorpusProgress, runCorpusWindows } from './corpus-windows.ts';
 import { isClaudeCliSelfSessionId } from '../ai/providers/claude-cli-scratch.ts';
 import { writeHeartbeat } from './hook-heartbeat.ts';
+import { OperationError } from '../ops/contract.ts';
 
 /** Bounded queue — overflow is a typed skip; the sweep backstop extracts later. */
 export const HARVEST_QUEUE_CAP = 8;
 /** Per-file abort so a hung provider can't wedge the FIFO. */
 export const HARVEST_JOB_TIMEOUT_MS = 60_000;
+/**
+ * #5557: a writeback turn whose facts preflight still finds the canonical
+ * writer busy after its own wait (`writer_lock_unavailable`, thrown before any
+ * model call) is re-queued after each of these delays in turn; past the last
+ * one it ends as an error. A Git effect holds that lock through its commit and
+ * its push.
+ */
+export const HARVEST_WRITER_BUSY_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000];
 /** Receipt sidecar suffix — canonical home is corpus-segments (engine-free,
  * so the hook's GC can reap orphaned receipts); re-exported for callers. */
 export { HARVEST_RECEIPT_SUFFIX };
@@ -68,6 +80,8 @@ export interface HarvestJob {
   capabilities?: CapabilityReport;
   /** TEST SEAM: per-job abort budget override (default HARVEST_JOB_TIMEOUT_MS). */
   timeoutMs?: number;
+  /** Busy-writer re-queues already spent on this job; set by the pump only (#5557). */
+  writerBusyRetries?: number;
 }
 
 interface HarvestReceipt {
@@ -83,6 +97,11 @@ let shuttingDown = false;
 let currentAbort: AbortController | null = null;
 /** Resolves when the pump goes idle — the shutdown join point. */
 let idleResolve: (() => void) | null = null;
+/** Busy-writer retries waiting on their delay (#5557); shutdown clears them. */
+const pendingRetries = new Map<ReturnType<typeof setTimeout>, HarvestJob>();
+let writerBusyRetryDelays: readonly number[] = HARVEST_WRITER_BUSY_RETRY_DELAYS_MS;
+/** Error reasons already written to stderr by this serve run (#5557). */
+const loggedErrorReasons = new Set<string>();
 
 export type HarvestAck = { status: 'scheduled' } | { status: 'skipped'; reason: string };
 
@@ -92,7 +111,7 @@ export type HarvestAck = { status: 'scheduled' } | { status: 'skipped'; reason: 
  */
 export function scheduleCheckpointHarvest(job: HarvestJob): HarvestAck {
   if (shuttingDown) return { status: 'skipped', reason: 'shutting_down' };
-  if (queue.some((q) => q.file === job.file && q.corpusDir === job.corpusDir)) {
+  if ([...queue, ...pendingRetries.values()].some((q) => q.file === job.file && q.corpusDir === job.corpusDir)) {
     return { status: 'skipped', reason: 'already_queued' };
   }
   // F9/OV2-4 cost posture: per-session prompt-harvest cap for the writeback
@@ -150,6 +169,7 @@ export const HARVEST_SHUTDOWN_GRACE_MS = 5000;
 export async function shutdownCheckpointHarvest(): Promise<void> {
   shuttingDown = true;
   queue.length = 0;
+  clearPendingRetries();
   try {
     currentAbort?.abort();
   } catch {
@@ -174,11 +194,19 @@ export function __resetCheckpointHarvestForTests(): void {
   currentAbort = null;
   idleResolve = null;
   wbSessionCounts.clear();
+  clearPendingRetries();
+  writerBusyRetryDelays = HARVEST_WRITER_BUSY_RETRY_DELAYS_MS;
+  loggedErrorReasons.clear();
 }
 
-/** TEST SEAM: resolves once the queue is fully drained. */
+/** TEST SEAM: busy-writer retry delays (null restores the defaults). */
+export function __setWriterBusyRetryDelaysForTests(delays: readonly number[] | null): void {
+  writerBusyRetryDelays = delays ?? HARVEST_WRITER_BUSY_RETRY_DELAYS_MS;
+}
+
+/** TEST SEAM: resolves once the queue is fully drained, pending retries included. */
 export async function __drainCheckpointHarvestForTests(): Promise<void> {
-  while (inFlight || queue.length > 0) {
+  while (inFlight || queue.length > 0 || pendingRetries.size > 0) {
     await new Promise((r) => setTimeout(r, 10));
   }
 }
@@ -208,8 +236,7 @@ async function pump(): Promise<void> {
     superseded = r.superseded;
     links = r.links;
   } catch (e) {
-    outcome = 'error';
-    reason = e instanceof Error ? (e.name || 'Error').toLowerCase() : 'error';
+    ({ outcome, reason } = classifyHarvestFailure(job, e));
   } finally {
     inFlight = false;
     await writeHeartbeat({
@@ -233,6 +260,78 @@ async function pump(): Promise<void> {
       idleResolve = null;
     }
   }
+}
+
+function clearPendingRetries(): void {
+  for (const timer of pendingRetries.keys()) clearTimeout(timer);
+  pendingRetries.clear();
+}
+
+/**
+ * A writeback turn refused because the canonical writer stayed busy is
+ * re-queued; any other failure is an error that keeps its code. A compact
+ * segment is never re-queued: its first window already wrote `.progress`, which
+ * a retry reads as window 1 done, so the error stands and the sweep resumes it.
+ */
+function classifyHarvestFailure(job: HarvestJob, e: unknown): { outcome: 'degraded' | 'error'; reason: string } {
+  if (job.lane === 'writeback' && isWriterBusy(e) && requeueWhileWriterBusy(job)) {
+    return { outcome: 'degraded', reason: 'writer_busy_requeued' };
+  }
+  const reason = harvestErrorReason(e);
+  logFirstHarvestError(job, reason, e);
+  return { outcome: 'error', reason };
+}
+
+/** The facts preflight refused because the canonical writer stayed busy; nothing was extracted. */
+function isWriterBusy(e: unknown): boolean {
+  return e instanceof OperationError && e.code === 'writer_lock_unavailable';
+}
+
+/**
+ * Schedules the job's next attempt after its busy-writer delay; false once the
+ * delays are spent or serve is stopping. The retry skips the admission checks:
+ * the job was admitted (and counted against its session cap) once already.
+ */
+function requeueWhileWriterBusy(job: HarvestJob): boolean {
+  const spent = job.writerBusyRetries ?? 0;
+  const delay = writerBusyRetryDelays[spent];
+  if (delay === undefined || shuttingDown) return false;
+  const timer = setTimeout(() => {
+    pendingRetries.delete(timer);
+    if (shuttingDown) return;
+    queue.push({ ...job, writerBusyRetries: spent + 1 });
+    void pump();
+  }, delay);
+  (timer as { unref?: () => void }).unref?.();
+  pendingRetries.set(timer, job);
+  return true;
+}
+
+/** A heartbeat reason is a short machine code, the shape hook.ts's reasonCode() enforces. */
+const HEARTBEAT_REASON_CODE = /^[A-Za-z0-9_.:-]{1,48}$/;
+
+/**
+ * The error name plus its `code`, or else its `reason` (FactsExtractionError):
+ * `operationerror:writer_lock_unavailable`, `factsextractionerror:provider_error`.
+ * A composite past the reason-code shape falls back to the bare name.
+ */
+function harvestErrorReason(e: unknown): string {
+  if (!(e instanceof Error)) return 'error';
+  const name = (e.name || 'Error').toLowerCase();
+  const { code, reason } = e as { code?: unknown; reason?: unknown };
+  const detail = typeof code === 'string' ? code : typeof reason === 'string' ? reason : null;
+  const composite = detail === null ? name : `${name}:${detail.toLowerCase()}`;
+  if (HEARTBEAT_REASON_CODE.test(composite)) return composite;
+  return HEARTBEAT_REASON_CODE.test(name) ? name : 'error';
+}
+
+/** The heartbeat keeps counts and codes only; the first failure of each reason also reaches serve's stderr. */
+function logFirstHarvestError(job: HarvestJob, reason: string, e: unknown): void {
+  if (loggedErrorReasons.has(reason)) return;
+  loggedErrorReasons.add(reason);
+  const message = e instanceof Error ? e.message : String(e);
+  console.error(`[checkpoint-harvest] ${job.lane ?? 'compact'} harvest failed (${reason}): ${message.slice(0, 300)} `
+    + '(logged once per serve run; later failures with this reason are counted in the hooks heartbeat only)');
 }
 
 /** `<sessionId>.seg-<hash12>.txt` → hash12 ('' when the name has no hash part). */
@@ -269,8 +368,14 @@ async function runOne(job: HarvestJob): Promise<{
     // manifest publish failed transiently. Re-publish WITHOUT re-extracting.
     let receipt = await readReceipt(receiptPath);
     let counts: { inserted: number; duplicate: number } | null = null;
+    // #5887: the harvest extracts window 1 only; when more remains, `.progress`
+    // stands in for `.ingested` and the sweep finishes the tail.
+    let windowsPending = receipt !== null && (await readCorpusProgress(full))?.finished === null;
 
     if (!receipt) {
+      // An existing `.progress` means window 1 is done (an earlier harvest or
+      // the sweep wrote it): never re-extract it here.
+      if (await readCorpusProgress(full)) return { outcome: 'ok', reason: 'windows_pending' };
       // Gates in the pinned sweep order: capability THEN kill switch. A
       // gate-skip releases the claim and writes NO sidecar — when the gate
       // opens later, the sweep (which applies the same gates) extracts.
@@ -283,6 +388,7 @@ async function runOne(job: HarvestJob): Promise<{
         return { outcome: 'degraded', reason: 'extraction_disabled' };
       }
 
+      const fileStat = corpusFileStat(await stat(full));
       const raw = await readFile(full, 'utf-8');
       const { isDreamOutput } = await import('../cycle/transcript-discovery.ts');
       const { runFactsPipeline } = await import('../facts/backstop.ts');
@@ -297,17 +403,21 @@ async function runOne(job: HarvestJob): Promise<{
       const abort = new AbortController();
       const timer = setTimeout(() => abort.abort(), job.timeoutMs ?? HARVEST_JOB_TIMEOUT_MS);
       currentAbort = abort;
-      let r: Awaited<ReturnType<typeof runFactsPipeline>>;
+      let run: Awaited<ReturnType<typeof runCorpusWindows>>;
       try {
-        r = await runFactsPipeline(corpusTextForExtraction(job.file, raw), {
-          engine: job.engine,
-          sourceId: job.sourceId,
-          sessionId: job.sessionId,
-          source: 'hook:compact',
-          mode: 'inline',
-          remote: false,
-          abortSignal: abort.signal,
-          // visibility deliberately unset → resolveDefaultVisibility [ENG-8]
+        // Paste stripping happens per turn inside the window planner (#5812).
+        run = await runCorpusWindows({
+          full, raw, fileStat, maxWindows: 1, overBudget: () => false, signal: abort.signal,
+          extract: (text) => runFactsPipeline(text, {
+            engine: job.engine,
+            sourceId: job.sourceId,
+            sessionId: job.sessionId,
+            source: 'hook:compact',
+            mode: 'inline',
+            remote: false,
+            abortSignal: abort.signal,
+            // visibility deliberately unset → resolveDefaultVisibility [ENG-8]
+          }),
         });
       } finally {
         clearTimeout(timer);
@@ -315,8 +425,11 @@ async function runOne(job: HarvestJob): Promise<{
       }
       // POST-check (codex round 2): runFactsPipeline returns normally with
       // PARTIAL results on abort. An aborted run writes NOTHING (no receipt,
-      // no .ingested) and releases the claim — fully retryable.
-      if (abort.signal.aborted) return { outcome: 'degraded', reason: 'aborted' };
+      // no .ingested, no progress) and releases the claim — fully retryable.
+      if (abort.signal.aborted || run.status === 'aborted') return { outcome: 'degraded', reason: 'aborted' };
+      if (run.status === 'contended') return { outcome: 'degraded', reason: 'claimed_elsewhere' };
+      windowsPending = run.status !== 'complete';
+      const r = run.result;
 
       counts = { inserted: r.inserted, duplicate: r.duplicate };
       receipt = {
@@ -354,6 +467,18 @@ async function runOne(job: HarvestJob): Promise<{
         // re-extracting. Writing `.ingested` here would delete the links.
         return { outcome: 'degraded', reason: 'manifest_failed' };
       }
+    }
+
+    if (windowsPending) {
+      // Window 1's links are banked and `.progress` is written: release the
+      // receipt; the sweep extracts the remaining windows and writes `.ingested`.
+      await rm(receiptPath, { force: true }).catch(() => {});
+      return {
+        outcome: 'ok',
+        reason: 'windows_pending',
+        ...(counts ? { inserted: counts.inserted, duplicate: counts.duplicate } : {}),
+        links: verified.length,
+      };
     }
 
     // `.ingested` LAST — the sweep now skips this segment; the receipt has

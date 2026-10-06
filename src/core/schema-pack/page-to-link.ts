@@ -27,6 +27,7 @@ import type { OperationContext } from '../operations.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { loadActivePackBestEffort } from './best-effort.ts';
 import type { PackResolverSpec } from './manifest-v1.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 export interface PageToLinkRule {
   from_type: string;
@@ -208,7 +209,7 @@ export async function runPageToLinkCore(
         converted = linksBuffer.length;
       }
       for (const slug of pagesToSoftDelete) {
-        const result = await ctx.engine.softDeletePage(slug, { sourceId });
+        const result = await maintenanceTransaction(ctx.engine, tx => tx.softDeletePage(slug, { sourceId }));
         if (result) soft_deleted++;
       }
       opts.onProgress?.({ rule_index: i, convertedSoFar: converted });

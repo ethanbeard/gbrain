@@ -376,6 +376,13 @@ export interface PageFilters {
    * (search/private-visibility.ts) in BOTH engines.
    */
   excludePrivate?: boolean;
+  /**
+   * #5154: select only the listing columns (identity, type, title, dates).
+   * `compiled_truth` and `timeline` come back as '' and `frontmatter` as {},
+   * so a listing never detoasts or ships page bodies. Only for callers that
+   * read none of those fields (list_pages).
+   */
+  listColumnsOnly?: boolean;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
@@ -792,6 +799,13 @@ export interface ChunkInput {
 }
 
 // Search
+export interface RrfAttribution {
+  raw: number;
+  normalized: number;
+  compiled_truth_boost: number;
+  arms: import('./search/rrf-page-fusion.ts').RrfArmVote[];
+}
+
 export interface SearchResult {
   slug: string;
   page_id: number;
@@ -802,7 +816,8 @@ export interface SearchResult {
   chunk_id: number;
   chunk_index: number;
   score: number;
-  stale: boolean;
+  /** #5988: `{ held_since, last_indexed_revision }` when sync holds the page's newer file (stampHeldHits). */
+  stale: boolean | { held_since: string; last_indexed_revision: string | null };
   /**
    * v0.42 (issue #1699) content-quality gate agent-warning channel. Set
    * when the result's page carries a `frontmatter.content_flag` marker
@@ -910,6 +925,16 @@ export interface SearchResult {
   relational_hop?: number;
   /** Shortest connecting slug path seed→…→result (for "how I know this"). */
   relational_path?: string[];
+  /** Stored-direction edges along `relational_path` (for retrieval feedback attribution). */
+  relational_path_edges?: string[];
+  /**
+   * Multi-hop chain evidence: why a chain put this page here. `role` is the
+   * page's place on the chain (a candidate answer, an intermediate page, or the
+   * page an edge was written on), not a correctness claim; `path_count` counts
+   * retained paths and is not corroboration. `edges` is the best path's
+   * evidence, at most three edges.
+   */
+  relational?: RelationalEvidence;
   /**
    * Ranker wave — set when `pinRelationalRows` (relational-rerank-pin.ts)
    * re-pinned this relational-arm row above the reranked text rows. Autocut
@@ -928,6 +953,18 @@ export interface SearchResult {
   /** RRF + cosine score BEFORE any boost stage mutated it. */
   base_score?: number;
   /**
+   * Explain attribution from weighted RRF fusion: the summed vote (`raw`),
+   * the score after max-normalization (`normalized`), the compiled-truth
+   * factor, and every arm-instance vote behind it (0-based ranks). Absent on
+   * rows that never went through `rrfFusionWeighted` (keyword-only single-arm
+   * paths). Lean MCP rows strip it; `explain` renders it as score_details.
+   */
+  rrf?: RrfAttribution;
+  /** Cosine blend input: the max-normalized RRF score the 0.7/0.3 blend used. */
+  blend_norm_rrf?: number;
+  /** Per-row ranking breakdown, set by the `search`/`query` ops only when the caller passes `explain: true`. */
+  score_details?: import('./search/explain-formatter.ts').ScoreDetails;
+  /**
    * v0.46.15 — RAW query↔chunk cosine similarity from cosineReScore's
    * hydration (the active embedding column's space). Absent on keyword-only
    * / no-embedding paths. This is the ONLY calibrated semantic signal on the
@@ -938,6 +975,12 @@ export interface SearchResult {
   cosine?: number;
   /** Multiplier applied by applyBacklinkBoost (1.0 = unchanged). */
   backlink_boost?: number;
+  /** Use-attributed feedback multiplier on the ordering score (src/core/search/feedback-boost.ts); absent when neutral. */
+  feedback_boost?: number;
+  /** The page's content_hash when this result was retrieved (stamped while retrieval feedback is enabled). */
+  content_hash?: string | null;
+  /** Caller-visible inbound linking pages behind backlink_boost (stamped with it). */
+  backlink_count?: number;
   /** Multiplier applied by applySalienceBoost. */
   salience_boost?: number;
   /** Multiplier applied by applyRecencyBoost. */
@@ -1391,6 +1434,12 @@ export interface SearchOpts extends PageReadPolicy {
    * Eval A/B gates drive it here.
    */
   relationalRerankPin?: number;
+  /** Per-call override for `search.relational_planner` (multi-hop chains; eval A/B). */
+  relationalPlanner?: boolean;
+  /** Per-call override for `search.relational_orient_onehop` (typed one-hop orientation; eval A/B). */
+  relationalOrientOneHop?: boolean;
+  /** Per-call override for `search.relational_chain_slots` (0..10; eval A/B). */
+  relationalChainSlots?: number;
 }
 
 /**
@@ -1505,11 +1554,14 @@ export interface RelationalFanoutRow {
   edge_count: number;
   via_link_types: string[];
   path: string[];
+  /** Stored-direction edges ('from_slug|link_type|to_slug') along `path`, in order. */
+  path_edges?: string[];
   canonical_chunk_id: number | null;
 }
 
 /** Options for BrainEngine.relationalFanout. */
 export interface RelationalFanoutOpts extends PageReadPolicy {
+  temporal?: import('./link-validity.ts').EdgeTemporalOpts; // per-hop temporal edge policy; absent = every edge
   /** Resolved seed identities; separate from the read grant for edge origins. */
   seedRefs?: Array<{ source_id: string; slug: string }>;
   /** Edge types to traverse; null/empty = type-agnostic. */
@@ -1526,6 +1578,67 @@ export interface RelationalFanoutOpts extends PageReadPolicy {
   sourceIds?: string[];
   /** Hard cap on returned candidate nodes. Default 50. */
   limit?: number;
+}
+
+/** Chain evidence carried on a search row (SearchResult.relational). */
+export interface RelationalEvidence {
+  role: 'answer' | 'support' | 'origin';
+  seed: string;
+  hop: number;
+  path_count: number;
+  edges: Array<{
+    link_type: string;
+    stored_from: string;
+    stored_to: string;
+    orientation: 'canonical' | 'stored' | 'flipped' | 'uncertain';
+    context: string | null;
+    origin: string | null;
+  }>;
+}
+
+/**
+ * Options for BrainEngine.relationalChainHop: one bounded, oriented expansion
+ * step of a multi-hop relational chain. `subjectTypes`/`objectTypes` are the
+ * hop relation's page-type signature; `degreeLinkTypes` names the typed edges
+ * counted for a frontier node's degree (hub weighting).
+ */
+export interface ChainHopOpts extends PageReadPolicy {
+  linkTypes: string[];
+  toward: 'object' | 'subject';
+  subjectTypes: string[];
+  objectTypes: string[];
+  degreeLinkTypes: string[];
+  /** Max logical edges returned per frontier node (deterministic: lowest link id first). */
+  neighborCap: number;
+  temporal?: import('./link-validity.ts').EdgeTemporalOpts; // relationship-validity policy per link row; absent = every edge
+}
+
+/**
+ * One LOGICAL edge from a frontier node, oriented by the relation's type
+ * signature and already authorized (both endpoints and any origin page pass
+ * the read policy). Stored rows between the same pair that resolve to the same
+ * subject/object collapse into one edge (`link_ids`).
+ */
+export interface ChainHopEdge {
+  from_page_id: number;
+  to_page_id: number;
+  to_slug: string;
+  to_type: string;
+  source_id: string;
+  link_type: string;
+  orientation: 'canonical' | 'stored' | 'flipped' | 'uncertain';
+  link_ids: number[];
+  stored_from_slug: string;
+  stored_to_slug: string;
+  /** Edge context from the evidence row; null when the caller may not read the evidence page's text. */
+  context: string | null;
+  origin_page_id: number | null;
+  origin_slug: string | null;
+  canonical_chunk_id: number | null;
+  /** Distinct typed neighbors of the frontier node the caller may read; saturates at 300 readable link rows. */
+  from_degree: number;
+  /** True when the frontier node had more logical edges than `neighborCap`. */
+  neighbor_cap_hit: boolean;
 }
 
 // Timeline
@@ -1667,6 +1780,17 @@ export interface RawData {
 
 export type { PageVersion } from './page-state/version-types.ts';
 
+/** Who wrote a row, joined at read time (`ops/attribution.ts`); `unrecorded` = pre-attribution or an unattributed legacy writer. */
+export interface WriteAttributionView {
+  request_id: string | null; operation: string | null; at: string | null;
+  principal: { kind: string; id: string; name: string | null } | null;
+  origin: 'request' | 'maintenance' | 'unrecorded';
+}
+/** A `get_versions` row as trusted local and admin callers see it. */
+export type AttributedPageVersion = import('./page-state/version-types.ts').PageVersion & {
+  written_by: WriteAttributionView; archived_by: WriteAttributionView;
+};
+
 // Stats + Health
 export interface BrainStats {
   page_count: number;
@@ -1767,7 +1891,7 @@ export interface BrainHealth {
    */
   schema_version?: '1';
   migrations?:
-    | { pending: string[]; partial: string[]; wedged: string[]; skipped_future: number }
+    | { pending: string[]; pending_fresh_install: string[]; partial: string[]; wedged: string[]; skipped_future: number }
     | { error: 'ledger_unreadable' };
 }
 
@@ -1897,6 +2021,7 @@ export const DEGRADED_REASONS = [
   'candidate_budget',
   'iterative_scan_unavailable',
   'egress_denied', // System One: the Jev reranker skipped a query with a candidate from decide.egress.deny_sources
+  'embedding_disabled', // the brain opted out of embedding: the query text was never sent to the provider
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
@@ -1988,6 +2113,8 @@ export interface HybridSearchMeta {
    * and every reranker fail-open path. Surfaced for `gbrain search --explain`.
    */
   relational_rerank_pin?: import('./search/relational-rerank-pin.ts').RelationalRerankPinDecision;
+  /** Multi-hop planner outcome for a 2-3 relation question (status, anchor, per-hop counts, cap). */
+  relational_plan?: import('./search/relational-recall.ts').RelationalPlanMeta;
   /**
    * Ranker wave (Phase E2, Cat 13) — keyword-arm confidence decision:
    * `margin_ratio` (scale-free `top / (top + second)` over the keyword arm's

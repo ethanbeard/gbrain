@@ -10,10 +10,11 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import { probeSourceGitState } from '../../../core/git-head.ts';
 // v0.41.32.0: remote staleness reads the stored newest_content_at column via
 // this pure comparator (no git subprocess on the HTTP MCP doctor path).
-import { lagFromContentMs, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
+import { lagFromContentMs, loadSyncFreshnessSources, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
 import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
 import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../../../core/link-extraction.ts';
+import { previewMentionPass } from '../../../core/mentions/stale.ts';
 import { isUndefinedColumnError } from '../../../core/utils.ts';
 import {
   loadStorageConfig,
@@ -25,9 +26,13 @@ import { slugifyPath, slugifyCodePath, isCodeFilePath } from '../../../core/sync
 import { resolveSourceLocalFilePath } from '../../../core/markdown.ts';
 import { scannerSlugRootMode } from '../../../core/write-through.ts';
 import { unverifiedExtractionFragment } from '../../../core/extraction-review.ts';
-import { isSyncDisabledConfig } from '../../../core/sync-policy.ts';
+import { managedPersistenceEnabled } from '../../../core/persistence/ownership.ts';
+import { upstreamFreshness } from '../../../core/sync-upstream.ts';
 import type { Check } from '../../doctor.ts';
 import { ownedContentFreshness } from '../../../core/shared-skills/content-freshness.ts';
+import { connectorAuthorities } from '../../../core/persistence/connector-authority.ts';
+import { parseSourceConfig } from '../../../core/sources-load.ts';
+import { checkError } from '../check-fix.ts';
 
 /** Local aliases; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveEnvNumber = resolveEnvNumber;
@@ -155,21 +160,25 @@ export async function checkLinksExtractionLag(
       }
     }
 
-    const details = { total, stale, attendance_blocked: attendanceBlocked, pct: Number(pctStr), warn_pct: warnPct, fail_pct: failPct ?? null, source_id: sourceId ?? null };
+    // Entity mention index: pages the mention pass has not scanned at their current content.
+    const mention = await previewMentionPass(engine, sourceId).catch(() => null);
+    const mentionNote = mention?.due ? `; ${mention.due} page(s) await the mention pass (last pass: ${mention.last_pass_at ?? 'never'})` : '';
+    const details = { total, stale, attendance_blocked: attendanceBlocked, pct: Number(pctStr), warn_pct: warnPct, fail_pct: failPct ?? null, source_id: sourceId ?? null,
+      mention_due: mention?.due ?? null, mention_last_pass_at: mention?.last_pass_at ?? null };
     if (failPct !== undefined && pct > failPct) {
-      return { name, status: 'fail', message: `${stale}/${total} pages (${pctStr}%)${scope} need link/timeline extraction (> ${failPct}% fail threshold). ${fix}${blockedNote}`, details };
+      return { name, status: 'fail', message: `${stale}/${total} pages (${pctStr}%)${scope} need link/timeline extraction (> ${failPct}% fail threshold)${mentionNote}. ${fix}${blockedNote}`, details };
     }
     if (pct > warnPct) {
-      return { name, status: 'warn', message: `${stale}/${total} pages (${pctStr}%)${scope} have un-extracted edges. ${fix}${blockedNote}`, details };
+      return { name, status: 'warn', message: `${stale}/${total} pages (${pctStr}%)${scope} have un-extracted edges${mentionNote}. ${fix}${blockedNote}`, details };
     }
-    return { name, status: 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${blockedNote}`, details };
+    return { name, status: 'ok', message: `Extraction current: ${stale}/${total} pages (${pctStr}%) stale${scope}${mentionNote}${blockedNote}`, details };
   } catch (e) {
     // Pre-v112 brain: links_extracted_at column doesn't exist yet. Graceful OK
     // (migration/bootstrap adds it; nothing to assess until then).
     if (isUndefinedColumnError(e, 'links_extracted_at')) {
       return { name, status: 'ok', message: 'links_extracted_at not present (pre-v112 brain)' };
     }
-    return { name, status: 'warn', message: `Could not check links_extraction_lag: ${(e as Error).message}` };
+    return checkError(name, 'check links_extraction_lag', e);
   }
 }
 
@@ -215,7 +224,7 @@ export async function checkUnverifiedExtractions(
       details: { count: n, days, source_id: sourceId ?? null },
     };
   } catch (e) {
-    return { name, status: 'warn', message: `Could not check unverified_extractions: ${(e as Error).message}` };
+    return checkError(name, 'check unverified_extractions', e);
   }
 }
 
@@ -299,7 +308,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
       },
     };
   } catch (e) {
-    return { name, status: 'warn', message: `Could not check content-hash duplicates: ${(e as Error).message}` };
+    return checkError(name, 'check content-hash duplicates', e);
   }
 }
 
@@ -341,7 +350,7 @@ export async function checkCodeChunkMetadata(engine: BrainEngine): Promise<Check
       details: { chunks_missing_metadata: chunks, pages_affected: pages },
     };
   } catch (e) {
-    return { name, status: 'warn', message: `Could not check code chunk metadata: ${(e as Error).message}` };
+    return checkError(name, 'check code chunk metadata', e);
   }
 }
 
@@ -390,19 +399,22 @@ export async function checkUndeclaredDbOnlyPages(engine: BrainEngine): Promise<C
   try {
     // #3880: archived sources are out of scope for filesystem audits (v34
     // legacy fallback, house style per pickSoleNonDefaultSource).
-    let sources: Array<{ id: string; local_path: string | null }>;
+    let sources: Array<{ id: string; local_path: string | null; config: unknown }>;
     try {
-      sources = await engine.executeRaw<{ id: string; local_path: string | null }>(
-        `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+      sources = await engine.executeRaw<{ id: string; local_path: string | null; config: unknown }>(
+        `SELECT id, local_path, config FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
       );
     } catch {
-      sources = await engine.executeRaw<{ id: string; local_path: string | null }>(
-        `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL`,
+      sources = await engine.executeRaw<{ id: string; local_path: string | null; config: unknown }>(
+        `SELECT id, local_path, config FROM sources WHERE local_path IS NOT NULL`,
       );
     }
-    const checkable = sources.filter(s => s.local_path && existsSync(s.local_path));
+    const authorities = await connectorAuthorities(engine, sources.map(s => ({ id: s.id, kind: parseSourceConfig(s.config).kind })));
+    const connectorDb = new Set([...authorities].filter(([, a]) => a === 'connector_database').map(([id]) => id));
+    const connectorNote = connectorDb.size > 0 ? ` ${connectorDb.size} API connector source(s) skipped: connector_database pages are DB-only by design (recover them with gbrain sync --source <id> --full).` : '';
+    const checkable = sources.filter(s => s.local_path && existsSync(s.local_path) && !connectorDb.has(s.id));
     if (checkable.length === 0) {
-      return { name, status: 'ok', message: 'Not applicable (no sources with a local repo path on this host)' };
+      return { name, status: 'ok', message: `Not applicable (no sources with a local repo path on this host).${connectorNote}` };
     }
     let total = 0;
     const samples: string[] = [];
@@ -446,17 +458,17 @@ export async function checkUndeclaredDbOnlyPages(engine: BrainEngine): Promise<C
       return {
         name,
         status: 'ok',
-        message: `Every DB page is file-backed or under a declared/default db_only path (derive-phase defaults: ${DERIVE_PHASE_DB_ONLY_DEFAULTS.join(' ')})`,
+        message: `Every DB page is file-backed or under a declared/default db_only path (derive-phase defaults: ${DERIVE_PHASE_DB_ONLY_DEFAULTS.join(' ')}).${connectorNote}`,
       };
     }
     return {
       name,
       status: 'warn',
-      message: `${total} DB page(s) have no backing file and sit outside every declared/default db_only path — invisible to file-lane backup/recovery. Sample: ${samples.join('; ')}. Fix: restore or export the files, or declare their prefixes under storage.db_only in gbrain.yml (derive-phase defaults already cover: ${DERIVE_PHASE_DB_ONLY_DEFAULTS.join(' ')})`,
+      message: `${total} DB page(s) have no backing file and sit outside every declared/default db_only path — invisible to file-lane backup/recovery. Sample: ${samples.join('; ')}. Fix: restore or export the files, or declare their prefixes under storage.db_only in gbrain.yml (derive-phase defaults already cover: ${DERIVE_PHASE_DB_ONLY_DEFAULTS.join(' ')})${connectorNote}`,
       details: { total, per_source: perSource, sample_slugs: samples },
     };
   } catch (e) {
-    return { name, status: 'warn', message: `Could not check undeclared db-only pages: ${(e as Error).message}` };
+    return checkError(name, 'check undeclared db-only pages', e);
   }
 }
 
@@ -519,7 +531,7 @@ export async function checkDbOnlyCollectorCollision(
       details: { collisions: hits },
     };
   } catch (e) {
-    return { name, status: 'warn', message: `Could not check collector/db_only collisions: ${(e as Error).message}` };
+    return checkError(name, 'check collector/db_only collisions', e);
   }
 }
 
@@ -690,6 +702,7 @@ export async function computeExtractAtomsBacklogCheck(
     }
 
     const { packDeclaresPhase } = await import('../../../core/cycle.ts');
+    const { extractAtomsPhaseStaleWarning } = await import('../../../core/cycle/extract-atoms-stamp.ts');
     let declared = false;
     try { declared = await packDeclaresPhase(engine, 'extract_atoms'); } catch { declared = false; }
 
@@ -756,7 +769,13 @@ export async function computeExtractAtomsBacklogCheck(
           },
         };
       }
-      // Pack runs it AND a cycle completed recently (or the backlog is small,
+      // #5028: a recent cycle does not prove THIS phase ran; check each backlog source's own stamp.
+      if (evidence && evidence.state === 'fresh') {
+        const bySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog, opts.sourceIds);
+        const phaseWarn = bySource ? await extractAtomsPhaseStaleWarning(engine, backlog, bySource, buildExtractAtomsDrainCommand, approx) : null;
+        if (phaseWarn) return { name, status: 'warn', ...phaseWarn };
+      }
+      // Pack runs it AND the phase ran recently (or the backlog is small,
       // or evidence is unreadable — fail-open). Informational.
       return {
         name, status: 'ok',
@@ -934,7 +953,8 @@ export async function computeAtomProvenanceDriftCheck(
           `${drifted}/${total} atom(s) (${details.drift_pct}%) reference a source_hash no live page carries ` +
           `— ${sourceChanged} whose source page still exists (edited), ${sourceGone} whose source page is gone` +
           (oldestDays != null ? `; oldest ${oldestDays}d` : '') + su +
-          `. These still surface in search with a source_quote that no current page contains. Fix: ${fix}`,
+          `. This compares source_hash only (any edit to the source page changes it); it does not re-check whether ` +
+          `the atom's source_quote still appears in the page, so edited-source atoms may still be accurate. Fix: ${fix}`,
         details,
       };
     }
@@ -990,6 +1010,7 @@ export async function computeExtractHealthCheck(
       expected_limit_count: number;
       rollup_write_failures: number;
       last_updated_at: Date | string | null;
+      last_halt_age_days: number | string | null;
     };
 
     // #4482: expected_limit_count (migration v141) counts runs that stopped
@@ -1006,7 +1027,8 @@ export async function computeExtractHealthCheck(
          SUM(round_completed_count) AS round_completed_count,
          ${withExpected ? 'SUM(expected_limit_count)' : '0'} AS expected_limit_count,
          SUM(rollup_write_failures) AS rollup_write_failures,
-         MAX(updated_at) AS last_updated_at
+         MAX(updated_at) AS last_updated_at,
+         CURRENT_DATE - MAX(day) FILTER (WHERE halt_count > 0) AS last_halt_age_days
        FROM extract_rollup_7d
        WHERE day >= CURRENT_DATE - 7
        GROUP BY kind
@@ -1042,6 +1064,7 @@ export async function computeExtractHealthCheck(
       expected_limit_count: number;
       halt_rate: number;
       last_updated_at: string | null;
+      last_halt_age_days: number | null;
     };
 
     const kinds: KindAggregate[] = rows.map(r => {
@@ -1065,6 +1088,7 @@ export async function computeExtractHealthCheck(
         last_updated_at: r.last_updated_at
           ? new Date(r.last_updated_at).toISOString()
           : null,
+        last_halt_age_days: r.last_halt_age_days == null ? null : Number(r.last_halt_age_days),
       };
     });
 
@@ -1084,16 +1108,15 @@ export async function computeExtractHealthCheck(
       // high halt rate from entirely historical failures with nothing
       // currently wrong — the operator has no way to tell "actively
       // failing" from "hasn't run since a bug that's already fixed" without
-      // this. last_updated_at is already computed (MAX(updated_at) above)
-      // but wasn't surfaced in the message text, only in `details`.
+      // this. The age is the most recent day with a halt, not the last
+      // rollup write: a kind that halted 4 days ago and ran cleanly today
+      // reads "last halt 4d ago".
       const top3 = [...highHaltKinds]
         .sort((a, b) => b.halt_rate - a.halt_rate)
         .slice(0, 3)
         .map(k => {
-          const ageDays = k.last_updated_at
-            ? Math.floor((Date.now() - new Date(k.last_updated_at).getTime()) / 86_400_000)
-            : null;
-          const ageSuffix = ageDays === null ? '' : ageDays <= 0 ? ', today' : `, ${ageDays}d ago`;
+          const ageDays = k.last_halt_age_days;
+          const ageSuffix = ageDays === null ? '' : ageDays <= 0 ? ', last halt today' : `, last halt ${ageDays}d ago`;
           return `${k.kind}=${(k.halt_rate * 100).toFixed(1)}%${ageSuffix}`;
         })
         .join(', ');
@@ -1161,30 +1184,6 @@ export async function computeExtractHealthCheck(
       message: `rollup query failed: ${msg}`,
     };
   }
-}
-
-async function loadSyncFreshnessSources(engine: BrainEngine) {
-  type FreshnessSourceRow = {
-    id: string;
-    name: string;
-    local_path: string | null;
-    last_sync_at: Date | null;
-    last_commit: string | null;
-    chunker_version: string | null;
-    newest_content_at: Date | null;
-    config: unknown;
-  };
-  let sources: FreshnessSourceRow[];
-  try {
-    sources = await engine.executeRaw<FreshnessSourceRow>(
-      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
-    );
-  } catch {
-    sources = await engine.executeRaw<FreshnessSourceRow>(
-      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config FROM sources WHERE local_path IS NOT NULL`,
-    );
-  }
-  return sources.filter((source) => !isSyncDisabledConfig(source.config));
 }
 
 export async function checkSyncFreshness(
@@ -1284,6 +1283,10 @@ export async function checkSyncFreshness(
     // source is judged against the same number (and the env read + warn-once
     // machinery runs once, not once per source).
     const stalenessCeilingSeconds = resolveStalenessCeilingSeconds();
+    let managed = false;
+    try { managed = await managedPersistenceEnabled(engine); } catch { /* pre-persistence brain */ }
+    let upstream_unknown_count = 0;
+    let upstream_behind_count = 0;
     for (const source of sources) {
       if (ownedContent.has(source.id)) { writer_owned_count++; continue; }
       // Embed source.id in user-visible messages so `gbrain sync --source <id>`
@@ -1291,6 +1294,14 @@ export async function checkSyncFreshness(
       const display = source.name && source.name !== source.id
         ? `'${source.id}' (${source.name})`
         : `'${source.id}'`;
+
+      // O-DX-8: judged before (and independently of) the local projection buckets below.
+      const upstream = upstreamFreshness(source, display, now, managed);
+      if (upstream) {
+        issues.push(upstream.issue);
+        hasWarnings = true;
+        if (upstream.state === 'unknown') upstream_unknown_count++; else upstream_behind_count++;
+      }
 
       // BUG 4: actively syncing (live lock) → healthy, count as synced_recently
       // and skip the staleness checks. Keeps the 3-bucket invariant intact.
@@ -1433,7 +1444,8 @@ export async function checkSyncFreshness(
     }
 
     // D6 invariant: every source incremented exactly one bucket.
-    const details = { unchanged_count, synced_recently_count, stale_count, ...(writer_owned_count ? { writer_owned_count } : {}) };
+    const details = { unchanged_count, synced_recently_count, stale_count, ...(writer_owned_count ? { writer_owned_count } : {}),
+      ...(upstream_unknown_count ? { upstream_unknown_count } : {}), ...(upstream_behind_count ? { upstream_behind_count } : {}) };
     // BUG 4: append in-progress context when any source is actively syncing.
     // Empty otherwise, so steady-state messages are byte-for-byte unchanged.
     const inProgressNote = (inProgress.length ? `. ${inProgress.join('; ')}` : '')
@@ -1486,10 +1498,6 @@ export async function checkSyncFreshness(
       details,
     };
   } catch (e) {
-    return {
-      name: 'sync_freshness',
-      status: 'warn',
-      message: `Could not check sync freshness: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('sync_freshness', 'check sync freshness', e);
   }
 }

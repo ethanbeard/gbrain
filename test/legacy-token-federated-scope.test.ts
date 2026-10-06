@@ -12,6 +12,7 @@
 import { describe, test, expect } from 'bun:test';
 import { parseLegacyTokenScope } from '../src/mcp/http-transport.ts';
 import { parseTakesHoldersAllowList, coerceLegacyPermissions } from '../src/core/legacy-token-scope.ts';
+import { NO_SOURCES } from '../src/core/source-id.ts';
 
 describe('parseLegacyTokenScope', () => {
   test('array grant → allowedSources (federated read) with first as scalar floor', () => {
@@ -31,8 +32,9 @@ describe('parseLegacyTokenScope', () => {
     expect(parseLegacyTokenScope(null)).toEqual({ sourceId: 'default' });
   });
 
-  test('empty array → default floor, no grant (NOT "all")', () => {
-    expect(parseLegacyTokenScope([])).toEqual({ sourceId: 'default' });
+  test('empty array → explicit no-source grant (NEVER the default floor, NOT "all")', () => {
+    expect(parseLegacyTokenScope([])).toEqual({ sourceId: NO_SOURCES, allowedSources: [] });
+    expect(parseLegacyTokenScope(['', 5])).toEqual({ sourceId: NO_SOURCES, allowedSources: [] });
   });
 
   test('garbage (number / empty string) → default floor', () => {

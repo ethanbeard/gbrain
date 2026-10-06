@@ -19,6 +19,7 @@ triggers:
 tools:
   - shell
 mutating: true
+when_to_use: "Use when the user asks: \"soul audit\", \"customize agent\", \"who am I\", \"set up identity\", \"change my agent's personality\"."
 ---
 
 # Soul Audit — Agent Identity Builder (re-run / deepen surface)
@@ -113,6 +114,13 @@ Report exactly what changed: which keys were updated, which files re-rendered,
 and where the backups landed. Example: "Soul audit: updated VOICE_REGISTER +
 SOUL_WINCE, re-rendered SOUL.md (backup in .gbrain-bootstrap-backups/...).
 Re-run any phase anytime."
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain bootstrap interview --confirm <hash>` fails: the hash must come from a read-back the user actually saw. Re-run `gbrain bootstrap interview --status`, read the answers back, and confirm only with the user's agreement.
+- Rendering refuses because required answers are missing: ask the user for them; never fill identity answers yourself.
 
 ## Anti-Patterns
 

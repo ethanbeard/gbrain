@@ -34,10 +34,12 @@ WORKFLOW="$ROOT/.github/workflows/heavy-tests.yml"
 
 if [ ! -f "$WORKFLOW" ]; then
   echo "check-grok-pin: SKIP (no $WORKFLOW)"
+  echo "GBRAIN_CHECK_SKIPPED: no heavy-tests.yml"
   exit 0
 fi
 if ! grep -q '^  grok-door:' "$WORKFLOW"; then
   echo "check-grok-pin: SKIP (no grok-door job in heavy-tests.yml yet)"
+  echo "GBRAIN_CHECK_SKIPPED: no grok-door job in heavy-tests.yml"
   exit 0
 fi
 # Once the grok-door job EXISTS, a missing pin doc is a FAILURE, not a skip —

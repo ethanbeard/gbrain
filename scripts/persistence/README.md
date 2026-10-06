@@ -69,6 +69,119 @@ use the real consumer, authority checks, kernel locks, coordinator, durable
 files and database transactions. Four writes per producer stay in flight;
 every seventeenth logical write is replayed under the same request ID.
 
+## Crash robot
+
+The crash robot runs generated sequences of real operations against a
+managed brain and checks a reference model after every step, after every
+crash and recovery, and after the final drain. It is a phase of
+`validate.ts` with a time budget (`--robot-seconds`, default 300; `0` skips
+it). Run it alone with:
+
+```sh
+bun --no-env-file scripts/persistence/validate.ts --engine=pglite \
+  --schedules=0 --operations=0 --no-crashes --robot-seconds=300
+```
+
+Every op is a JSON descriptor (`ops.ts`) executed through its registered
+operation handler with a real `OperationContext`: page writes, edits,
+deletes and restores, `remember`/`forget`, takes add and supersede, timeline
+entries, a user commit followed by `sync_brain`, a GitHub connector publish,
+and credential revocation. Actors are the local CLI principal and two remote
+agents, an OAuth client and a legacy access token, authenticated through the
+production token verifier. Two sources share slugs, sit in two durability-
+hardened Git checkouts, and a third source is the connector's.
+
+Each run starts from a fresh datastore. The fixed sequences always run:
+withdrawal followed by a stale republication, overlapping slugs across two
+sources, competing writers on one page, caller-bound replay, an authority
+revoked while effects are pending, and sync plus connector publish racing
+direct writes. A counting pass records every crash seam a sequence reaches
+(`src/core/persistence/fault-points.ts`); the robot then crashes each seam at
+least once: the worker freezes at the seam, the driver SIGKILLs it, and a
+fresh worker checks the state left behind, drains, resubmits the interrupted
+requests with their original request ids and finishes the sequence. Random
+sequences fill the rest of the budget. Process faults run once per engine:
+a stale `index.lock`, a hung `git commit` that holds `index.lock` (it releases
+the lock on SIGTERM, not on SIGKILL), on Postgres every session of the run
+database dropped every 400 ms, and the owner killed right after a
+`facts-absorb` job's extraction commits (deterministic chat and embedding
+stubs); the job then runs again and every absorbed fact must be active
+exactly once.
+The robot records each session-drop round it injects. Its own reads (oracle
+checks, drain polls, `$current` revision lookups, token re-verification)
+retry a closed connection only after a round that began before the error
+terminated a session; any other close fails the run with the next step,
+so a database, pooler or product-side close is never retried away.
+
+The reference model (`model.ts`) checks: a committed receipt is visible at
+once and later revisions move only through committed ops; a late receipt
+names a revision the page really had; after a concurrent group a page ends
+at a revision a committed member returned, or at the write of a committed sync
+or connector publish (which return no revision) whose marker it carries, and
+every receipted revision a later member replaced is in the page's history; a
+refused write never becomes visible;
+a withdrawn fact never returns through recall, `get_page` or the facts table;
+a write never lands in another source; another principal reusing a request
+id never receives the original receipt; takes and facts rows equal their
+page fences; content rows carry write attribution; no orphan rows; every
+request and effect drains (within 20 s on PGLite, whose restarted owner
+releases a dead owner's claims, and within the 2-minute effect lease plus
+margin on Postgres); a fresh write still commits. `lock-order.ts` checks each
+transaction's row locks: worktrees before sources, sources in id order, no
+exclusive brain-row lock inside a publication, and the brain row before any
+worktree, source or counter row whenever one transaction locks both (a write
+to `persistence_requests` or `persistence_effects` counts as the brain-row
+FOR SHARE read its protocol trigger takes).
+
+Postgres runs connect through `GBRAIN_PGBOUNCER_URL` when it is set, with
+prepared statements off. A Postgres run with a budget under 300 s (the
+pull-request run) skips what can wait out a dead owner's claim lease: the
+`effect:*` seams, `consumer:prepared`, the publication seams `prepared`,
+`before_publication` and `after_publication`, and the pooler disconnect
+fault. Full runs crash every seam and run every fault. The manifest's `robot`
+key lists every run (schedule, seed, seam and occurrence or process fault),
+`sequences_x_crash_points`, `lease_bound_seams_skipped`,
+`lease_bound_faults_skipped` and violations with the observed trace;
+`robot_full_gate` is true for a full-budget run with no violations.
+
+A failing run prints two commands. `--replay=<manifest>` re-runs exactly the
+manifest's failing runs. `--shrink=<manifest>` removes ops from the first
+failing run (an op whose producer was removed goes with it) while a
+violation of the same class remains, accepts the result only when it
+reproduces in 3 of 3 reruns, and writes `<manifest>.shrunk.json`. Accepted
+shrunk sequences are checked in under `test/fixtures/crash-robot/` and
+replayed by `test/persistence-crash-robot.slow.test.ts`.
+
+For a local Postgres and PgBouncer replay:
+
+```sh
+docker network create gbrain-robot
+docker run -d --name robot-pg --network gbrain-robot -p 5432:5432 \
+  -e POSTGRES_USER=gbrain_test -e POSTGRES_PASSWORD=gbrain_test -e POSTGRES_DB=gbrain_test \
+  pgvector/pgvector:pg16
+docker run -d --name robot-pgbouncer --network gbrain-robot -p 55433:5432 \
+  -e DB_HOST=robot-pg -e DB_PORT=5432 -e DB_USER=gbrain_test -e DB_PASSWORD=gbrain_test \
+  -e POOL_MODE=transaction -e AUTH_TYPE=plain -e MAX_CLIENT_CONN=200 -e DEFAULT_POOL_SIZE=10 \
+  -e IGNORE_STARTUP_PARAMETERS=extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path \
+  edoburu/pgbouncer:latest
+PGPASSWORD=gbrain_test DATABASE_URL=postgres://gbrain_test@127.0.0.1:5432/gbrain_test \
+  GBRAIN_PGBOUNCER_URL=postgres://gbrain_test@127.0.0.1:55433/gbrain_test \
+  bun --no-env-file scripts/persistence/validate.ts --engine=postgres --replay=<manifest>
+```
+
+`buildHistoryFixture(engine, { pages, seed, sources, worktrees })`
+(`history-fixture.ts`) builds a managed brain with real persistence history
+(up to 10,000 pages) through the same op protocol: committed and queued
+requests, a delayed Git effect, withdrawals, superseded takes, page versions,
+chronicle ledger rows, local writers, an OAuth client and token, and an
+access token with unified grant columns. The engine must be initialized and
+not yet activated, under an isolated `GBRAIN_HOME`.
+
+`would-have-caught.ts` measures the gate against past fixes: for each fix
+frozen in `would-have-caught.json` it reverse-applies the fix's `src/` hunks
+in a scratch worktree and runs the pre-robot gate and the robot phase
+against it, after a HEAD control that must pass.
+
 The default manifest is `.context/persistence-<engine>-manifest.json`. It
 contains the actual completed case counts, crash outcomes, runtime/platform,
 latency distributions (p50/p95/p99/max), concurrent canonical-read checks, throughput, peak resident RSS,
@@ -184,3 +297,278 @@ over the 50% threshold exits successfully, but the manifest keeps its
 Invalid samples, failed reads/writes and insufficient overlap still fail CI.
 Omit `--informational` to enforce the threshold locally; the threshold value
 and measurement workload have not changed.
+
+## Test suites
+
+These suites own the durable-persistence contracts. `test:full` alone does not run the complete
+native, runtime, crash, soak, deployment-matrix and read-latency gates; tie each result to its tested
+revision and disclose skipped cells.
+
+### Canonical reconciliation and accepted writes
+
+`test/persistence-reconcile-merge.test.ts` pins loss-preserving field choices.
+`test/persistence-reconcile.test.ts` runs the guarded repair and replay contracts
+on PGLite and, with an explicit safe `DATABASE_URL`, isolated PostgreSQL databases.
+It covers stale preconditions, current/original grants, private facts, retained
+backups, ordinary mutations after repair, and competing publications.
+`test/reconcile-owner-journey.serial.test.ts` drives real CLI requests through
+HTTP and stdio PGLite owners before and after activation, restarts the owner, and
+independently reads the newly remembered private fact and provenance.
+
+`test/reconcile-crash-*.slow.test.ts` and `test/e2e/reconcile-crash*.test.ts` kill real
+processes at all eight publication boundaries with activation off/on. PostgreSQL
+uses one file per activation state to stay within the unchanged per-file cap. Optional
+`GBRAIN_TEST_RECONCILE_CRASH_MANIFEST_DIR` retains executed-case evidence.
+`test/e2e/reconcile-pgbouncer.test.ts` requires the transaction-mode pooler when
+`GBRAIN_CI_REQUIRE_PGBOUNCER=1` and proves repair followed by a new private memory
+write. The durable-persistence workflow runs these contracts on both supported
+Bun versions and uploads the crash manifests; local CI runs the slow and E2E lanes.
+
+`test/put-page-persistence.test.ts` and `test/e2e/put-page-persistence-postgres.test.ts`
+pin durable page acceptance and ordinary-error publication: native contention
+returns an accepted pending receipt without changing the page, and replay of its
+original UUID commits exactly once after release. Filesystem or required
+source-path failure rolls back the database transaction. Embedding failure
+preserves the canonical receipt; a delayed result superseded by another revision
+cannot install vectors. The PGLite suite also covers scoped physical file paths,
+unchanged-content no-ops, legacy hashes, deletion/recreation, and sanitized
+diagnostics. Actual process-death boundaries belong to the crash suites below.
+
+`test/subagent-required-writes.test.ts` and
+`test/subagent-put-page-rejection.serial.test.ts` distinguish a persisted write
+from prose-only completion, rejected imports, and historical rejected ledger
+envelopes across the Anthropic, gateway, and oneshot lanes. Unchanged saves,
+optional-write jobs, and saved pages with failed enrichment are positive controls.
+`test/cycle/global-freshness-postcondition.serial.test.ts` exercises the registered
+maintenance handler with failed phases, incomplete children, budget deferrals,
+abort/lock loss, and successful warning-only controls.
+
+### Native-matrix publication and managed writers
+
+The glibc Linux, macOS and Windows matrix also runs
+`persistence-publication-native.serial.test.ts`,
+`persistence-git-publication.test.ts`,
+`persistence-sync-origin-native.test.ts` and
+`backup-portability-native.serial.test.ts` in separate Bun processes. These
+exercise real Git publication, historical source origins and backup restoration
+with fresh-process reopen. macOS and Windows set
+`GBRAIN_TEST_REQUIRE_CASE_INSENSITIVE=1`; a case-sensitive fixture must fail
+rather than silently skip the publication regression. Inspect executed test
+counts before claiming native coverage; a configured lane alone is not evidence.
+
+The publication, sync-origin, processing-option and company-sync suites also
+run separately with an explicit PostgreSQL URL in the persistence deployment
+matrix. `test/e2e/persistence-publication-parity.test.ts` and
+`test/e2e/persistence-sync-{origin,options,company}-parity.test.ts` include them
+in the full local E2E gate; the keyless serial runner alone cannot exercise
+their PostgreSQL branches.
+
+Focused safety coverage: `test/apply-migrations-safety.serial.test.ts` checks
+force dry-run previews before DB/ledger access and failed-phase partial exit;
+`test/real-home-guard-preload.test.ts` pins the test-home fingerprint backstop
+(detection, not prevention). Managed retry, durable diagnostics, restart and
+PGLite/Postgres parity are covered by `test/persistence-sync-failures.serial.test.ts`
+and `test/e2e/managed-sync-failures.test.ts`. Backup remote readback and fsync
+fault cases run in `test/backup-verification.serial.test.ts` and
+`test/backup-fsync.serial.test.ts`; `test/e2e/backup-coverage-parity.test.ts`
+covers PGLite/Postgres page/fact/config parity. Output redaction uses
+`test/search/output-redaction.serial.test.ts` and
+`test/search/output-redaction.test.ts`, including unchanged internal capture.
+
+Managed writer fixtures use isolated PGLite and guarded disposable Postgres:
+`test/e2e/fact-vector-repair-parity.test.ts`,
+`test/e2e/fact-embedding-backfill-parity.test.ts`, and
+`test/fact-backfill-resident.test.ts` cover preserved vectors, bounded
+NULL-only fact backfill, selected-config refusal and owner-held PGLite IPC;
+`test/ai/google-embed-batch-items.test.ts` pins 100-item provider batches.
+`test/persistence-embedding-effects.test.ts`,
+`test/persistence-effect-retry.test.ts`, and
+`test/embedding-completion-atomic.serial.test.ts` cover partial vector
+completion, exhausted durable attempts and state-bound explicit retry.
+`test/managed-extract-atoms.test.ts`, `test/managed-facts-backstop.test.ts`
+and their `test/e2e/` counterparts exercise admitted atom/fact replay,
+including fresh-process facts authority. `test/persistence-connectors.test.ts`
+covers managed bound/unbound Google/GitHub sources, API pagination and
+source-scoped deletions. `test/persistence-connector-retry.test.ts` covers
+explicit retry, compaction, checkpoint dependency identity, concurrent approval
+and lost acknowledgements. Each suite creates its own home, engines and
+lifecycle through `test/helpers/connector-fixture.ts`; the helper shares no
+live engine or mutable suite state. Their separate E2E entry points,
+`test/e2e/managed-connector-routing.test.ts` and
+`test/e2e/managed-connector-retry.test.ts`, retain the runner's default
+180-second per-file cap without duplicating the base cases in the retry lane.
+Linux root runners execute the complete EACCES case in an isolated `setpriv`
+child and assert UID 65534 before testing permissions. This needs a readable
+checkout, not changes to the parent process identity or checkout permissions;
+the CI runner image supplies `setpriv`.
+`test/managed-maintenance.test.ts` and
+`test/helpers/maintenance-restart.ts` cover local synthesize/patterns/
+consolidation, restart replay, retired takes and semantic snapshots;
+`test/managed-unsupported-preflight.serial.test.ts` checks that the managed
+facts-family bulk lanes refuse an unaccepted writer before spend, and
+`test/managed-facts-writers.test.ts` proves each of them (fence reconcile,
+phantom redirect, fence writes, loops extraction, bulk conversation facts)
+publishes through the coordinator on PGLite and Postgres. These use synthetic provider/API transports, not
+paid model calls or production connectors. PGLite dream/job CLI with an active
+owner is **not** proven delegated by the live fact-backfill IPC test.
+
+`test/facts-worker-config.test.ts` and its PostgreSQL E2E counterpart dispose
+the original consumer before executing a real facts-absorb job. They verify the
+worker passes trusted selected configuration, ignores job-supplied configuration
+and settles the entity-page effect with zero fact or chunk embedding calls when
+disabled. Fact extraction still captures the generated fact with a NULL embedding.
+
+`test/managed-facts-embedding.test.ts` and its PostgreSQL counterpart bind retained
+fact vectors to the selected brain's model and dimensions, including equal-width
+host/mount mismatches, keyless capture, policy changes and replay without new spend.
+`test/managed-atom-regressions.test.ts` and its PostgreSQL counterpart preserve
+later target edits through explicit retries and honor database-only storage policy
+without relaxing source authority. `test/managed-synthesis-postprocess.test.ts`
+and its E2E wrapper verify that completed quote/provenance work never rewrites a
+later user edit, while unfinished work resumes against its original revision.
+The synthesis suite also preserves the existing same-date summary on replay and
+rebuilds a complete index after partial recovery. `test/managed-atom-compaction.test.ts`
+and its PostgreSQL counterpart age and compact real receipts: permanent completion
+identity still prevents repeated extraction, while expired retry payloads produce
+an explicit refusal without changing terminal outcomes or compaction accounting.
+`test/managed-facts-compaction.test.ts` and its PostgreSQL counterpart cover the
+same lifetime boundary for explicit and derived fact-batch identities, including
+failed or partially committed batches and successful replay without new spend.
+Connector sweep fencing and physical-path normalization have separate parity
+coverage in `test/persistence-connector-fencing.test.ts`. Standalone crash/recovery
+cases live in `test/persistence-connector-recovery.test.ts` and their own E2E
+wrapper so they do not share the routing file's wall-clock budget; their original
+assertions, child watchdogs and per-file timeout are unchanged.
+
+`test/managed-atoms-cli.slow.test.ts` exercises real disk-backed PGLite CLI
+recovery with a loopback provider: live-owner refusal, graceful owner stop,
+malformed extraction, explicit same-input retry, idempotent replay and owner
+restart. Fresh-process readback checks the private canonical file, searchable
+chunk, retained failure receipt, committed completion and released leases.
+`test/managed-connector-routing.serial.test.ts` pins actual activation and
+`performSync` routing for API sources; the maintenance suite also drives
+`runCycle` with eligible facts in two sources and proves the other source is
+unchanged. The E2E wrapper files ensure these optional PostgreSQL arms execute
+in the database lane rather than only passing their PGLite controls.
+
+The persistence invariant jobs run the complete `scripts/persistence/validate.ts`
+gate (10,000-write soak) on pushes to master and manual dispatches. Pull requests
+run the same schedules and crash boundaries with a 2,500-write soak; the full
+PGLite soak alone takes 15-28 minutes and would otherwise set every PR's wall
+time. `test/scripts/data-safety-native-workflow.test.ts` pins the split. The
+crash robot (generated sequences of real operations, SIGKILL at every crash
+seam they reach, process faults, the reference model) runs as its own job
+beside the soak: 150 s on pull requests, 600 s elsewhere, Postgres through a
+transaction-mode PgBouncer. That job also replays the shrunk crash-robot
+regressions (`test/persistence-crash-robot.slow.test.ts`) and the history
+fixture test on both engines; see `scripts/persistence/README.md`.
+
+For platform-only feedback, dispatch
+`gh workflow run test.yml --ref <branch> -f native_only=true`. This explicit manual option uses a separate concurrency
+group so it does not cancel an ongoing full persistence soak. Its
+`native-only-validation-scope` artifact records the exact commit and
+`full_ci: false`; it never emits the required `test-status` check for unrun full
+CI. Omitting the option preserves every normal PR, push and full manual gate.
+
+### Schedules and process crashes
+
+`test/persistence-consumer-scheduling.test.ts` pins completion wake-ups,
+including a wake-up arriving during an active tick, without lowering the idle
+poll interval. Per-root deadlines preserve blocked/retryable backoff even while
+another root keeps committing; expired deadlines permit retries. Shutdown drains
+active preparation without starting another request.
+`test/persistence-root-refresh.test.ts` checks that unchanged root registrations
+do not replace their durable files while unbound, moved and original bound paths
+all remain fenced.
+
+`test/e2e/persistence-http-liveness.test.ts` drives real authenticated HTTP MCP
+with legacy and source-bound OAuth credentials against an isolated PostgreSQL
+database. It covers pending page/fact writes, lost acknowledgments, owner
+interruption, exact canonical readback, 44 pages over three clients, and current
+receipt authorization. Set `GBRAIN_TEST_OLD_BINARY` to a retained compatible
+executable to additionally exercise old/new owner handoffs in both directions
+for queued, actually claimed and recovery-bearing rows. Interrupted owners are
+reaped and native exclusion is verified before their successors start; only the
+abandoned running lease is advanced by the fixture. An omitted executable skips
+these compatibility cases, not proves them.
+`test/e2e/persistence-phase-liveness.test.ts` holds real table/row locks and
+ordinary/direct pool slots to verify phase cancellation (including capacity
+marking), tracked queued `BEGIN`, renewal, expired-head FIFO and shutdown fences.
+A loopback TCP gate separately delays or rejects cold direct initialization,
+checking retained work through shutdown and same-ID completion after retry.
+The memory-mutation tests use a
+deterministic loopback embedding transport for slow and aborted preparation;
+they do not contact a paid provider. Receipt contract, MCP parser, IPC and CLI
+tests pin the same nested allowlist and advisory age policy. Diagnostic tests
+exercise both fresh/index-upgrade parity and a genuinely interrupted PostgreSQL
+concurrent index build when a PostgreSQL fixture is supplied.
+
+`test/persistence-chaos.slow.test.ts` and `test/e2e/persistence-chaos.test.ts`
+execute real journal/coordinator schedules and eight SIGKILL publication
+boundaries, followed by a small multi-process soak. The Postgres test creates
+and drops fresh test databases, requiring CREATEDB on the explicit test URL.
+It never truncates the shared E2E database. The reusable
+`persistence-validation.yml` gate runs 1,000 schedules and 10,000 writes per
+engine under Bun 1.4.0 and 1.4.2 and uploads actual executed-case manifests;
+the sections above cover workloads, reruns, performance measurements and the
+process-crash scope.
+
+`test/e2e/persistence-runtime-matrix.test.ts` additionally requires the real
+transaction-mode PgBouncer fixture. Its 24 cells exercise direct/pooler
+connections, enforced RLS under a non-bypass role, ordinary pool sizes 1/2/3,
+and shared pools or a separate one-connection direct route. It verifies
+reserved short control capacity while bulk connections remain held, then
+drains and commits the original request. Ownership cases cover mismatched
+successor manifests, stale owners, root replacement under a held kernel
+lock, and actual source deletion/recreation. The reusable persistence lane
+runs this matrix on both supported Bun versions and uploads its manifest.
+
+The required persistence lane also runs `scripts/persistence/performance.ts`
+on both engines and Bun versions. Three independent instances use the
+existing 500-page/200-query read-latency corpus, with public `put_page`
+mutations and actual in-flight interval coverage of at least 90%. Any read
+or write failure invalidates the sample. CI uses `--informational`: the 50%
+loaded-versus-idle p99 threshold is advisory, not a merge blocker. Loaded
+reads compete with additional write work, so this ratio alone is not evidence
+of a change regressing the same workload. Manifests retain the original
+threshold verdict, each sample, admission/commit latency, queue age, RSS,
+recovery bytes and pool activity.
+The CLI without `--informational` still enforces the threshold. The original
+heavy shell entry invokes this harness; its optional `STRICT_LATENCY=1`
+flag affects only the latency threshold, never validity requirements.
+
+## Engine graduation tests
+
+Graduation (`gbrain migrate --to postgres`) is tested against two fixtures.
+`test/fixtures/graduation/legacy-brain.ts` builds a small brain by hand-written
+SQL on a fresh schema, and its expected outcomes live in `expected.json`
+beside it (`test/graduation-legacy-fixture.test.ts` proves the build matches
+and that the target checker discriminates).
+`scripts/persistence/graduation-fixture.ts` wraps `buildHistoryFixture` for
+the 1k and 10k history brains, builds keylessly in a child process, and
+caches each build as a tarball keyed by the fixture sources, schema version,
+seed and size (`GBRAIN_GRADUATION_FIXTURE_CACHE`, default
+`~/.cache/gbrain-graduation-fixtures`). A restore re-homes paths and owner
+stamps and marks sources synced, so the source doctor stays green.
+
+The E2E suites drive the real CLI in child processes, each split into files
+of about two minutes or less so CI queues spread them:
+`graduation-crash-run-N` and `graduation-crash-rollback-N` (SIGKILL at every
+run and rollback boundary), `graduation-faults` (ENOSPC on a tmpfs
+tablespace, which needs Docker; password rotation; DDL route mismatch),
+`graduation-clients` (older releases) and `graduation-clients-serve`
+(respawned and resident serve, stale CLI and MCP configs), and
+`graduation-cli` (agent flow, `--force`), `graduation-cli-topologies`
+(PgBouncer through `GBRAIN_PGBOUNCER_URL`, a NOSUPERUSER role),
+`graduation-cli-history` (the 1k round trip) and
+`graduation-cli-zero-mutation-N` (zero-mutation `--plan`/`--status`, each
+file probing a share of the custody boundaries). Kill and pause points come
+from `graduationBoundary()` hooks that only
+`test/helpers/graduation-hooks-preload.ts` registers. Older release binaries
+are built once per tag under `GBRAIN_OLDER_RELEASE_DIR`. A crash case takes
+about 16 seconds; `scripts/run-e2e.sh` gives every graduation file four times
+its per-file cap.
+`scripts/persistence/graduation-ttv.ts` records the commands and wall time
+from the first plan to a green doctor, the run's phase timings and query
+p50/p95 on both engines. The 1k-page gate is five minutes;
+`tests/heavy/graduation_10k.sh` reports the 10k run.

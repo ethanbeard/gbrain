@@ -3,6 +3,7 @@
  * Each stage reads the resolved request (HybridRequest, request.ts) and
  * writes its per-request accumulators only as `req.<field>`.
  */
+import { normalizeChainSlots } from '../relational-chain.ts';
 import type { BrainEngine } from '../../engine.ts';
 import { perArmPoolLimit } from '../eval-pool-depth.ts';
 import type { DegradedStageEntry, HybridSearchMeta, SearchOpts, SearchResult } from '../../types.ts';
@@ -16,7 +17,7 @@ import { normalizeExpansionVariantBudget } from '../fusion-lists.ts';
 import { normalizeKeywordArmConfidenceFloor } from '../arm-confidence.ts';
 import { normalizeMetadataBoostGate } from '../metadata-boost-gate.ts';
 import { normalizeRelationalRerankPin } from '../relational-rerank-pin.ts';
-import { parseRelationalQuery } from '../relational-intent.ts';
+import { isRelationalQuery } from '../relational-plan.ts';
 import { pushDegraded } from './degraded.ts';
 import { recordSearchTelemetry } from '../telemetry.ts';
 import { resolveBoostMap, resolveHardExcludes } from '../source-boost.ts';
@@ -64,6 +65,8 @@ export interface HybridRequest {
   decide?: DecideSearchContext;
   /** Set by the rerank stage when the System One reranker answered. */
   rerankMeta?: { model_resolved: string };
+  /** Set by the relational arm when the multi-hop planner ran (meta.relational_plan). */
+  relationalPlan?: import('../relational-recall.ts').RelationalPlanMeta;
 }
 
 const DEBUG = process.env.GBRAIN_SEARCH_DEBUG === '1';
@@ -124,6 +127,10 @@ export async function resolveHybridRequest(
       // Ranker wave (R1) — relational rerank pin per-call thread-through (eval
       // A/B); normalized through the ONE range contract (relational-rerank-pin.ts).
       relational_rerank_pin: normalizeRelationalRerankPin(opts?.relationalRerankPin),
+      // Multi-hop planner + one-hop orientation per-call thread-through (eval A/B).
+      relational_planner: typeof opts?.relationalPlanner === 'boolean' ? opts.relationalPlanner : undefined,
+      relational_orient_onehop: typeof opts?.relationalOrientOneHop === 'boolean' ? opts.relationalOrientOneHop : undefined,
+      relational_chain_slots: normalizeChainSlots(opts?.relationalChainSlots),
       // Ranker wave (Phase E2) — keyword-arm confidence floor per-call thread-through.
       keyword_arm_confidence_floor: normalizeKeywordArmConfidenceFloor(opts?.keywordArmConfidenceFloor),
       // Ranker wave (Phase E3) — metadata boost gate per-call thread-through (eval A/B).
@@ -284,14 +291,14 @@ export async function resolveHybridRequest(
   // Intent identity boosts (exact/mentioned title or slug, mentioned alias),
   // shared by the fused path and both keyword-only paths. Caller re-sorts.
 export async function applyIdentityBoosts(req: HybridRequest, list: SearchResult[]): Promise<void> {
-  const { engine, query, opts, suggestions, intentWeightingOn, intentWeights } = req;
+  const { engine, query, opts, suggestions, intentWeightingOn, intentWeights, resolvedMode } = req;
   if (intentWeights.exactMatchBoost === 1.0) {
     // #4694: general and temporal questions still honor a multi-token
     // title that is the query's subject. Not concept intent (Cat 13: a
     // lexical title decoy is exactly what paraphrase probes must not
     // reward) and not a relational question ("who invested in <title>"),
     // whose answer is the pages linked to that title, not the title page.
-    if (intentWeightingOn && suggestions.intent !== 'concept' && parseRelationalQuery(query) === null) {
+    if (intentWeightingOn && suggestions.intent !== 'concept' && !isRelationalQuery(query, resolvedMode.relational_planner)) {
       applyTitleMentionBoost(list, query);
     }
     return;
@@ -314,8 +321,11 @@ export function emitHybridMeta(req: HybridRequest, rawMeta: HybridSearchMeta): v
   const { engine, opts } = req;
   const decide = decideMetaFor(req.decide);
   const answerability = req.decide?.answerability;
-  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability
-    ? { ...rawMeta, ...(decide ? { decide } : {}), ...(req.rerankMeta ? { rerank: req.rerankMeta } : {}), ...(answerability ? { answerability } : {}) }
+  const meta: HybridSearchMeta = decide || req.rerankMeta || answerability || req.relationalPlan
+    ? {
+        ...rawMeta, ...(decide ? { decide } : {}), ...(req.rerankMeta ? { rerank: req.rerankMeta } : {}),
+        ...(answerability ? { answerability } : {}), ...(req.relationalPlan ? { relational_plan: req.relationalPlan } : {}),
+      }
     : rawMeta;
   try {
     opts?.onMeta?.(meta);

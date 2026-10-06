@@ -21,6 +21,7 @@ writes_to:
   - people/
   - companies/
   - concepts/
+when_to_use: "Use when the user asks: \"every substantive inbound message after automatic-capture opt-in\"."
 ---
 
 # Signal Detector — Ambient Brain Capture
@@ -141,6 +142,14 @@ brief and verify captured content with an actual readback. Without opt-in,
 perform no capture writes; a skipped-capture diagnostic is not a reason to
 interrupt every response or ask for enablement repeatedly.
 
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- No automatic-capture opt-in on record: do nothing. An API key, silence or a first-fire announcement is not consent.
+- A capture write returns `write_pending` (exit 10) or `revision_conflict`: never block the main reply; poll the receipt or re-read and merge on the next turn.
+- Paid enrichment of a thin page needs its own authorization; on `no_pricing` or a cost-cap refusal, skip enrichment and leave the page thin.
+
 ## Anti-Patterns
 
 - Blocking the main response to wait for signal detection to complete
@@ -160,3 +169,12 @@ interrupt every response or ask for enablement repeatedly.
 - `put_page` — create/update brain pages
 - `add_link` — cross-reference entities
 - `add_timeline_entry` — record events on entity timelines
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
+
+- `add_link` → `gbrain link`
+
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

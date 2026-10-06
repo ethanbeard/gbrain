@@ -203,8 +203,9 @@ export function sourceE2ECorpus(commit: string): string[] {
   const tracked = git(["ls-tree", "-r", "--name-only", commit]).split("\n").filter(file => file.endsWith(".test.ts"));
   const root = mkdtempSync(join(tmpdir(), "gbrain-full-e2e-source-"));
   try {
-    mkdirSync(join(root, "scripts"));
+    mkdirSync(join(root, "scripts/lib"), { recursive: true });
     writeFileSync(join(root, "scripts/run-e2e.sh"), git(["show", `${commit}:scripts/run-e2e.sh`]));
+    writeFileSync(join(root, "scripts/lib/test-env.sh"), git(["show", `${commit}:scripts/lib/test-env.sh`]));
     writeFileSync(join(root, "scripts/e2e-live-key-only.txt"), git(["show", `${commit}:scripts/e2e-live-key-only.txt`]));
     for (const file of tracked) {
       mkdirSync(dirname(join(root, file)), { recursive: true });

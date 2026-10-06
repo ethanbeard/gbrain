@@ -22,6 +22,7 @@
 import { describe, test, expect } from 'bun:test';
 import { __testing as captureTesting } from '../src/commands/capture.ts';
 import { computeContentHash } from '../src/core/ingestion/types.ts';
+import { caught, envelopeFor } from './helpers/agent-envelope.ts';
 
 const { detectBinaryNullByte, detectBinarySignature, normalizeForHash, maybeRewriteSourceFkError } = captureTesting;
 
@@ -245,5 +246,19 @@ describe('A2 — maybeRewriteSourceFkError (friendly FK violation hint)', () => 
     const hint = maybeRewriteSourceFkError('pages_source_id_fk constraint violation', 'foo');
     expect(hint).not.toBeNull();
     expect(hint).toContain("source 'foo'");
+  });
+});
+
+describe('capture argument refusals name their own next step', () => {
+  test('an unsupported option lists the accepted flags, offers the help and never echoes its value', async () => {
+    const env = envelopeFor(await caught(() => captureTesting.parseArgs(['--token=synthetic-credential-value', 'note'])));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'capture', '--help'], next: 'run' } });
+    expect(env.suggestion).toContain('Remove --token; gbrain capture accepts --file');
+    expect(JSON.stringify(env)).not.toContain('synthetic-credential-value');
+  });
+
+  test('a mutation flag without a UUID names where the value comes from', async () => {
+    expect(envelopeFor(await caught(() => captureTesting.parseArgs(['--expected-revision']))).suggestion).toContain('gbrain get --json');
+    expect(envelopeFor(await caught(() => captureTesting.parseArgs(['--request-id', '--json']))).suggestion).toContain('replays that request');
   });
 });

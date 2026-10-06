@@ -87,7 +87,11 @@ export function inspectGmailAttachments(root: GmailMimePart | undefined, account
       id: createHash('sha256').update(JSON.stringify([account.toLowerCase(), messageId, partId, path])).digest('hex'),
       account, messageId, partId, filename, mimeType,
       size: typeof part.body?.size === 'number' && Number.isSafeInteger(part.body.size) && part.body.size >= 0 ? part.body.size : null,
-      attachmentId: part.body?.attachmentId || null,
+      // #5802: attachmentId is an ephemeral fetch handle (Gmail rotates it per
+      // request); persisting it made every receipt differ each sync and forced
+      // permanent re-admission. partId + messageId + sha256 id identify the
+      // attachment; the handle is re-fetched when download is implemented.
+      attachmentId: null,
       kind: calendar ? 'calendar' : disposition === 'inline' || gmailPartHeader(part, 'Content-ID') ? 'inline' : 'document',
       fetched: false, indexed: false,
     };

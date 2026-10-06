@@ -7,7 +7,7 @@ import { hashToken } from '../src/core/utils.ts';
 import { hasScope } from '../src/core/scope.ts';
 import { readClientGrant, rescopeClientGrant, resolveGrantProfile, intersectGrantedScopes, grantValidationContext, delegationReasons } from '../src/core/grants/service.ts';
 import { repairLegacyClientGrants } from '../src/core/grants/migration.ts';
-import { parseRescopeGrantArgs } from '../src/core/grants/cli.ts';
+import { parseClientRescopeArgs, parseRescopeGrantArgs } from '../src/core/grants/cli.ts';
 import type { AuthInfo } from '../src/core/ops/contract.ts';
 import type { Response } from 'express';
 import { opAllowedForBoundClient } from '../src/core/ops/context.ts';
@@ -326,6 +326,38 @@ describe('client capability grants', () => {
     expect(parsed.repair).toBe(true);
     expect(parsed.dryRun).toBe(true);
     expect(() => parseRescopeGrantArgs(['--if-version', '-1'])).toThrow('non-negative');
+  });
+
+  test('operations all drops the snapshot and the profile; a csv still sets a snapshot', () => {
+    expect(parseRescopeGrantArgs(['--allowed-operations', 'all']).patch).toEqual({ allowedOperations: null, profile: null });
+    expect(parseClientRescopeArgs('client-example', ['--operations', 'all']).patch).toEqual({ allowedOperations: null, profile: null });
+    expect(parseClientRescopeArgs('client-example', ['--allowed-operations', 'all']).patch).toEqual({ allowedOperations: null, profile: null });
+    expect(parseRescopeGrantArgs(['--allowed-operations', 'get_page,search']).patch).toEqual({ allowedOperations: ['get_page', 'search'] });
+    expect(() => parseRescopeGrantArgs(['--profile', 'memory-writer', '--allowed-operations', 'all'])).toThrow('not both');
+    expect(() => parseClientRescopeArgs('client-example', ['--profile', 'memory-writer', '--operations', 'all'])).toThrow('not both');
+  });
+
+  test('admin API: a null operation list clears the profile unless a profile is named', () => {
+    expect(parseAdminGrantRequest({ allowedOperations: null }).patch).toEqual({ allowedOperations: null, profile: null });
+    const named = parseAdminGrantRequest({ allowedOperations: null, profile: 'memory-writer' }).patch;
+    expect(named.profile).toBe('memory-writer');
+    expect(named.scopes).toEqual(['read', 'write']);
+    expect(parseAdminGrantRequest({ allowedOperations: ['get_page'] }).patch.profile).toBeUndefined();
+  });
+
+  test('a profile-snapshot client rescoped to operations all returns to the unrestricted grant', async () => {
+    const created = await memoryClient('operations-all-example');
+    const before = await readClientGrant(engine, created.clientId);
+    expect(before.profile).toBe('memory-writer');
+    expect(before.allowedOperations!.length).toBeGreaterThan(0);
+    await expect(rescopeClientGrant(engine, created.clientId, { allowedOperations: null }, { actor: 'test' })).rejects.toThrow();
+    const result = await rescopeClientGrant(engine, created.clientId, parseClientRescopeArgs(created.clientId, ['--operations', 'all']).patch,
+      { actor: 'test', expectedRevision: before.revision });
+    expect(result.after).toMatchObject({ profile: null, allowedOperations: null, scopes: before.scopes, surface: before.surface });
+    const [row] = await engine.executeRaw('SELECT grant_profile, allowed_operations FROM oauth_clients WHERE client_id = $1', [created.clientId]);
+    expect(row).toEqual({ grant_profile: null, allowed_operations: null });
+    const tokens = await provider.exchangeClientCredentials(created.clientId, created.clientSecret!);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeDefined();
   });
 });
 

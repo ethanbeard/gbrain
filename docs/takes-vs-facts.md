@@ -21,15 +21,25 @@ The epistemological layer. WHO believes WHAT, with confidence weight and time.
 
 **Query surface:** `gbrain takes list`, `gbrain takes search`, `gbrain takes search --semantic`, `gbrain think`
 
-Run `gbrain takes embed` after extraction to populate the take vectors used by
-semantic search and the `think` vector stream. `gbrain takes embed --dry-run`
-shows the pending provider work without making calls.
+Take vectors (used by `takes search --semantic` and the `think` vector stream)
+are kept current by `gbrain embed --stale`, which the cycle's embed phase runs:
+it embeds every active take that has no vector, whose claim changed since it
+was embedded, or whose vector came from another embedding model. Each vector
+records the model and the claim text it was computed from. Takes on deleted
+pages or archived sources are skipped. `gbrain takes embed` runs the same pass
+on its own; `gbrain takes embed --dry-run` shows the pending provider work
+without making calls.
 
-The `takes.embedding` column follows your configured embedding dimension
-(migration v142): if the configured model's width differs from the column,
-the migration resizes it and clears every existing take vector by design —
-run `gbrain takes embed` once after the migration to repopulate them. Until you
-do, `think` falls back to keyword-only takes retrieval and
+To stop automatic take embedding, run `gbrain config set takes.auto_embed false`
+(or set `GBRAIN_EMBED_TAKES=0` for one process; the variable wins over the
+config key). `gbrain takes embed` keeps working when it is off.
+
+`gbrain migrate embeddings` moves take vectors with the rest of the brain: the
+plan counts stale takes, a width change resizes `takes.embedding`, the re-embed
+drain refills it, and the run does not complete while takes are still stale.
+`gbrain doctor` reports takes and facts without a current-model vector in the
+`fact_take_vectors` check ([verification runbook](GBRAIN_VERIFY.md#5a-fact-and-take-vectors)).
+Until take vectors exist, `think` falls back to keyword-only takes retrieval and
 `takes search --semantic` simply reports no semantic matches.
 
 ## Facts (hot memory — `facts` table)
@@ -117,5 +127,5 @@ Known limitation: the owner can also
 appear under `brain` (a take the owner asserts, via `propose_takes`) and
 `people/<owner>` (extraction that names the owner). The resolver selects the
 *default* canonical owner string for reads; it does not merge those other
-strings. Per-take attribution for other people (e.g. `people/george`) is
+strings. Per-take attribution for other people (e.g. `people/bob-example`) is
 unaffected and correct.

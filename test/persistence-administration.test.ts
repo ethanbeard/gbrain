@@ -16,6 +16,7 @@ import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
 import { parsePersistenceAdminArgs } from '../src/commands/persistence-admin.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { reviewedWriterIntent } from './helpers/writer-admin-intent.ts';
+import { caught, envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 let engine: PGLiteEngine;
 let brainId: string;
@@ -168,5 +169,52 @@ describe('local writer administration', () => {
     expect(() => parsePersistenceAdminArgs('writer', ['claim', 'default', '--source', 'other'])).toThrow('Specify the source once');
     expect(() => parsePersistenceAdminArgs('writer', ['status', '--probe=false'])).toThrow('does not accept a value');
     expect(() => parsePersistenceAdminArgs('writer', ['transfer', 'steal', 'default'])).toThrow('prepare or accept');
+  });
+});
+
+describe('administration refusals name their own next step', () => {
+  test('every invalid() and uuid() call site carries a site-specific suggestion', () => {
+    expectFunnelSuggestions('src/core/persistence/administration.ts', 'invalid', 15);
+    expectFunnelSuggestions('src/core/persistence/administration.ts', 'uuid', 4);
+    expectFunnelSuggestions('src/commands/persistence-admin.ts', 'invalid', 8);
+  });
+
+  test('a grant naming an inactive source names it and reads the source list', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_register', { lane: 'stdio', source_ids: ['missing-source'] })));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'list', '--json'], next: 'run' } });
+    expect(env.suggestion).toContain('missing-source');
+  }));
+
+  test('a grant outside its scope names the operations to remove', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_register', { lane: 'stdio', allowed_operations: ['writer_status'] })));
+    expect(env.code).toBe('invalid_params');
+    expect(env.suggestion).toContain('Remove writer_status from --allowed-operations');
+  }));
+
+  test('activation without --confirm-quiesced points at the reviewed status', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'writer_activate', {})));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'writer', 'status', '--json'], next: 'run' } });
+    expect(env.suggestion).toContain('--admin-intent writer_activate');
+  }));
+
+  test('deactivate with a source previews the brain-wide change instead', () => isolated(async () => {
+    const env = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'writer_deactivate', { source_id: 'default' })));
+    expect(env).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'writer', 'deactivate', '--dry-run', '--json'], next: 'run' } });
+  }));
+
+  test('revoke with a malformed id reads the writer list; a non-boolean flag names its CLI form', () => isolated(async () => {
+    const revoke = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_revoke', { id: 'nope' })));
+    expect(revoke).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'], next: 'run' } });
+    const dryRun = envelopeFor(await caught(() => runPersistenceAdministration(engine, 'local_writer_revoke', { id: 'nope', dry_run: 'yes' })));
+    expect(dryRun.suggestion).toContain('--dry-run');
+  }));
+
+  test('CLI usage refusals name the exact usage and offer the group help', async () => {
+    const duplicate = envelopeFor(await caught(() => parsePersistenceAdminArgs('writer', ['claim', 'default', '--source', 'other'])));
+    expect(duplicate).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'writer', '--help'], next: 'run' } });
+    expect(duplicate.suggestion).toContain('default and other');
+    const unknown = envelopeFor(await caught(() => parsePersistenceAdminArgs('local-writer', ['list', '--force'])));
+    expect(unknown).toMatchObject({ fix: { argv: ['gbrain', 'auth', 'local-writer', '--help'] } });
+    expect(unknown.suggestion).toContain('Remove --force');
   });
 });

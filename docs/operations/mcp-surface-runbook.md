@@ -7,16 +7,86 @@ behavior only; release history lives in `CHANGELOG.md` + git. Companion referenc
 scope/starter/gate), `docs/protocol/MEMORY_VERBS_v1.md` (surface modes),
 `docs/protocol/MCP_META_CHANNELS.md` (`_meta` conventions).
 
-Everything below assumes `gbrain serve --http` (the OAuth transport).
+The moves below assume `gbrain serve --http` (the OAuth transport); stdio
+surfaces come first.
 tools/list is recomputed **per request** — none of these moves needs a
 server restart unless it says so.
+
+## Stdio surfaces (the owner's pipe)
+
+A stdio `gbrain serve` resolves its surface once at start, then a session may
+widen it:
+
+| Precedence | Source | `surface_source` |
+|---|---|---|
+| 1 | `GBRAIN_SURFACE` in the server's env (`verbs`, `starter` or `full`) | `env` |
+| 2 | `--surface <verbs\|starter\|full>` | `flag` |
+| 3 | config `mcp_surface` | `config` |
+| 4 | `full` | `default` |
+
+`serve` prints `surface=<x> (source: …)` on stderr at start; `whoami`,
+`gbrain://capabilities` and the status-only `gbrain_status` report `surface`
+and `surface_source`. An invalid `GBRAIN_SURFACE` never stops the server: it
+is ignored with a stderr line, and the first successful tool result carries
+one `surface_env_invalid` info notice naming the surface actually served.
+`serve --http` ignores `GBRAIN_SURFACE` (its ceiling widens only through an
+explicit `--surface` restart; `GBRAIN_MCP_FORCE_SURFACE` narrows it).
+
+**Registrations.** Every stdio registration gbrain writes pins `starter`
+(`REGISTRATION_SURFACE` in `src/core/mcp-registration.ts`): readiness's
+`harness_wiring` fix, `gbrain init`'s quickstart line, `gbrain bootstrap
+hooks` for Claude Code, Codex and opencode, and the plugins.
+`gbrain init --surface` and `gbrain bootstrap hooks --surface` pick another.
+`bootstrap hooks` never narrows an existing install: a matching registration
+is kept untouched, and a replaced one keeps its form (a pinned `--surface x`
+stays `x`, a bare `serve` stays bare). The OpenClaw plugin manifest runs a
+bare `serve`, so config `mcp_surface` decides there.
+
+**Bootstrap starter gaps.** The tools bootstrap's workspace instructions name
+that `starter` lacks, with their CLI equivalents:
+
+| Tool | CLI equivalent |
+|---|---|
+| `get_timeline` | `gbrain timeline <slug>` |
+| `extract_facts` | `gbrain call extract_facts '<params_json>'` |
+
+A call to either on a starter session gets the hidden-tool hint below.
+
+**Session widening.** On the owner's stdio pipe, `request_tools {surface}`
+widens this session's tool set (never past `--access read-only` or
+`GBRAIN_MCP_FORCE_SURFACE`), sends `tools/list_changed`, and returns the new
+tools' schemas so a client that ignores `list_changed` can call them by name.
+Nothing is written; a new session starts at the registered surface. Each widen
+writes a `surface_widened from=<x> to=<y> op=request_tools` line on stderr.
+`gbrain config set mcp.allow_session_widen false` turns widening off; the
+hidden-tool hint then names the lasting route instead.
+
+```text
+→ tools/call get_health {}
+← unknown_tool: get_health exists, but this session serves the starter tool surface, which does not include it.
+  fix: request_tools {"surface":"full"}   next: run
+→ tools/call request_tools {"surface":"full"}
+← {"persisted":false,"scope":"session","surface":"full","previous":"starter","tools":[{"name":"get_health",…},…],
+   "note":"This session now serves 'full' (tools/list_changed was sent). Call the new tools by name now; …"}
+← notifications/tools/list_changed
+→ tools/call get_health {}
+← { …health report… }
+```
+
+For a lasting change, put `GBRAIN_SURFACE=full` in the harness's per-server
+env block (`claude mcp add gbrain -e GBRAIN_SURFACE=full -- …`, the `env`
+table of the Codex server entry, or the plugin's `GBRAIN_SURFACE` setting),
+never a shell profile: an inherited `GBRAIN_SURFACE` overrides every pinned
+`--surface` on the machine.
 
 ## Move 1 — flip a publish gate
 
 Gated ops (`Operation.publishGateKey`): `list_skills` / `get_skill` /
 `list_brain_skillpack` (`mcp.publish_skills`) and `advisor`
-(`mcp.publish_advisor`). Both gates default OFF: the ops are hidden from
-remote tools/list AND denied at call time.
+(`mcp.publish_advisor`). Both gates default OFF for remote HTTP callers: the
+ops are hidden from remote tools/list AND denied at call time. The read-only
+advisor defaults ON for the owner's local stdio server (an explicit `false`
+hides it there too).
 
 ```bash
 gbrain config set mcp.publish_skills true      # or mcp.publish_advisor

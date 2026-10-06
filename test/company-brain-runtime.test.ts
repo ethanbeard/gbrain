@@ -18,6 +18,7 @@ import { performSync } from '../src/commands/sync.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { submitEmbedBackfill } from '../src/core/embed-backfill-submit.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { makeGitFixture } from './helpers/git-fixture.ts';
 import * as verification from '../src/core/company-brain/verification.ts';
 
@@ -202,7 +203,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
       const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0, 8)}`, path: root,
         plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false, requestId: randomUUID() };
       expect((await connectCompanyBrain(engine, input)).ok).toBe(true);
-      await engine.transaction(tx => withCoordinatedWrite(tx, [input.sourceId], () => tx.addTag('customers/account', 'retained-tag', { sourceId: input.sourceId })));
+      await engine.transaction(tx => withCoordinatedWrite(tx, [input.sourceId], () => tx.addTag('customers/account', 'retained-tag', { sourceId: input.sourceId }), TEST_WRITE_ATTRIBUTION));
       const file = join(root, 'customers/account.md');
       const changed = readFileSync(file, 'utf8') + '\nA committed source update.\n';
       writeFileSync(file, changed); git(root, 'add', '.'); git(root, 'commit', '-qm', 'Synthetic source update');

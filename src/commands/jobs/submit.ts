@@ -5,6 +5,8 @@ import { assertEmbedBackfillQueueAdmission } from '../../core/minions/embed-back
 import { clampLockDurationMs } from '../../core/minions/handler-timeouts.ts';
 import { MinionWorker } from '../../core/minions/worker.ts';
 import { reportInlineWorkerConfiguration } from '../jobs-readiness.ts';
+import { intFlagValue, numberFlagValue } from '../../cli/flag-values.ts';
+import { spendSubmitSummary, type SpendAuthorization } from '../../core/minions/spend-authorization.ts';
 
 export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext): Promise<void> {
   // Lazy: jobs.ts imports this module statically, so a static import back would be a cycle.
@@ -22,11 +24,15 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
     catch { console.error('Error: --params must be valid JSON'); process.exit(1); }
   }
 
-  const priority = parseInt(parseFlag(args, '--priority') ?? '0', 10);
-  const delay = parseInt(parseFlag(args, '--delay') ?? '0', 10);
-  const maxAttempts = parseInt(parseFlag(args, '--max-attempts') ?? '3', 10);
-  const maxStalledRaw = parseFlag(args, '--max-stalled');
-  const maxStalled = maxStalledRaw !== undefined ? parseInt(maxStalledRaw, 10) : undefined;
+  // #5936 (D4): numeric flags are validated strictly (usage error, exit 2) before anything is enqueued.
+  const optionalInt = (flag: string, rule: Parameters<typeof intFlagValue>[2]) => {
+    const raw = parseFlag(args, flag);
+    return raw === undefined ? undefined : intFlagValue(raw, flag, rule);
+  };
+  const priority = optionalInt('--priority', { example: 0 }) ?? 0;
+  const delay = optionalInt('--delay', { min: 0, example: 0 }) ?? 0;
+  const maxAttempts = optionalInt('--max-attempts', { min: 1, example: 3 }) ?? 3;
+  const maxStalled = optionalInt('--max-stalled', { min: 0, example: 1 });
   // --max-waiting N: submission-time backpressure cap. Mirrors --max-stalled
   // clamp [1, 100]. Feature is usable from CLI as of v0.19.1; pre-v0.19.1
   // only programmatic callers reached it.
@@ -39,25 +45,14 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
   const backoffType = backoffTypeRaw === 'fixed' || backoffTypeRaw === 'exponential'
     ? backoffTypeRaw
     : undefined;
-  const backoffDelayRaw = parseFlag(args, '--backoff-delay');
-  const backoffDelay = backoffDelayRaw !== undefined ? parseInt(backoffDelayRaw, 10) : undefined;
+  const backoffDelay = optionalInt('--backoff-delay', { min: 0, example: 1000 });
   const backoffJitterRaw = parseFlag(args, '--backoff-jitter');
-  const backoffJitter = backoffJitterRaw !== undefined ? parseFloat(backoffJitterRaw) : undefined;
-  const timeoutMsRaw = parseFlag(args, '--timeout-ms');
-  const timeoutMs = timeoutMsRaw !== undefined ? parseInt(timeoutMsRaw, 10) : undefined;
-  if (timeoutMsRaw !== undefined && (isNaN(timeoutMs!) || timeoutMs! <= 0)) {
-    console.error('Error: --timeout-ms must be a positive integer (milliseconds)');
-    process.exit(1);
-  }
+  const backoffJitter = backoffJitterRaw === undefined ? undefined : numberFlagValue(backoffJitterRaw, '--backoff-jitter', { min: 0, max: 1, example: 0.2 });
+  const timeoutMs = optionalInt('--timeout-ms', { min: 1, example: 60000 });
   // #4145: per-job lock lease. Clamped to [5s,1h] in queue.add via
   // clampLockDurationMs (shared with the MCP op); NULL falls to the
   // handler map, then the worker default.
-  const lockDurationMsRaw = parseFlag(args, '--lock-duration-ms');
-  const lockDurationMs = lockDurationMsRaw !== undefined ? parseInt(lockDurationMsRaw, 10) : undefined;
-  if (lockDurationMsRaw !== undefined && (isNaN(lockDurationMs!) || lockDurationMs! <= 0)) {
-    console.error('Error: --lock-duration-ms must be a positive integer (milliseconds)');
-    process.exit(1);
-  }
+  const lockDurationMs = optionalInt('--lock-duration-ms', { min: 1, example: 300000 });
   const idempotencyKey = parseFlag(args, '--idempotency-key');
   const queueName = parseFlag(args, '--queue') ?? 'default';
   const dryRun = hasFlag(args, '--dry-run');
@@ -99,8 +94,39 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
     return;
   }
 
+  // A4: an explicit embedding backfill submitted from the CLI is paid work (the worker-side handlers keep running unattended).
+  const { EMBED_BACKFILL_JOB_NAMES, requireEmbedBackfillConsent } = await import('../../core/embed-consent.ts');
+  if (EMBED_BACKFILL_JOB_NAMES.has(name)) {
+    const { isConsentRefusal, printConsentRefusal } = await import('../../core/consent.ts');
+    const { setCliExitVerdict } = await import('../../core/cli-force-exit.ts');
+    const argv = ['gbrain', 'jobs', ...args.filter(a => a !== '--yes')];
+    try {
+      await requireEmbedBackfillConsent(engine, {
+        command: 'jobs submit', argv, preview_argv: [...argv, '--dry-run'], args,
+        scope: { all: data.all === true, ...(typeof data.sourceId === 'string' ? { sourceId: data.sourceId } : {}), unestimated: Array.isArray(data.slugs) },
+      });
+    } catch (e) {
+      if (!isConsentRefusal(e)) throw e;
+      setCliExitVerdict(printConsentRefusal(e, { json: hasFlag(args, '--json') }));
+      return;
+    }
+  }
+
+  // A4 + T8: queued paid enrich/subagent work needs the user's authorization; it is stored on the row and the worker enforces its cap.
+  let spendAuthorization: SpendAuthorization | undefined;
+  if (PAID_SUBMIT_NAMES.has(name)) {
+    const authorized = await authorizePaidSubmit(engine, name, data, args);
+    if (!authorized) return;
+    spendAuthorization = authorized;
+  }
+
   try { await queue.ensureSchema(); }
   catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
+
+  if (engine.kind === 'pglite' && !follow && !hasFlag(args, '--queue-only')) {
+    await refuseNoWorker(args, name, queueName);
+    return;
+  }
 
   // v0.35.8.0: pre-enqueue shell-job validation. Validates `inherit:`
   // closed enum, rejects secret env-keys, fail-fasts on missing config.
@@ -131,7 +157,10 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
     lock_duration_ms: lockDurationMs,
     idempotency_key: idempotencyKey,
     queue: queueName,
-  }, trusted);
+  }, { ...trusted, ...(spendAuthorization ? { spendAuthorization } : {}) });
+  if (spendAuthorization) {
+    for (const line of spendSubmitSummary(spendAuthorization, [job], spendAuthorization.argv ?? []).lines) process.stderr.write(`${line}\n`);
+  }
 
   // Submission audit log (operational trace, not forensic insurance).
   try {
@@ -220,4 +249,64 @@ export async function runJobsSubmit({ args, engine, queue }: JobsCommandContext)
   } else {
     console.log(JSON.stringify(job, null, 2));
   }
+}
+
+/** Paid job names a CLI submit must authorize (the consent-gated producers' job types). */
+const PAID_SUBMIT_NAMES = new Set(['enrich', 'subagent']);
+
+/**
+ * The same consent gate the producing commands run: `--yes` (derived or
+ * default cap), `--max-usd <usd>`, a preapproval or tokenmax authorize it,
+ * `--max-usd off` is the explicit uncapped choice; otherwise exit 3 with the
+ * consent payload and nothing queued. Returns the record to store, or null.
+ */
+async function authorizePaidSubmit(engine: JobsCommandContext['engine'], name: string, data: Record<string, unknown>, args: string[]): Promise<SpendAuthorization | null> {
+  const { consentGate, engineConsentEnv } = await import('../../core/consent-cli.ts');
+  const { jobSpendAuthorization } = await import('../../core/minions/spend-authorization.ts');
+  const argv = ['gbrain', 'jobs', ...args.filter(a => a !== '--yes')];
+  const maxUsd = parseFlag(args, '--max-usd');
+  if (maxUsd !== undefined && ['off', 'unlimited', 'none'].includes(maxUsd.trim().toLowerCase())) {
+    return jobSpendAuthorization({ uncapped: true, via: 'max_usd' }, { command: `jobs submit ${name}`, of: 1, argv });
+  }
+  const { DEFAULT_LIMIT } = await import('../enrich.ts');
+  const estUsd = name === 'enrich'
+    ? Math.ceil((typeof data.limit === 'number' && data.limit > 0 ? data.limit : DEFAULT_LIMIT) * 0.01 * 100) / 100
+    : null;
+  const auth = await consentGate({
+    command: `jobs submit ${name}`, effects: ['paid'], actor: 'agent',
+    what: `Queue a paid ${name} job`,
+    why: name === 'enrich'
+      ? 'An enrich job writes model-generated summaries into thin pages and pays the chat model provider per page.'
+      : 'A subagent job runs a model tool loop and pays the model provider for every turn.',
+    risk: estUsd !== null
+      ? `Spends about $${estUsd.toFixed(2)} with the chat model provider once a worker runs it. Without --max-usd, a model with no known price runs unmetered under the derived or default cap.`
+      : 'Spends with the model provider once a worker runs it; with no estimate the default $5 cap applies unless --max-usd sets one. Without --max-usd, a model with no known price runs unmetered under the derived or default cap.',
+    user_message: estUsd !== null
+      ? `Queue an enrich job that spends about $${estUsd.toFixed(2)}?`
+      : `Queue a subagent job that spends up to $5 unless you set another cap?`,
+    argv, preview_argv: [...argv, '--dry-run'], est_usd: estUsd, args,
+  }, { json: hasFlag(args, '--json'), env: engineConsentEnv(engine) });
+  return auth ? jobSpendAuthorization(auth, { command: `jobs submit ${name}`, of: 1, argv, ...(estUsd !== null ? { est_usd: estUsd } : {}) }) : null;
+}
+
+/**
+ * Queue honesty (agent-first operator wave E5): PGLite has no background
+ * worker, so a plain submit would leave the job waiting with no error. Refuse
+ * with `no_worker` and the exact `--follow` command; `--queue-only` queues it
+ * deliberately for a later `gbrain jobs work` drain.
+ */
+async function refuseNoWorker(args: string[], name: string, queueName: string): Promise<void> {
+  const { opError } = await import('../../core/ops/contract.ts');
+  const { renderCliError } = await import('../../core/agent-output.ts');
+  const { setCliExitVerdict, writeStdoutFinal } = await import('../../core/cli-force-exit.ts');
+  const err = opError('no_worker',
+    `PGLite has no background worker, so job '${name}' would wait in queue '${queueName}' until something runs it. Nothing was queued.`,
+    'Run it now with --follow, or pass --queue-only to queue it for a later `gbrain jobs work` drain.',
+    { why: 'PGLite brains have no background worker (the database is single-writer), so a queued job waits with no error until a `gbrain jobs work` drain runs it.',
+      fix: { argv: ['gbrain', 'jobs', ...args, '--follow'], consent: [], actor: 'agent', requires_exclusive: true,
+      why: '--follow runs the job in this process and waits for its result; it needs the brain to itself, so any running `gbrain serve` must stop first.' } });
+  const out = renderCliError(err, { json: hasFlag(args, '--json'), command: 'jobs submit', tty: !!process.stderr.isTTY });
+  if (out.stdout) await writeStdoutFinal(out.stdout);
+  if (out.stderr) process.stderr.write(out.stderr);
+  setCliExitVerdict(out.exitCode);
 }

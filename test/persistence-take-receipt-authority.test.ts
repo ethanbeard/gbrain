@@ -4,6 +4,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import { mintLegacyToken } from '../src/core/token-mint.ts';
+import { parseRescopeTokenArgs, rescopeLegacyToken } from '../src/core/grants/legacy-token.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { compactWriteReceipts, getWriteRequest } from '../src/core/persistence/journal.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -71,8 +72,9 @@ test('holder narrowing hides every affected take receipt and replay after real c
     await engine.executeRaw("UPDATE persistence_requests SET authority=authority-'takeHoldersUsed' WHERE request_id=$1::uuid",
       [privateCalls[0].params.request_id]);
     expect((await operationsByName.get_write_request.handler(ctx, { request_id: privateCalls[0].params.request_id }) as any).state).toBe('committed');
-    await engine.executeRaw('UPDATE access_tokens SET permissions=$2::text::jsonb WHERE id=$1::uuid',
-      [token.id, JSON.stringify({ source_id: [sourceId], takes_holders: ['world'] })]);
+    // F3: narrow through the grant editor (columns + JSONB mirror). A raw
+    // JSONB-only edit now reads as older-binary drift and denies the axis.
+    await rescopeLegacyToken(engine, parseRescopeTokenArgs(['--id', token.id, '--takes-holders', 'world']));
     const narrowed = { ...ctx, takesHoldersAllowList: ['world'] };
     for (const call of privateCalls) {
       const row = (await getWriteRequest(engine, principal, String(call.params.request_id)))!;

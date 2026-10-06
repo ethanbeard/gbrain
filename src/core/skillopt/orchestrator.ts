@@ -99,7 +99,7 @@
 import { assertLegacySkillWriter } from '../skillpack/writer-guard.ts';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
+import { BudgetExhausted, BudgetTracker, loadPricingOverrides, type NoPricingGuidance } from '../budget/budget-tracker.ts';
 import type { PricingOverrides } from '../budget/reservation-cost.ts';
 import { buildModelsUsed } from '../budget/models-used.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
@@ -272,6 +272,7 @@ export async function runSkillOpt(opts: SkillOptOpts): Promise<RunSkillOptResult
     targetModel: opts.targetModel,
     judgeModel: opts.judgeModel,
     maxCostUsd: opts.maxCostUsd,
+    maxCostSource: opts.maxCostSource ?? 'user',
     heldOutSize: heldOutTasks.length,
     interactive: process.stderr.isTTY === true,
     reflectMaxTokens: reflectCap.maxTokens,
@@ -284,7 +285,15 @@ export async function runSkillOpt(opts: SkillOptOpts): Promise<RunSkillOptResult
       trainSize: split.train.length, selSize: split.sel.length, testSize: split.test.length,
       optimizerModel: opts.optimizerModel, targetModel: opts.targetModel, judgeModel: opts.judgeModel,
       maxCostUsd: opts.maxCostUsd,
+      maxCostSource: opts.maxCostSource ?? 'user',
     }) + '\n');
+  }
+  if (preflightResult.abort_code === 'no_pricing') {
+    throw errorFor({
+      class: 'BudgetExhausted',
+      code: 'no_pricing',
+      message: `${preflightResult.abort_reason} No model call was made; or pass --max-usd off to run uncapped.`,
+    });
   }
   if (!preflightResult.proceed) {
     throw errorFor({
@@ -372,6 +381,8 @@ export function classifyAbortError(
   outcome: 'aborted' | 'errored';
   abortReason: 'budget_exhausted' | 'runtime_exceeded' | 'sigint' | 'error';
   abortDetail: string;
+  /** A no_pricing abort's lookup-and-register guidance. */
+  pricing?: NoPricingGuidance;
 } {
   const msg = err instanceof Error ? err.message : String(err);
   if (err instanceof BudgetExhausted) {
@@ -379,6 +390,7 @@ export function classifyAbortError(
       outcome: 'aborted',
       abortReason: err.reason === 'runtime' ? 'runtime_exceeded' : 'budget_exhausted',
       abortDetail: msg,
+      ...(err.pricing ? { pricing: err.pricing } : {}),
     };
   } else if (msg.includes(SKILLOPT_RUNTIME_EXCEEDED)) {
     return {
@@ -522,7 +534,7 @@ async function runOptimizationLoop(
   // hard BudgetExhausted(no_pricing) abort to the legacy warn-once path, so
   // unpriced model ids (openrouter:*, litellm:*) can run at the user's own risk.
   const tracker = new BudgetTracker({
-    ...(opts.maxCostUsd > 0 ? { maxCostUsd: opts.maxCostUsd } : {}),
+    ...(opts.maxCostUsd > 0 ? { maxCostUsd: opts.maxCostUsd, capSource: opts.maxCostSource ?? 'user' } : {}),
     ...(resolved.pricingOverrides ? { pricingOverrides: resolved.pricingOverrides } : {}),
     label: `skillopt:${skillName}`,
   });
@@ -1044,7 +1056,7 @@ async function runOptimizationLoop(
     // #3516: abort/error detail rides the receipt so --json consumers and the
     // CLI's stderr summary both see WHY, not just that the run died.
     ...(abortReason !== undefined ? { abort_reason: abortReason } : {}),
-    ...(abortDetail !== undefined ? { abort_detail: abortDetail } : {}),
+    ...(abortDetail !== undefined ? { abort_detail: abortDetail, ...(caught?.pricing ? { no_pricing: caught.pricing } : {}) } : {}),
     stop_reason: stopReason,
     ...(tally.reflect_errors.length > 0 ? { reflect_errors: [...tally.reflect_errors] } : {}),
     ...(tally.invalid_edits_dropped > 0 ? { reflect_invalid_edits_dropped: tally.invalid_edits_dropped } : {}),

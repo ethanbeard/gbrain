@@ -440,6 +440,9 @@ describeE2E('E2E: sync --skip-failed structured summary loop (v0.22.12, issue #5
     // #2114: see resetBrainRepoIdentity above — setupDB truncates config but
     // not sources, and this block syncs a brand-new mkdtemp repo.
     await resetBrainRepoIdentity();
+    // #5988: content refusals are held by default; this block pins the
+    // fail-closed ledger gate, which sync.holds=fail keeps.
+    await getEngine().setConfig('sync.holds', 'fail');
 
     // Save+clear the real ~/.gbrain/sync-failures.jsonl so the test starts from
     // a known-empty state. Restored in afterAll. This file is per-machine, NOT

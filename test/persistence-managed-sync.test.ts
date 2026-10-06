@@ -17,11 +17,16 @@ import { sha256 } from '../src/core/persistence/digest.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { discoverManagedSync } from '../src/core/persistence/sync-discovery.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
-import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
+import { disposePersistenceConsumer, registerMutationPreparer } from '../src/core/persistence/service.ts';
+import { UNFINISHED_PAGE_REQUEST_SQL, noopWaiversEnabled } from '../src/core/persistence/sync-waivers.ts';
+import { waitFor } from './helpers/wait-for.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { prepareRemoteJob, withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { loadSyncFailures, syncFailuresPath } from '../src/core/sync-failure-ledger.ts';
+import { renderFactsTable } from '../src/core/facts-fence.ts';
+import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-sync-'));
 const engines: BrainEngine[] = [];
@@ -185,7 +190,7 @@ test('repeated slices reuse one manifest and still reject an intervening page id
       expect(manifestReads).toBe(1);
       await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.putPage('c', {
         type: 'note', title: 'c', compiled_truth: 'A newer accepted page between sync slices.', timeline: '', frontmatter: {}, content_hash: 'newer',
-      }, { sourceId: f.id })));
+      }, { sourceId: f.id }), TEST_WRITE_ATTRIBUTION));
       await expect(performManagedSync(engine, options, slice)).rejects.toMatchObject({ code: 'revision_conflict' });
       expect(manifestReads).toBe(1);
       expect(await engine.executeRaw('SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2',
@@ -242,9 +247,9 @@ test('a write between batches cannot be overwritten by an older enumerated Git p
     let changed: Promise<void>|undefined;
     const abort=new AbortController();
     const first=await performManagedSync(engine,{sourceId:f.id,noPull:true,signal:abort.signal,onProgress:p=>{
-      if(p.bankedFiles===1){ abort.abort(); changed=engine.transaction(tx=>withCoordinatedWrite(tx,[f.id],async()=>{
+      if(p.bankedFiles===1){ abort.abort(); changed=engine.transaction(tx=>withCoordinatedWrite(tx, [f.id], async()=>{
         await tx.putPage('b',{type:'note',title:'b',compiled_truth:'A concurrently accepted newer observation.',timeline:'',frontmatter:{},content_hash:'newer'}, {sourceId:f.id});
-      })); }
+      }, TEST_WRITE_ATTRIBUTION)); }
     }});
     expect(first.status).toBe('partial'); await changed;
     await expect(performManagedSync(engine,{sourceId:f.id,noPull:true})).rejects.toMatchObject({code:'revision_conflict'});
@@ -445,5 +450,317 @@ test('continuous foreground arrivals cannot starve a bounded sync batch', async 
       expect(queuedWhenSyncCommitted).toBeGreaterThan(0);
       expect(consumer.foregroundCompletions(binding.worktree_id)).toBeGreaterThan(0);
     }finally{stopping=true;clearInterval(timer);await Promise.all(admitted);await disposePersistenceConsumer(engine);}
+  }
+}),120_000);
+
+// Page identity must survive repeated suffixes. Existing sync cases only used
+// extension-free slugs; this exercises actual publication, without a new seam.
+test('managed sync preserves extension-bearing slugs and their distinct extension-free siblings', async () =>
+  withEnv({ GBRAIN_HOME: home }, async () => {
+    for (const engine of engines) {
+      const content = (title: string, body: string) => `---\ntype: note\ntitle: ${title}\n---\n${body}\n`;
+      const ordinary = content('Ordinary', 'The ordinary page remains separate.');
+      const extended = content('Extended', 'The extension-bearing page keeps its identity.');
+      // No explicit title: the overlay comparison must use the same filename fallback as import.
+      const repeated = '---\ntype: note\n---\nThe repeated-extension page is separate too.\n';
+      const f = await fixture(engine, {
+        'notes/example.md': ordinary,
+        'notes/example.md.md': extended,
+        'notes/example.md.md.md': repeated,
+      });
+      const opts = { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true };
+      expect(await performManagedSync(engine, opts)).toMatchObject({ status: 'first_sync', added: 3 });
+      const slugs = ['notes/example', 'notes/example.md', 'notes/example.md.md'];
+      const before = await Promise.all(slugs.map(slug => engine.getPage(slug, { sourceId: f.id })));
+      expect(new Set(before.map(page => page?.id)).size).toBe(3);
+      expect(before.map(page => page?.title)).toEqual(['Ordinary', 'Extended', 'Example.Md.Md']);
+      expect(before.map(page => page?.source_path)).toEqual(slugs.map(slug => `${slug}.md`));
+      expect(readFileSync(join(f.root, 'notes/example.md.md.md'), 'utf8')).toBe(repeated);
+      for (const slug of slugs) expect(readFileSync(join(f.root, `${slug}.md`), 'utf8')).not.toContain('slug:');
+      writeFileSync(join(f.root, 'notes/example.md.md'), content('Extended', 'Updated extension-bearing content.'));
+      const head = commit(f.root, 'update extension-bearing page');
+      expect(await performManagedSync(engine, opts)).toMatchObject({ status: 'synced', modified: 1, toCommit: head });
+      const after = await Promise.all(slugs.map(slug => engine.getPage(slug, { sourceId: f.id })));
+      expect(after.map(page => page?.id)).toEqual(before.map(page => page?.id));
+      expect(after[0]?.compiled_truth).toBe(before[0]?.compiled_truth);
+      expect(after[1]?.compiled_truth).toContain('Updated extension-bearing content.');
+      expect(after[2]?.compiled_truth).toBe(before[2]?.compiled_truth);
+      expect(await performManagedSync(engine, opts)).toMatchObject({ status: 'up_to_date' });
+    }
+  }), 120_000);
+
+test('managed sync still rejects conflicting explicit slugs on extension-bearing paths', async () =>
+  withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+    for (const engine of engines) {
+      const f = await fixture(engine, { 'notes/example.md.md':
+        '---\ntype: note\ntitle: Example\nslug: notes/other\n---\nA conflicting identity must not be imported.\n' });
+      // #5988: the conflicting file is held (never imported) instead of blocking the sync.
+      const synced = await performManagedSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true });
+      expect(synced).toMatchObject({ status: 'first_sync', held_count: 1 });
+      expect(synced.held?.[0]).toMatchObject({ path: 'notes/example.md.md', code: 'frontmatter_slug_conflict' });
+      expect(await engine.getPage('notes/example.md', { sourceId: f.id })).toBeNull();
+      expect(await engine.getPage('notes/other', { sourceId: f.id })).toBeNull();
+    }
+  }), 120_000);
+
+test('retry-failed resets cursor when pending write is committed but failure record exists', async () =>
+  withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+    for (const engine of engines) {
+      await disposePersistenceConsumer(engine);
+      const f = await fixture(engine, {
+        'a.md': 'First observation committed during the original sync run.\n',
+        'b.md': 'Second observation not yet imported.\n',
+      });
+      const abort = new AbortController();
+      const partial = await performManagedSync(engine, {
+        sourceId: f.id, noPull: true, noEmbed: true, noExtract: false,
+        signal: abort.signal,
+        onProgress: p => { if (p.phase === 'managed_sync.page_committed') abort.abort(); },
+      });
+      expect(partial).toMatchObject({ status: 'partial', filesImported: 1 });
+      await disposePersistenceConsumer(engine);
+
+      // The progress callback fires AFTER cursor advancement. Reconstruct the
+      // crash window between the committed write and that cursor update.
+      const [row] = await engine.executeRaw<{ fingerprint: string; completed_keys: [{
+        runId: string; incarnation: string; index: number;
+        counts: { added: number; modified: number; deleted: number; chunks: number };
+        pending?: { requestId: string; slug: string; pageId: number | null; intent: SyncIntent };
+      }] }>("SELECT fingerprint,completed_keys FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [f.id]);
+      const [committed] = await engine.executeRaw<{ request_id: string; slug: string; intent: SyncIntent; state: string }>(
+        "SELECT request_id,slug,intent,state FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_import'", [f.id]);
+      expect(committed?.state).toBe('committed');
+      expect(committed?.slug).toBe('a');
+      const cursor = row.completed_keys[0];
+      cursor.index = 0;
+      cursor.counts = { added: 0, modified: 0, deleted: 0, chunks: 0 };
+      cursor.pending = { requestId: committed.request_id, slug: committed.slug, pageId: null, intent: committed.intent };
+      await engine.executeRaw("UPDATE op_checkpoints SET completed_keys=$2::text::jsonb WHERE op='managed-sync' AND fingerprint=$1",
+        [row.fingerprint, JSON.stringify([cursor])]);
+      expect((await engine.getPage('a', { sourceId: f.id }))?.compiled_truth).toContain('First observation');
+      expect(await engine.getPage('b', { sourceId: f.id })).toBeNull();
+
+      // A real mismatched invocation records the failure against that run.
+      await expect(performManagedSync(engine, {
+        sourceId: f.id, noPull: true, noEmbed: true, noExtract: true,
+      })).rejects.toThrow('processing options');
+      const failuresBefore = await engine.executeRaw(
+        "SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1 AND completed_keys->0->>'run_id'=$2", [row.fingerprint, cursor.runId]);
+      expect(failuresBefore).toHaveLength(1);
+
+      const retried = await performManagedSync(engine, {
+        sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, retryFailed: true,
+      });
+      expect(['first_sync', 'synced']).toContain(retried.status);
+      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('Second observation');
+      expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
+      expect(await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1", [row.fingerprint])).toHaveLength(0);
+      await disposePersistenceConsumer(engine);
+    }
+  }), 120_000);
+
+test('managed sync leaves reserved skillpack paths to the skill publisher instead of blocking (#5852)', async () =>
+  withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+    for (const engine of engines) {
+      const page = (title: string) => `---\ntype: concept\ntitle: ${title}\n---\n${title} content.\n`;
+      const f = await fixture(engine, {
+        'topics/foo.md': page('Foo'),
+        'skills/brain-router/SKILL.md': '---\nname: brain-router\ndescription: seeded pack skill\n---\n\n# Brain Router\n',
+        'skillpack.json': '{"name":"example-pack","skills":["brain-router"]}\n',
+        'docs/skills/nested.md': page('Nested'),
+        'docs/skillset/tips.md': page('Tips'),
+        'skills.md': page('Skills'),
+      });
+      const opts = { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true };
+      expect(await performManagedSync(engine, opts)).toMatchObject({ status: 'first_sync', added: 3 });
+      const slugs = (await engine.executeRaw<{ slug: string }>('SELECT slug FROM pages WHERE source_id=$1 ORDER BY slug', [f.id])).map(row => row.slug);
+      expect(slugs).toEqual(['docs/skillset/tips', 'skills', 'topics/foo']);
+      writeFileSync(join(f.root, 'skills/brain-router/SKILL.md'), '---\nname: brain-router\ndescription: edited\n---\n\n# Brain Router v2\n');
+      const head = commit(f.root, 'edit the seeded skill');
+      expect(await performManagedSync(engine, opts)).toMatchObject({ status: 'synced', added: 0, modified: 0, deleted: 0, toCommit: head });
+      expect(await engine.executeRaw("SELECT 1 FROM persistence_requests WHERE source_id=$1 AND state<>'committed'", [f.id])).toEqual([]);
+    }
+  }), 120_000);
+
+// #5984 (CEO-A12/A32/A34, ENG-A7, DX-A7/A15): a manifest delete of a page that is
+// already soft-deleted at its frozen revision advances without an admission.
+const WAIVER_OPTS = { noPull: true, noEmbed: true, noExtract: true };
+async function deletedFixture(engine: BrainEngine, files: Record<string, string>, softDeleted: string[]) {
+  const f = await fixture(engine, files);
+  expect((await performManagedSync(engine, { sourceId: f.id, ...WAIVER_OPTS })).status).toBe('first_sync');
+  for (const slug of softDeleted) await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.softDeletePage(slug, { sourceId: f.id }), TEST_WRITE_ATTRIBUTION));
+  for (const path of Object.keys(files)) rmSync(join(f.root, path));
+  commit(f.root, 'remove every file');
+  return f;
+}
+const runRequests = (engine: BrainEngine, sourceId: string, runId: string) => engine.executeRaw<{ kind: string; slug: string; state: string }>(
+  "SELECT intent->>'kind' AS kind,slug,state FROM persistence_requests WHERE source_id=$1 AND intent->>'runId'=$2 ORDER BY sequence", [sourceId, runId]);
+const deleteRequests = (engine: BrainEngine, sourceId: string) => engine.executeRaw<{ slug: string; state: string }>(
+  "SELECT slug,state FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_delete' ORDER BY sequence", [sourceId]);
+/** Runs `hook` when the screen re-reads `slug` (the second snapshot read: the first is the freeze). */
+function onScreen(engine: BrainEngine, slug: string, hook: () => Promise<void>): BrainEngine {
+  let reads = 0;
+  return new Proxy(engine, { get(target, key) {
+    if (key === 'readPageSnapshot') return async (read: string, opts: Parameters<BrainEngine['readPageSnapshot']>[1]) => {
+      if (read === slug && ++reads === 2) await hook();
+      return target.readPageSnapshot(read, opts);
+    };
+    const value = Reflect.get(target, key);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+const note = (body: string) => `---\ntitle: Example\n---\n${body}\n`;
+
+test('a mostly-waived manifest reports waived deletes, not deleted pages, and admits only the live delete', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    const f = await deletedFixture(engine, { 'a.md': note('First'), 'b.md': note('Second'), 'c.md': note('Third'), 'd.md': note('Fourth') }, ['a', 'b', 'c']);
+    const result = await performManagedSync(engine, { sourceId: f.id, ...WAIVER_OPTS });
+    expect(result).toMatchObject({ status: 'synced', deleted: 1, waived: { imports: 0, deletes: 3 }, filesImported: 4 });
+    expect(result.legacySkips).toBeUndefined();
+    expect((await runRequests(engine, f.id, result.runId!)).map(row => [row.kind, row.slug, row.state]))
+      .toEqual([['managed_sync_delete', 'd', 'committed'], ['managed_sync_checkpoint', '__managed_sync_checkpoint__', 'committed']]);
+    expect(await engine.getPage('d', { sourceId: f.id })).toBeNull();
+    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(git(f.root, 'rev-parse', 'HEAD'));
+  }
+}), 120_000);
+
+test('GBRAIN_SYNC_WAIVE_NOOP=0 admits every no-op entry', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_WAIVE_NOOP: '0' }, async () => {
+  expect(noopWaiversEnabled()).toBe(false);
+  expect(noopWaiversEnabled({})).toBe(true);
+  for (const engine of engines) {
+    const f = await deletedFixture(engine, { 'a.md': note('First'), 'b.md': note('Second') }, ['a', 'b']);
+    const result = await performManagedSync(engine, { sourceId: f.id, ...WAIVER_OPTS });
+    expect(result).toMatchObject({ status: 'synced', deleted: 0, waived: { imports: 0, deletes: 0 } });
+    expect((await runRequests(engine, f.id, result.runId!)).map(row => row.kind)).toEqual(['managed_sync_delete', 'managed_sync_delete', 'managed_sync_checkpoint']);
+  }
+}), 120_000);
+
+test('a restore between freeze and screen is admitted, not waived', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+  for (const engine of engines) {
+    const f = await deletedFixture(engine, { 'a.md': note('Restored concurrently') }, ['a']);
+    const proxy = onScreen(engine, 'a', () => engine.transaction(tx => withCoordinatedWrite(tx, [f.id], async () => { await tx.restorePage('a', { sourceId: f.id }); }, TEST_WRITE_ATTRIBUTION)));
+    try {
+      const result = await performManagedSync(proxy, { sourceId: f.id, ...WAIVER_OPTS });
+      expect(result.waived).toEqual({ imports: 0, deletes: 0 });
+      expect(await deleteRequests(engine, f.id)).toHaveLength(1);
+      expect(await engine.getPage('a', { sourceId: f.id })).not.toBeNull();
+    } finally { await disposePersistenceConsumer(proxy); rmSync(syncFailuresPath(), { force: true }); }
+  }
+}), 120_000);
+
+test.each(['restore', 'rename', 'database-only'] as const)('an unfinished %s request for the page is never overtaken by a waiver', async kind => withEnv({ GBRAIN_HOME: home }, async () => {
+  let hold = Promise.withResolvers<void>();
+  registerMutationPreparer('test_waiver_hold', async () => { await hold.promise; return { observedRevision: null, noop: true, apply: async () => ({ status: 'complete' }) }; });
+  try {
+    for (const engine of engines) {
+      hold = Promise.withResolvers<void>();
+      const f = await deletedFixture(engine, { 'a.md': note('Pending foreground work') }, ['a']);
+      const binding = (await getWorktreeBinding(engine, f.id))!;
+      const authority = await managedSyncAuthority(engine, f.id, binding.source_incarnation, f.root);
+      const page = (await engine.readPageSnapshot('a', { sourceId: f.id, includeDeleted: true }))!.page;
+      const intent = kind === 'rename' ? { renameFrom: { slug: 'a', pageId: page.id } } : { restore: true };
+      const foreground = await admitWrite(engine, { operation: 'test_waiver_hold', sourceId: f.id, sourceIncarnation: binding.source_incarnation,
+        slug: kind === 'rename' ? 'a-renamed' : 'a', pageId: kind === 'rename' ? null : page.id,
+        worktreeId: kind === 'database-only' ? null : binding.worktree_id, topologyGeneration: kind === 'database-only' ? null : binding.topology_generation,
+        principal: authority.writer.principal, authority: authority.writer, callerIntent: intent, intent });
+      expect(await engine.executeRaw(UNFINISHED_PAGE_REQUEST_SQL, [binding.worktree_id, binding.source_incarnation, f.id, 'a', page.id, String(page.id)])).toHaveLength(1);
+      const abort = new AbortController();
+      const admitted = waitFor(async () => (await deleteRequests(engine, f.id)).length > 0, { timeoutMs: 30_000 }).then(() => abort.abort());
+      const result = await performManagedSync(engine, { sourceId: f.id, ...WAIVER_OPTS, signal: abort.signal });
+      await admitted;
+      expect(result.waived ?? { imports: 0, deletes: 0 }).toEqual({ imports: 0, deletes: 0 });
+      expect(await deleteRequests(engine, f.id)).toHaveLength(1);
+      if (kind !== 'database-only') expect(result).toMatchObject({ status: 'partial', reason: 'timeout', writeWait: { status: 'pending' } });
+      hold.resolve();
+      await waitFor(async () => ['committed', 'conflict', 'failed'].includes((await engine.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE id=$1::uuid', [foreground.id]))[0].state), { timeoutMs: 30_000 });
+      let finished = result;
+      for (let i = 0; i < 5 && finished.status === 'partial'; i++) finished = await performManagedSync(engine, { sourceId: f.id, ...WAIVER_OPTS });
+      expect(finished).toMatchObject({ status: 'synced', waived: { imports: 0, deletes: 0 } });
+      await disposePersistenceConsumer(engine);
+    }
+  } finally { hold.resolve(); }
+}), 120_000);
+
+test('revoked sync authority refuses before any waiver or cursor advance', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    const f = await deletedFixture(engine, { 'a.md': note('Deleted before the grant is revoked') }, ['a']);
+    const clientId = `sync-client-${randomUUID()}`;
+    await engine.executeRaw(`INSERT INTO oauth_clients(client_id,client_name,client_secret_hash,scope,source_id,allowed_operations)
+      VALUES($1,'example-client','test-only','admin',$2,ARRAY['submit_job'])`, [clientId, f.id]);
+    const ctx = { engine, remote: true, sourceId: f.id, auth: { clientId, principal: { kind: 'oauth_client', id: clientId }, scopes: ['admin'], sourceId: f.id, allowedOperations: ['submit_job'] } } as OperationContext;
+    const accepted = await prepareRemoteJob(ctx, 'sync', { noPull: true });
+    const before = (await engine.readPageSnapshot('a', { sourceId: f.id, includeDeleted: true }))!.revision;
+    const proxy = onScreen(engine, 'a', async () => { await engine.executeRaw("UPDATE oauth_clients SET scope='read' WHERE client_id=$1", [clientId]); });
+    try {
+      await expect(withSubmissionAuthority(accepted.authority, () => performManagedSync(proxy, accepted.data))).rejects.toMatchObject({ code: 'permission_denied' });
+      expect(await deleteRequests(engine, f.id)).toHaveLength(0);
+      const [cursor] = await engine.executeRaw<{ completed_keys: [{ index: number; pending?: { slug: string }; counts: { waived?: unknown } }] }>(
+        "SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 AND completed_keys->0->'authority'->'writer'->>'remote'='true'", [f.id]);
+      expect(cursor.completed_keys[0]).toMatchObject({ index: 0, pending: { slug: 'a' } });
+      expect(cursor.completed_keys[0].counts.waived).toBeUndefined();
+      expect((await engine.readPageSnapshot('a', { sourceId: f.id, includeDeleted: true }))!.revision).toBe(before);
+    } finally { await disposePersistenceConsumer(proxy); }
+  }
+}), 120_000);
+
+test('a waiver that loses the cursor to another drain adopts the winner without double counting', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    const f = await deletedFixture(engine, { 'a.md': note('First'), 'b.md': note('Second') }, ['a', 'b']);
+    let winner: Awaited<ReturnType<typeof performManagedSync>> | undefined;
+    const proxy = onScreen(engine, 'a', async () => { winner = await performManagedSync(engine, { sourceId: f.id, ...WAIVER_OPTS }); });
+    try {
+      const loser = await performManagedSync(proxy, { sourceId: f.id, ...WAIVER_OPTS });
+      expect(winner).toMatchObject({ status: 'synced', waived: { imports: 0, deletes: 2 } });
+      expect(loser).toMatchObject({ status: 'synced', runId: winner!.runId, waived: { imports: 0, deletes: 2 }, deleted: 0 });
+      expect((await runRequests(engine, f.id, winner!.runId!)).map(row => row.kind)).toEqual(['managed_sync_checkpoint']);
+    } finally { await disposePersistenceConsumer(proxy); await disposePersistenceConsumer(engine); }
+  }
+}), 120_000);
+
+test('the waiver lookup for unfinished page requests is served by the request indexes', async () => {
+  for (const engine of engines) {
+    const plan = await engine.transaction(async tx => {
+      await tx.executeRaw('SET LOCAL enable_seqscan=off');
+      return tx.executeRaw<Record<string, string>>(`EXPLAIN ${UNFINISHED_PAGE_REQUEST_SQL}`,
+        [randomUUID(), randomUUID(), 'example-source', 'notes/example', 1, '1']);
+    });
+    const text = plan.map(row => Object.values(row)[0]).join('\n');
+    // Every branch (worktree pending, worktree recovery, database-only pending) is an index scan; the planner may
+    // serve the database-only branch from either partial pending index.
+    expect(text.match(/(Index Scan|Index Only Scan|Bitmap Index Scan) (using|on) persistence_requests_(pending|recovery|database_pending)\b/g)?.length).toBeGreaterThanOrEqual(3);
+    expect(text).toContain('persistence_requests_recovery');
+    expect(text).not.toContain('Seq Scan');
+  }
+}, 60_000);
+
+test('a fact withdrawn between sync preparation and canonical file writeback conflicts without publishing', async () => withEnv({GBRAIN_HOME:home},async()=>{
+  for(const engine of engines){
+    const f=await fixture(engine,{'a.md':'An original observation before the withdrawal race.\n'});
+    await performManagedSync(engine,{sourceId:f.id,noPull:true,noEmbed:true,noExtract:true});
+    await disposePersistenceConsumer(engine);
+    await engine.transaction(tx=>withCoordinatedWrite(tx,[f.id],()=>tx.addTag('a','database-only-tag',{sourceId:f.id}),TEST_WRITE_ATTRIBUTION));
+    const base=(await engine.readPageSnapshot('a',{sourceId:f.id}))!;
+    const claim='withdrawn between managed sync preparation and publication';
+    const content=`Facts: ${renderFactsTable([{rowNum:1,claim,kind:'fact',confidence:1,visibility:'world',notability:'medium',active:true,context:'test evidence'}])}\n`;
+    writeFileSync(join(f.root,'a.md'),content); const target=commit(f.root);
+    const binding=(await getWorktreeBinding(engine,f.id))!;
+    const authority=await managedSyncAuthority(engine,f.id,binding.source_incarnation,f.root);
+    const intent:SyncIntent={kind:'managed_sync_import',processingOptions:{noEmbed:true,noExtract:true,noSchemaPack:false},expected_revision:base.revision,sourcePath:'a.md',path:'a.md',rawHash:sha256(content),content,
+      ownerEpoch:String(binding.owner_epoch),syncAuthority:authority,cursorKey:'test-cursor',runId:randomUUID(),index:0,total:1,from:f.head,target,slugMode:'git-root'};
+    await admitWrite(engine,{requestId:randomUUID(),operation:'submit_job',sourceId:f.id,sourceIncarnation:binding.source_incarnation,slug:'a',pageId:base.page.id,
+      worktreeId:binding.worktree_id,topologyGeneration:binding.topology_generation,principal:authority.writer.principal,authority:authority.writer,callerIntent:intent,intent});
+    const claimed=(await claimNextWrite(engine,localHostId()))!;
+    const prepared=await prepareManagedSyncMutation(engine,claimed,{engine:engine.kind});
+    expect(prepared.file?.content).toContain(claim);
+    const fact=await engine.transaction(tx=>withCoordinatedWrite(tx,[f.id],()=>
+      tx.insertFact({fact:claim,source:'remember',visibility:'world'},{source_id:f.id}),TEST_WRITE_ATTRIBUTION));
+    await engine.transaction(tx=>withCoordinatedWrite(tx,[f.id],()=>recordFactWithdrawal(tx,fact.id,f.id,true),TEST_WRITE_ATTRIBUTION));
+    const boundaries:string[]=[];
+    const outcome=await publishMutation(engine,claimed,prepared,localHostId(),{boundary:async name=>{boundaries.push(name);},fileBoundary:name=>{boundaries.push(name);}});
+    expect(outcome).toMatchObject({state:'conflict',error_code:'revision_conflict'});
+    expect(boundaries).not.toContain('before_publication');
+    expect(boundaries).not.toContain('before_file');
+    expect(readFileSync(join(f.root,'a.md'),'utf8')).toBe(content);
+    expect((await engine.readPageSnapshot('a',{sourceId:f.id}))?.revision).toBe(base.revision);
   }
 }),120_000);

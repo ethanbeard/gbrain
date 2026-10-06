@@ -15,6 +15,7 @@ triggers:
 tools:
   - advisor
 mutating: false
+when_to_use: "Use when the user asks: \"what should I do to get more out of gbrain\", \"is my brain set up right\", \"gbrain advisor\", \"advise me on my brain\", \"weekly brain checkup\"."
 ---
 
 # gbrain Advisor
@@ -104,6 +105,13 @@ WARN      gbrain 0.44 is available (you're on 0.43).
 - If nothing is pressing, say so in one line ("brain looks healthy") — don't
   manufacture work.
 
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A `critical` finding (pending migrations) carries a fix such as `gbrain apply-migrations --yes`: ask the user before running it; findings without a `dispatch_id` are not auto-runnable.
+- `gbrain advisor` cannot reach the brain (`GBRAIN_DB_ACCESS` marker): route to the db-repair skill instead of reporting "no findings".
+
 ## Anti-Patterns
 
 - **Running a fix without asking.** The advisor is read-only by contract. Never
@@ -117,3 +125,12 @@ WARN      gbrain 0.44 is available (you're on 0.43).
 - **Calling the MCP `advisor` op for workspace install state.** Over MCP the
   advisor returns brain-state signals only; uninstalled-skill findings are a
   local-CLI concern.
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
+
+- `advisor` → `gbrain advisor`
+
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

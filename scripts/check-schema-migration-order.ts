@@ -71,6 +71,7 @@ function main(): number {
       return 1;
     }
     console.log(`skip: ${msg}`);
+    console.log(`GBRAIN_CHECK_SKIPPED: base ref ${ref} unavailable`);
     return 0;
   }
   let head;

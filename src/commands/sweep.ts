@@ -30,7 +30,9 @@ Runs the three bounded sweep passes against the connected brain:
   2. link/timeline extraction (zero-LLM): the same deterministic extraction
      "gbrain extract" runs, over recently-modified pages.
   3. corpus ingest (spend-gated): unprocessed transcript .txt files run
-     through facts extraction. Skipped in keyless mode (no provider key).
+     through facts extraction in turn-boundary windows (8 per file and 32
+     total per sweep; GBRAIN_CORPUS_WINDOWS_PER_SWEEP overrides the total);
+     longer files finish over later sweeps. Skipped in keyless mode.
 
 Flags:
   --once             Required. One bounded sweep, then exit.
@@ -112,6 +114,9 @@ export async function runSweep(engine: BrainEngine, args: string[]): Promise<voi
     console.log(`  links removed:      ${report.linksRemoved}`);
     console.log(`  timeline extracted: ${report.timelineExtracted}`);
     console.log(`  corpus ingested:    ${report.corpusIngested}`);
+    for (const f of report.corpus_files) {
+      console.log(`    ${f.file}: ${f.windows_done} window(s) extracted, ${f.windows_remaining} remaining`);
+    }
     if (report.skipped.length > 0) {
       console.log('  skipped:');
       for (const s of report.skipped) {

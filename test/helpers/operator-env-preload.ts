@@ -29,50 +29,33 @@
  * A blanket GBRAIN_* delete would break that machinery — e.g. the e2e lane's
  * GBRAIN_DATABASE_URL target or the snapshot fast path.
  *
+ * The keep-lists, the renamed-opt-in map and the naming rule for test opt-ins
+ * live in ./operator-env-policy.ts, shared with
+ * scripts/check-test-env-opt-ins.ts.
+ *
  * Escape hatch: GBRAIN_TEST_KEEP_AMBIENT_ENV=1 disables the scrub entirely
  * (it lives under GBRAIN_TEST_, so it survives its own scrub). Debugging:
  * GBRAIN_DEBUG_PRELOAD=1 logs the removed NAMES — never values, which may be
  * secrets.
  */
 
-/** Operator/agent workspace prefixes with no test-machinery tenants. */
-const STRIP_PREFIX = /^(CONDUCTOR_|MCP_|OPENCLAW_)/;
+import { isStripped, renamedOptInMessage } from './operator-env-policy';
 
-const KEEP_EXACT = new Set([
-  'GBRAIN_HOME', // per-run HOME isolation — gbrain-home-preload and run-e2e.sh both respect a pre-set value
-  'GBRAIN_DATABASE_URL', // e2e DB target; database-url-guard-preload (registered first) already vetoed un-opted runs
-  'GBRAIN_MODEL_DISCOVERY', // operator override provider-keys-preload deliberately respects
-  'GBRAIN_PGLITE_SNAPSHOT', // schema-snapshot fast path exported by every unit runner (scripts/lib/test-env.sh)
-  'GBRAIN_NO_SNAPSHOT', // cold-path opt-out must survive this preload and reach CLI children
-  'GBRAIN_PGBOUNCER_URL', // explicit pooled test target supplied by ci-local
-  'GBRAIN_PGBOUNCER_DIRECT_URL', // admin connection used to create the isolated pooler test DB
-  'GBRAIN_COMPILED_BIN', // heavy-lane compile-once binary (agent-harness.ts ensureCompiledGbrain)
-  'GBRAIN_AUDIT_DIR', // audit-dir-preload honors a wrapper pre-set (inspect audit output after a run)
-  'GBRAIN_SYNC_FAILURES_DIR', // same wrapper pre-set contract in sync-failures-preload
-  'GBRAIN_DEBUG_PRELOAD', // the preload stack's own logging hatch
-  // Test-control opt-in documented in cycle-synthesize-triage-calibration's
-  // header — the scrub was silently no-op'ing the paid live layer (any
-  // GBRAIN_* opt-in read by a test file needs a row here or a KEEP_PREFIX).
-  'GBRAIN_TRIAGE_CALIBRATION_LIVE',
-  // Opt-in keyed System One wire test (test/live/decide-typesafe.live.test.ts).
-  'GBRAIN_LIVE_TYPESAFE',
-]);
-
-// GBRAIN_TEST_*: test-control opt-ins (ALLOW_DATABASE_URL, KEEP_PROVIDER_KEYS,
-// shard/memory knobs) must survive their own scrub or every escape hatch is a
-// dead end. GBRAIN_CI_*: ci-local.sh port plumbing. GBRAIN_E2E_*: db-guard's
-// name-floor opt-in (its error message tells operators to set it) + e2e
-// runner knobs. GBRAIN_REAL_*: heavy-lane real-agent door-suite opt-ins read
-// in-process by test/e2e/install-real-*.serial.test.ts.
-const KEEP_PREFIX = /^GBRAIN_(TEST_|CI_|E2E_|REAL_)/;
+// Old opt-in names fail fast BEFORE the scrub (and regardless of
+// GBRAIN_TEST_KEEP_AMBIENT_ENV): the scrub would otherwise delete them and the
+// gated tests would skip silently.
+for (const [name, value] of Object.entries(process.env)) {
+  if (value === undefined || value === '') continue;
+  const message = renamedOptInMessage(name, value);
+  if (!message) continue;
+  console.error(`[operator-env-preload] ${message}`);
+  process.exit(2);
+}
 
 if (process.env.GBRAIN_TEST_KEEP_AMBIENT_ENV !== '1') {
   const removed: string[] = [];
   for (const name of Object.keys(process.env)) {
-    const strip =
-      STRIP_PREFIX.test(name) ||
-      (name.startsWith('GBRAIN_') && !KEEP_EXACT.has(name) && !KEEP_PREFIX.test(name));
-    if (!strip) continue;
+    if (!isStripped(name)) continue;
     delete process.env[name];
     removed.push(name);
   }

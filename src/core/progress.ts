@@ -13,7 +13,7 @@
  *
  * JSON event schema (stable from v0.15.2, additive only):
  *   {"event":"start","phase":"<snake.dot.path>","total"?:N,"ts":"<iso>"}
- *   {"event":"tick","phase":"...","done":N,"total"?:N,"pct"?:F,"elapsed_ms":N,"eta_ms"?:N,"ts":"..."}
+ *   {"event":"tick","phase":"...","done":N,"total"?:N,"pct"?:F,"elapsed_ms":N,"cpu_ms":N,"eta_ms"?:N,"ts":"..."}
  *   {"event":"heartbeat","phase":"...","note":"<str>","elapsed_ms":N,"ts":"..."}
  *   {"event":"finish","phase":"...","done"?:N,"total"?:N,"elapsed_ms":N,"ts":"..."}
  *   {"event":"abort","phase":"...","reason":"<SIGINT|SIGTERM>","elapsed_ms":N,"ts":"..."}
@@ -25,6 +25,8 @@
  *
  * See docs/progress-events.md for the full reference.
  */
+
+import { noteForwardProgress } from './forward-progress.ts';
 
 export type ProgressMode = 'auto' | 'human' | 'json' | 'quiet';
 
@@ -166,6 +168,7 @@ interface PhaseState {
   total?: number;
   done: number;
   startedAt: number;
+  cpuAtStart: NodeJS.CpuUsage;
   lastEmitMs: number;
   lastDoneEmitted: number;
   heartbeatTimer?: ReturnType<typeof setInterval>;
@@ -255,6 +258,7 @@ class Reporter implements ReporterInternal {
       total,
       done: 0,
       startedAt: now,
+      cpuAtStart: process.threadCpuUsage(),
       lastEmitMs: now,
       lastDoneEmitted: 0,
       live: null,
@@ -284,6 +288,7 @@ class Reporter implements ReporterInternal {
     const s = this.state;
     if (!s) return;
     s.done += n;
+    noteForwardProgress();
 
     if (this.renderMode === 'quiet') return;
 
@@ -302,11 +307,13 @@ class Reporter implements ReporterInternal {
 
     const elapsedMs = now - s.startedAt;
     if (this.renderMode === 'json') {
+      const cpu = process.threadCpuUsage(s.cpuAtStart);
       const obj: Record<string, unknown> = {
         event: 'tick',
         phase: s.phase,
         done: s.done,
         elapsed_ms: elapsedMs,
+        cpu_ms: Math.round((cpu.user + cpu.system) / 1000),
         ts: nowIso(),
       };
       if (typeof s.total === 'number' && s.total > 0) {

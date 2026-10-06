@@ -237,7 +237,7 @@ Four options:
 1. **Use OpenRouter** when the provider/model is available through OR's OpenAI-compatible API (covers most hosted chat models + a growing embedding catalog).
 2. **Use LiteLLM proxy** (above) — the universal escape hatch. Works for 100+ providers.
 3. **Open a feature request** at [github.com/garrytan/gbrain/issues](https://github.com/garrytan/gbrain/issues) with the provider's API docs URL and a setup snippet. Recipes are ~30-40 lines of TypeScript.
-4. **Submit a recipe**: clone, copy `src/core/ai/recipes/voyage.ts` as the gold-standard openai-compat template, register in `src/core/ai/recipes/index.ts`, add a per-recipe smoke test under `test/ai/recipe-<name>.test.ts`. The recipe contract test (`test/ai/recipes-contract.test.ts`) and IRON RULE regression test pin the structural invariants.
+4. **Submit a recipe**: clone, copy `src/core/ai/recipes/voyage.ts` as the gold-standard openai-compat template, register in `src/core/ai/recipes/index.ts`, add a per-recipe smoke test under `test/ai/recipe-<name>.test.ts`. The IRON RULE regression test (`test/ai/recipes-existing-regression.test.ts`) pins the shared auth contract for the existing recipes.
 
 ## Switching providers on an existing brain
 

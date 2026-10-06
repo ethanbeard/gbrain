@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, copyFileSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -87,8 +87,10 @@ test('fresh process',()=>{
       const failedCoverage = join(root, 'failed-coverage');
       const bad = spawnSync('bash', ['scripts/run-e2e.sh', ...files], { cwd: root, env: { ...coverageEnv, COVERAGE_DIR: failedCoverage }, encoding: 'utf8' });
       expect(bad.status).toBe(1);
+      // B9: a red lane still records which files it ran; only the
+      // complete:true manifest stays green-only.
       expect(existsSync(join(failedCoverage, 'lane-manifest.json'))).toBe(false);
-      expect(existsSync(join(failedCoverage, 'executed-files.txt'))).toBe(false);
+      expect(readFileSync(join(failedCoverage, 'executed-files.txt'), 'utf8').trim().split('\n').sort()).toEqual(files);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   test.each(['empty', 'populated'])('refuses an existing %s coverage destination without changing its files', kind => {
@@ -113,6 +115,20 @@ test('fresh process',()=>{
       expect(result.stderr).toContain('must be a new, unused directory');
       expect(result.stdout).not.toContain('=== a.test.ts ===');
       for (const [file, contents] of Object.entries(prior)) expect(readFileSync(join(coverage, file), 'utf8')).toBe(contents);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test('coverage runs default GBRAIN_TEST_WAIT_MULTIPLIER to 2 and keep an explicit value through the env scrub', () => {
+    const root = setup();
+    try {
+      writeFileSync(join(root, 'bin/git'), '#!/bin/sh\nprintf fixture-commit\n', { mode: 0o755 });
+      writeFileSync(join(root, 'test/e2e/a.test.ts'), "import {test,expect} from 'bun:test'; test('multiplier',()=>expect(process.env.GBRAIN_TEST_WAIT_MULTIPLIER).toBe(process.env.EXPECTED_MULTIPLIER));");
+      const path = `${join(root, 'bin')}:${process.env.PATH}`;
+      for (const [coverage, multiplier, expected] of [['coverage-a', '', '2'], ['coverage-b', '3', '3'], ['', '1.5', '1.5']]) {
+        const result = spawnSync('bash', ['scripts/run-e2e.sh', 'test/e2e/a.test.ts'], {
+          cwd: root, encoding: 'utf8', env: { ...env, COVERAGE_DIR: coverage, GBRAIN_TEST_WAIT_MULTIPLIER: multiplier, EXPECTED_MULTIPLIER: expected, PATH: path },
+        });
+        expect(result.status, result.stdout + result.stderr).toBe(0);
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   test('a fully skipped file has execution evidence but need not emit LCOV', () => {
@@ -167,7 +183,7 @@ test('parent',()=>{
       const complete = kind === 'nested summary with parent';
       expect(result.status, result.stdout + result.stderr).toBe(complete ? 0 : 1);
       expect(existsSync(join(root, 'coverage/lane-manifest.json'))).toBe(complete);
-      expect(existsSync(join(root, 'coverage/executed-files.txt'))).toBe(complete);
+      expect(readFileSync(join(root, 'coverage/executed-files.txt'), 'utf8')).toBe('test/e2e/a.test.ts\n');
       if (!complete) expect(result.stdout).toContain('did not produce a complete native Bun report');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -195,7 +211,7 @@ printf '%s' '${output}'
       expect(result.status, result.stdout + result.stderr).toBe(1);
       expect(result.stdout).toContain('did not produce a complete native Bun report');
       expect(existsSync(join(root, 'coverage/lane-manifest.json'))).toBe(false);
-      expect(existsSync(join(root, 'coverage/executed-files.txt'))).toBe(false);
+      expect(readFileSync(join(root, 'coverage/executed-files.txt'), 'utf8')).toBe(`${selected}\n`);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   for (const firstFails of [false, true]) test(`each file has a fresh home after a ${firstFails ? 'failing' : 'passing'} config writer`, () => {
@@ -275,4 +291,73 @@ printf '%s' '${output}'
       rmSync(root, { recursive: true, force: true });
     }
   }, 10000);
+});
+
+describe('per-file HOME cleanup and receipts', () => {
+  const env = { ...process.env, GBRAIN_NO_SNAPSHOT: '1', DATABASE_URL: '', GBRAIN_DATABASE_URL: '', SHARD: '', COVERAGE_DIR: '' };
+  const files = ['test/e2e/a.test.ts', 'test/e2e/b.test.ts'];
+
+  test('a HOME that cannot be removed fails that file by name and the partition continues (B2)', () => {
+    const root = setup();
+    const tmp = join(root, 'tmp');
+    mkdirSync(tmp);
+    try {
+      writeFileSync(join(root, files[0]), `import {test} from 'bun:test';
+import {mkdirSync,writeFileSync,chmodSync} from 'node:fs';
+test('leaves an unremovable HOME entry',()=>{
+  const dir = process.env.HOME + '/locked';
+  mkdirSync(dir + '/inner', { recursive: true });
+  writeFileSync(dir + '/inner/x', 'x');
+  chmodSync(dir, 0o500);
+});`);
+      const r = spawnSync('bash', ['scripts/run-e2e.sh', ...files], { cwd: root, encoding: 'utf8', env: { ...env, TMPDIR: tmp } });
+      expect(r.status, r.stdout + r.stderr).toBe(1);
+      expect(r.stdout).toMatch(/FAILED: a\.test\.ts left a process writing to its HOME; cleanup could not remove \S+file-1-direct/);
+      expect(r.stdout).toContain('Fix: make the test wait for or stop its children; reproduce with: bash scripts/run-e2e.sh test/e2e/a.test.ts');
+      expect(r.stdout).toContain('=== b.test.ts ===');
+      expect(r.stdout).toContain('Files: 2 total, 1 passed, 1 failed');
+    } finally {
+      spawnSync('chmod', ['-R', 'u+rwx', tmp]);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform !== 'linux')('a child left running with the file HOME is killed before cleanup and named', () => {
+    const root = setup();
+    try {
+      writeFileSync(join(root, files[0]), `import {test} from 'bun:test';
+import {spawn} from 'node:child_process';
+import {writeFileSync} from 'node:fs';
+test('leaks a detached child',()=>{
+  const child = spawn('sleep', ['60'], { detached: true, stdio: 'ignore', env: process.env });
+  child.unref();
+  writeFileSync(${JSON.stringify(join(root, 'leak.pid'))}, String(child.pid));
+});`);
+      const r = spawnSync('bash', ['scripts/run-e2e.sh', files[0]], { cwd: root, encoding: 'utf8', env });
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(r.stdout).toContain('WARN: a.test.ts left processes running with HOME=');
+      const pid = Number(readFileSync(join(root, 'leak.pid'), 'utf8'));
+      let alive = true;
+      for (let i = 0; i < 50 && alive; i++) {
+        try { process.kill(pid, 0); alive = !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { alive = false; }
+        if (alive) Bun.sleepSync(20);
+      }
+      expect(alive).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('each file pass leaves a receipt with its native JUnit report, failures included', () => {
+    const root = setup();
+    try {
+      writeFileSync(join(root, files[1]), "import {test,expect} from 'bun:test';test('breaks',()=>expect(1).toBe(2));");
+      const receipts = join(root, 'receipts');
+      const r = spawnSync('bash', ['scripts/run-e2e.sh', ...files], { cwd: root, encoding: 'utf8', env: { ...env, GBRAIN_TEST_RECEIPT_DIR: receipts, GBRAIN_TEST_RECEIPT_LANE: 'tier9' } });
+      expect(r.status).toBe(1);
+      const ids = readdirSync(receipts).filter(n => n.endsWith('.receipt')).sort();
+      expect(ids).toEqual(['tier9--run-f1-direct--primary.receipt', 'tier9--run-f2-direct--primary.receipt']);
+      expect(readFileSync(join(receipts, ids[1]), 'utf8')).toContain('exit=1');
+      expect(readFileSync(join(receipts, 'tier9--run-f2-direct--primary.junit.xml'), 'utf8')).toContain('<failure');
+      expect(readFileSync(join(receipts, 'tier9--run-f2-direct--primary.files'), 'utf8')).toBe('test/e2e/b.test.ts\n');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

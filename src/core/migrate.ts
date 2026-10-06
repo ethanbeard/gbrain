@@ -9,6 +9,7 @@ import {
   isRetryableConnError,
 } from './retry-matcher.ts';
 import { repairTimelineDedupIndex } from './timeline-dedup-repair.ts';
+import { resumePageRevisionBackfill } from './page-state/revision-backfill-schema.ts';
 import { repairPagesUpsertArbiter } from './pages-upsert-arbiter.ts';
 import { repairLinkSourceCheck, LINK_SOURCE_GATE_MIGRATION_VERSION } from './link-source-check-repair.ts';
 
@@ -240,7 +241,7 @@ async function runMigrationSQL(
         // Falling through means the DDL runs with the server default.
       }
       await conn.executeRaw(sql);
-    });
+    }, { selfContained: true });
   }
 }
 
@@ -464,7 +465,9 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     }
   }
 
+  const backfill = () => resumePageRevisionBackfill(engine).catch(e => console.error(`[migrate] page revision backfill paused (#5216): ${e instanceof Error ? e.message : String(e)}`));
   if (pending.length === 0) {
+    await backfill();
     return { applied: 0, current };
   }
 
@@ -519,7 +522,7 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     // covers every exit path from here on (incl. the pre-flight probe).
     setQuietMigrationNotices(false);
   }
-
+  await backfill();
   return { applied, current: LATEST_VERSION };
 }
 

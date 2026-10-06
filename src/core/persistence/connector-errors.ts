@@ -63,7 +63,21 @@ export function connectorFenceHint(source: string): string {
     + `then re-attempt the item: gbrain sources retry-held ${source}`;
 }
 
-export function receiptDeliveredHint(receipt: { error_code?: string | null; error_message?: string | null; source_id?: string; slug?: string | null; intent?: Record<string, unknown> | null }):
+/** #5974: a trigger refusal is a gbrain defect or a writer-version mismatch, not a content conflict. */
+export const DATABASE_REFUSAL_HINT = 'This is not a content conflict: a gbrain process wrote a row its publication did not own, so the database refused it and nothing was committed. '
+  + 'On the brain host run gbrain sources writer status --probe --json; recent_failures[].error_detail names the table, operation, guard branch, sources, '
+  + 'and the gbrain build and host that ran the attempt. If that build differs from gbrain --version, upgrade or restart every gbrain process sharing this database '
+  + '(serve, autopilot, sync jobs), then retry with a new request ID. If the builds match, report error_detail (it contains no page text) on the gbrain issue tracker. '
+  + 'Do not force-write, edit SQL, or disable the guard; ask the user before changing which hosts own the brain.';
+
+/** #5974: another database trigger (named in write_error_detail.raiser) refused the write. */
+export const DATABASE_TRIGGER_HINT = 'A database trigger refused this write and nothing was committed; write_error_detail.raiser names it. '
+  + 'On the brain host run gbrain sources writer status --probe --json and compare recent_failures[].error_detail.attempt.consumer_version '
+  + 'with the version of every gbrain process sharing this database; upgrade or restart the older one, run gbrain apply-migrations --yes, then retry with a new request ID. '
+  + 'If versions match, report error_detail on the gbrain issue tracker. Do not edit SQL or disable triggers.';
+
+export function receiptDeliveredHint(receipt: { error_code?: string | null; error_message?: string | null; source_id?: string; slug?: string | null; intent?: Record<string, unknown> | null;
+  error_detail?: Record<string, unknown> | null }):
   { suggestion: string; detail?: string; docs: string } | null {
   const source = receipt.source_id ?? '<source>';
   switch (receipt.error_code) {
@@ -87,6 +101,14 @@ export function receiptDeliveredHint(receipt: { error_code?: string | null; erro
       return { docs: EMBEDDING_ZERO_NORM_DOCS,
         suggestion: `The embedding provider gave no usable vector for some chunks of ${slug}; the other chunks were stored and nothing is retried. `
           + `Inspect those chunks' text (empty, whitespace- or symbol-only chunks are the usual cause) or the provider, then run gbrain embed ${slug}${sourceFlag}.` };
+    }
+    case 'writer_coordinator_required':
+    case 'storage_error': {
+      // #5974: a database trigger refused the publication (see publication-failure.ts).
+      const origin = receipt.error_detail?.origin;
+      if (origin !== 'database_guard' && origin !== 'database_trigger') return null;
+      return { detail: String(origin), docs: docsAnchor('writer_coordinator_required'),
+        suggestion: origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT };
     }
     case 'connector_fence_below_timeline':
       return { docs: docsAnchor('connector_fence_below_timeline'), detail: 'fence_not_carried', suggestion: connectorFenceHint(source) };

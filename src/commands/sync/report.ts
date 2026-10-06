@@ -20,6 +20,17 @@ export function shouldNudgeAfterSync(status: SyncResult['status']): boolean {
 }
 
 /**
+ * #3068 / #5012: partials that do not converge on a plain retry exit
+ * non-zero so cron and monitoring see them: a failed pull, connector items
+ * that failed to import, and a connector that stopped early without a cause.
+ * Timeout-class partials keep exit 0 (the next run continues).
+ */
+export function isFailedPartial(result: Pick<SyncResult, 'status' | 'reason'>): boolean {
+  return result.status === 'partial'
+    && (result.reason === 'pull_failed' || result.reason === 'connector_item_failures' || result.reason === 'connector_partial');
+}
+
+/**
  * Post-sync backup-coverage refresh (monthly, stale-only). The sync CLI is a
  * trusted local engine holder (D4), so the compute piggybacks here; the
  * shared choke point (getBackupStatus) makes a fresh cache a no-op file read.
@@ -99,7 +110,8 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       if (result.uncommitted) writeUncommittedNote(result.uncommitted);
       break;
     case 'synced':
-      write(`Synced ${result.fromCommit?.slice(0, 8)}..${result.toCommit.slice(0, 8)}:`);
+      // Connector sources have no commit range.
+      write(result.toCommit ? `Synced ${result.fromCommit?.slice(0, 8) ?? '<initial>'}..${result.toCommit.slice(0, 8)}:` : 'Synced:');
       write(`  +${result.added} added, ~${result.modified} modified, -${result.deleted} soft-deleted (recoverable 72h), R${result.renamed} renamed`);
       write(`  ${result.chunksCreated} chunks created${result.embedded > 0 ? `, ${result.embedded} pages embedded` : ''}`);
       if (result.uncommitted) writeUncommittedNote(result.uncommitted);
@@ -143,6 +155,27 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
           `git pull failed — the local checkout may be behind its remote.`,
         );
         write(`  Fix the pull (see the warning above), then re-run 'gbrain sync' (last_commit unchanged; safe to retry).`);
+        break;
+      }
+      if (result.reason === 'connector_item_failures') {
+        write(
+          `Sync PARTIAL [connector_item_failures]: ${result.failedFiles ?? 0} connector item(s) failed to import; ` +
+          `${result.filesImported ?? result.added + result.modified} page(s) written.`,
+        );
+        write(`  The failure reasons are in the warnings above. Fix the cause, then re-run 'gbrain sync --source <id>' (the cursor did not advance past failed items; see 'gbrain sources status <id>'). Docs: docs/guides/google-connect.md#held-items`);
+        break;
+      }
+      if (result.reason === 'connector_partial') {
+        write(
+          `Sync PARTIAL [connector_partial]: the connector stopped before finishing and reported no cause; ` +
+          `${result.filesImported ?? result.added + result.modified} page(s) written.`,
+        );
+        write(`  Check the warnings above (expired or revoked credentials print there), fix the cause, then re-run 'gbrain sync --source <id>'.`);
+        break;
+      }
+      // #5984: a managed cursor knows its manifest size; the drain summary prints the next step.
+      if (result.managedCursor) {
+        write(`Sync PARTIAL at ${result.fromCommit?.slice(0, 8) ?? '<initial>'}: ${result.managedCursor.index} of ${result.managedCursor.total} manifest entries processed, reason=${result.reason ?? 'timeout'} (last_commit unchanged; safe to retry).`);
         break;
       }
       // v0.41.13.0 (T7 / D-V3-5): --timeout fired before the bookmark write

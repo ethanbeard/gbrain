@@ -272,7 +272,7 @@ describe('runUpgrade target verification (#4366)', () => {
       mockPrelude +
         `import { runUpgrade } from '${repoRoot}src/commands/upgrade.ts';\n` +
         `const t = process.env.TEST_TARGET_VERSION;\n` +
-        `await runUpgrade(['--swap-only'], t ? { targetVersion: t } : {});\n`,
+        `await runUpgrade(['--swap-only', '--no-bun-floor-check'], t ? { targetVersion: t } : {});\n`,
     );
     let bunExec = process.execPath;
     if (opts.binaryResult) {
@@ -429,7 +429,8 @@ describe('runUpgrade target verification (#4366)', () => {
     try {
       const root = join(home, repoDir);
       expect(stdout).toContain('Detected install method: bun-link');
-      const calls = readFileSync(join(home, 'calls.log'), 'utf-8').trim().split('\n');
+      // `rev-parse HEAD` records the pre-swap commit for #5855's recovery text.
+      const calls = readFileSync(join(home, 'calls.log'), 'utf-8').trim().split('\n').filter((c) => !c.endsWith(' rev-parse HEAD'));
       expect(calls[0]!.split('|')[1]).toBe(`-C ${root} pull --ff-only`);
       expect(calls[1]).toBe(`${realpathSync(root)}|install`);
       for (const dir of [home, repoRoot, join(root, 'src')]) {

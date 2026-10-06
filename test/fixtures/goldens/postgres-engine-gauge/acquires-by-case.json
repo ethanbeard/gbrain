@@ -194,6 +194,9 @@
     "listFactsByEntity#default": {},
     "listFactsBySession#allFilters": {},
     "listFactsBySession#default": {},
+    "listFactsKeyset#default": {},
+    "listFactsKeyset#keyset": {},
+    "listFactsKeyset#strictTime": {},
     "listFactsSince#allFilters": {},
     "listFactsSince#default": {},
     "listFilesForPage#default": {},
@@ -282,7 +285,7 @@
       "tx": 1
     },
     "replaceDerivedLinks#default": {
-      "raw": 11,
+      "raw": 12,
       "tx": 1
     },
     "resolveSlugWithAlias#default": {},

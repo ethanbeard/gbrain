@@ -36,6 +36,18 @@ class Foo {
     expect(syms.some((s) => s === 'go' || s === 'Foo::go')).toBe(true);
   });
 
+  test('N13-8: an untyped member call is flagged memberCall; bare and typed calls are not', async () => {
+    const src = `
+import { util } from './util';
+function join(a: string) { return a; }
+function f(xs: string[]) { join('a'); util.go(); return xs.join('/'); }
+`.trim();
+    const result = await chunkCodeTextFull(src, 'src/foo.ts');
+    const flagged = (sym: string) => result.edges.filter(e => e.toSymbol === sym).map(e => e.memberCall === true);
+    expect(flagged('join').sort()).toEqual([false, true]);
+    expect(flagged('./util::go')).toEqual([false]);
+  });
+
   test('all edges typed as calls', async () => {
     const src = 'function f() { return g(); }';
     const result = await chunkCodeTextFull(src, 'src/foo.ts');

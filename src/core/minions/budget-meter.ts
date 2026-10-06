@@ -9,7 +9,7 @@
  * and both proceed, total spend = $8. That's the bug. The fix is atomic
  * check-and-reserve under pg_advisory_xact_lock.
  *
- * The lock key is hashed from client_id. Stale reservations (worker
+ * The lock key is hashed from client_id (or the group budget key). Stale reservations (worker
  * crashed before settle) become overdue after `RESERVATION_TTL_MS`.
  * Their liability remains reserved until actual usage is reconciled: a
  * timeout or UTC day change is not evidence that a provider did no work.
@@ -165,6 +165,120 @@ export async function reserve(
 }
 
 /**
+ * Why a group reservation was refused. `exhausted`: settled spend plus
+ * overdue holds leave no room, so the group is done. `pressure`: only live
+ * holds of concurrent attempts are in the way; a retry after they settle can
+ * be admitted.
+ */
+export class GroupBudgetRefusal extends BudgetExceededError {
+  constructor(
+    readonly kind: 'exhausted' | 'pressure',
+    readonly budgetKey: string,
+    readonly spend: GroupSpend,
+    capCents: number,
+  ) {
+    super(
+      `budget ${kind === 'exhausted' ? 'exhausted' : 'under pressure'} for ${budgetKey}: ` +
+      `committed=${spend.committedCents.toFixed(2)}¢, overdue=${spend.overdueCents.toFixed(2)}¢, ` +
+      `live=${spend.liveCents.toFixed(2)}¢, cap=${capCents.toFixed(2)}¢`,
+      spend.committedCents + spend.overdueCents,
+      capCents,
+    );
+    this.name = 'GroupBudgetRefusal';
+  }
+}
+
+/** A group budget's lifetime totals in cents. Overdue holds count as spent until reconciled. */
+export interface GroupSpend {
+  committedCents: number;
+  overdueCents: number;
+  liveCents: number;
+}
+
+/** Read-only group totals; a pending hold past its deadline reads as overdue. */
+export async function readGroupSpend(engine: BrainEngine, budgetKey: string): Promise<GroupSpend> {
+  assertNonEmpty('budgetKey', budgetKey);
+  const sql = sqlQueryForEngine(engine);
+  const rows = await sql`
+    SELECT
+      COALESCE((SELECT SUM(spend_cents)::text FROM mcp_spend_log WHERE budget_key = ${budgetKey}), '0') AS committed_text,
+      COALESCE((SELECT SUM(estimated_cents)::text FROM mcp_spend_reservations
+                 WHERE budget_key = ${budgetKey}
+                   AND (status = 'expired' OR (status = 'pending' AND expires_at < now()))), '0') AS overdue_text,
+      COALESCE((SELECT SUM(estimated_cents)::text FROM mcp_spend_reservations
+                 WHERE budget_key = ${budgetKey} AND status = 'pending' AND expires_at >= now()), '0') AS live_text
+  `;
+  return {
+    committedCents: requiredFiniteTotal(rows[0]?.committed_text, 'committed spend'),
+    overdueCents: requiredFiniteTotal(rows[0]?.overdue_text, 'overdue spend'),
+    liveCents: requiredFiniteTotal(rows[0]?.live_text, 'pending spend'),
+  };
+}
+
+/** A reservation against a command group's shared budget (`group:<group_id>`) instead of an OAuth client. */
+export type GroupReserveOpts = Omit<ReserveOpts, 'clientId' | 'validateAdmission'> & { budgetKey: string };
+
+/**
+ * Group reservation: one approved total shared by every job of a command
+ * group, summed over the group's lifetime (no daily window, no client row).
+ * Under the same per-key advisory lock as client reservations:
+ *
+ *   1. Expire this key's pending holds past their deadline (overdue).
+ *   2. Settled spend plus overdue holds at or over the cap → `exhausted`.
+ *   3. The attempt reserves its maximum, bounded by the remaining headroom,
+ *      so one attempt can always run while nothing else is in flight; its
+ *      actual cost is charged at settle, and a settled total at the cap
+ *      refuses the next reservation.
+ *   4. Live holds of concurrent attempts that leave no room → `pressure`.
+ *
+ * A null cap reserves without a check (spend is still ledgered). Unknown
+ * estimates are admitted at their stated amount: the caller decides whether
+ * an unpriced attempt may run.
+ */
+export async function reserveGroup(engine: BrainEngine, opts: GroupReserveOpts): Promise<Reservation> {
+  const key = opts.budgetKey;
+  assertNonEmpty('budgetKey', key);
+  assertFiniteNonNegative('estimatedCents', opts.estimatedCents);
+  if (opts.capCents !== null) assertFiniteNonNegative('capCents', opts.capCents);
+  assertNonEmpty('model', opts.model);
+  assertNonEmpty('provider', opts.provider);
+  if (opts.jobId !== undefined && (!Number.isSafeInteger(opts.jobId) || opts.jobId <= 0)) {
+    throw new TypeError('jobId must be a positive safe integer when provided');
+  }
+  const reservationId = randomUUIDv7();
+  const expiresAt = new Date(Date.now() + RESERVATION_TTL_MS);
+  let estimated = opts.estimatedCents;
+  await engine.transaction(async (tx) => {
+    const sql = sqlQueryForEngine(tx);
+    if (tx.kind === 'postgres') {
+      // Lock-census (PR6 D5): INTENTIONALLY per budget key — every job of a group shares one total regardless of source.
+      await sql`SELECT pg_advisory_xact_lock(${BigInt(clientLockKey(key))})`;
+    }
+    await sql`
+      UPDATE mcp_spend_reservations SET status = 'expired'
+       WHERE budget_key = ${key} AND status = 'pending' AND expires_at < now()
+    `;
+    if (opts.capCents !== null) {
+      const spend = await readGroupSpend(tx, key);
+      const remaining = opts.capCents - spend.committedCents - spend.overdueCents;
+      if (remaining <= 0) throw new GroupBudgetRefusal('exhausted', key, spend, opts.capCents);
+      estimated = Math.min(estimated, remaining);
+      if (spend.liveCents > 0 && spend.liveCents + estimated > remaining) {
+        throw new GroupBudgetRefusal('pressure', key, spend, opts.capCents);
+      }
+    }
+    await sql`
+      INSERT INTO mcp_spend_reservations
+        (reservation_id, client_id, budget_key, job_id, estimated_cents, model, provider, status, expires_at, estimate_known, usage_unknown_reason)
+      VALUES
+        (${reservationId}, ${null}, ${key}, ${opts.jobId ?? null},
+         ${estimated}, ${opts.model}, ${opts.provider}, 'pending', ${expiresAt}, ${opts.estimateKnown !== false}, ${opts.estimateKnown === false ? 'pricing_or_bound_unknown' : null})
+    `;
+  });
+  return { reservationId, estimatedCents: estimated, ttlMs: RESERVATION_TTL_MS };
+}
+
+/**
  * Settle a reservation with the actual spend. Idempotent — second call
  * on the same reservation_id no-ops. Also writes a row to `mcp_spend_log`
  * so the rollup query in the next reserve sees the committed spend.
@@ -195,7 +309,7 @@ export async function settle(
              settled_at = now()
        WHERE reservation_id = ${reservationId}
          AND status IN ('pending', 'expired')
-      RETURNING client_id, model, provider
+      RETURNING client_id, budget_key, model, provider
     `;
     if (updated.length === 0) {
       const existing = await sql`
@@ -210,9 +324,10 @@ export async function settle(
     // Mirror into mcp_spend_log so getTodaySpendCents/reserve sees it.
     await sql`
       INSERT INTO mcp_spend_log
-        (client_id, token_name, operation, spend_cents, provider, model)
+        (client_id, budget_key, token_name, operation, spend_cents, provider, model)
       VALUES
-        (${String(row.client_id)}, ${tokenName}, ${operation}, ${actualCents},
+        (${row.client_id == null ? null : String(row.client_id)}, ${row.budget_key == null ? null : String(row.budget_key)},
+         ${tokenName}, ${operation}, ${actualCents},
          ${String(row.provider)}, ${String(row.model)})
     `;
   });

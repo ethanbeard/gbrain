@@ -36,6 +36,7 @@ export function makeGatewayThinkClient(): ThinkLLMClient {
         system,
         messages,
         maxTokens: params.max_tokens,
+        allowFallback: false,
       });
       return {
         id: '',

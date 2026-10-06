@@ -20,8 +20,9 @@
  * _brain-filing-rules.json) always ship, mirroring the openclaw bundler.
  *
  * Starter-surface gap snapshot: each bundled skill's frontmatter `tools:`
- * list is compared against STARTER_OPS (the plugin lanes serve
- * `--surface starter`). Harness tools (shell/exec/read/write/edit/
+ * list is compared against the REGISTRATION_SURFACE op set (the plugin lanes
+ * serve `--surface starter`, the surface every stdio registration gbrain
+ * writes pins; the root plugin manifests must pin the same value). Harness tools (shell/exec/read/write/edit/
  * web_search/web_fetch), literal `gbrain` (CLI usage marker), and unknown
  * non-op names are not MCP ops; `mcp:`-prefixed names count with the prefix
  * stripped. The computed per-skill gap set must equal the `starter_gaps`
@@ -38,8 +39,12 @@
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
-import { STARTER_OPS } from '../src/mcp/surface.ts';
+import { allowedOpNames } from '../src/mcp/surface.ts';
+import { REGISTRATION_SURFACE } from '../src/core/mcp-registration.ts';
+import { operations } from '../src/core/operations.ts';
+import { cliEquivalent } from '../src/core/ops/cli-equivalent.ts';
 import { parseSkillFrontmatter } from '../src/core/skill-frontmatter.ts';
+import { FAILSAFE_SCHEMA, load } from 'js-yaml';
 // Personas: the SINGLE validation implementation (the harness-bridge CLI
 // imports the same module), so CLI errors and CI errors match by construction.
 import { loadPersonas, type PersonaDef } from '../src/core/skillpack/personas.ts';
@@ -128,6 +133,7 @@ try {
 }
 
 // ── Starter-gap snapshot ────────────────────────────────────────────────────
+const SURFACE_OPS = allowedOpNames(operations, REGISTRATION_SURFACE);
 // Harness-native tool names a skill may declare that are not gbrain MCP ops.
 const HARNESS_TOOLS = new Set(['shell', 'exec', 'read', 'write', 'edit', 'web_search', 'web_fetch', 'gbrain']);
 
@@ -141,15 +147,79 @@ function frontmatterTools(slug: string): string[] {
   return parseSkillFrontmatter(text)?.tools ?? [];
 }
 
-const computedGaps: Record<string, string[]> = {};
-for (const slug of laneSet) {
+/** The beyond-starter MCP ops a bundled skill declares (sorted). */
+function starterGaps(slug: string): string[] {
   const mcpOps = frontmatterTools(slug)
     .map(t => (t.startsWith('mcp:') ? t.slice(4) : t))
     // Multi-word entries ("gbrain schema add-type …") are CLI command
     // strings, not MCP op names — same class as the bare `gbrain` marker.
     .filter(t => !HARNESS_TOOLS.has(t) && !t.startsWith('gbrain '));
-  const gaps = [...new Set(mcpOps.filter(t => !STARTER_OPS.has(t)))].sort();
+  return [...new Set(mcpOps.filter(t => !SURFACE_OPS.has(t)))].sort();
+}
+
+const computedGaps: Record<string, string[]> = {};
+for (const slug of laneSet) {
+  const gaps = starterGaps(slug);
   if (gaps.length > 0) computedGaps[slug] = gaps;
+}
+
+/**
+ * Agent contract v1 (F6): the generated copy of a skill whose steps name
+ * tools outside the plugin's starter surface ends with a note mapping each
+ * one to its gbrain CLI equivalent. Source skills are never edited.
+ */
+const OPS_BY_NAME = new Map(operations.map(op => [op.name, op]));
+function surfaceNote(gaps: readonly string[]): string {
+  const rows = gaps.map(name => {
+    const op = OPS_BY_NAME.get(name);
+    return `- \`${name}\` → \`${op ? cliEquivalent(op).join(' ') : `gbrain call ${name} '<params_json>'`}\``;
+  });
+  return [
+    '', '## Tools outside your MCP surface', '',
+    `This plugin serves the ${REGISTRATION_SURFACE} tool surface. When a step above names one of these tools and your tool list`,
+    'does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:', '',
+    ...rows, '',
+    "To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.", '',
+  ].join('\n');
+}
+
+/** Claude Code's skill listing caps description + when_to_use at this many characters per skill. */
+const SKILL_LISTING_CHARS = 1536;
+const WHEN_TO_USE_TRIGGERS = 5;
+
+/**
+ * #5858: Claude Code lists a skill by `name`, `description` and `when_to_use`
+ * only, so `triggers:` never reached the model. Each plugin-lane SKILL.md
+ * that declares triggers and no `when_to_use` gets one built from its first
+ * triggers, kept inside the listing cap. Source skills stay unchanged.
+ */
+function withWhenToUse(text: string): string {
+  const fm = parseSkillFrontmatter(text);
+  const triggers = (fm?.triggers ?? []).filter(t => t.trim());
+  if (!fm || triggers.length === 0 || /^when_to_use:/m.test(fm.raw)) return text;
+  let description = '';
+  try {
+    const data: unknown = load(fm.raw, { schema: FAILSAFE_SCHEMA });
+    if (data && typeof data === 'object' && typeof (data as { description?: unknown }).description === 'string') description = (data as { description: string }).description;
+  } catch { return text; }
+  const room = SKILL_LISTING_CHARS - description.length - 1;
+  let picked = triggers.slice(0, WHEN_TO_USE_TRIGGERS);
+  const render = (list: string[]) => `Use when the user asks: ${list.map(t => `"${t.trim()}"`).join(', ')}.`;
+  while (picked.length > 1 && render(picked).length > room) picked = picked.slice(0, -1);
+  if (render(picked).length > room) return text;
+  const close = text.indexOf('\n---', 4);
+  return `${text.slice(0, close)}\nwhen_to_use: ${JSON.stringify(render(picked))}${text.slice(close)}`;
+}
+
+/** Copy one bundled skill; add `when_to_use` and append the surface note to its SKILL.md when it has gaps. */
+function copySkill(slug: string, destSkillsDir: string): void {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  cpSync(join(ROOT, 'skills', slug), join(destSkillsDir, slug), { recursive: true });
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- build-time generator; slug comes from this repository's own plugin definition
+  const skillMd = join(destSkillsDir, slug, 'SKILL.md');
+  const gaps = starterGaps(slug);
+  const text = withWhenToUse(readFileSync(skillMd, 'utf8'));
+  writeFileSync(skillMd, gaps.length === 0 ? text : text.replace(/\n*$/, '\n') + surfaceNote(gaps));
 }
 
 if (writeGaps) {
@@ -166,6 +236,19 @@ if (writeGaps) {
         '`bun run scripts/generate-plugin-tree.ts --out plugin --write-gaps`.',
     );
   }
+}
+
+// The root plugin manifests (copied into every variant) must pin the registration surface.
+function pinnedSurface(args: unknown): string | undefined {
+  if (!Array.isArray(args)) return undefined;
+  const i = args.indexOf('--surface');
+  return i >= 0 ? String(args[i + 1]) : undefined;
+}
+for (const file of ['.codex-plugin/mcp.json', '.claude-plugin/plugin.json']) {
+  if (!existsSync(join(ROOT, file))) continue;
+  const servers = (JSON.parse(readFileSync(join(ROOT, file), 'utf8')) as { mcpServers?: Record<string, { args?: unknown }> }).mcpServers;
+  const pinned = pinnedSurface(servers?.gbrain?.args);
+  if (pinned !== REGISTRATION_SURFACE) fail(`${file} pins --surface ${pinned ?? '(none)'}; plugin lanes serve the registration surface '${REGISTRATION_SURFACE}' (src/core/mcp-registration.ts)`);
 }
 
 if (failed) process.exit(1);
@@ -197,7 +280,7 @@ function copySharedDeps(destSkillsDir: string): void {
 }
 
 for (const slug of laneSet) {
-  cpSync(join(ROOT, 'skills', slug), join(outDir, 'skills', slug), { recursive: true });
+  copySkill(slug, join(outDir, 'skills'));
 }
 copySharedDeps(join(outDir, 'skills'));
 
@@ -215,15 +298,16 @@ addition/exclusion).
 
 ## MCP surface note (read once)
 
-The plugin's MCP server runs \`gbrain serve --surface starter\` — the
-${STARTER_OPS.size}-op daily-driver surface (the seven memory verbs + daily
-brain ops + capture). ${gapSkills}
+The plugin's MCP server runs \`gbrain serve --surface ${REGISTRATION_SURFACE}\` — the
+${SURFACE_OPS.size}-op daily-driver surface (the seven memory verbs + daily
+brain ops + capture), the same surface every stdio registration gbrain writes
+pins. ${gapSkills}
 bundled skills reference gbrain operations beyond that surface; every one of
 them has a first-class \`gbrain\` CLI path, which is the primary way skills
 drive gbrain. When a skill step names an operation your MCP tool list doesn't
-carry, run the equivalent \`gbrain\` CLI command, or widen this machine's
-plugin surface with \`GBRAIN_SURFACE=full\` (the launcher honors it; new
-sessions pick it up).
+carry, call \`request_tools {"surface":"full"}\` to add it to this session, run
+the equivalent \`gbrain\` CLI command, or widen this machine's plugin surface
+with \`GBRAIN_SURFACE=full\` (the server honors it; new sessions pick it up).
 
 ## Requirements
 
@@ -246,10 +330,8 @@ function emitVariant(variantsDir: string, personaName: string, def: PersonaDef, 
   mkdirSync(join(root, 'skills'), { recursive: true });
 
   const slugs = Object.keys(def.skills).sort();
-  for (const slug of slugs) {
-    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-    cpSync(join(ROOT, 'skills', slug), join(root, 'skills', slug), { recursive: true });
-  }
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- build-time generator over this repository's own plugin definition
+  for (const slug of slugs) copySkill(slug, join(root, 'skills'));
   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   copySharedDeps(join(root, 'skills'));
 

@@ -1,52 +1,21 @@
-// v0.38 ReDoS guard (E6 + E9 refinement).
+// ReDoS guard for schema-pack link inference.
 //
 // Community schema packs ship arbitrary regexes in
-// `link_types[].inference.regex`. A pack with catastrophic-backtracking
-// pattern (`^(a+)+$` and friends) + a moderately-long paragraph would
-// pin CPU on every link extraction.
+// `link_types[].inference.regex`. A pack with a catastrophic-backtracking
+// pattern (`^(a+)+$` and friends) plus a moderately long paragraph would pin
+// CPU on every link extraction. Bounding is: (1) the input-length cap below,
+// (2) a runtime hard gate refusing nested-quantifier (catastrophic-shape)
+// patterns — the star-height lint heuristic, enforced at execution time
+// (degrade-to-mentions, never executed), and (3) a per-page cumulative budget
+// (`LINK_EXTRACTION_TOTAL_BUDGET_MS`): once a page's regex time exceeds it,
+// all remaining verbs on that page degrade to `mentions`, sorted by verb name
+// so degraded-link sets reproduce.
 //
-// E6 locked `vm.runInContext({timeout: 50})` as the primary defense.
-// E9 added two layers:
-//   1. A Bun-vm spike (scripts/spike-bun-vm-timeout.ts) MUST run before
-//      this guard is trusted in production. If the spike shows Bun's
-//      vm timeout doesn't actually interrupt under catastrophic regex,
-//      fall back to a persistent worker pool (E6 option B).
-//   2. A per-PAGE total budget. `LINK_EXTRACTION_TOTAL_BUDGET_MS = 500`.
-//      If cumulative regex time on a page exceeds 500ms, degrade ALL
-//      remaining verbs on that page to `mentions`, deterministically
-//      sorted by lex of verb name so degraded-link sets reproduce.
-//
-// This file ships the integration shape; the spike confirmation is
-// gated by T24. If the spike fails, swap `runRegexBounded` with a
-// worker-pool variant; the public surface stays the same.
-//
-// T24 spike result (2026-05-20): Bun's vm.runInContext({timeout: 50})
-// DOES interrupt catastrophic regex, but with ~10x wall-clock latency
-// versus the configured timeout. A configured 50ms timeout takes ~500ms
-// wall-clock to actually unwind for `^(a+)+$` against a 1MB input. This
-// is because Bun checks the timeout at instruction boundaries, and tight
-// backtracking loops yield infrequently. The per-page budget design
-// absorbs this: one catastrophic regex consumes the 500ms budget, all
-// remaining verbs degrade to mentions. Total CPU per page is bounded by
-// the budget regardless of pathological pattern count. SAFE for v0.38.
-//
-// v0.46 megawave FALSIFICATION (bootstrap-verify corpus hang): in a process
-// that ALSO hosts PGLite (WASM Postgres), repeated `vm.runInContext(...,
-// { timeout })` calls wedge Bun's event loop — after some dozens of watchdog
-// runs, ALL JS timers stop firing and the next in-flight PGLite query promise
-// never resolves (main thread parks in kevent64 at 0% CPU forever). Repro:
-// put_page x ~20 with pack regex inference (#3190) against an in-memory
-// PGLite brain; hang point drifts run-to-run. The vm timeout was therefore
-// REMOVED — it protected against a slow regex by freezing the entire brain,
-// strictly worse than the attack. This is likely the mechanism behind the
-// #1569-followup field report of syncs wedging deterministically mid-run.
-// Bounding is now: (1) the input-length cap below, (2) a runtime HARD gate
-// refusing nested-quantifier (catastrophic-shape) patterns — the same
-// heuristic the star-height lint flags, escalated from advisory to enforced
-// at execution time (degrade-to-mentions, never executed), and (3) the
-// per-page cumulative budget. If a true preemptive bound is ever needed
-// again, it must be the E6 option B worker pool — NOT node:vm — because the
-// watchdog is unsafe in PGLite-hosting processes.
+// There is no `node:vm` timeout: in a process that also hosts PGLite,
+// repeated `vm.runInContext(..., { timeout })` calls wedge Bun's event loop
+// (timers stop firing and the next PGLite query never resolves), which froze
+// the whole brain to protect against one slow regex. If a preemptive bound is
+// ever needed, it must be a worker pool, not node:vm.
 
 export const LINK_EXTRACTION_TOTAL_BUDGET_MS = 500 as const;
 export const PER_REGEX_TIMEOUT_MS = 50 as const;

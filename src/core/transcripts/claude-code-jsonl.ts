@@ -28,7 +28,8 @@
  * ~/.claude/projects, `.jsonl` extension, lstat-rejected symlinks, byte cap.
  */
 
-import { closeSync, lstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { isPathContained } from '../path-confine.ts';
 import { detectWslMountRoot, translateWindowsPath } from '../wsl-paths.ts';
 import { stripPastedContent } from './pasted-content.ts';
@@ -68,7 +69,7 @@ export const TRANSCRIPT_HARD_CAP_BYTES = 50 * 1024 * 1024;
 // ── Confinement [S3#8] ──────────────────────────────────────────────────────
 
 export type ConfineTranscriptResult =
-  | { ok: true; path: string; size: number }
+  | { ok: true; path: string; size: number; absent?: boolean }
   | { ok: false; reason: 'missing_path' | 'not_jsonl' | 'unreadable' | 'symlink' | 'not_file' | 'too_large' | 'outside_projects_dir' };
 
 /**
@@ -77,7 +78,12 @@ export type ConfineTranscriptResult =
  * lstat'ed so a symlink is SEEN, never followed), regular file, byte cap,
  * and realpath containment in ~/.claude/projects (`isPathContained` resolves
  * intermediate symlinked directories, so a planted dir-symlink that escapes
- * the tree also fails). Fail-closed on every error.
+ * the tree also fails). Fail-closed on every error — with ONE deliberate
+ * exception (#5465): an ENOENT leaf whose parent resolves inside the tree
+ * validates ok with `absent: true`, because Claude Code writes transcripts
+ * asynchronously and a not-yet-created file has nothing to read (the same
+ * trust as no transcript_path at all). An absent parent, or any other lstat
+ * failure, still fails closed.
  *
  * Cross-OS install (#4522, Claude Code on the Windows host + gbrain in WSL):
  * the hook stdin's transcript_path arrives as a Windows drive literal
@@ -109,38 +115,50 @@ export function confineTranscriptPath(
   const mountRoot = opts.wslMountRoot !== undefined ? opts.wslMountRoot : detectWslMountRoot();
   const translated = mountRoot !== null ? translateWindowsPath(p, mountRoot) : null;
   const candidate = translated ?? p;
-  let st: ReturnType<typeof lstatSync>;
-  try {
-    st = lstatSync(candidate);
-  } catch {
-    return { ok: false, reason: 'unreadable' };
-  }
-  if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
-  if (!st.isFile()) return { ok: false, reason: 'not_file' };
-  // #5701: the size gate belongs to the READER, not the confinement. Every
-  // hook lane tail-reads a bounded window through parseTranscript (128KB
-  // writeback probe, 2MB user-prompt, 10MB session end), so refusing a
-  // legitimate >50MiB session here dropped automatic capture for long-running
-  // Claude Code sessions while the bounded read would have worked: one
-  // 12-hour heartbeat window recorded 41 `transcript_too_large` degrades.
-  // Callers that opt in skip the gate; path, symlink and root confinement
-  // still apply, and the full-file import path (parseClaudeSessionFile, whose
-  // cap lives in TRANSCRIPT_JSONL_HARD_CAP) is untouched.
-  const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
-  if (!opts.allowOversize && st.size > cap) return { ok: false, reason: 'too_large' };
   const rootRaw = opts.root ?? claudeProjectsDir();
   const root = (mountRoot !== null ? translateWindowsPath(rootRaw, mountRoot) : null) ?? rootRaw;
-  if (!isPathContained(candidate, root)) {
+  // Containment against the resolved tree, shared by the existing-file and
+  // absent-leaf paths. realpathSync resolves intermediate symlinked segments
+  // (the planted dir-symlink escape), so the caller's pinned root — not the
+  // path's own shape — decides membership.
+  const containedIn = (leaf: string): boolean => {
+    if (isPathContained(leaf, root)) return true;
     // Cross-OS fallback (#4522): only for a path we translated ourselves and
     // only when the caller didn't pin an explicit root.
     const derived =
       mountRoot !== null && translated !== null && opts.root === undefined
         ? deriveTranslatedProjectsRoot(translated, mountRoot)
         : null;
-    if (derived === null || !isPathContained(candidate, derived)) {
-      return { ok: false, reason: 'outside_projects_dir' };
-    }
+    return derived !== null && isPathContained(leaf, derived);
+  };
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(candidate);
+  } catch (e) {
+    // #5465: Claude Code writes the transcript asynchronously, so on turn 1
+    // of a fresh session (or the only turn of `claude -p`) the path can be
+    // absent. A CONFINED absent path has nothing to read — the same trust as
+    // no transcript_path at all — so it validates with absent:true and the
+    // caller's prompt-only path runs instead of aborting the event. An
+    // absent path whose parent escapes the tree stays a rejection, and every
+    // non-ENOENT lstat failure (EACCES, ENOTDIR, …) stays fail-closed.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return { ok: false, reason: 'unreadable' };
+    const parent = dirname(candidate);
+    // No directory component (a bare filename — e.g. an untranslated Windows
+    // drive literal on a non-WSL host) or an absent parent: containment is
+    // unprovable, so fail closed exactly as before.
+    if (parent === '.' || !existsSync(parent)) return { ok: false, reason: 'unreadable' };
+    if (!containedIn(parent)) return { ok: false, reason: 'outside_projects_dir' };
+    return { ok: true, path: candidate, size: 0, absent: true };
   }
+  if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
+  if (!st.isFile()) return { ok: false, reason: 'not_file' };
+  // #5701: the size gate belongs to the READER, not the confinement. Every
+  // hook lane tail-reads a bounded window through parseTranscript, so callers
+  // that opt in skip the gate; path, symlink and root confinement still apply.
+  const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
+  if (!opts.allowOversize && st.size > cap) return { ok: false, reason: 'too_large' };
+  if (!containedIn(candidate)) return { ok: false, reason: 'outside_projects_dir' };
   return { ok: true, path: candidate, size: st.size };
 }
 
@@ -594,6 +612,12 @@ export interface ParsedClaudeSession {
    * the real drift signal: turn records exist but no longer yield text.
    */
   turnShapedLines: number;
+  /**
+   * User records deliberately excluded (root isMeta/isSidechain/isCompactSummary
+   * or a non-human origin): a session with these and no user turn was started
+   * by automation, not a parser that lost the human side.
+   */
+  excludedUserLines: number;
 }
 
 /**
@@ -617,6 +641,7 @@ export function parseClaudeSessionFile(
   let cwd: string | undefined;
   let skippedLines = 0;
   let turnShapedLines = 0;
+  let excludedUserLines = 0;
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -637,6 +662,7 @@ export function parseClaudeSessionFile(
     ) {
       turnShapedLines++;
     }
+    if (e.type === 'user' && (isSkippedTurnEntry(e) || hasNonHumanOrigin(e))) excludedUserLines++;
     if (!turn) continue;
     const timestamp = typeof e.timestamp === 'string' ? e.timestamp : '';
     turns.push({ role: turn.turn.role, text: turn.turn.text, timestamp });
@@ -649,6 +675,7 @@ export function parseClaudeSessionFile(
     bytesRead: size,
     skippedLines,
     turnShapedLines,
+    excludedUserLines,
   };
 }
 

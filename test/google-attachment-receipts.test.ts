@@ -80,7 +80,7 @@ describe('Gmail attachment receipts', () => {
     expect(calls).toBe(1);
     expect(result.messages[0].bodyText).toBe('');
     expect(result.messages[0].attachmentInspection).toMatchObject({ state: 'present', attachments: [
-      { partId: '1.0', filename: 'nested.pdf', attachmentId: 'opaque', size: 42, fetched: false, indexed: false },
+      { partId: '1.0', filename: 'nested.pdf', attachmentId: null, size: 42, fetched: false, indexed: false },
     ] });
   });
 
@@ -125,7 +125,7 @@ describe('Gmail attachment receipts', () => {
       { partId: '1', mimeType: 'application/pdf', filename: 'report.pdf', body: { attachmentId: 'opaque-id', size: 42 } },
     ] });
     expect(result.messages[0].attachmentInspection).toMatchObject({ state: 'present', attachments: [
-      { filename: 'report.pdf', mimeType: 'application/pdf', size: 42, attachmentId: 'opaque-id', partId: '1', fetched: false, indexed: false },
+      { filename: 'report.pdf', mimeType: 'application/pdf', size: 42, attachmentId: null, partId: '1', fetched: false, indexed: false },
     ] });
     expect(result.messages[0].bodyText).toBe('Hello');
     const rendered = renderThreadPage(result)!.markdown;
@@ -158,6 +158,18 @@ describe('Gmail attachment receipts', () => {
     expect(a.attachments[0].id).not.toBe(inspectGmailAttachments(payload, 'other@example.com', 'one').attachments[0].id);
     expect(a.attachments[0].id).not.toBe(inspectGmailAttachments(payload, 'reader@example.com', 'two').attachments[0].id);
     expect(a.attachments[0].attachmentId).toBeNull();
+  });
+
+  test('an ephemeral attachmentId never reaches the persisted receipt — two fetches produce identical output (#5802)', () => {
+    const part = (id: string): GmailMimePart => ({ mimeType: 'multipart/mixed', parts: [
+      { partId: '1', mimeType: 'application/pdf', filename: 'report.pdf', body: { attachmentId: id, size: 42 } },
+    ] });
+    const first = inspectGmailAttachments(part('ANGjdJ_first'), 'reader@example.com', 'one');
+    const second = inspectGmailAttachments(part('ANGjdJ_rotated'), 'reader@example.com', 'one');
+    // Gmail returns a different attachmentId per fetch; the persisted receipt
+    // must be identical or every sync re-admits the thread.
+    expect(second).toEqual(first);
+    expect(first.attachments[0].attachmentId).toBeNull();
   });
 
   test('unclassifiable empty leaves and childless multipart containers remain incomplete', async () => {

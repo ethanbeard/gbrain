@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { runEvalGate } from '../src/commands/eval-gate.ts';
+import { expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 import {
   BASELINE_FILE_SCHEMA_VERSION,
   DEFAULT_THRESHOLDS,
@@ -121,6 +122,11 @@ function withExitCapture<T>(fn: () => Promise<T>): Promise<{ exitCode: number | 
 }
 
 describe('eval gate: usage errors', () => {
+  test('every usage() refusal names its own next step', () => {
+    expectFunnelSuggestions('src/commands/eval-gate.ts', 'usage', 7);
+  });
+
+
   test('no flags → exit 2 with usage error', async () => {
     const out = await withExitCapture(() => runEvalGate(engine, []));
     expect(out.exitCode).toBe(2);

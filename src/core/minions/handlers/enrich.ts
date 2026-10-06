@@ -6,9 +6,11 @@ import type { MinionHandler } from '../types.ts';
 
 /**
  * v0.41.39 (#1700) — enrich. NOT in PROTECTED_JOB_NAMES: per-call cost is
- * bounded by data.maxCostUsd (default DEFAULT_MAX_COST_USD) and the handler
- * re-creates the BudgetTracker in its own process. BudgetExhausted is caught
- * at the core level and returned as result.budget_exhausted (NOT a failure).
+ * bounded by data.maxCostUsd (default DEFAULT_MAX_COST_USD, or the job's
+ * spend authorization cap) and the handler re-creates the BudgetTracker in
+ * its own process. BudgetExhausted is caught at the core level and returned
+ * as result.budget_exhausted; under a spend authorization (`ctx.spend`) it is
+ * terminal instead: the job dies with the group's exhaustion envelope.
  * Strict per-source: the CLI fans out one job per source when --source is
  * omitted, so a job ALWAYS carries data.sourceId.
  */
@@ -30,13 +32,20 @@ export function makeEnrichHandler(engine: BrainEngine): MinionHandler {
       limit: typeof job.data.limit === 'number' ? job.data.limit : undefined,
       workers: typeof job.data.workers === 'number' ? job.data.workers : undefined,
       model: typeof job.data.model === 'string' ? job.data.model : undefined,
-      maxCostUsd: typeof job.data.maxCostUsd === 'number' ? job.data.maxCostUsd : undefined,
+      maxCostUsd: typeof job.data.maxCostUsd === 'number' ? job.data.maxCostUsd
+        : job.spend ? (job.spend.record.cap_usd ?? Infinity) : undefined,
       minContextChars: typeof job.data.minContextChars === 'number' ? job.data.minContextChars : undefined,
       thinThreshold: typeof job.data.thinThreshold === 'number' ? job.data.thinThreshold : undefined,
       reenrichAfterMs: typeof job.data.reenrichAfterMs === 'number' ? job.data.reenrichAfterMs : undefined,
       dryRun: !!job.data.dryRun,
       force: !!job.data.force,
     });
+    if (job.spend && result.budget_exhausted) {
+      const { spendRefusal } = await import('../spend-authorization.ts');
+      throw await spendRefusal(engine, job, job.spend.record, result.budget_exhausted_reason === 'no_pricing' && result.budget_exhausted_model
+        ? { kind: 'no_pricing', model: result.budget_exhausted_model }
+        : { kind: 'cost' });
+    }
     return result;
   };
 }

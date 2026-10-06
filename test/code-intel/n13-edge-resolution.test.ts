@@ -78,6 +78,23 @@ for (const kind of testBackends()) {
       expect(edge?.resolved).toBe(false);
     });
 
+    test('N13-8: a member call never resolves to a same-file top-level function of that name', async () => {
+      await importCodeFile(engine, 'src/pathish.ts',
+        'export function join(...parts: string[]): string {\n  return parts.join("/");\n}\n\n'
+        + 'export function dirname(p: string): string {\n  const segments = p.split("/");\n  return segments.slice(0, -1).join("/");\n}\n\n'
+        + 'export function cwd(): string {\n  return process.cwd();\n}\n\n'
+        + 'export function resolve(p: string): string {\n  return join(cwd(), p);\n}\n',
+        { noEmbed: true });
+      await resolveSymbolEdgesIncremental(engine, { sourceId: 'default' });
+      const resolvedCallers = async (symbol: string) =>
+        (await engine.getCallersOf(symbol, { sourceId: 'default' })).filter((e) => e.resolved).map((e) => e.from_symbol_qualified).sort();
+      expect(await resolvedCallers('join')).toEqual(['resolve']);
+      expect(await resolvedCallers('cwd')).toEqual(['resolve']);
+      const memberEdge = (await engine.getCallersOf('join', { sourceId: 'default' })).find((e) => e.from_symbol_qualified === 'dirname');
+      expect(memberEdge?.edge_metadata.member_call).toBe(true);
+      expect(memberEdge?.resolved).toBe(false);
+    });
+
     test('N13-3: a Python function sharing a Go function name walks; Go callers stay out', async () => {
       await importCodeFile(engine, 'gate/shared.go',
         'package main\n\nfunc shared_helper() int {\n\treturn 2\n}\n\nfunc go_user() int {\n\treturn shared_helper()\n}\n',

@@ -292,6 +292,21 @@ describe('scanBrainSources (PGLite)', () => {
     expect(beta.errors_by_code.NESTED_QUOTES).toBeGreaterThanOrEqual(1);
   });
 
+  test('#5988 splits each code into imported-anyway vs held-on-import', async () => {
+    const src = join(tmp, 'mixed');
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, 'quotable.md'), `${fence}\ntype: x\ntitle: a: b\n${fence}\n\nbody`);
+    writeFileSync(join(src, 'folded.md'), `${fence}\ntype: x\ntitle: first\nsecond line\n${fence}\n\nbody`);
+    writeFileSync(join(src, 'slugged.md'), `${fence}\ntype: x\ntitle: ok\nslug: elsewhere/page\n${fence}\n\nbody`);
+    await registerSource('mixed', src);
+
+    const report = await scanBrainSources(engine, { sourceId: 'mixed' });
+    const mixed = report.per_source.find(s => s.source_id === 'mixed')!;
+    expect(mixed.recoverability_by_code?.YAML_PARSE).toEqual({ recoverable: 1, unrecoverable: 1 });
+    expect(mixed.recoverability_by_code?.SLUG_MISMATCH).toEqual({ recoverable: 0, unrecoverable: 1 });
+    expect(report.recoverability_by_code?.YAML_PARSE).toEqual({ recoverable: 1, unrecoverable: 1 });
+  });
+
   test('respects sourceId filter', async () => {
     const srcA = join(tmp, 'a');
     const srcB = join(tmp, 'b');

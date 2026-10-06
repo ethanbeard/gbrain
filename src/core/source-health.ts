@@ -26,6 +26,7 @@ import type { BrainEngine } from './engine.ts';
 import { parseSourceConfig, type SourceRow } from './sources-load.ts';
 import { isSourceUnchangedSinceSync } from './git-head.ts';
 import { resolveHoursEnv } from './env-number.ts';
+import { isSyncDisabledConfig } from './sync-policy.ts';
 
 export interface SourceMetrics {
   source_id: string;
@@ -407,4 +408,44 @@ async function jobCountsBySource(engine: BrainEngine): Promise<Map<string, JobSt
   } catch {
     return new Map();
   }
+}
+
+/**
+ * Sync-eligible sources with a local path, for doctor `sync_freshness`,
+ * including the upstream observation sync records (#5255, O-DX-8). Older
+ * brains without those columns (or without `archived`) still load.
+ */
+export async function loadSyncFreshnessSources(engine: BrainEngine) {
+  type FreshnessSourceRow = {
+    id: string;
+    name: string;
+    local_path: string | null;
+    last_sync_at: Date | null;
+    last_commit: string | null;
+    chunker_version: string | null;
+    newest_content_at: Date | null;
+    config: unknown;
+    upstream_checked_at: Date | null;
+    upstream_commit: string | null;
+    upstream_behind: number | null;
+  };
+  const columns = 'id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at, config';
+  let sources: FreshnessSourceRow[];
+  try {
+    sources = await engine.executeRaw<FreshnessSourceRow>(
+      `SELECT ${columns}, upstream_checked_at, upstream_commit, upstream_behind FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+    );
+  } catch {
+    const noUpstream = 'NULL AS upstream_checked_at, NULL AS upstream_commit, NULL AS upstream_behind';
+    try {
+      sources = await engine.executeRaw<FreshnessSourceRow>(
+        `SELECT ${columns}, ${noUpstream} FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+      );
+    } catch {
+      sources = await engine.executeRaw<FreshnessSourceRow>(
+        `SELECT ${columns}, ${noUpstream} FROM sources WHERE local_path IS NOT NULL`,
+      );
+    }
+  }
+  return sources.filter((source) => !isSyncDisabledConfig(source.config));
 }

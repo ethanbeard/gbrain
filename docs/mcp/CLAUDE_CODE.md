@@ -54,7 +54,7 @@ tools use the plugin lane's own approval flow.
 ## Option 1: Local (recommended, zero server needed)
 
 ```bash
-claude mcp add gbrain -- gbrain serve --surface verbs
+claude mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs
 ```
 
 That's it. Claude Code spawns `gbrain serve` as a stdio subprocess. No server, no
@@ -182,8 +182,7 @@ sub-second, world-visibility by default, and available on `--surface verbs`.
   window's standing entities so that rehydration pack is warm) into
   `.claude/settings.local.json`. Nothing to call; `GBRAIN_HOOKS=0` disables
   every hook event, including capture. Session start never shows another
-  session's activity: the `Last session activity` line older releases printed
-  was removed in v0.60.28.0 (#5558), with deliberately no opt-in to restore it.
+  session's activity, and no setting turns that on.
 - **Manual (any brain, incl. remote/Postgres):** call the verbs yourself at
   boundaries — `context_pack(entities, budget_tokens)` at session start /
   after compaction, `delta(session_id, budget_tokens)` on wakes. See

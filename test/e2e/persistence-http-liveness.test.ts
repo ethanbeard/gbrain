@@ -97,7 +97,8 @@ describe.skipIf(!url)('authenticated PostgreSQL HTTP accepted-write liveness', (
       GBRAIN_MCP_FORCE_SURFACE: undefined, GBRAIN_REMOTE_CLIENT_SECRET: undefined, GBRAIN_REMOTE_PRIVATE_PAGES: undefined });
     const legacy = cli(['auth', 'create', 'synthetic-http-writer', '--scopes', 'read,write']);
     tokens.push(legacy.match(/gbrain_[a-f0-9]{64}/)![0]);
-    await pg.engine.executeRaw("UPDATE access_tokens SET permissions=jsonb_set(COALESCE(permissions,'{}'::jsonb),'{source_id}',to_jsonb($1::text)) WHERE name='synthetic-http-writer'", [config.sourceIds[0]]);
+    // F3: grant through the editor; a raw JSONB edit on a unified token reads as drift and denies.
+    cli(['auth', 'rescope', '--token', 'synthetic-http-writer', '--sources', config.sourceIds[0]]);
     const oauth = cli(['auth', 'register-client', 'synthetic-oauth-writer', '--grant-types', 'client_credentials',
       '--scopes', 'read write', '--source', config.sourceIds[0]]);
     oauthId = oauth.match(/Client ID:\s+(gbrain_cl_\S+)/)![1];

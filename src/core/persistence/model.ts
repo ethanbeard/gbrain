@@ -82,6 +82,8 @@ export interface WriteRequest {
   outcome: Record<string, unknown> | null;
   error_code: string | null;
   error_message: string | null;
+  /** #5974 structured failure (publication-failure.ts); receipts expose only its public view. */
+  error_detail?: Record<string, unknown> | null;
   blocked_reason: string | null;
   compacted: boolean;
   publication_started: boolean;

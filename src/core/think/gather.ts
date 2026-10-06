@@ -17,9 +17,11 @@
 
 import type { BrainEngine, TakeHit, Take } from '../engine.ts';
 import { hybridSearch } from '../search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../search/internal-breadth.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import type { Page, SearchResult } from '../types.ts';
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
+import { pageContentDate } from './temporal-context.ts';
 import { sanitizeQueryForPrompt } from '../search/expansion.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
@@ -151,16 +153,15 @@ export async function runGather(
   let windowDiagnostic: ThinkGatherResult['diagnostics']['window'];
 
   // Stream 1: hybrid page search (existing primitive).
-  // autocut: false on both legs (#4561) — autocut is default-ON in
-  // balanced/tokenmax and cuts BEFORE the limit slice, so an evidence
-  // gather sized for breadth (default 40) could collapse to minKeep=1 and
-  // starve synthesis. Same breadth reason as the CRAG escalation re-run in
-  // ops/search.ts; precision trimming is the synth prompt's job here.
+  // Both legs opt out of the reader-facing trims (autocut #4561, adaptive
+  // return #5890): each cuts BEFORE the limit slice, so an evidence gather
+  // sized for breadth (default 40) could collapse to 1-6 pages and starve
+  // synthesis. Precision trimming is the synth prompt's job here.
   const pagesPromise = (window ? Promise.all([
     hybridSearch(engine, opts.question, {
       limit: Math.min(gatherLimit * 4, 200),
       expansion: false,
-      autocut: false,
+      ...INTERNAL_BREADTH_SEARCH_OPTS,
       ...pageScope,
       decide,
     }),
@@ -182,7 +183,7 @@ export async function runGather(
   }) : hybridSearch(engine, opts.question, {
     limit: gatherLimit,
     expansion: false,
-    autocut: false,
+    ...INTERNAL_BREADTH_SEARCH_OPTS,
     ...pageScope,
     decide,
   })).catch((e) => {
@@ -606,7 +607,8 @@ export const INJECTION_SUSPECTED_LINE = 'injection_suspected: this page contains
 
 /**
  * Render gather results into the per-block strings the prompt builder uses.
- * Pages are rendered as `<page slug="..." score="...">excerpt</page>`;
+ * Pages are rendered as `<page slug="..." rank="..." date="...">excerpt</page>`; `date` appears only
+ * for content-dated pages (see temporal-context.ts) and renders in `opts.timeZone`;
  * takes are rendered via the renderTakesBlock helper from sanitize.ts.
  * `excerptLen` is exact per page — callers wanting budget-aware sizing pass
  * `pagesBlockExcerptLen(pages.length)` (the think pipeline does).
@@ -615,9 +617,11 @@ export function renderPagesBlock(
   pages: SearchResult[],
   excerptLen = 600,
   query = '',
-  opts: { verbatim?: boolean | ((p: SearchResult) => boolean); verbatimLen?: number } = {},
+  opts: { verbatim?: boolean | ((p: SearchResult) => boolean); verbatimLen?: number; timeZone?: string } = {},
 ): string {
   return pages.map((p, idx) => {
+    const day = pageContentDate(p, opts.timeZone ?? 'UTC');
+    const dateAttr = day ? ` date="${day}"` : '';
     const page = p as unknown as {
       slug?: string;
       title?: string;
@@ -629,11 +633,11 @@ export function renderPagesBlock(
     const title = String(page.title ?? '');
     const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
     const content = String(page.chunk_text ?? page.compiled_truth ?? page.snippet ?? '');
-    const flag = p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '';
+    const flag = (p.injection_suspected ? `${INJECTION_SUSPECTED_LINE}\n` : '') + graphEvidenceLine(p);
     // Evidence delivery: the block was already budgeted and cut around its
     // hits; render it whole (capped only by excerptLen).
     if (typeof opts.verbatim === 'function' ? opts.verbatim(p) : opts.verbatim) {
-      return `<page slug="${slug}" rank="${idx + 1}">\n${flag}${content.slice(0, opts.verbatimLen ?? excerptLen)}\n</page>`;
+      return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}>\n${flag}${content.slice(0, opts.verbatimLen ?? excerptLen)}\n</page>`;
     }
     const excerpt = selectRelevantExcerptDetailed(
       content,
@@ -645,8 +649,16 @@ export function renderPagesBlock(
       (excerpt.truncatedStart ? `${EXCERPT_CUT_START_MARKER}\n` : '') +
       excerpt.text +
       (excerpt.truncatedEnd ? `\n${EXCERPT_CUT_END_MARKER}` : '');
-    return `<page slug="${slug}" rank="${idx + 1}">\n${flag}${body}\n</page>`;
+    return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}>\n${flag}${body}\n</page>`;
   }).join('\n\n');
+}
+
+/** One line naming the typed links that put a chain row in the context (slugs and link types only). */
+function graphEvidenceLine(p: SearchResult): string {
+  const edges = p.relational?.edges ?? [];
+  if (edges.length === 0) return '';
+  const clean = (v: string) => v.replace(/[\r\n<>]/g, ' ');
+  return `Graph evidence (${p.relational!.role}): ${edges.map(e => `${clean(e.stored_from)} -${clean(e.link_type)}-> ${clean(e.stored_to)}`).join('; ')}\n`;
 }
 
 export function takesHitToTakeForPrompt(h: TakeHit | Take): {

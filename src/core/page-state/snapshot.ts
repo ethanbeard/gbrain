@@ -3,7 +3,7 @@ import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { ReadQuery } from '../search/read-enrichment.ts';
 import { rowToPage } from '../utils.ts';
 import type { PageSnapshot, PageSnapshotOptions, PageWithdrawal } from './types.ts';
-import { PageSnapshotAmbiguousError } from './types.ts';
+import { PageSnapshotAmbiguousError, REVISION_BACKFILL_PENDING } from './types.ts';
 
 /** Normalize filesystem bytes with the exact ledger fingerprint rules before comparing them. */
 export async function overlayCanonicalBodies(query: ReadQuery, body: string, timeline: string, withdrawals: PageWithdrawal[]): Promise<{ compiled_truth: string; timeline: string }> {
@@ -60,6 +60,6 @@ export async function readPageSnapshot(query: ReadQuery, slug: string, opts?: Pa
   const withdrawals = row.snapshot_withdrawals as PageWithdrawal[];
   page.compiled_truth = overlayWithdrawalBody(page.compiled_truth, String(row.fingerprint_body ?? ''), withdrawals);
   page.timeline = overlayWithdrawalBody(page.timeline, String(row.fingerprint_timeline ?? ''), withdrawals);
-  return { page, tags: row.snapshot_tags as string[], revision: String(row.knowledge_revision),
+  return { page, tags: row.snapshot_tags as string[], revision: row.knowledge_revision == null ? REVISION_BACKFILL_PENDING : String(row.knowledge_revision),
     sourceIncarnation: String(row.source_incarnation), withdrawals };
 }

@@ -408,7 +408,7 @@ for (const backend of backends) describe(`evidence delivery leak canaries (${bac
       assertNoLeak('mid-flight edit', after.results, ['EDITSECRETCANARY']);
       expect(JSON.stringify(after.results)).toContain('EDITEDPUBLICLINE');
       // Private flip between ranking and expansion.
-      const hits = await operations.find(o => o.name === 'search')!.handler(ctxOf(true), { query: 'heron editable EDITEDPUBLICLINE', source_id: BOUND, limit: 50 }) as SearchResult[];
+      const hits = await operations.find(o => o.name === 'search')!.handler(ctxOf(true), { query: 'heron editable EDITEDPUBLICLINE', source_id: BOUND, limit: 50, fields: 'full' }) as SearchResult[];
       const editHit = hits.filter(h => h.slug === 'notes/heron-edit');
       expect(editHit.length).toBeGreaterThan(0);
       await importPage('notes/heron-edit', BOUND, `---\ntitle: heron edit\ntype: note\nvisibility: private\n---\n\nheron editable page. EDITEDPUBLICLINE replaced.\n\n${filler(6)}\n`);

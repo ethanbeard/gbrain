@@ -128,6 +128,12 @@ for (const kind of testBackends()) describe(`#5530 Git effect coalescing (${kind
     await activateSharedSkillPersistence(engine, { confirmQuiesced: true });
     await seed(ctx('default'), PAGES - 1);
     await disposePersistenceConsumer(engine);
+    // A seed write's Git effect can still be queued here, backed off after a
+    // writer-busy attempt while the consumer was publishing; apply it now so
+    // only the grandfather's and the interleaved write's effects are pending
+    // below.
+    for (let i = 0; (await gitStates(engine)).queued && i < 50; i++) { await release(engine); await pass(engine); }
+    expect((await gitStates(engine)).queued).toBeUndefined();
     harden(repo);
     const commitsBefore = repo.commits();
     await pauseGitEffects(engine, async () => {

@@ -364,127 +364,176 @@ async function dispatchConnectorFreshnessSync(
 async function dispatchAutoDrain(
   engine: BrainEngine,
   queue: MinionQueue,
-  { timeoutMs, jsonMode }: { timeoutMs: number; jsonMode: boolean },
+  opts: { timeoutMs: number; jsonMode: boolean },
 ): Promise<void> {
-  // ── #1685 GAP D: per-source extract_atoms auto-drain ───────────────
-  // The silent-backlog incident: a pack that doesn't declare extract_atoms
-  // never runs the phase in the routine cycle, so the atom backlog grows
-  // invisibly. Auto-submit a bounded, PROTECTED drain per source when the
-  // backlog exceeds the threshold AND the active pack doesn't declare the
-  // phase. Default-ON, daily-spend-capped, time-sloted key so a new slot
-  // opens each UTC day (CODEX #1/#2/#3, DECISION 3C). Postgres-only —
-  // PGLite has no multi-process worker to run the job.
+  // Postgres-only — PGLite has no multi-process worker to run the job.
   if (engine.kind === 'postgres') {
     try {
-      const enabled = (await engine.getConfig('autopilot.auto_drain.enabled')) !== 'false';
-      if (enabled) {
-        const { packDeclaresPhase } = await import('../core/cycle.ts');
-        // packDeclaresPhase reads the active pack (brain-wide, not
-        // per-source). If the pack declares extract_atoms the routine
-        // cycle already drains it for every source — nothing to do.
-        const declares = await packDeclaresPhase(engine, 'extract_atoms');
-        if (!declares) {
-          const parsePosInt = (v: string | null, d: number): number => {
-            if (v == null) return d;
-            const n = parseInt(v, 10);
-            return Number.isFinite(n) && n > 0 ? n : d;
-          };
-          const parseNonNegFloat = (v: string | null, d: number): number => {
-            if (v == null) return d;
-            const n = parseFloat(v);
-            return Number.isFinite(n) && n >= 0 ? n : d;
-          };
-          const threshold = parsePosInt(await engine.getConfig('autopilot.auto_drain.threshold'), 25);
-          const windowSeconds = parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120);
-          const maxUsdPerDay = parseNonNegFloat(await engine.getConfig('autopilot.auto_drain.max_usd_per_day'), 2.0);
-          // Each drain run is BudgetTracker-capped at ~$0.30; bound the
-          // brain-wide daily count instead of a real-time spend ledger.
-          const PER_RUN_USD = 0.3;
-          const maxJobsToday = Math.max(0, Math.floor(maxUsdPerDay / PER_RUN_USD));
-          const utcDay = new Date().toISOString().slice(0, 10);
-
-          let submittedToday = 0;
-          try {
-            const rows = await engine.executeRaw<{ cnt: number }>(
-              `SELECT count(*)::int AS cnt FROM minion_jobs WHERE name = 'extract-atoms-drain' AND created_at >= $1::timestamptz`,
-              [`${utcDay}T00:00:00Z`],
-            );
-            submittedToday = rows[0]?.cnt ?? 0;
-          } catch {
-            // count is best-effort; treat as 0 (cap still bounds submits this tick).
-          }
-
-          if (submittedToday < maxJobsToday) {
-            const { countExtractAtomsBacklog } = await import('../core/cycle/extract-atoms.ts');
-            const sources = await loadAllSources(engine);
-            for (const src of sources) {
-              if (submittedToday >= maxJobsToday) break; // brain-wide daily cap (fairness)
-              if (!src.local_path) continue;
-              // Same unavailable-path skip (relative / missing on this
-              // machine) as the freshness loop above, same --json shape.
-              const skipWarn = sourceLocalPathSkipWarning(src.id, src.local_path, undefined, src.config);
-              if (skipWarn) {
-                process.stderr.write(
-                  (jsonMode ? JSON.stringify({ event: 'freshness_source_path_skipped', source_id: src.id, reason: skipWarn }) : skipWarn) + '\n',
-                );
-                continue;
-              }
-              const backlog = await countExtractAtomsBacklog(engine, src.id);
-              if (backlog === null || backlog <= threshold) continue;
-              // Time-sloted key (CODEX #2): a static key would block the
-              // source FOREVER once the first job completes. A new UTC-day
-              // slot reopens it each day.
-              const idemKey = `autopilot-extract-atoms-drain:${src.id}:${utcDay}`;
-              try {
-                // CODEX (impl review #4): DO NOT use maxWaiting here — it
-                // coalesces by (name, queue), NOT by source, so source B's
-                // submit would return source A's waiting row, B would never
-                // queue, and the cap counter would over-count. The per-source
-                // idempotency key is the correct dedup. Pre-check it so we
-                // submit + count only genuinely-new sources (queue.add returns
-                // the existing row on an idempotency hit with no created flag,
-                // which would otherwise over-count the daily cap). The
-                // single-instance autopilot lock + the unique idempotency
-                // index make this pre-check race-free.
-                const dupe = await engine.executeRaw<{ one: number }>(
-                  `SELECT 1 AS one FROM minion_jobs WHERE idempotency_key = $1 LIMIT 1`,
-                  [idemKey],
-                );
-                if (dupe.length > 0) continue; // already queued/drained for this source today
-                const job = await queue.add(
-                  'extract-atoms-drain',
-                  { sourceId: src.id, window: windowSeconds, repoPath: src.local_path },
-                  {
-                    queue: 'default',
-                    idempotency_key: idemKey,
-                    // issue #3218: the handler now throws on an
-                    // all-provider-failed batch, so give the queue's
-                    // backoff a chance (was 1 — dead-lettered instantly).
-                    max_attempts: 3,
-                    timeout_ms: timeoutMs,
-                  },
-                  { allowProtectedSubmit: true },
-                );
-                submittedToday++;
-                if (jsonMode) {
-                  process.stderr.write(JSON.stringify({
-                    event: 'dispatched', job_id: job.id, mode: 'auto-drain',
-                    source_id: src.id, backlog,
-                  }) + '\n');
-                } else {
-                  console.log(`[dispatch] job #${job.id} extract-atoms-drain (auto-drain: ${src.id}; backlog=${backlog})`);
-                }
-              } catch (e) {
-                logError('dispatch.auto-drain', e);
-              }
-            }
-          }
-        }
-      }
+      if ((await engine.getConfig('autopilot.auto_drain.enabled')) !== 'false') await submitAutoDrains(engine, queue, opts);
     } catch (e) {
       logError('dispatch.auto-drain-gate', e);
     }
   }
+}
+
+/** #5856: the source kind the auto-drain offers the next free slot to; alternates across ticks and days. */
+export const AUTO_DRAIN_NEXT_KIND_KEY = 'autopilot.auto_drain.next_kind';
+type AutoDrainKind = 'checkout' | 'connector';
+
+/**
+ * #5856: units of today's drain jobs against the daily cap. Every started
+ * attempt costs one (a waiting job one), so retried provider failures still
+ * count; a job whose only attempt was a structural refusal spent nothing and
+ * costs none.
+ */
+async function autoDrainUnitsToday(engine: BrainEngine, utcDay: string): Promise<number> {
+  const { STRUCTURAL_REFUSAL_PREFIX } = await import('../core/cycle/extract-atoms-drain.ts');
+  const rows = await engine.executeRaw<{ cnt: number }>(
+    `SELECT COALESCE(sum(CASE WHEN status = 'dead' AND attempts_started <= 1
+         AND left(COALESCE(error_text, ''), length($2::text)) = $2::text THEN 0 ELSE GREATEST(attempts_started, 1) END), 0)::int AS cnt
+       FROM minion_jobs WHERE name = 'extract-atoms-drain' AND created_at >= $1::timestamptz`,
+    [`${utcDay}T00:00:00Z`, STRUCTURAL_REFUSAL_PREFIX],
+  );
+  return Number(rows[0]?.cnt ?? 0);
+}
+
+/**
+ * The auto-drain submission pass behind dispatchAutoDrain's Postgres and
+ * `autopilot.auto_drain.enabled` gates; exported so tests drive it on either engine. `now` is the clock seam for
+ * the UTC-day slot.
+ */
+export async function submitAutoDrains(
+  engine: BrainEngine,
+  queue: MinionQueue,
+  { timeoutMs, jsonMode, now = Date.now }: { timeoutMs: number; jsonMode: boolean; now?: () => number },
+): Promise<void> {
+  // ── #1685 GAP D: per-source extract_atoms auto-drain ───────────────
+  // The silent-backlog incident: the atom backlog grows invisibly when
+  // nothing runs extract_atoms. Auto-submit a bounded, PROTECTED drain per
+  // source when the backlog exceeds the threshold. Default-ON, daily-capped,
+  // time-sloted key so a new slot opens each UTC day (CODEX #1/#2/#3,
+  // DECISION 3C). #5028: this runs whether or not the active pack declares
+  // extract_atoms. The daemon's per-source cycles run only
+  // SOURCE_FRESHNESS_PHASES and the maintenance job runs no source phase, so
+  // a declaring pack does not make the routine cycle drain it; skipping here
+  // left this drain as the only runner switched off.
+  const parsePosInt = (v: string | null, d: number): number => {
+    if (v == null) return d;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n > 0 ? n : d;
+  };
+  const parseNonNegFloat = (v: string | null, d: number): number => {
+    if (v == null) return d;
+    const n = parseFloat(v);
+    return Number.isFinite(n) && n >= 0 ? n : d;
+  };
+  const threshold = parsePosInt(await engine.getConfig('autopilot.auto_drain.threshold'), 25);
+  const windowSeconds = parsePosInt(await engine.getConfig('autopilot.auto_drain.window_seconds'), 120);
+  const maxUsdPerDay = parseNonNegFloat(await engine.getConfig('autopilot.auto_drain.max_usd_per_day'), 2.0);
+  // Each drain attempt runs under one BudgetTracker capped at ~$0.30
+  // (cycle.extract_atoms.budget_usd); bound the brain-wide daily attempt
+  // count instead of a real-time spend ledger.
+  const PER_RUN_USD = 0.3;
+  const maxJobsToday = Math.max(0, Math.floor(maxUsdPerDay / PER_RUN_USD));
+  const utcDay = new Date(now()).toISOString().slice(0, 10);
+
+  let submittedToday = 0;
+  try {
+    submittedToday = await autoDrainUnitsToday(engine, utcDay);
+  } catch {
+    // count is best-effort; treat as 0 (cap still bounds submits this tick).
+  }
+  if (submittedToday >= maxJobsToday) return;
+
+  const { countExtractAtomsBacklog } = await import('../core/cycle/extract-atoms.ts');
+  const { atomDrainOwnerRefusal } = await import('../core/persistence/atom-maintenance.ts');
+  // #5856 fairness: checkout-backed and connector sources alternate for the
+  // daily slots, starting with the kind the persisted pointer names, so a
+  // large connector backlog cannot starve a git source's atoms (or the reverse).
+  const byKind: Record<AutoDrainKind, SourceRow[]> = { checkout: [], connector: [] };
+  for (const src of await loadAllSources(engine)) {
+    byKind[isConnectorSourceKind(parseSourceConfig(src.config).kind) ? 'connector' : 'checkout'].push(src);
+  }
+  const pointer: AutoDrainKind = (await engine.getConfig(AUTO_DRAIN_NEXT_KIND_KEY)) === 'connector' ? 'connector' : 'checkout';
+  let next = pointer;
+  while (submittedToday < maxJobsToday) { // brain-wide daily cap (fairness)
+    const kind: AutoDrainKind = byKind[next].length ? next : next === 'checkout' ? 'connector' : 'checkout';
+    const src = byKind[kind].shift();
+    if (!src) break;
+    // A connector source syncs from its provider: its local_path is a state
+    // directory, so it needs none and its job carries no repoPath.
+    if (kind === 'checkout') {
+      if (!src.local_path) continue;
+      // Same unavailable-path skip (relative / missing on this
+      // machine) as the freshness loop above, same --json shape.
+      const skipWarn = sourceLocalPathSkipWarning(src.id, src.local_path, undefined, src.config);
+      if (skipWarn) {
+        process.stderr.write(
+          (jsonMode ? JSON.stringify({ event: 'freshness_source_path_skipped', source_id: src.id, reason: skipWarn }) : skipWarn) + '\n',
+        );
+        continue;
+      }
+    }
+    // Time-sloted key (CODEX #2): a static key would block the
+    // source FOREVER once the first job completes. A new UTC-day
+    // slot reopens it each day; it also bounds a structural refusal
+    // to one dead job per source per day.
+    const idemKey = `autopilot-extract-atoms-drain:${src.id}:${utcDay}`;
+    try {
+      // CODEX (impl review #4): DO NOT use maxWaiting here — it
+      // coalesces by (name, queue), NOT by source, so source B's
+      // submit would return source A's waiting row, B would never
+      // queue, and the cap counter would over-count. The per-source
+      // idempotency key is the correct dedup. Pre-check it so we
+      // submit + count only genuinely-new sources (queue.add returns
+      // the existing row on an idempotency hit with no created flag,
+      // which would otherwise over-count the daily cap). The
+      // single-instance autopilot lock + the unique idempotency
+      // index make this pre-check race-free.
+      const dupe = await engine.executeRaw<{ one: number }>(
+        `SELECT 1 AS one FROM minion_jobs WHERE idempotency_key = $1 LIMIT 1`,
+        [idemKey],
+      );
+      if (dupe.length > 0) continue; // already queued/drained for this source today
+      const backlog = await countExtractAtomsBacklog(engine, src.id);
+      if (backlog === null || backlog <= threshold) continue;
+      // #5856: the drain's writer preflight would refuse this source (no
+      // active local owner); submitting it would only dead-letter.
+      const refusal = await atomDrainOwnerRefusal(engine, src.id);
+      if (refusal) {
+        const reason = `[autopilot] skipping atom auto-drain for '${src.id}': ${refusal}`;
+        process.stderr.write((jsonMode ? JSON.stringify({ event: 'auto_drain_source_skipped', source_id: src.id, reason }) : reason) + '\n');
+        continue;
+      }
+      const job = await queue.add(
+        'extract-atoms-drain',
+        { sourceId: src.id, window: windowSeconds, ...(kind === 'checkout' ? { repoPath: src.local_path } : {}) },
+        {
+          queue: 'default',
+          idempotency_key: idemKey,
+          // issue #3218: the handler now throws on an
+          // all-provider-failed batch, so give the queue's
+          // backoff a chance (was 1 — dead-lettered instantly).
+          max_attempts: 3,
+          timeout_ms: timeoutMs,
+        },
+        { allowProtectedSubmit: true },
+      );
+      submittedToday++;
+      next = kind === 'checkout' ? 'connector' : 'checkout';
+      if (jsonMode) {
+        process.stderr.write(JSON.stringify({
+          event: 'dispatched', job_id: job.id, mode: 'auto-drain',
+          source_id: src.id, backlog,
+        }) + '\n');
+      } else {
+        console.log(`[dispatch] job #${job.id} extract-atoms-drain (auto-drain: ${src.id}; backlog=${backlog})`);
+      }
+    } catch (e) {
+      logError('dispatch.auto-drain', e);
+    }
+  }
+  if (next !== pointer) await engine.setConfig(AUTO_DRAIN_NEXT_KIND_KEY, next);
 }
 
 /** The remediation plan autopilot routes on (brain score + doctor/onboard recommendations). */

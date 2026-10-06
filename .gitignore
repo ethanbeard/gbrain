@@ -61,3 +61,7 @@ graphify-out/
 # Coverage lane output (COVERAGE_DIR opt-in in test-shard.sh /
 # run-serial-tests.sh / run-e2e.sh; merged by scripts/merge-lcov.ts)
 .coverage/
+
+# Local eval run ledger (gbrain eval run-all / longmemeval / canary --record);
+# each machine keeps its own, so it is never committed.
+/.gbrain-evals/eval-results.jsonl

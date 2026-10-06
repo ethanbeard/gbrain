@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { GBrainConfig } from '../config.ts';
+import { flushDirectory } from '../fs-durable.ts';
 import { shouldDropAgentEnv } from './environment.ts';
 import { shellQuote } from '../mcp-registration.ts';
 import type { LocalSharedSkillsResult } from './shared-skills.ts';
@@ -103,18 +104,7 @@ export function confinedPath(root: string, relative: string): string {
   return target;
 }
 
-export function syncDirectory(path: string): void {
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, 'r');
-    fsyncSync(fd);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (!(process.platform === 'win32' && ['EISDIR', 'EPERM', 'EINVAL', 'ENOTSUP'].includes(code ?? ''))) throw error;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-}
+export { flushDirectory as syncDirectory } from '../fs-durable.ts';
 
 export function privateWrite(path: string, contents: string | Uint8Array, mode = 0o600): void {
   assertNoSymlinks(path);
@@ -127,7 +117,7 @@ export function privateWrite(path: string, contents: string | Uint8Array, mode =
     fsyncSync(fd);
     closeSync(fd); fd = undefined;
     renameSync(tmp, path);
-    syncDirectory(dirname(path));
+    flushDirectory(dirname(path));
   } catch (error) {
     if (fd !== undefined) closeSync(fd);
     try { unlinkSync(tmp); } catch { /* no temporary file after a failed write */ }

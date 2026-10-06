@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
 import { activatePersistence, type ActivationReport } from './activation.ts';
 import { existingLocalHostId, localHostId } from './identity.ts';
 import { acquireWorktree, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
@@ -26,7 +26,11 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
       if (!binding || binding.owner_host_id !== hostId || binding.state !== 'active' || !binding.local_path) throw quiescence();
       bindings.push(binding);
     }
-    if (!bindings.length) throw new OperationError('writer_registration_required', 'Shared publication requires a registered canonical source root.');
+    if (!bindings.length) {
+      throw opError('writer_registration_required', 'Shared publication requires a registered canonical source root.',
+        'No active source has a registered canonical owner, so shared skill publication was not enabled. Check writer status; claiming a source root is a deliberate topology change the operator reviews.',
+        { fix: { argv: ['gbrain', 'sources', 'writer', 'status', '--json'], consent: [], actor: 'agent', why: 'Shows each source\'s canonical owner and claim, read-only.', requires_exclusive: false } });
+    }
     return bindings;
   };
   const initial = await loadBindings(engine);
@@ -42,10 +46,10 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
       locks.push(lock);
     }
     return await engine.transaction(async tx => {
-      await declarePersistenceProtocol(tx);
       await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true)");
       await assertWriterAdminState(tx, options.expectedState);
       await tx.executeRaw('SELECT singleton FROM persistence_brain WHERE singleton=1 FOR UPDATE');
+      await declarePersistenceProtocol(tx);
       await assertWriterAdminUnlocked(tx);
       await tx.executeRaw('SELECT id FROM persistence_worktrees ORDER BY id FOR UPDATE');
       await tx.executeRaw('SELECT id FROM sources ORDER BY id FOR SHARE');

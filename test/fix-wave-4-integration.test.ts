@@ -49,6 +49,7 @@ import { readAllSourceHolds } from '../src/core/connectors/item-holds-store.ts';
 import { retryHeld } from '../src/commands/sources-retry-held.ts';
 import { planRepairSteps } from '../src/core/remediation/repairs.ts';
 import { runRemediate } from '../src/commands/doctor/remediate.ts';
+import { approvedRemediateArgs } from './helpers/remediate-approval.ts';
 import { AUTO_REPAIR_REGISTRY } from '../src/core/repair/registry.ts';
 import { capture } from './helpers/wave-scenarios.ts';
 import { createConnectorFixture, contact, json, options, withGoogleAccount } from './helpers/connector-fixture.ts';
@@ -210,7 +211,7 @@ test('X6: deactivate carries a held connector item into classic state (wave 5): 
 test('X11: the remediation run reaches every new repair kind, runs the free ones under --max-usd 0 and clears their doctor findings', async () => withEnv(env, async () => {
   for (const engine of engines) {
     expect(AUTO_REPAIR_REGISTRY.map(spec => spec.kind)).toEqual(['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints',
-      'request-indexes', 'connector-fences', 'orphan-bindings', 'embedding-effects']);
+      'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats']);
     // Pending work for Lane A (a dropped index) and Lane D (an orphan binding of a removed source).
     await engine.executeRaw('DROP INDEX IF EXISTS persistence_requests_sync_run_open');
     await withPersistenceOff(engine, async () => {
@@ -223,7 +224,7 @@ test('X11: the remediation run reaches every new repair kind, runs the free ones
     const planned = Object.fromEntries((await planRepairSteps(engine, { noEmbed: true })).map(step => [step.kind, step]));
     expect(planned['request-indexes']).toMatchObject({ paid: false, embeds: 'none', command: 'gbrain repair request-indexes --apply' });
     expect(planned['orphan-bindings']).toMatchObject({ paid: false, embeds: 'none', command: 'gbrain repair orphan-bindings --apply' });
-    const run = JSON.parse((await capture(() => runRemediate(engine, ['--remediate', '--yes', '--include-repairs', '--no-embed', '--max-usd', '0', '--json']))).out);
+    const run = JSON.parse((await capture(async () => runRemediate(engine, await approvedRemediateArgs(engine, ['--remediate', '--yes', '--include-repairs', '--no-embed', '--max-usd', '0', '--json'])))).out);
     await disposePersistenceConsumer(engine);
     const byKind = Object.fromEntries(run.repairs.map((r: { kind: string }) => [r.kind, r]));
     expect(byKind['request-indexes']).toMatchObject({ status: 'completed' });

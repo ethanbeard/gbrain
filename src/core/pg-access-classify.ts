@@ -67,6 +67,7 @@ export type PgAccessReason =
   | 'db_missing'          // 3D000 database does not exist
   | 'schema_missing'      // 42P01 / 42703 missing relation or column
   | 'pgvector_missing'    // vector extension absent
+  | 'storage_corrupt'     // XX000/XX001/XX002: torn TOAST value, catalog/tuple damage (#5216, #4738)
   | 'unknown';
 
 export type PgAccessFix =
@@ -122,6 +123,17 @@ export interface PgAccessDiagnosis {
 export const DB_ACCESS_MARKER_PREFIX = 'GBRAIN_DB_ACCESS';
 
 /**
+ * #5205: the smallest GBRAIN_POOL_SIZE a long-running gbrain process (serve,
+ * autopilot, jobs work) needs: two publication long-holds, the idle probe lane,
+ * the projection and effects workers, and one connection for reads and tool
+ * calls. Below it, boot or projections stall under traffic. Pooler budget:
+ * processes x pool size (+ GBRAIN_DIRECT_POOL_SIZE per process with a direct
+ * route) must fit the pooler's client limit; run fewer processes rather than
+ * shrinking the pool. Documented in docs/ENGINES.md#pool-sizing.
+ */
+export const RESIDENT_POOL_FLOOR = 6;
+
+/**
  * The one emission-policy gate for stderr markers (agents read non-TTY
  * stderr; humans on a TTY get the prose instead; GBRAIN_FORCE_DB_MARKER=1
  * forces it for testing). Every stderr emitter calls THIS — the marker is a
@@ -152,6 +164,8 @@ interface ReasonRow {
   codePrefixes?: string[];
   patterns?: RegExp[];
   remediation: string;
+  /** E10: the same advice without Supabase specifics, used when the configured URL is not a Supabase host. */
+  plainRemediation?: string;
   fix?: PgAccessFix;
 }
 
@@ -165,6 +179,16 @@ interface ReasonRow {
  * second person, never preachy.
  */
 const REASON_ROWS: ReadonlyArray<ReasonRow> = [
+  {
+    reason: 'storage_corrupt',
+    transient: false,
+    codes: ['XX001', 'XX002'],
+    patterns: [/unexpected chunk number/i, /missing chunk number/i, /tuple concurrently (deleted|updated)/i, /invalid page in block/i,
+      /could not read block/i, /compressed data is corrupt/i, /found xmin .* from before relfrozenxid/i],
+    remediation: 'Stored data looks damaged (SQLSTATE XX000: a torn TOAST value or a damaged row). First preview orphaned child rows and torn page bodies: '
+      + 'gbrain repair orphan-children. See docs/guides/repair.md#orphan-children for recovery of the rows it names.',
+    fix: { kind: 'run_command', argv: ['gbrain', 'repair', 'orphan-children'] },
+  },
   {
     reason: 'pgvector_missing',
     transient: false,
@@ -222,8 +246,8 @@ const REASON_ROWS: ReadonlyArray<ReasonRow> = [
     transient: true,
     codes: ['53300'],
     patterns: [/EMAXCONNSESSION/i, /too many clients already/i, /max.*clients?.*in session mode/i, /remaining connection slots are reserved/i],
-    remediation: 'Connection slots are exhausted. Lower the pool: export GBRAIN_POOL_SIZE=2 (recommended for low-cap poolers like Supabase Supavisor).',
-    fix: { kind: 'set_env', name: 'GBRAIN_POOL_SIZE', value: '2', why: 'low-cap poolers exhaust session slots under the default pool of 10' },
+    remediation: `Connection slots are exhausted: the pooler client limit is below the sum of every gbrain process's pool. Keep each long-running process (serve, autopilot, jobs work) at export GBRAIN_POOL_SIZE=${RESIDENT_POOL_FLOOR} or more and run fewer of them (share one gbrain serve --http), or raise the pooler limit; one-shot CLI commands may use GBRAIN_POOL_SIZE=2. See docs/ENGINES.md#pool-sizing.`,
+    fix: { kind: 'set_env', name: 'GBRAIN_POOL_SIZE', value: String(RESIDENT_POOL_FLOOR), why: `the floor for a long-running process; when processes x ${RESIDENT_POOL_FLOOR} exceeds the pooler limit, run fewer processes instead of going lower` },
   },
   {
     reason: 'server_starting',
@@ -238,6 +262,7 @@ const REASON_ROWS: ReadonlyArray<ReasonRow> = [
     codes: ['ECONNREFUSED'],
     patterns: [/connection refused/i, /ECONNREFUSED/i],
     remediation: 'Connection refused. If this is a Supabase direct URL (db.<ref>...:5432), switch to the transaction pooler (port 6543): gbrain db-repair can rewrite it.',
+    plainRemediation: 'Connection refused: nothing accepted the connection at the configured host and port. Check that the database server is running and that the URL names the right host and port.',
   },
   {
     reason: 'dns_failed',
@@ -245,6 +270,7 @@ const REASON_ROWS: ReadonlyArray<ReasonRow> = [
     codes: ['ENOTFOUND', 'EAI_AGAIN'],
     patterns: [/ENOTFOUND/i, /EAI_AGAIN/i, /getaddrinfo/i],
     remediation: 'The hostname did not resolve. Check the URL; a free-tier Supabase project may be paused — restore it from the dashboard.',
+    plainRemediation: 'The hostname did not resolve. Check the host in the database URL and this machine\'s DNS/network.',
   },
   {
     reason: 'network_unreachable',
@@ -254,6 +280,7 @@ const REASON_ROWS: ReadonlyArray<ReasonRow> = [
     codes: ['ENETUNREACH', 'EHOSTUNREACH', 'ETIMEDOUT', 'CONNECT_TIMEOUT'],
     patterns: [/ENETUNREACH/i, /EHOSTUNREACH/i, /ETIMEDOUT/i, /CONNECT_TIMEOUT/i],
     remediation: 'The host is unreachable (often an IPv6-only direct host on an IPv4 network). The session pooler is the IPv4 path — gbrain db-repair can switch to it.',
+    plainRemediation: 'The database host is unreachable from this machine (routing, firewall or VPN). Check the network path to the host in the database URL.',
   },
   {
     reason: 'conn_dropped',
@@ -374,7 +401,7 @@ export function classifyPgAccessError(err: unknown, ctx?: PgAccessContext): PgAc
       transient: row.transient,
       sqlstate: looksLikeSqlstate(code),
       message,
-      remediation: row.remediation,
+      remediation: ctx?.url && !looksLikeSupabase(ctx.url) && row.plainRemediation ? row.plainRemediation : row.remediation,
       fix: contextualFix(row.reason, ctx?.url) ?? row.fix,
       supabase: supabaseHints(ctx?.url, row.reason),
       brainId: ctx?.brainId,

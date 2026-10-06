@@ -47,12 +47,13 @@ import type { SyncResult, SyncOpts } from '../sync.ts';
 import { syncCheckpointKeys, resolveSyncCheckpointEvery } from './checkpoint.ts';
 import { runConnectorSync } from './connector.ts';
 import { performFullSync } from './full.ts';
+import { applyHoldsToManifest, planHoldRescreen, wouldHoldFields, type LegacyHolds } from './holds.ts';
 import { sweepOrphanedRenameSentinels } from './rename-reconcile.ts';
 import type { SyncPlan, SyncActivePack } from './sync-run.ts';
 
 export type PreflightOutcome = { readonly done: SyncResult } | { readonly plan: SyncPlan };
 
-export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOpts): Promise<PreflightOutcome> {
+export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOpts, holds: LegacyHolds | null): Promise<PreflightOutcome> {
   const repo = await resolveSyncRepo(engine, opts);
   if ('done' in repo) return repo;
   const { company, repoPath, syncActivePack, gitContextRoot, syncScopeRoot, syncScopeRelPath, scoped, anchorPath, slugRootMode } = repo;
@@ -90,7 +91,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
       // back to the authoritative full reconcile (which now also purges stale
       // pages for deleted files; see performFullSync's delete-reconcile pass).
       serr(`Sync anchor ${lastCommit.slice(0, 8)} object missing (gc'd after history rewrite). Running full reimport.`);
-      return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts) };
+      return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts, holds) };
     }
 
     // Observability only — NOT control flow. A non-ancestor bookmark is still
@@ -113,7 +114,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
 
   // First sync
   if (!lastCommit) {
-    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts) };
+    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts, holds) };
   }
 
   if (opts.includeGitignored) {
@@ -121,7 +122,7 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
       `[sync] --include-gitignored: running full filesystem reconcile because ` +
       `git diff cannot report untracked ignored files.`,
     );
-    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts) };
+    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts, holds) };
   }
 
   const { ckpt, checkpointEvery, pin, completedPaths } = await resolveCheckpointPin(engine, opts, company, gitContextRoot, lastCommit, headCommit);
@@ -131,7 +132,18 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
     hasWorkingTreeChanges, uncommittedDrift, inScope, scopeRel, isSelectedForRun, excluded, syncOpts,
   } = await resolveWorkingTreeScope(engine, opts, { company, gitContextRoot, detachedHead, scoped, syncScopeRelPath });
 
-  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !(importWorkingTree && hasWorkingTreeChanges)) {
+  // #5988: held files re-screen even when Git did not touch them; a run with
+  // nothing else to do still re-screens them, and clears holds of gone files.
+  const sourceRootMode = scoped && slugRootMode === 'source-root';
+  if (holds) {
+    planHoldRescreen(holds, { root: sourceRootMode ? syncScopeRoot : gitContextRoot, touched: new Set(), selected: path => {
+      const gitPath = sourceRootMode ? `${syncScopeRelPath}/${path}` : path;
+      return inScope(gitPath) ? !excluded(gitPath) && isSelectedForRun(gitPath, syncOpts) : null;
+    } });
+  }
+  const holdWork = !!holds && holds.rescreen.length + holds.gone.length + holds.retryTaken.length > 0;
+
+  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !(importWorkingTree && hasWorkingTreeChanges) && !holdWork) {
     // #3068: the pull failed and nothing local advanced — this run imported
     // NOTHING and the remote may hold commits we could not fetch. Reporting
     // `up_to_date` here (and bumping the heartbeat below) is exactly the
@@ -203,24 +215,33 @@ export async function preflightIncrementalSync(engine: BrainEngine, opts: SyncOp
     // BLOCKED run (losing the retry signal: the next run said up_to_date
     // and the failed re-walk never re-ran) and on a --dry-run PREVIEW
     // (persistent brain-state write from a preview).
-    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts) };
+    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts, holds) };
   }
 
   const delta = await computeFilteredDelta(engine, opts, {
     company, gitContextRoot, syncScopeRoot, lastCommit, headCommit, pin, fullSyncRoots, importWorkingTree,
-    workingTreeManifest, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts,
+    workingTreeManifest, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
   });
   if ('done' in delta) return delta;
-  const { manifest, filtered, malformedSkipped, syncImportRoot, modePath, totalChanges } = delta;
+  const { manifest, filtered, malformedSkipped, syncImportRoot, modePath } = delta;
+  if (holds) {
+    const touched = new Set([...filtered.added, ...filtered.modified, ...filtered.deleted, ...filtered.renamed.flatMap(r => [r.from, r.to])]);
+    for (let i = holds.rescreen.length - 1; i >= 0; i--) if (touched.has(holds.rescreen[i]!)) holds.rescreen.splice(i, 1);
+    applyHoldsToManifest(holds, filtered);
+  }
+  const totalChanges = filtered.added.length + filtered.modified.length + filtered.deleted.length + filtered.renamed.length + (holds?.rescreen.length ?? 0);
 
   // Dry run
-  if (opts.dryRun) return { done: dryRunResult({ lastCommit, headCommit, filtered, malformedSkipped, totalChanges }) };
+  if (opts.dryRun) {
+    return { done: { ...dryRunResult({ lastCommit, headCommit, filtered, malformedSkipped, totalChanges }),
+      ...(await wouldHoldFields(engine, holds, syncImportRoot, [...filtered.added, ...filtered.modified, ...filtered.renamed.map(r => r.to), ...(holds?.rescreen ?? [])], syncActivePack)) } };
+  }
 
   return {
     plan: {
       opts, company, repoPath, gitContextRoot, anchorPath, syncImportRoot, syncActivePack, lastCommit, headCommit, pin,
       pullFailed, ckpt, completedPaths, checkpointEvery, manifest, filtered, malformedSkipped, totalChanges,
-      uncommittedDrift, inScope, isSelectedForRun, syncOpts, modePath,
+      uncommittedDrift, inScope, isSelectedForRun, syncOpts, modePath, holds,
     },
   };
 }
@@ -948,6 +969,7 @@ async function computeFilteredDelta(
     excluded: (p: string) => boolean;
     isSelectedForRun: SyncPlan['isSelectedForRun'];
     syncOpts: SyncPlan['syncOpts'];
+    holds: LegacyHolds | null;
   },
 ): Promise<
   | { done: SyncResult }
@@ -955,7 +977,7 @@ async function computeFilteredDelta(
 > {
   const {
     company, gitContextRoot, syncScopeRoot, lastCommit, headCommit, pin, fullSyncRoots, importWorkingTree,
-    workingTreeManifest, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts,
+    workingTreeManifest, detachedHead, scoped, slugRootMode, inScope, scopeRel, excluded, isSelectedForRun, syncOpts, holds,
   } = input;
   // Diff using git diff (net result, not per-commit). v0.42.x (#1794): diff
   // against the PINNED target, not live HEAD. With a fixed (lastCommit, pin)
@@ -981,7 +1003,7 @@ async function computeFilteredDelta(
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +
       `(${delta.reason}) — falling back to full reconcile.`,
     );
-    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts) };
+    return { done: await performFullSync(engine, fullSyncRoots, headCommit, opts, holds) };
   }
   const manifest = delta.manifest;
   if (company) {

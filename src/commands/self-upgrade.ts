@@ -5,7 +5,7 @@ import { detectInstallMethod, runUpgrade } from './upgrade.ts';
 import { writeUpdateCache } from '../core/self-upgrade.ts';
 
 /**
- * `gbrain self-upgrade [--check-only] [--force] [--json]`
+ * `gbrain self-upgrade [--check-only] [--force] [--json] [--no-bun-floor-check]`
  *
  * The universal substrate every agent ecosystem (Codex / Claude Code / Hermes /
  * OpenClaw / Perplexity-server) can call to stay current. The CLI startup hook
@@ -16,17 +16,20 @@ import { writeUpdateCache } from '../core/self-upgrade.ts';
  *   --check-only  Report whether an upgrade is available; never apply.
  *   --force       Apply even if not behind (re-run the install-method swap).
  *   --json        Machine-readable output for the check.
+ *   --no-bun-floor-check  Passed through to `gbrain upgrade` (#5855).
  */
 export async function runSelfUpgrade(args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
-      'Usage: gbrain self-upgrade [--check-only] [--force] [--json]\n\n' +
+      'Usage: gbrain self-upgrade [--check-only] [--force] [--json] [--no-bun-floor-check]\n\n' +
         'Check for and apply gbrain updates. The shared entry point used by the\n' +
         'CLI startup marker, the gbrain-upgrade agent skill, and the autopilot\n' +
         'silent channel.\n\n' +
         '  --check-only  Report whether an upgrade is available; do not apply.\n' +
         '  --force       Apply even when not behind.\n' +
-        '  --json        Machine-readable output (with --check-only).',
+        '  --json        Machine-readable output (with --check-only).\n' +
+        '  --no-bun-floor-check  Apply even when the target\'s Bun floor cannot be read or is\n' +
+        '                above this host\'s Bun. Docs: docs/guides/upgrades-auto-update.md#bun-floor',
     );
     return;
   }
@@ -101,7 +104,7 @@ export async function runSelfUpgrade(args: string[]): Promise<void> {
   // Apply: delegate to the hardcoded upgrade path (full swap + post-upgrade).
   // Pass the fetched target so runUpgrade can detect exact-tag no-op
   // "upgrades" instead of reporting false success (#4366).
-  await runUpgrade([], {
+  await runUpgrade(args.filter((a) => a === '--no-bun-floor-check'), {
     targetVersion: latest && isValidVersionString(latest) ? latest : undefined,
   });
 }

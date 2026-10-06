@@ -24,10 +24,17 @@ zero LLM, free, always on). For every synced Gmail thread:
   ≥72h → `unanswered_outbound` — *you are waiting on them*.
 - a reply lands → the loop **closes itself** (`closed_by: reply_detected`).
   Loops close by state transition, never delete — the audit trail stays.
+  A reply of yours that only acknowledges their question ("Thanks!",
+  "Got it, thanks.") is not an answer: the loop stays open and its clock
+  keeps running. "Will do" counts as a reply.
+- a question mark inside a link (`https://docs.example.com/view?id=42`) is
+  not a question, so an FYI that only shares a link opens nothing.
 - "unanswered" is measured from the oldest unanswered message since the
   last turn flip (the first one addressed to you, or your first question),
   so a nudge or follow-up never restarts the clock — a request that waited
-  40h and got a "bumping this" 5h ago opens on the first sync.
+  40h and got a "bumping this" 5h ago opens on the first sync. The loop's
+  `opened_at` is that message's time, not the time gbrain noticed it, so a
+  first sync of an old inbox ranks a 30-day wait as older than yesterday's.
 
 Precision rules (pinned by a labeled fixture corpus in
 `test/google-loop-detect.test.ts` — every false-positive class gets a
@@ -119,6 +126,34 @@ thread is a no-op and that key is the only dedupe in play. A generous safety
 ceiling (500/sweep) remains purely as a spend backstop for pathological
 sweeps; when it binds, the log names the drop honestly.
 
+The sweep queues extraction on managed and unmanaged brains alike. Its sync
+result carries `loops_enqueue` (`enqueued`, `deferred`, `skipped_reason`:
+`extraction_disabled`, `chat_unavailable`, `no_candidates` or
+`enqueue_failed`), and every skip is logged. On a managed brain a one-time
+catch-up also re-candidates email threads whose newest message is from the
+last 30 days. A thread counts as done only when the extractor recorded an
+outcome for its current revision (`extracted` or `skipped:<reason>`), so a
+thread whose job ran while extraction was off is analyzed later; a
+dead-lettered job is retried once. The catch-up honors the kill switch and
+the enqueue ceiling and marks itself done once every candidate is settled.
+
+### Quiet threads and grace holds
+
+A thread inside its waiting window (an inbound message under 24 h old, or
+your own question under 72 h) opens nothing yet. The sweep records a **grace
+hold** with the time the window ends and re-checks the thread on the first
+sweep after that time, even when no new mail arrives: an unchanged thread
+opens its loop from the stored page without a Gmail read, and a thread that
+changed or whose page is missing is re-fetched (at most 100 per sweep). A
+reply or a mute in the meantime means no loop opens. The first sweep after
+upgrading seeds holds for email pages active in the last 14 days from stored
+pages only, with no Gmail calls.
+
+Grace holds are kept apart from [held items](google-connect.md#held-items):
+they never appear in `connector_held_items`, never make `gbrain waiting`
+report partial coverage, and are capped at 2,000 per source (the oldest is
+dropped and logged).
+
 ## The surfaces
 
 ```bash
@@ -128,15 +163,17 @@ gbrain waiting [--top N] [--json] [--stale-ok]
     REFUSES when every google source has gone >24h without a successful
     sync, printing the exact fix — stale-but-confident output is worse than
     none. (One fresh account keeps output flowing; per-source sync ages are
-    always reported.) When a Gmail thread from the last 14 days is held
+    always reported. If only some sources are stale, output continues with a
+    warning naming those sources; JSON includes their ids in `stale_sources`.)
+    When a Gmail thread from the last 14 days is held
     after repeated import failures, the answer carries
     completeness: "partial" and names each held thread with its retry
     command (gbrain sources retry-held <id>); an empty partial answer says
     coverage is partial instead of "You are clean".
 
 gbrain loops list|show <id>          inspect
-gbrain loops done <id> | drop <id>   close (a closed commitment expires its
-                                     projected fact too)
+gbrain loops done <id> | drop <id>   close (a closed commitment retires its
+                                     projected fact too; see Close semantics)
 gbrain loops mute sender <email>     never open loops for this sender again
 gbrain loops mute thread <id>        ...or this thread (existing loops keep
                                      their state)
@@ -197,7 +234,8 @@ carry additive optional fields (`direction`, `due`, `counterparty`,
 
 ## Close semantics
 
-- Thread loops close deterministically when a reply lands.
+- Thread loops close deterministically when a reply lands (an
+  acknowledgement-only reply to a question does not count).
 - Commitment loops close manually (`gbrain loops done`) or by staleness
   (overdue >14 days AND no activity in 14 days — an actively-discussed
   overdue commitment stays open — or >90 days without any activity →
@@ -207,9 +245,32 @@ carry additive optional fields (`direction`, `due`, `counterparty`,
   same thread never resurrects a loop you closed by hand.
 - Fulfillment-by-reply detection for commitments is future work, not
   pretended at.
+- **Closing a commitment retires its fact.** `gbrain loops done`/`drop` and
+  the `loops_close` tool expire the commitment fact and strike its row in the
+  entity page's `## Facts` fence in one coordinated write, so entity cards
+  and recall stop showing the finished promise. A fact that another open loop
+  still references stays active until that loop closes too. The result
+  reports what actually happened: `{ closed, id, status, fact_expired,
+  retryable, reason? }`. `fact_expired: false, retryable: true` means the
+  loop closed but the fact retirement did not commit (`reason` names the
+  refusal); closing the same loop again retries it. `reason:
+  "shared_with_open_loop"` comes with `retryable: false`. No withdrawal is
+  recorded, so the same promise made again is stored normally.
+- **Loops closed before the fact was retired.** `gbrain doctor` reports them
+  as `loop_facts_drift`. Preview with `gbrain repair loop-facts`, then apply
+  the printed `gbrain repair loop-facts --apply --expect <hash>` after you
+  agree ([repair guide](repair.md#loop-facts)).
+
+**Say to your agent:** *"I finished the deck for Alice Example; close that
+loop."* (the agent runs `gbrain loops done <id>` and checks `fact_expired`) or
+*"Doctor says closed loops still have active commitments. Preview the fix."*
+(the agent runs `gbrain repair loop-facts`).
 
 ## Ranking
 
 Counterparties rank by open-loop count, due-date proximity, age of the
 oldest loop, and how connected the person is in your brain (backlink
-count). Deterministic — same data, same order.
+count). Deterministic — same data and same reference time, same order. Due
+dates and ages are relative to the reference time, which defaults to now;
+pin it with `gbrain waiting --as-of <iso>` (MCP: `open_loops` `as_of`) to
+reproduce a ranking. The result echoes it as `as_of`.

@@ -6,15 +6,21 @@
  * Returns a list of file paths + content + content_hash so the caller
  * can key the verdict cache and dispatch one subagent per transcript.
  *
- * No DB; pure filesystem + crypto. Tested with hermetic temp directories.
+ * The corpus walk is pure filesystem + crypto (hermetic temp-dir tests);
+ * the conversation-page section at the end reads `type: conversation`
+ * pages from the database (#4419).
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, basename, sep } from 'node:path';
+import { join, basename, dirname, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { pruneDir } from '../sync.ts';
 import { realpathOrResolve, resolvedPrefixContained } from '../path-confine.ts';
 import { corpusFileSessionId } from '../context/corpus-segments.ts';
+import { readSeatSidecar } from '../context/seat.ts';
+import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
+import type { BrainEngine } from '../engine.ts';
+import type { PhaseResult } from '../cycle.ts';
 
 export interface DiscoveredTranscript {
   /** Absolute path to the transcript file. */
@@ -27,6 +33,8 @@ export interface DiscoveredTranscript {
   basename: string;
   /** Inferred date if the basename matches `YYYY-MM-DD...` (or null). */
   inferredDate: string | null;
+  /** #4618: the capturing seat from the session's `.seat.json` sidecar, when one exists. */
+  seat?: string;
 }
 
 export interface DiscoverOpts {
@@ -331,12 +339,14 @@ export function discoverTranscripts(opts: DiscoverOpts): DiscoveredTranscript[] 
         continue;
       }
 
+      const seat = transcriptSeat(filePath);
       results.push({
         filePath,
         contentHash: hashContent(content),
         content,
         basename: baseName,
         inferredDate,
+        ...(seat ? { seat } : {}),
       });
     }
   }
@@ -388,11 +398,197 @@ export function readSingleTranscript(
   const ext = filePath.endsWith('.md') ? '.md' : '.txt';
       const baseName = basename(filePath, ext);
   const dateMatch = DATE_RE.exec(baseName);
+  const seat = transcriptSeat(filePath);
   return {
     filePath,
     contentHash: hashContent(content),
     content,
     basename: baseName,
     inferredDate: dateMatch ? dateMatch[1] : null,
+    ...(seat ? { seat } : {}),
+  };
+}
+
+/**
+ * #4618: credit each ref to the seat of the transcript it was synthesized
+ * from (the seat sidecar discovery read). The synthesis idempotency key never
+ * includes the seat, so a sidecar added later triggers no re-synthesis.
+ */
+export function withTranscriptSeats<T extends { raw_source?: string }>(refs: T[], transcripts: DiscoveredTranscript[]): Array<T & { seat?: string }> {
+  const seats = new Map(transcripts.flatMap(t => (t.seat ? [[t.filePath, t.seat] as const] : [])));
+  return refs.map(ref => {
+    const seat = ref.raw_source ? seats.get(ref.raw_source) : undefined;
+    return seat ? { ...ref, seat } : ref;
+  });
+}
+
+/**
+ * #4618: the seat recorded for a transcript's session. A `.txt` corpus file
+ * (session-end file, checkpoint segment or writeback turn) shares its
+ * session's `<sessionId>.seat.json`; any other file uses its own basename.
+ */
+function transcriptSeat(filePath: string): string | undefined {
+  const name = basename(filePath);
+  const key = name.endsWith('.txt') ? corpusFileSessionId(name) : name.replace(/\.md$/, '');
+  return readSeatSidecar(dirname(filePath), key)?.seat;
+}
+
+// ── #4419: imported type: conversation pages (database discovery) ───────
+/*
+ * Dream's synthesize phase discovers imported `type: conversation`
+ * pages from the database, beside the filesystem corpus walk.
+ *
+ * `gbrain transcripts ingest` (and the chat connectors) already parse,
+ * role-filter, redact and render each session as a conversation page; this
+ * section hands those page bodies to synthesis as transcripts so a native
+ * import needs no parallel `.txt` exporter. Discovery is scoped to the
+ * cycle's source, filters dates on the page's `date` frontmatter, applies
+ * the same min_chars / exclude_patterns / self-consumption rules as the
+ * corpus walk, and keys each page as `gbrain-page://<source>/<slug>` with a
+ * sha256 of its body, so the verdict cache and synthesis idempotency keys
+ * stay stable until the page changes.
+ */
+
+export const CONVERSATION_PAGE_URI_PREFIX = 'gbrain-page://';
+
+export interface ConversationPageDiscoverOpts {
+  sourceId: string;
+  minChars?: number;
+  excludePatterns?: string[];
+  date?: string;
+  from?: string;
+  to?: string;
+  bypassGuard?: boolean;
+  /** #5413: gbrain's own claude-cli session ids; their imported pages are self-captures. */
+  selfCaptureSessionIds?: ReadonlySet<string>;
+}
+
+interface ConversationRow {
+  slug: string;
+  compiled_truth: string;
+  frontmatter: Record<string, unknown> | string | null;
+}
+
+function frontmatterOf(row: ConversationRow): Record<string, unknown> {
+  if (!row.frontmatter) return {};
+  if (typeof row.frontmatter === 'string') {
+    try { return JSON.parse(row.frontmatter) as Record<string, unknown>; } catch { return {}; }
+  }
+  return row.frontmatter;
+}
+
+function pageDate(fm: Record<string, unknown>, slug: string): string | null {
+  const raw = fm.date instanceof Date ? fm.date.toISOString() : typeof fm.date === 'string' ? fm.date : '';
+  return DATE_RE.exec(raw)?.[1] ?? DATE_RE.exec(slug.split('/').pop() ?? '')?.[1] ?? null;
+}
+
+/** Live conversation pages in one source (used for the not-consumed warning). */
+export async function countConversationPages(engine: BrainEngine, sourceId: string): Promise<number> {
+  const rows = await engine.executeRaw<{ n: string | number }>(
+    `SELECT count(*)::text AS n FROM pages WHERE source_id = $1 AND type = 'conversation' AND deleted_at IS NULL`,
+    [sourceId],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
+export async function discoverConversationPages(
+  engine: BrainEngine,
+  opts: ConversationPageDiscoverOpts,
+): Promise<DiscoveredTranscript[]> {
+  const minChars = opts.minChars ?? 2000;
+  const rows = await engine.executeRaw<ConversationRow>(
+    `SELECT slug, compiled_truth, frontmatter FROM pages
+      WHERE source_id = $1 AND type = 'conversation' AND deleted_at IS NULL
+        AND length(compiled_truth) >= $2::int
+      ORDER BY slug`,
+    [opts.sourceId, minChars],
+  );
+  const excludes = compileExcludePatterns(opts.excludePatterns);
+  let excluded = 0;
+  let guarded = 0;
+  const out: DiscoveredTranscript[] = [];
+  for (const row of rows) {
+    const fm = frontmatterOf(row);
+    const date = pageDate(fm, row.slug);
+    if (opts.date || opts.from || opts.to) {
+      if (!date) continue;
+      if (opts.date && date !== opts.date) continue;
+      if (opts.from && date < opts.from) continue;
+      if (opts.to && date > opts.to) continue;
+    }
+    if (fm.mode === 'lsd' || (fm.dream_generated === true && !opts.bypassGuard)) { guarded++; continue; }
+    const imported = fm.transcript_import as { session_id?: unknown } | undefined;
+    if (typeof imported?.session_id === 'string' && opts.selfCaptureSessionIds?.has(imported.session_id)) { guarded++; continue; }
+    if (excludes.some((re) => re.test(row.compiled_truth))) { excluded++; continue; }
+    out.push({
+      filePath: `${CONVERSATION_PAGE_URI_PREFIX}${opts.sourceId}/${row.slug}`,
+      contentHash: hashContent(row.compiled_truth),
+      content: row.compiled_truth,
+      basename: row.slug.split('/').pop() ?? row.slug,
+      inferredDate: date,
+    });
+  }
+  if (excluded > 0) {
+    process.stderr.write(`[dream] excluded ${excluded} conversation page(s) matching exclude_patterns; set dream.synthesize.exclude_patterns to change\n`);
+  }
+  if (guarded > 0) {
+    process.stderr.write(`[dream] skipped ${guarded} conversation page(s): dream output or gbrain's own sessions (self-consumption guard)\n`);
+  }
+  return out;
+}
+
+/** dream.synthesize.conversation_pages: on by default with a corpus dir, `true` opts in without one, `false` off. */
+async function conversationPagesSetting(engine: Pick<BrainEngine, 'getConfig'>): Promise<string | undefined> {
+  return (await engine.getConfig('dream.synthesize.conversation_pages'))?.trim().toLowerCase() || undefined;
+}
+
+export async function conversationPagesOptedIn(engine: Pick<BrainEngine, 'getConfig'>): Promise<boolean> {
+  return (await conversationPagesSetting(engine)) === 'true';
+}
+
+/**
+ * The synthesize phase's transcript list: the corpus walk (or `--input`)
+ * first, then the source's conversation pages when the setting is on; a page
+ * whose body hash a corpus file already carries is not processed twice.
+ */
+export async function withConversationPages(
+  engine: BrainEngine,
+  opts: { inputFile?: string; sourceId?: string; date?: string; from?: string; to?: string; bypassDreamGuard?: boolean },
+  config: { corpusDir: string | null; minChars: number; excludePatterns: string[] },
+  corpus: DiscoveredTranscript[],
+): Promise<DiscoveredTranscript[]> {
+  if (opts.inputFile) return corpus;
+  const setting = await conversationPagesSetting(engine);
+  if (setting === 'false' || (setting !== 'true' && !config.corpusDir)) return corpus;
+  const pages = await discoverConversationPages(engine, {
+    sourceId: opts.sourceId ?? 'default', minChars: config.minChars, excludePatterns: config.excludePatterns,
+    date: opts.date, from: opts.from, to: opts.to, bypassGuard: opts.bypassDreamGuard,
+    selfCaptureSessionIds: claudeCliSelfSessionIds(),
+  });
+  const seen = new Set(corpus.map((t) => t.contentHash));
+  return [...corpus, ...pages.filter((p) => !seen.has(p.contentHash))];
+}
+
+/**
+ * #4419: synthesis is not configured (no corpus dir, conversation_pages
+ * unset) but the source holds imported conversation pages. Returns a warn
+ * naming the opt-in instead of a clean zero-work skip; null when there is
+ * nothing to say (no pages, or the operator set conversation_pages=false).
+ */
+export async function conversationPagesNotConsumed(engine: BrainEngine, sourceId: string): Promise<PhaseResult | null> {
+  if (await conversationPagesSetting(engine)) return null;
+  const n = await countConversationPages(engine, sourceId);
+  if (n === 0) return null;
+  const fix = 'gbrain config set dream.synthesize.conversation_pages true';
+  return {
+    phase: 'synthesize',
+    status: 'warn',
+    duration_ms: 0,
+    summary: `${n} imported conversation page(s) in source ${sourceId} are not fed to Dream: synthesis is not configured. ` +
+      `Fix: ${fix} (or set dream.synthesize.session_corpus_dir); silence with dream.synthesize.conversation_pages false.`,
+    details: {
+      reason: 'not_configured', code: 'conversation_pages_not_consumed', conversation_pages: n, source_id: sourceId,
+      fix, docs: 'docs/guides/chat-connectors.md#feed-imported-conversations-to-dream',
+    },
   };
 }

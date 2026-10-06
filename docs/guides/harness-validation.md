@@ -92,7 +92,7 @@ Run from a development checkout with dependencies installed:
 
 ```bash
 bun test --timeout 60000 test/agent-install-backup.serial.test.ts \
-  test/harness-access.serial.test.ts test/harness-delivery-recovery.serial.test.ts \
+  test/harness-access.test.ts test/harness-delivery-recovery.serial.test.ts \
   test/harness-install-ownership.test.ts test/harness-verification-uncertainty.test.ts
 ```
 

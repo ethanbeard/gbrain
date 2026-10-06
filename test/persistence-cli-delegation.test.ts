@@ -11,6 +11,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
 import { parseTakesMutation } from '../src/commands/takes-mutation.ts';
+import { PENDING_WRITE_EXIT_CODE } from '../src/core/exit-codes.ts';
 
 const BRAIN = '10000000-0000-4000-8000-000000000001';
 const ID = '20000000-0000-4000-8000-000000000001';
@@ -184,10 +185,10 @@ describe('CLI-only persistence delegation before engine connection', () => {
     await withOwner(async (dir, calls) => {
       const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), 'takes', 'update', 'test/pending',
         '--row', '1', '--weight', '0.8', '--request-id', ID, '--json'], {
-        cwd: dir, env: { ...process.env, GBRAIN_NO_BANNER: '1', GBRAIN_BACKUP_CHECK: '0' }, stdout: 'pipe', stderr: 'pipe',
+        cwd: dir, env: { ...process.env, GBRAIN_NO_BANNER: '1', GBRAIN_BACKUP_CHECK: '0', GBRAIN_WRITE_WAIT_MS: '0' }, stdout: 'pipe', stderr: 'pipe',
       });
       const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-      expect(code).toBe(1);
+      expect(code).toBe(PENDING_WRITE_EXIT_CODE);
       expect(JSON.parse(stdout).write_request).toMatchObject({ request_id: ID, state: 'queued' });
       expect(stderr).toContain(`--request-id ${ID}`);
       expect(stdout + stderr).not.toContain('Updated take');

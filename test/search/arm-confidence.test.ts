@@ -229,11 +229,12 @@ describe('composeFusionLists — arm-confidence weighting of the keyword + title
   test('floor null / unset → byte-identical entries: no `weight` key anywhere', () => {
     for (const floor of [null, undefined]) {
       const lists = compose({ floor });
+      // `arm` is the explain-only instance label; fusion never reads it.
       expect(lists).toEqual([
-        { list: [gold], k: KS.vectorK },
-        { list: [d1, d2], k: KS.keywordK },
-        { list: [d1, d2], k: KS.keywordK },
-        { list: [rel], k: KS.baseRrfK },
+        { list: [gold], k: KS.vectorK, arm: 'vector' },
+        { list: [d1, d2], k: KS.keywordK, arm: 'keyword' },
+        { list: [d1, d2], k: KS.keywordK, arm: 'title' },
+        { list: [rel], k: KS.baseRrfK, arm: 'relational' },
       ]);
       for (const e of lists) expect(e).not.toHaveProperty('weight');
     }
@@ -243,10 +244,10 @@ describe('composeFusionLists — arm-confidence weighting of the keyword + title
     let decision: KeywordArmConfidenceDecision | undefined;
     const lists = compose({ floor: 0.6, onDecision: (d) => { decision = d; } });
     expect(lists).toEqual([
-      { list: [gold], k: KS.vectorK },
-      { list: [d1, d2], k: KS.keywordK, weight: 0.5 },
-      { list: [d1, d2], k: KS.keywordK, weight: 0.5 },
-      { list: [rel], k: KS.baseRrfK },
+      { list: [gold], k: KS.vectorK, arm: 'vector' },
+      { list: [d1, d2], k: KS.keywordK, weight: 0.5, arm: 'keyword' },
+      { list: [d1, d2], k: KS.keywordK, weight: 0.5, arm: 'title' },
+      { list: [rel], k: KS.baseRrfK, arm: 'relational' },
     ]);
     expect(lists[0]).not.toHaveProperty('weight');
     expect(lists[3]).not.toHaveProperty('weight');
@@ -256,8 +257,8 @@ describe('composeFusionLists — arm-confidence weighting of the keyword + title
   test('strong arm (single keyword row) → unchanged; callback reports downweighted false', () => {
     let decision: KeywordArmConfidenceDecision | undefined;
     const lists = compose({ floor: 0.6, keyword: [d1], onDecision: (d) => { decision = d; } });
-    expect(lists[1]).toEqual({ list: [d1], k: KS.keywordK });
-    expect(lists[2]).toEqual({ list: [d1, d2], k: KS.keywordK });
+    expect(lists[1]).toEqual({ list: [d1], k: KS.keywordK, arm: 'keyword' });
+    expect(lists[2]).toEqual({ list: [d1, d2], k: KS.keywordK, arm: 'title' });
     expect(decision).toEqual({ margin_ratio: 1, top_score: 0.2, downweighted: false });
   });
 
@@ -280,7 +281,7 @@ describe('composeFusionLists — arm-confidence weighting of the keyword + title
     const variantOnly: VectorArm[] = [];
     pushVectorList(variantOnly, [], 'original');
     pushVectorList(variantOnly, [gold], 'variant');
-    expect(compose({ floor: 0.6, arms: variantOnly })[2]).toEqual({ list: [d1, d2], k: KS.keywordK, weight: 0.5 });
+    expect(compose({ floor: 0.6, arms: variantOnly })[2]).toEqual({ list: [d1, d2], k: KS.keywordK, weight: 0.5, arm: 'keyword' });
   });
 
   test('empty keyword list → unchanged; the empty title list is still omitted', () => {
@@ -293,7 +294,7 @@ describe('composeFusionLists — arm-confidence weighting of the keyword + title
       ks: KS,
       knobs: { expansionVariantBudget: null, keywordArmConfidenceFloor: 0.6 },
     });
-    expect(lists).toEqual([{ list: [gold], k: KS.vectorK }, { list: [], k: KS.keywordK }]);
+    expect(lists).toEqual([{ list: [gold], k: KS.vectorK, arm: 'vector' }, { list: [], k: KS.keywordK, arm: 'keyword' }]);
   });
 
   test('the callback fires exactly once per composition, even with the knob off; a throwing callback never breaks fusion', () => {

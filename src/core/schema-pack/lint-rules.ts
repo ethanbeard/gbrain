@@ -12,6 +12,7 @@
 // Issue shape mirrors the StructuredAgentError envelope from
 // src/core/errors.ts so JSON output is consistent across CLI + MCP.
 
+import { RELATION_SEMANTICS } from '../link-validity.ts';
 import type { SchemaPackManifest } from './manifest-v1.ts';
 import type { BrainEngine } from '../engine.ts';
 import { readRecentMutations } from './mutate-audit.ts';
@@ -165,6 +166,50 @@ export const linkTypesUndeclared: LintRule = (manifest) => {
         hint: `add a page_type for '${lt.inference.target_type}' OR remove inference.target_type`,
       });
     }
+  }
+  return issues;
+};
+
+/**
+ * `link_types[].temporal`: `mentions` never carries temporal state (error);
+ * redeclaring a built-in relation with different semantics, or an inverse
+ * pair that disagrees, is flagged (warning).
+ */
+export const linkTypesTemporal: LintRule = (manifest) => {
+  const issues: LintIssue[] = [];
+  const declared = new Map(manifest.link_types.filter((lt) => lt.temporal).map((lt) => [lt.name, lt.temporal!]));
+  for (const lt of manifest.link_types) {
+    if (!lt.temporal) continue;
+    if (lt.name === 'mentions') {
+      issues.push({ rule: 'link_types_temporal_mentions', severity: 'error', pack: manifest.name, link: lt.name,
+        message: "link_type 'mentions' cannot be temporal: mentions are references, and every mention would get relationship state. Remove temporal from 'mentions'." });
+      continue;
+    }
+    const builtin = RELATION_SEMANTICS[lt.name];
+    if (builtin && builtin !== lt.temporal) {
+      issues.push({ rule: 'link_types_temporal_overrides_builtin', severity: 'warning', pack: manifest.name, link: lt.name,
+        message: `link_type '${lt.name}' is built in as '${builtin}'; this pack makes it '${lt.temporal}' for every brain using the pack. Drop temporal from '${lt.name}' to keep '${builtin}'.` });
+    }
+    const inverse = lt.inverse ? declared.get(lt.inverse) : undefined;
+    if (inverse && inverse !== lt.temporal) {
+      issues.push({ rule: 'link_types_temporal_inverse_mismatch', severity: 'warning', pack: manifest.name, link: lt.name,
+        message: `link_type '${lt.name}' is '${lt.temporal}' but its inverse '${lt.inverse}' is '${inverse}'. Declare the same temporal value on both.` });
+    }
+  }
+  return issues;
+};
+
+export const linkTypesCardinality: LintRule = (manifest) => {
+  const issues: LintIssue[] = [];
+  for (const lt of manifest.link_types) {
+    if (lt.cardinality !== 'one_per_from' || (lt.temporal ?? RELATION_SEMANTICS[lt.name]) === 'state') continue;
+    issues.push({
+      rule: 'link_types_cardinality_not_state',
+      severity: 'error',
+      message: `link_type '${lt.name}' declares cardinality one_per_from, but only state relations have stints a newer start can close; declare temporal: state on '${lt.name}' or remove its cardinality`,
+      pack: manifest.name,
+      link: lt.name,
+    });
   }
   return issues;
 };
@@ -427,6 +472,8 @@ export const ALL_LINT_RULES: ReadonlyArray<{ name: string; rule: LintRule; plane
   { name: 'alias_references_undeclared_type', rule: aliasReferencesUndeclaredType, planeAware: false },
   { name: 'enrichable_types_undeclared', rule: enrichableTypesUndeclared, planeAware: false },
   { name: 'link_types_undeclared', rule: linkTypesUndeclared, planeAware: false },
+  { name: 'link_types_temporal', rule: linkTypesTemporal, planeAware: false },
+  { name: 'link_types_cardinality', rule: linkTypesCardinality, planeAware: false },
   { name: 'frontmatter_links_undeclared', rule: frontmatterLinksUndeclared, planeAware: false },
   { name: 'expert_routing_without_prefix', rule: expertRoutingWithoutPrefix, planeAware: false },
   { name: 'prefix_collision', rule: prefixCollision, planeAware: false },

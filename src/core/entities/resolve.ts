@@ -35,7 +35,8 @@ import { privatePagesFilterFragment } from '../search/private-visibility.ts';
  *      exact pages.slug row in this source), return it untouched. A mention
  *      that is exactly one live page's own name (slug basename) resolves to
  *      it next, before any other page's alias.
- *   2. Resolve a bare name only when prefix expansion finds one candidate.
+ *   2. Resolve a bare name only when prefix expansion finds one candidate,
+ *      or one candidate whose title is exactly that name.
  *   3. For multi-token input, take a fuzzy candidate within the source only
  *      when it carries the same name tokens (sameEntityName).
  *   4. Fall back to a deterministic slugify: lowercase-no-spaces with
@@ -85,7 +86,7 @@ export async function resolveEntitySlug(
   //    `"Alice"` → `people/alice-example` before we phantom-stub a bare
   //    `people/alice.md`.
   if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, trimmed);
     if (expanded) return expanded;
   } else {
     // 3. Fuzzy match against existing pages within the source. Bare names
@@ -279,7 +280,7 @@ export async function resolveEntitySlugWithSource(
   if (basenames.length > 1) return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
 
   if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, trimmed);
     if (expanded) return { slug: expanded, source: 'prefix_expansion' };
   } else {
     const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
@@ -400,20 +401,53 @@ export async function resolvePhantomCanonical(
   engine: BrainEngine,
   source_id: string,
   phantomSlug: string,
+  opts: { type?: string | null } = {},
 ): Promise<string | null> {
   if (!phantomSlug) return null;
   const trimmed = phantomSlug.trim();
   if (!trimmed) return null;
+  // Type guard: a phantom that declares an entity type only merges into a page
+  // of that type's directory (a company phantom never lands on people/…).
+  const allowedDirs = opts.type ? PHANTOM_TYPE_DIRS[opts.type] : undefined;
+  const typeOk = (slug: string) => !allowedDirs || allowedDirs.some(dir => slug.startsWith(`${dir}/`));
   // The phantom slug is the input; we treat it as the search term too,
   // because phantom slugs ARE the lowercased bare name a fuzzy / prefix
-  // lookup would naturally target.
-  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, false);
-  if (fuzzy && fuzzy !== phantomSlug && fuzzy.includes('/')) return fuzzy;
+  // lookup would naturally target. Short or repetitive names carry too little
+  // signal for a trigram match, so they skip the fuzzy tier.
+  if (hasNameSignal(trimmed.replace(/-/g, ' '))) {
+    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, false);
+    if (fuzzy && fuzzy !== phantomSlug && fuzzy.includes('/') && typeOk(fuzzy)) return fuzzy;
+  }
 
   const expanded = await tryPrefixExpansion(engine, source_id, slugify(trimmed));
-  if (expanded && expanded !== phantomSlug && expanded.includes('/')) return expanded;
+  if (expanded && expanded !== phantomSlug && expanded.includes('/') && typeOk(expanded)) return expanded;
 
   return null;
+}
+
+/** Entity types whose phantoms may only merge into their own directories. */
+const PHANTOM_TYPE_DIRS: Readonly<Record<string, readonly string[]>> = {
+  person: ['people'],
+  company: ['companies'],
+  project: ['projects'],
+  host: ['hosts'],
+};
+
+/**
+ * Name-specificity gate for fuzzy phantom merges: at least 6 characters or two
+ * tokens, and Shannon character entropy of at least 1.5 bits. Short or
+ * repetitive names ("ai", "aaaa") defer to the stricter prefix tier.
+ */
+export function hasNameSignal(name: string): boolean {
+  const normalized = name.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (normalized.length < 6 && normalized.split(' ').length < 2) return false;
+  const chars = normalized.replace(/ /g, '');
+  if (!chars) return false;
+  const counts = new Map<string, number>();
+  for (const c of chars) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let entropy = 0;
+  for (const n of counts.values()) { const p = n / chars.length; entropy -= p * Math.log2(p); }
+  return entropy >= 1.5;
 }
 
 /**
@@ -476,13 +510,43 @@ export async function findPrefixCandidates(
   }
 }
 
+/**
+ * The sole prefix candidate, or, when every candidate sits in one entity
+ * directory, the one page whose title is exactly the bare name: "Acme" is
+ * `companies/acme-0` titled "Acme", not `companies/acme-labs-50` titled
+ * "Acme Labs" (gbrain-evals N9-5). A collision across directories (a person
+ * and a host) or two exact titles stays ambiguous.
+ */
 async function tryUnambiguousPrefixExpansion(
   engine: BrainEngine,
   source_id: string,
-  token: string,
+  raw: string,
 ): Promise<string | null> {
+  const token = slugify(raw);
   const candidates = await findPrefixCandidates(engine, source_id, token);
-  return candidates.length === 1 ? candidates[0].slug : null;
+  if (candidates.length === 1) return candidates[0].slug;
+  if (candidates.length === 0) return null;
+  const patterns = PREFIX_EXPANSION_DIRS.flatMap(dir => [`${dir}/${token}`, `${dir}/${token}-%`]);
+  try {
+    const dirs = await engine.executeRaw<{ dir: string }>(
+      `SELECT DISTINCT split_part(slug, '/', 1) AS dir FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE ANY($2::text[])
+        LIMIT 2`,
+      [source_id, patterns],
+    );
+    if (dirs.length !== 1) return null;
+    const rows = await engine.executeRaw<{ slug: string; title: string | null }>(
+      `SELECT slug, title FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL
+          AND slug LIKE ANY($2::text[]) AND lower(title) = lower($3)
+        LIMIT 3`,
+      [source_id, patterns, raw.trim()],
+    );
+    const exact = rows.filter(r => sameEntityName(raw, r.title, r.slug));
+    return exact.length === 1 ? exact[0].slug : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

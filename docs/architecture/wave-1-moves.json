@@ -3969,9 +3969,10 @@
     {
       "old": "src/core/postgres-engine/forward-reference-bootstrap.ts:applyPostgresForwardReferenceBootstrap",
       "kind": "split",
-      "facade": "src/core/postgres-engine/forward-reference-bootstrap.ts:applyPostgresForwardReferenceBootstrap",
+      "facade": null,
       "wasExported": true,
       "new": [
+        "src/core/engine-sql/bootstrap.ts:applyPostgresForwardReferenceBootstrap",
         "src/core/engine-sql/bootstrap.ts:applyForwardReferenceBootstrap",
         "src/core/engine-sql/bootstrap.ts:forwardReferenceGaps"
       ]

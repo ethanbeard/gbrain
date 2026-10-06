@@ -90,6 +90,7 @@ describe('serve idle sweep source resolution (#4679)', () => {
       mcpStdio: false,
       bootTimeoutMs: 0,
       sweepEnabled: true,
+      factsDrain: false, // its own 10-minute timer is covered by test/facts-drain-scheduler.test.ts
     };
 
     process.chdir(dir);

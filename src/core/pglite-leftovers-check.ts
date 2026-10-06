@@ -54,6 +54,19 @@ export interface PgliteLeftoversAssessment {
   status: 'ok' | 'warn' | 'skip';
   message: string;
   leftovers: PgliteLeftoverDir[];
+  /** Engine graduation's retained source copies (`<path>.graduated-<run_id>`). */
+  retained?: PgliteLeftoverDir[];
+}
+
+/** Engine graduation's retained copy of a moved brain: `<data dir>.graduated-<run_id>`. */
+export const GRADUATED_COPY_RE = /\.graduated-[A-Za-z0-9_-]+$/;
+
+/** What graduation's manifest tells this check (file read by the caller). */
+export interface GraduationLeftoverContext {
+  /** The manifest state is non-terminal: a move is in flight or interrupted. */
+  inFlight: boolean;
+  /** The retained copy path the manifest records (it can live outside the gbrain home). */
+  retainedPath?: string;
 }
 
 /**
@@ -68,8 +81,9 @@ export const SIZE_WALK_MAX_ENTRIES = 20_000;
  *  survives an interrupted run and is cleared only on clean completion. */
 export const MIGRATE_MANIFEST_NAME = 'migrate-manifest.json';
 
-/** True only for the one directory the engines themselves create: the old
- *  store `brain.pglite`. gbrain never creates `brain.pglite.*` siblings
+/** True only for the one directory the legacy copier leaves: the old
+ *  store `brain.pglite` (engine graduation's `<path>.graduated-<run_id>`
+ *  copies are matched separately by GRADUATED_COPY_RE). gbrain never creates `brain.pglite.*` siblings
  *  (no pre-migrate copies, no backups) — those all have unknown provenance
  *  and are out of scope. */
 export function isMigrationLeftoverName(name: string): boolean {
@@ -167,9 +181,17 @@ export function assessPgliteLeftovers(
   engineKind: string | null | undefined,
   gbrainHome: string,
   maxEntries: number = SIZE_WALK_MAX_ENTRIES,
+  graduation: GraduationLeftoverContext | null = null,
 ): PgliteLeftoversAssessment {
   if (engineKind !== 'postgres') {
     return { status: 'skip', message: '', leftovers: [] };
+  }
+  if (graduation?.inFlight) {
+    return {
+      status: 'skip',
+      message: 'An engine graduation is in flight or interrupted; its PGLite source and retained copy are not leftovers until it finishes.',
+      leftovers: [],
+    };
   }
   if (existsSync(join(gbrainHome, MIGRATE_MANIFEST_NAME))) {
     return {
@@ -181,6 +203,7 @@ export function assessPgliteLeftovers(
     };
   }
   let names: string[] = [];
+  const retainedPaths = new Set<string>();
   const budget = { entries: maxEntries };
   try {
     const handle = opendirSync(gbrainHome);
@@ -192,6 +215,8 @@ export function assessPgliteLeftovers(
         // a store this check can claim ownership of.
         if (entry.isDirectory() && !entry.isSymbolicLink() && isMigrationLeftoverName(entry.name)) {
           names.push(entry.name);
+        } else if (entry.isDirectory() && !entry.isSymbolicLink() && GRADUATED_COPY_RE.test(entry.name)) {
+          retainedPaths.add(join(gbrainHome, entry.name));
         }
       }
     } finally {
@@ -200,9 +225,15 @@ export function assessPgliteLeftovers(
   } catch {
     return { status: 'skip', message: '', leftovers: [] };
   }
-  const leftovers: PgliteLeftoverDir[] = [];
-  for (const name of names.sort()) {
-    const p = join(gbrainHome, name);
+  if (graduation?.retainedPath) {
+    try {
+      const st = lstatSync(graduation.retainedPath);
+      if (st.isDirectory() && !st.isSymbolicLink()) retainedPaths.add(graduation.retainedPath);
+    } catch {
+      // the user already deleted it — nothing to report
+    }
+  }
+  const measure = (p: string): PgliteLeftoverDir => {
     let mtime: string | null = null;
     try {
       const st = lstatSync(p);
@@ -211,7 +242,22 @@ export function assessPgliteLeftovers(
       // stat raced a concurrent delete — still report the dir, without a date
     }
     const { bytes, incomplete } = walkSize(p, budget);
-    leftovers.push({ path: p, approx_bytes: bytes, size_incomplete: incomplete, dir_mtime: mtime });
+    return { path: p, approx_bytes: bytes, size_incomplete: incomplete, dir_mtime: mtime };
+  };
+  const leftovers: PgliteLeftoverDir[] = names.sort().map(name => measure(join(gbrainHome, name)));
+  const retained: PgliteLeftoverDir[] = [...retainedPaths].sort().map(measure);
+  if (retained.length > 0) {
+    const listing = retained.map(l => `${l.path} (${l.size_incomplete ? '>=' : ''}${humanBytes(l.approx_bytes, l.size_incomplete)})`).join('; ');
+    const legacy = leftovers.length ? ` The legacy copier's old store also remains: ${leftovers.map(l => l.path).join('; ')}.` : '';
+    return {
+      status: 'warn',
+      message:
+        `Engine graduation kept the PGLite brain it moved to Postgres: ${listing}. It still holds private ` +
+        `memory and access-token hashes, and it is what a rollback to PGLite restores. Deleting it is the ` +
+        `user's call; afterwards a rollback is no longer possible.${legacy}`,
+      leftovers,
+      retained,
+    };
   }
   if (leftovers.length === 0) {
     return {

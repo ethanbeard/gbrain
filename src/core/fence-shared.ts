@@ -28,8 +28,9 @@
  * whitespace trimmed, with the outer pipes already stripped.
  *
  * Escaped pipes (`\|`) stay inside their cell and are decoded back to `|`.
- * Other backslashes are preserved verbatim so existing fence text such as
- * Windows paths remains byte-stable across a render/parse cycle.
+ * After cell boundaries are found, `<br>` (also `<br/>` and `<br />`, case
+ * insensitive) decodes to `\n`. A literal `<br>` in a claim therefore reads
+ * back as a newline. Other backslashes are preserved verbatim.
  */
 export function parseRowCells(line: string): string[] | null {
   const trimmed = line.trim();
@@ -50,7 +51,7 @@ export function parseRowCells(line: string): string[] | null {
     }
   }
   cells.push(cell.trim());
-  return cells;
+  return cells.map(cell => cell.replace(/<br\s*\/?>/gi, '\n'));
 }
 
 /**
@@ -73,7 +74,8 @@ export function isSeparatorRow(cells: string[]): boolean {
  * via the `context` cell at the domain layer, not here).
  */
 export function stripStrikethrough(s: string): { text: string; struck: boolean } {
-  const m = s.match(/^~~(.+?)~~$/);
+  // [\s\S] rather than `.`: cells may hold decoded newlines (<br>).
+  const m = s.match(/^~~([\s\S]+?)~~$/);
   if (m) return { text: m[1].trim(), struck: true };
   return { text: s, struck: false };
 }
@@ -90,9 +92,11 @@ export function parseStringCell(raw: string): string | undefined {
 
 /**
  * Escape a value for safe placement inside a pipe-separated cell. Replaces
- * any literal `|` with `\|` so the table layout stays intact. `parseRowCells`
- * is the inverse and decodes the escape after identifying cell boundaries.
+ * literal `|` with `\|` and line breaks (`\r\n`, `\r`, `\n`) with `<br>` so
+ * each row stays on one physical line. `parseRowCells` decodes these after
+ * identifying cell boundaries. A literal `<br>` collides with this encoding
+ * and reads back as a newline.
  */
 export function escapeFenceCell(s: string): string {
-  return s.replace(/\|/g, '\\|');
+  return s.replace(/\|/g, '\\|').replace(/\r\n?|\n/g, '<br>');
 }

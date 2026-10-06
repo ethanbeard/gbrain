@@ -119,7 +119,7 @@ are one principal. See [shared brain skills](shared-brain-skills.md).
 
 A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation, the named shared-skill scopes, or owner dashboard/client-management authority. Starter includes authorized skill discovery and membership; the exact seven-tool `verbs` surface is memory-only. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
 
-New grants snapshot operation names and source access. A later server upgrade does not silently give a snapshot-bound client new operations. Explicitly regrant to include them. Archived sources are excluded. Legacy clients with a `NULL` operation snapshot retain their prior operation behavior.
+New grants snapshot operation names and source access. A later server upgrade does not silently give a snapshot-bound client new operations. Explicitly regrant to include them: `gbrain auth rescope-client <client_id> --allowed-operations …` for OAuth clients, or `gbrain auth rescope-token <name> --refresh-operations` (preview) then `--add <op,...>` for legacy tokens. `gbrain auth rescope --client <client_id> --operations all` (alias: `gbrain auth rescope-client <client_id> --allowed-operations all`) stores no snapshot and clears the profile instead, so the scopes and the surface alone decide, including operations later upgrades add. `gbrain auth clients` marks such a client `operations: "all"` with `includes_future_operations: true` and the command that re-pins it. A `bootstrap harness` re-run carries the replaced token's grants and does not widen its snapshot ([legacy token grants](../mcp/ADMIN.md#legacy-token-grants)). Archived sources are excluded. Legacy clients with a `NULL` operation snapshot retain their prior operation behavior.
 
 Snapshot-bound clients write through approved MCP operations such as `remember`, `capture`, or `put_page`. They cannot use the legacy `POST /ingest` webhook, whose queued writes do not yet enforce operation snapshots. Existing webhook clients with a `NULL` snapshot keep their legacy behavior.
 
@@ -289,7 +289,7 @@ identity. This connection has no local database backup or `bin/gbrain-setup`
 helper; complete backups belong on the brain host. If the handoff was lost,
 recover it through the host's delivery procedure first.
 
-Before this security migration, stop old servers and workers and take a protected backup. Start only runtimes that enforce the migrated grants. If rollout fails, disable the affected entry points and restore a compatible runtime while preserving memory and the tightened grants; do not run an older authorization implementation against the migrated database. Local installations can be released independently of hosted delegation.
+Before applying the grant migration, stop old servers and workers and take a protected backup. Start only runtimes that enforce the migrated grants. If rollout fails, disable the affected entry points and restore a compatible runtime while preserving memory and the tightened grants; do not run an older authorization implementation against the migrated database. Local installations can be released independently of hosted delegation.
 
 Remove a managed configuration with the same private handoff and `gbrain connect
 ... --remove`, or remove the native OAuth connection through its harness
@@ -309,17 +309,19 @@ state as well as canonical content; Git alone cannot restore memberships,
 policy history, revocations, or receipts. See
 [shared-skills recovery limits](shared-brain-skills.md#troubleshoot-leave-and-recover).
 
-| Symptom | Next action |
-| --- | --- |
-| PGLite is busy | Use authenticated host administration (`--admin-token-file ~/.gbrain/serve/admin-token` against the running server) or wait for the current owner to close. Never remove a live lock. |
-| Published URL unreachable from the agent | On the host, `gbrain mcp expose --status`. A cloud agent needs `--funnel`; tailnet-only reach serves only the owner's own devices. Certificate issuance can leave tailnet health `pending` for a minute. See the [remote MCP troubleshooting table](remote-mcp.md#troubleshooting). |
-| Configuration conflict | Select a fresh connection name/root or inspect the changed entry; do not overwrite unrelated settings. |
-| `grant_conflict` | Fetch the new revision and preview again. |
-| Delegation missing | Inspect repair reasons and explicitly bind supported tools, an active source, path policy, and positive concurrency. |
-| Read works, writes fail | Check issued/current scopes, operation snapshot, source grant, and direct fence. Full surface alone adds no authority. |
-| Work queues but never finishes | Check the host worker and terminal job status; queue admission is not worker verification. |
-| Finite cap blocks a call | Inspect unresolved reservations and provider pricing/bounds; do not treat unknown usage as zero. |
-| Server checks pass, new conversation fails | Verify native instruction activation, reload, absolute launcher, and observed GBrain calls inside that harness. |
+<a id="hosted-harness-troubleshooting"></a>
+
+| Symptom | Next action | Who acts | Consent | Verify |
+| --- | --- | --- | --- | --- |
+| PGLite is busy | Use authenticated host administration (`--admin-token-file ~/.gbrain/serve/admin-token` against the running server) or wait for the current owner to close. Never remove a live lock. | brain host | none | `gbrain doctor --only connection --json` on the host |
+| Published URL unreachable from the agent | On the host, `gbrain mcp expose --status`. A cloud agent needs `--funnel`; tailnet-only reach serves only the owner's own devices. Certificate issuance can leave tailnet health `pending` for a minute. See the [remote MCP troubleshooting table](remote-mcp.md#troubleshooting). | brain host | `egress` when switching to `--funnel` | `gbrain mcp expose --status --json` |
+| Configuration conflict | Select a fresh connection name/root or inspect the changed entry; do not overwrite unrelated settings. | agent | none | re-read the harness's MCP configuration |
+| `grant_conflict` | Fetch the new revision and preview again. | agent, after the user agrees | none | preview the grant again |
+| Delegation missing | Inspect repair reasons and explicitly bind supported tools, an active source, path policy, and positive concurrency. | brain host | none | the harness's tool list |
+| Read works, writes fail | Check issued/current scopes, operation snapshot, source grant, and direct fence. Full surface alone adds no authority. | brain host | none | `whoami` (where callable) or `gbrain doctor --json` on the host |
+| Work queues but never finishes | Check the host worker and terminal job status; queue admission is not worker verification. | brain host | none | `gbrain jobs stats` on the host |
+| Finite cap blocks a call | Inspect unresolved reservations and provider pricing/bounds; do not treat unknown usage as zero. | user (sets or raises the cap) | `paid` | `gbrain doctor --json` on the host |
+| Server checks pass, new conversation fails | Verify native instruction activation, reload, absolute launcher, and observed GBrain calls inside that harness. | user (restarts or reloads the harness) | none | a `recall` from a new conversation |
 
 ## Evidence and release gates
 

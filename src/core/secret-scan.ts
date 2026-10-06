@@ -616,8 +616,24 @@ export function privateKeySpans(text: string): Array<{ start: number; end: numbe
 // constant-work-per-occurrence guarantee (the jwt segments share the cap):
 // a value longer than that is redacted only through its first 4096 chars —
 // the accepted miss, well above any real token or base64 key blob.
+//
+// The 3.5 bits/char floor is judged on the bias-corrected (Miller-Madow)
+// estimate, not the raw per-character Shannon entropy. The raw figure of an
+// n-character string can never exceed log2(n) (3.58 at 12 characters, 3.91
+// at 15) and drops sharply with a single repeated character, so the raw
+// floor rejected 68% of uniformly random 12-character alphanumeric secrets,
+// 9% at 15 and 5% at 16: exactly the 12-16 character passwords the 12-char
+// value floor exists to catch (a 15-character value such as `!dcG4Gmw1qGRbR3`
+// after a password key stayed plaintext).
+// Miller-Madow adds (distinct - 1) / (2 n ln 2), which cuts those misses
+// below 1% at every length from 12 up and is negligible on long values.
+// Because the correction can lift an all-digit value past the floor, the
+// value must also carry a non-digit: counters, timestamps and numeric ids
+// (`token_count=1234567890123`) never reached 3.5 raw bits (log2(10) = 3.32)
+// and still never redact.
 const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 3.5;
 const HIGH_ENTROPY_REQUIRES_DIGIT_RE = /[0-9]/;
+const HIGH_ENTROPY_REQUIRES_NON_DIGIT_RE = /[^0-9]/;
 
 // PUNCTUATED VALUES. The rule is two compiled patterns sharing the name and
 // the group-2-is-value contract. QUOTED: after an opening `"` or `'`, the
@@ -682,6 +698,16 @@ function compilePatterns(opts: ScanOpts): CompiledPattern[] {
     }
   }
   return out;
+}
+
+/**
+ * Bias-corrected (Miller-Madow) Shannon entropy in bits/char: the raw
+ * estimate plus (distinct - 1) / (2 n ln 2). The entropy gate of
+ * `high_entropy_assignment` reads this. Exported for tests.
+ */
+export function correctedEntropy(s: string): number {
+  if (s.length === 0) return 0;
+  return shannonEntropy(s) + (new Set(s).size - 1) / (2 * s.length * Math.LN2);
 }
 
 /** Shannon entropy in bits/char. Exported for tests. */
@@ -954,8 +980,8 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
         if (m[0].length === 0) p.re.lastIndex++;
         // The entropy gate judges the WHOLE matched value (the rule fired on
         // the assignment's value), before any overlap split.
-        if (p.entropyGated && !HIGH_ENTROPY_REQUIRES_DIGIT_RE.test(value)) continue;
-        if (p.entropyGated && shannonEntropy(value) < HIGH_ENTROPY_MIN_BITS_PER_CHAR) continue;
+        if (p.entropyGated && (!HIGH_ENTROPY_REQUIRES_DIGIT_RE.test(value) || !HIGH_ENTROPY_REQUIRES_NON_DIGIT_RE.test(value))) continue;
+        if (p.entropyGated && correctedEntropy(value) < HIGH_ENTROPY_MIN_BITS_PER_CHAR) continue;
         if (p.validate && !p.validate(value)) continue;
         if (!taken) {
           taken = new Uint8Array(line.length);

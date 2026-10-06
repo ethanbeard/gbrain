@@ -102,7 +102,7 @@ describe('operations contract — every op has scope + correct mutability shape'
     // Remote-gated exception (#2598, same allowlist as test/oauth.test.ts):
     // `think` is read-scoped for OAuth/MCP because its handler forces
     // save/take OFF for remote callers before persistence — pinned by
-    // test/takes-mcp-allowlist.serial.test.ts. Local CLI can still persist.
+    // test/takes-mcp-allowlist.test.ts. Local CLI can still persist.
     // WP4/D9: request_tools is read-scoped + mutating — its only write (the
     // {surface} persist branch) self-enforces the D2 ceiling, the operator
     // lock, and a per-client rate limit (test/request-tools.test.ts pins all
@@ -246,6 +246,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'retain_skill_revision',
       'sources_inspect',
       'sync_brain',
+      'takes_remove',
     ];
     const derived = operations.filter(o => o.localOnly).map(o => o.name).sort();
     expect(derived).toEqual(LOCAL_ONLY_SNAPSHOT);

@@ -49,6 +49,20 @@ describe('exact reconciliation CLI', () => {
     expect(() => parseReconcileArgs(['workspace', 'a', '--audit'])).toThrow();
   });
 
+  test('#5974 auto-additive shapes only a preview and classify only an audit', () => {
+    expect(parseReconcileArgs(['workspace', 'people/example', '--preview', '--auto-additive', '--accept-suggested', '--out', 'auto.json']))
+      .toMatchObject({ operation: 'writer_reconcile_preview', params: { source_id: 'workspace', slug: 'people/example', auto_additive: true, accept_suggested: true } });
+    expect(parseReconcileArgs(['workspace', '--audit', '--classify']))
+      .toMatchObject({ operation: 'writer_reconcile_audit', params: { source_id: 'workspace', classify: true } });
+    const requestId = '00000000-0000-4000-8000-000000000000';
+    for (const args of [['workspace', 'people/example', '--accept-suggested'], ['workspace', 'people/example', '--classify'],
+      ['workspace', '--audit', '--auto-additive'], ['workspace', 'people/example', '--auto-additive', '--from', 'a.json', '--decisions', 'd.json'],
+      ['workspace', 'people/example', '--apply', 'ready.json', '--request-id', requestId, '--auto-additive'],
+      ['workspace', 'people/example', '--backups', '--auto-additive']]) {
+      expect(() => parseReconcileArgs(args)).toThrow();
+    }
+  });
+
   test('backup cleanup is explicit, exact-page and separate from every repair mode', () => {
     expect(parseReconcileArgs(['workspace', 'people/example', '--backups', '--limit', '2']))
       .toMatchObject({ operation: 'writer_reconcile_backups', params: { source_id: 'workspace', slug: 'people/example', action: 'list', limit: 2 } });

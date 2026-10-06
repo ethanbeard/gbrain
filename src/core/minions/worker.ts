@@ -20,6 +20,7 @@ import type {
   MinionQueueOpts, TokenUpdate,
 } from './types.ts';
 import {
+  JobDeferredError,
   UnrecoverableError,
   ABORT_REASON_LOCK_RENEWAL_FAILED,
   ABORT_REASON_LOCK_LOST,
@@ -49,6 +50,7 @@ import {
   type PoolDiagnostics,
 } from './db-probe.ts';
 import { buildJobContext } from './job-context.ts';
+import { runWithJobSpend } from './spend-authorization.ts';
 import {
   runJobInChild,
   ChildSpawnInfraError,
@@ -84,6 +86,7 @@ export const INFRASTRUCTURE_ABORT_REASONS = new Set<string>([
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { evaluateQuietHours, type QuietHoursConfig } from './quiet-hours.ts';
+import { releaseUndrainedClaims, settleShutdownInterruptedJob } from './worker-shutdown.ts';
 import { readFileSync } from 'fs';
 
 /**
@@ -233,6 +236,7 @@ export class MinionWorker extends EventEmitter {
   private jobsCompleted = 0;
   /** Idempotency latch for gracefulShutdown — per-job and periodic check sites can race. */
   private gracefulShutdownFired = false;
+  drainForced = false; // #5062: the shutdown drain expired and running claims were handed back (`jobs work` exits 17)
   /**
    * Set true when the RSS watchdog (not a normal SIGTERM) initiated the
    * drain. The CLI handler (src/commands/jobs.ts case 'work') reads this
@@ -539,13 +543,7 @@ export class MinionWorker extends EventEmitter {
     // `ctx.shutdownSignal` (currently: shell handler) can run their own cleanup
     // BEFORE the 30s cleanup race expires. Non-shell handlers ignore shutdown
     // and keep running — they get the full 30s window.
-    const shutdown = () => {
-      console.log('Minion worker shutting down...');
-      this.running = false;
-      if (!this.shutdownAbort.signal.aborted) {
-        this.shutdownAbort.abort(new Error('shutdown'));
-      }
-    };
+    const shutdown = () => this.requestShutdown();
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
 
@@ -948,6 +946,7 @@ export class MinionWorker extends EventEmitter {
           new Promise(resolve => setTimeout(resolve, 30000)),
         ]);
         if (this.configurationError) await this.drainConfiguration();
+        else if (this.shutdownAbort.signal.aborted) this.drainForced = await releaseUndrainedClaims(this.engine, this.executions.values(), this.opts.jobIsolation === 'process');
       }
 
       // The worker does NOT disconnect the engine: it doesn't own the
@@ -1042,6 +1041,13 @@ export class MinionWorker extends EventEmitter {
     } catch (e) {
       console.error(`handleQuietHoursDefer error for job ${job.id}:`, e instanceof Error ? e.message : String(e));
     }
+  }
+
+  /** #5062: signal-driven shutdown entry (SIGTERM/SIGINT, or the `jobs work` signal owner). Idempotent. */
+  requestShutdown(): void {
+    if (this.running) console.log('Minion worker shutting down...');
+    this.running = false;
+    if (!this.shutdownAbort.signal.aborted) this.shutdownAbort.abort(new Error('shutdown'));
   }
 
   /** Stop the worker gracefully. */
@@ -1460,6 +1466,13 @@ export class MinionWorker extends EventEmitter {
     execution.promise = promise;
   }
 
+  /** A handler deferral (JobDeferredError): back to delayed, no attempt counted. */
+  private async deferJob(job: MinionJob, lockToken: string, err: JobDeferredError): Promise<void> {
+    const deferred = await this.queue.deferJob(job.id, lockToken, `deferred (${err.reason}): ${err.message}`, err.retryInMs);
+    if (!deferred) console.warn(`Job ${job.id} deferral dropped (lock token mismatch)`);
+    else console.log(`Job ${job.id} (${job.name}) deferred (${err.reason}) for ${Math.round(err.retryInMs / 1000)}s (no attempt burned)`);
+  }
+
   private async executeJob(
     job: MinionJob,
     lockToken: string,
@@ -1509,7 +1522,7 @@ export class MinionWorker extends EventEmitter {
       }
       const result = isolated
         ? await runJobInChild({
-            jobId: job.id,
+            jobId: job.id, spendAuthorized: job.spend_authorization != null,
             jobName: job.name,
             lockToken,
             abortSignal: abort.signal,
@@ -1527,7 +1540,7 @@ export class MinionWorker extends EventEmitter {
           })
         // #4218: attribute every gateway.chat() the handler makes to this
         // job so chat_usage_log rows carry `phase = 'job:<name>'`.
-        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => handler(context as MinionJobContext)), abort.signal);
+        : await withSubmissionAuthority(authority, () => withChatPhase(`job:${job.name}`, () => runWithJobSpend(this.engine, job, context as MinionJobContext, handler)), abort.signal);
 
       // The child spawned and ran — the spawn path is healthy again.
       this._consecutiveChildSpawnFailures = 0;
@@ -1629,12 +1642,8 @@ export class MinionWorker extends EventEmitter {
         }
         return;
       }
-      if (err instanceof ChildWorkerShutdownError) {
-        console.log(
-          `Job ${job.id} (${job.name}) released after worker shutdown (${errorText}); ` +
-          `stall detector will requeue (no attempt burned)`,
-        );
-        return;
+      if (err instanceof ChildWorkerShutdownError || (!isolated && this.shutdownAbort.signal.aborted && !abort.signal.aborted)) {
+        return settleShutdownInterruptedJob(this.engine, job, lockToken, errorText, !(err instanceof ChildWorkerShutdownError) || err.executionStopped === true);
       }
       if (err instanceof ChildNotClaimedError) {
         // The child proved the claim is gone (reclaimed/cancelled before the
@@ -1658,6 +1667,7 @@ export class MinionWorker extends EventEmitter {
       // `failJob` minus the `attempts_made` increment. Audit row to
       // `minion_lease_pressure_log` so operators see pressure live in
       // `gbrain doctor` + `gbrain jobs stats lease_pressure`.
+      if (err instanceof JobDeferredError) return this.deferJob(job, lockToken, err);
       const isLeaseFull = err instanceof RateLeaseUnavailableError;
       if (isLeaseFull) {
         const leaseErr = err as RateLeaseUnavailableError;

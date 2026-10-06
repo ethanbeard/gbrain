@@ -33,6 +33,24 @@ export interface PoolGaugeSnapshot {
 
 export class CheckoutGauge {
   private counts: PoolGaugeSnapshot = { raw: 0, direct: 0, reserved: 0, tx: 0 };
+  private checkoutListeners = new Set<() => void>();
+
+  /**
+   * #5801: `listener` runs after a connection is actually obtained (reserve
+   * resolution or transaction-callback entry), never when a call merely starts
+   * waiting. Callers attribute the call to their own work (for example through
+   * AsyncLocalStorage); the gauge itself knows nothing about callers.
+   */
+  onCheckout(listener: () => void): () => void {
+    this.checkoutListeners.add(listener);
+    return () => { this.checkoutListeners.delete(listener); };
+  }
+
+  checkedOut(): void {
+    for (const listener of this.checkoutListeners) {
+      try { listener(); } catch { /* best-effort */ }
+    }
+  }
 
   acquire(kind: GaugeKind): void {
     this.counts[kind] += 1;
@@ -45,4 +63,30 @@ export class CheckoutGauge {
   snapshot(): PoolGaugeSnapshot {
     return { ...this.counts };
   }
+}
+
+/**
+ * #5730: pooled connections the vendored driver terminated instead of reusing
+ * because their ReadyForQuery status was not idle (`T` inside a transaction,
+ * `E` inside a failed one). Each discard is counted once and logged as one
+ * fixed-shape warn line; the status byte is the only driver-supplied value.
+ */
+export class PoisonedDiscardCounter {
+  private discards = 0;
+
+  get count(): number {
+    return this.discards;
+  }
+
+  record(pool: 'read' | 'direct', status: string): void {
+    this.discards += 1;
+    try { console.warn(formatPoisonedDiscardWarning(pool, status)); } catch { /* best-effort */ }
+  }
+}
+
+export function formatPoisonedDiscardWarning(pool: 'read' | 'direct', status: string): string {
+  const byte = /^[A-Z]$/.test(status) ? status : '?';
+  return `[gbrain] warn code=pg_connection_poisoned status=${byte} pool=${pool}` +
+    ` cause="a connection came back to the pool inside a transaction; it was discarded and replaced"` +
+    ` fix="gbrain doctor --json" docs=docs/ENGINES.md#pg-connection-poisoned`;
 }

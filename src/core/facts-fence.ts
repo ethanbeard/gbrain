@@ -58,6 +58,8 @@ export const FACTS_FENCE_END   = '<!--- gbrain:facts:end -->';
 // markdown contexts (the chunker strip, the CI invariant check) where
 // importing engine.ts pulls a large DB-shaped transitive graph.
 export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact' | 'idea';
+export type FactAttribution = 'user' | 'assistant' | 'other';
+const ATTRIBUTION_VALUES: ReadonlySet<string> = new Set(['user', 'assistant', 'other']);
 
 // Mirror src/core/engine.ts FactVisibility ('private' | 'world'). Binary
 // gate per the existing takes D21 contract — drives the chunker strip
@@ -118,6 +120,14 @@ export interface ParsedFact {
   claimValue?: number;
   claimUnit?: string;
   claimPeriod?: string;
+  /**
+   * Speaker attribution (15th column): who asserted the claim. A row carrying
+   * it is written 15 cells wide with the typed-claim cells padded empty;
+   * every other row keeps its width. Parsers that predate the column read
+   * the first 14 cells and ignore the 15th; writers that predate it drop
+   * the cell on rewrite.
+   */
+  attributedTo?: FactAttribution;
 }
 
 export interface FactsFenceParseResult {
@@ -239,6 +249,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       claimValueRaw = '',
       claimUnitRaw = '',
       claimPeriodRaw = '',
+      attributedToRaw = '',
     ] = cells;
 
     const rowNum = parseInt(rowNumStr, 10);
@@ -286,6 +297,12 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       continue;
     }
 
+    const attributedTo = attributedToRaw.trim().toLowerCase();
+    if (attributedTo && !ATTRIBUTION_VALUES.has(attributedTo)) {
+      warnings.push(`FACTS_TABLE_MALFORMED: unknown attributed_to "${attributedToRaw.trim()}" in row ${rowNumStr} (expected user|assistant|other)`);
+      continue;
+    }
+
     const { text: claimText, struck } = stripStrikethrough(claimRaw);
     const context = parseStringCell(contextRaw);
     const supersededBy = parseSupersededByFromContext(context);
@@ -310,6 +327,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       claimValue,
       claimUnit:   parseStringCell(claimUnitRaw),
       claimPeriod: parseStringCell(claimPeriodRaw),
+      ...(attributedTo ? { attributedTo: attributedTo as FactAttribution } : {}),
     });
   }
 
@@ -361,18 +379,23 @@ export function renderFactsTable(facts: ParsedFact[]): string {
     f.claimUnit   !== undefined ||
     f.claimPeriod !== undefined,
   );
-  const header = anyTyped
-    ? `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |`
+  // Speaker attribution widens the header to 15; only rows that carry it
+  // are written 15 cells wide (typed cells padded), others keep their width.
+  const anyAttributed = facts.some(f => f.attributedTo !== undefined);
+  const wide = anyTyped || anyAttributed;
+  const header = wide
+    ? `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context | claim_metric | claim_value | claim_unit | claim_period |${anyAttributed ? ' attributed_to |' : ''}`
     : `| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |`;
-  const separator = anyTyped
-    ? `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|`
+  const separator = wide
+    ? `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|--------------|-------------|------------|--------------|${anyAttributed ? '---------------|' : ''}`
     : `|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|`;
   const rows = facts.map(f => {
     const claimCell = f.active ? f.claim : `~~${f.claim}~~`;
     const base = `| ${f.rowNum} | ${escapeFenceCell(claimCell)} | ${f.kind} | ${formatConfidence(f.confidence)} | ${f.visibility} | ${f.notability} | ${escapeFenceCell(f.validFrom ?? '')} | ${escapeFenceCell(f.validUntil ?? '')} | ${escapeFenceCell(f.source ?? '')} | ${escapeFenceCell(f.context ?? '')} |`;
-    if (!anyTyped) return base;
+    if (!wide) return base;
     const valueCell = f.claimValue === undefined ? '' : String(f.claimValue);
-    return `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
+    const typed = `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
+    return f.attributedTo ? `${typed} ${f.attributedTo} |` : typed;
   });
   // #4615: the leading double-'' emits a BLANK LINE between the begin marker
   // and the header. The marker is an HTML block; with only one newline after
@@ -536,6 +559,7 @@ export function upsertFactRow(
       claimValue:  newRow.claimValue,
       claimUnit:   newRow.claimUnit,
       claimPeriod: newRow.claimPeriod,
+      ...(newRow.attributedTo ? { attributedTo: newRow.attributedTo } : {}),
     },
   ];
 

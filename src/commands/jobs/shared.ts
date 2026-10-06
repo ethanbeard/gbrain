@@ -6,6 +6,7 @@
 import type { BrainEngine } from '../../core/engine.ts';
 import type { MinionQueue } from '../../core/minions/queue.ts';
 import type { MinionJob } from '../../core/minions/types.ts';
+import { spendBasis } from '../../core/minions/spend-record.ts';
 import type { OperationError } from '../../core/ops/contract.ts';
 import type { SelectionSummary } from '../../core/minions/legacy-selection.ts';
 import { setCliExitVerdict } from '../../core/cli-force-exit.ts';
@@ -221,6 +222,10 @@ export function formatJobDetail(job: MinionJob): string {
   if (job.delay_until) lines.push(`  Delayed until: ${job.delay_until.toISOString()}`);
   if (job.parent_job_id) lines.push(`  Parent: job #${job.parent_job_id} (on_child_fail: ${job.on_child_fail})`);
   if (job.error_text) lines.push(`  Error: ${job.error_text}`);
+  if (job.spend_authorization || job.spend_authorization_invalid) {
+    const { basis, why } = spendBasis(job);
+    lines.push(`  Spend: ${basis} — ${why}`);
+  }
   if (job.stacktrace.length > 0) {
     lines.push(`  History:`);
     for (const entry of job.stacktrace) lines.push(`    - ${entry}`);

@@ -60,50 +60,44 @@ const PROVENANCE_MAX = 500;
 
 const remember: Operation = {
   name: 'remember',
+  idempotent: true,
   outputRedaction: 'no_stored_text',
-  description:
-    'MEMORY VERB (v1): save one fact to durable agent memory — the protocol write verb. ' +
-    'provenance is REQUIRED (free text, e.g. "conversation 2026-06-12", "user said in chat", "import: notes.md"). ' +
-    'Set `entity` whenever the fact is about a specific person/company/project — entity-scoped recall will not find it otherwise. ' +
-    'ttl accepts duration shorthand ("30d", "12h") or an absolute ISO 8601 timestamp; ISO-8601 durations like "P30D" are rejected with a fix. ' +
-    'visibility defaults to "world" (readable by every agent connected to this brain; pass "private" for local-CLI-only facts). ' +
-    'Response: branch on `status` (inserted|duplicate|superseded), never on `status_text` (human rendering only). ' +
-    'On duplicate, `id` is the EXISTING fact\'s id. For bulk extraction from a raw transcript use extract_facts instead.',
+  description: 'MEMORY VERB (v1): save facts with provenance. Set `entity` to the subject or entity recall misses it. Branch on `status` (inserted|duplicate|superseded); write_pending: poll get_write_request.',
   params: {
     ...PAGE_MUTATION_PARAMS,
-    fact: { type: 'string', required: true, description: 'The fact to remember, one claim per call.' },
+    fact: { type: 'string', description: 'One claim.' },
+    items: {
+      type: 'array',
+      description: '≤20 facts: [{fact, provenance}]',
+      items: { type: 'object' },
+    },
     provenance: {
       type: 'string',
-      required: true,
-      description:
-        'Where this fact came from (REQUIRED, free text, max 500 chars). Examples: "conversation 2026-06-12", "user said in chat", "import: meeting-notes.md".',
+      // Required for a single fact (the handler refuses with provenance_required); with items it may be given per item.
+      description: 'Fact source (max 500 chars).',
     },
     ttl: {
       type: 'string',
-      description:
-        'Optional expiry: duration shorthand ("30d", "12h", "45m") or absolute ISO 8601 timestamp ("2026-07-12T00:00:00Z"). NOT ISO-8601 durations ("P30D" is rejected). Omit = never expires.',
+      description: '"30d", "12h" or ISO 8601 time; omit = never.',
     },
     entity: {
       type: 'string',
-      description:
-        'Person/company/project this fact is about (name or slug; canonicalized server-side). Set it whenever the fact has a subject — entity-scoped recall misses unattributed facts.',
+      description: 'Subject (name or slug).',
     },
     infer_entity: {
       type: 'boolean',
-      description:
-        'Default true. When `entity` is omitted, link the fact to the one entity page the text names exactly (response `entity_inferred: "mention"`); pass false to save it unattributed.',
+      description: 'Default true.',
     },
     kind: {
-      type: 'string',
+      type: 'string', description: 'Default fact.',
       enum: [...FACT_KINDS],
-      description: 'Fact kind: event | preference | commitment | belief | fact (default).',
     },
     visibility: {
       type: 'string',
       enum: ['world', 'private'],
-      description:
-        'world (default): readable by every agent connected to this brain — required for the remote remember→recall round-trip. private: local CLI reads only.',
+      description: 'world (default) or private (local CLI only).',
     },
+    replaces: { type: 'string', description: 'fact_id this fact replaces (same entity).', fullSurfaceOnly: true },
   },
   mutating: true,
   scope: 'write',
@@ -111,12 +105,26 @@ const remember: Operation = {
   annotations: { title: 'remember (memory write)', idempotentHint: true },
   handler: async (ctx, p) => {
     const { verbError, parseTtlParam } = await import('./operations.ts');
+    if (p.items !== undefined) {
+      const { runRememberBatch } = await import('./remember-batch.ts');
+      return runRememberBatch(ctx, p, remember.handler, (code, message, suggestion) => verbError(code as never, message, suggestion));
+    }
     const fact = typeof p.fact === 'string' ? p.fact.trim() : '';
     if (!fact) {
       throw verbError(
         'invalid_params',
         'fact must be a non-empty string.',
-        'Pass the claim to remember, e.g. fact: "picked Stripe over Adyen — onboarding speed".',
+        p.fact === undefined && Object.keys(p).length === 0
+          ? 'The call arrived with no arguments; a tool call cut off at your output-token limit looks like this. Pass fact, or items with fewer entries per call.'
+          : 'Pass the claim to remember, e.g. fact: "picked Stripe over Adyen — onboarding speed", or several as items: [{fact, provenance}].',
+      );
+    }
+    // v1 contract: an absent provenance is a missing required parameter (invalid_params), an empty one is provenance_required.
+    if (p.provenance === undefined) {
+      throw verbError(
+        'invalid_params',
+        'Missing required parameter: provenance',
+        'Pass `provenance` as a string (where the fact came from), e.g. provenance: "user told me, 2026-06-12". With items, provenance may be given per item instead.',
       );
     }
     const provenance = typeof p.provenance === 'string' ? p.provenance.trim() : '';
@@ -150,6 +158,14 @@ const remember: Operation = {
         'Use "world" (default — agents can recall it) or "private" (local CLI reads only).',
       );
     }
+    const replaces = typeof p.replaces === 'string' ? p.replaces.trim() : typeof p.replaces === 'number' ? String(p.replaces) : undefined;
+    if (replaces !== undefined && (!/^\d+$/.test(replaces) || Number(replaces) <= 0)) {
+      throw verbError(
+        'not_found',
+        `No fact with id "${String(p.replaces)}" to replace.`,
+        'Pass the opaque fact_id from remember or recall (facts[].fact_id), or omit replaces.',
+      );
+    }
     if (ctx.dryRun) {
       parseTtlParam(p.ttl); // Dry runs still validate without admitting intent.
       return {
@@ -162,7 +178,13 @@ const remember: Operation = {
 
     const { submitRememberMutation } = await import('./persistence/memory-mutations.ts');
     const { runMemoryWrite } = await import('./persistence/verb-errors.ts');
-    return runMemoryWrite(() => submitRememberMutation(ctx, { ...p, fact, provenance, kind, visibility }));
+    const result = await runMemoryWrite(() => submitRememberMutation(ctx, { ...p, fact, provenance, kind, visibility, ...(replaces !== undefined ? { replaces } : {}) }));
+    // F8: the explanation the CLI formatter prints, as a model-visible notice.
+    if ((result as { degraded_dedup?: boolean } | null)?.degraded_dedup) {
+      const { degradedDedupNotice } = await import('./interop-notices.ts');
+      ctx.emitNotice?.(degradedDedupNotice(ctx.config));
+    }
+    return result;
   },
   cliHints: { name: 'remember', positional: ['fact'] },
 };
@@ -171,15 +193,12 @@ const remember: Operation = {
 
 const entity: Operation = {
   name: 'entity',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
-  description:
-    'MEMORY VERB (v1): inspect ONE known person/company/project card — zero LLM calls, sub-100ms. ' +
-    'Resolution: alias > exact title > slug-suffix; ties break on most-recently-touched. ' +
-    'NEVER errors on a miss: returns found:false plus near-miss suggestions with create_safety hints ' +
-    '(exists | probable | unknown — whether writing a new page would duplicate). ' +
-    'Routing: for facts/snippets retrieval use recall; for broad questions needing reasoning use synthesize (expensive).',
+  description: 'MEMORY VERB (v1): person/company/account card, zero LLM. Previews are not evidence: fetch the page before stating status or dates. Miss: found:false with near matches and create_safety. Facts: recall.',
   params: {
-    name: { type: 'string', required: true, description: 'Free-text name, alias, or slug (e.g. "Alice Example", "people/alice-example").' },
+    name: { type: 'string', required: true, description: 'Name, alias or slug (e.g. "Alice Example").' },
   },
   scope: 'read',
   verb: true,
@@ -197,14 +216,21 @@ const entity: Operation = {
     const t0 = Date.now();
     const { buildEntityCard } = await import('./verbs/entity-card.ts');
     const result = await buildEntityCard(ctx.engine, ctx.sourceId ?? 'default', name, {
-      remote: ctx.remote !== false,
+      remote: ctx.remote !== false, includeReferences: true, surfaceCeiling: ctx.surfaceCeiling,
     });
+    const coverage = result.card?.coverage ?? result.coverage;
+    if (coverage) {
+      const { mentionCoverageNotice } = await import('./mentions/coverage.ts');
+      const notice = mentionCoverageNotice(coverage, result.card?.entity.type);
+      if (notice) ctx.emitNotice?.(notice);
+    }
     return {
       protocol_version: MEMORY_VERBS_VERSION,
       found: result.found,
       latency_ms: Date.now() - t0,
       ...(result.card ? { card: result.card } : {}),
       ...(result.suggestions !== undefined ? { suggestions: result.suggestions } : {}),
+      ...(!result.card && result.coverage ? { coverage: result.coverage } : {}),
     };
   },
   cliHints: { name: 'entity', positional: ['name'] },
@@ -226,19 +252,14 @@ const SYNTHESIS_FAILURE_CODES: Record<string, string> = {
 
 const synthesize: Operation = {
   name: 'synthesize',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
-  description:
-    '[EXPENSIVE / SLOW — makes LLM calls, seconds-to-minutes latency, costs money] ' +
-    'MEMORY VERB (v1): answer a broad question using cross-page LLM reasoning with citations and gap analysis. ' +
-    'Prefer recall (facts/snippets) or entity (one known card, zero LLM) for lookups — use synthesize only when the answer ' +
-    'requires combining evidence across pages. Response carries a best-effort cost block (model, tokens, usd_estimate) ' +
-    'plus compose-status fields (synthesis_status, pages_gathered, takes_gathered, warnings); when the LLM compose step ' +
-    'fails but retrieval succeeded, `answer` degrades to an extractive digest of retrieved pages ' +
-    '(synthesis_status: "extractive_fallback") instead of an error.',
+  description: '[EXPENSIVE / SLOW: LLM calls, costs money] MEMORY VERB (v1): answer a broad question across pages with citations. For lookups use recall or entity.',
   params: {
-    question: { type: 'string', required: true, description: 'The question to answer.' },
-    since: { type: 'string', description: 'Optional temporal window start (ISO 8601 date or datetime).' },
-    until: { type: 'string', description: 'Optional temporal window end (ISO 8601 date or datetime).' },
+    question: { type: 'string', description: 'The question.', required: true },
+    since: { type: 'string', description: 'Window start (ISO 8601).' },
+    until: { type: 'string', description: 'Window end (ISO 8601).' },
   },
   scope: 'read',
   verb: true,
@@ -278,12 +299,16 @@ const synthesize: Operation = {
     // unconfigured key routed to the extractive fallback would be masked on
     // every call and never get fixed.
     if (result.warnings.includes('NO_ANTHROPIC_API_KEY')) {
-      throw verbError(
+      // F9: a key enables paid calls, so the fix asks; the key never rides a command line.
+      const { chatKeyFix } = await import('./interop-notices.ts');
+      const e = verbError(
         'unavailable',
         'synthesize needs an LLM and none is configured.',
-        'Set an API key (e.g. `gbrain config set anthropic_api_key sk-...` or ANTHROPIC_API_KEY) and retry. recall and entity work without one.',
+        'Ask the user whether to add a chat-model API key (Anthropic or OpenAI; each synthesized answer is a paid call). Meanwhile recall and entity work without one: answer from their results.',
         'chat gateway unconfigured (NO_ANTHROPIC_API_KEY)',
       );
+      e.fix = chatKeyFix();
+      throw e;
     }
 
     // Best-effort cost block [E5/m3]: actual tokens when the gateway reported
@@ -308,6 +333,8 @@ const synthesize: Operation = {
     // gather → typed error. An answer is NEVER fabricated from nothing
     // (ENG-19). Defensive ?? 'ok' mirrors synthesisOk's back-compat posture.
     const status = result.synthesis_status ?? 'ok';
+    const { recordThinkAnswer, feedbackMetaFields } = await import('./feedback/record.ts');
+    const feedbackMeta = feedbackMetaFields(await recordThinkAnswer(ctx, 'synthesize', result));
     if (status !== 'ok') {
       if (result.extractive) {
         return {
@@ -319,6 +346,7 @@ const synthesize: Operation = {
           pages_gathered: result.pagesGathered,
           takes_gathered: result.takesGathered,
           warnings: result.warnings,
+          ...feedbackMeta,
           protocol_version: MEMORY_VERBS_VERSION,
         };
       }
@@ -332,6 +360,7 @@ const synthesize: Operation = {
 
     return {
       answer: result.answer,
+      ...(result.answer_raw !== undefined ? { answer_raw: result.answer_raw, quote_check: result.quote_check, unverified_quotes: result.unverified_quotes } : {}),
       sources: result.citations.map(c => c.page_slug),
       gaps: result.gaps,
       cost,
@@ -339,6 +368,7 @@ const synthesize: Operation = {
       pages_gathered: result.pagesGathered,
       takes_gathered: result.takesGathered,
       warnings: result.warnings,
+      ...feedbackMeta,
       protocol_version: MEMORY_VERBS_VERSION,
     };
   },
@@ -349,16 +379,14 @@ const synthesize: Operation = {
 
 const forget: Operation = {
   name: 'forget',
+  idempotent: true,
   outputRedaction: 'no_stored_text',
-  description:
-    'MEMORY VERB (v1): expire a remembered fact by id — the protocol delete verb. ' +
-    '`id` is the opaque string id returned by remember and recall (facts[].fact_id) — never a page slug. ' +
-    'Idempotent: forgetting an already-expired fact returns expired:false (success), unknown id returns a not_found error. ' +
-    'The fact is expired (audit trail kept), not deleted.',
+  description: 'MEMORY VERB (v1): expire a remembered fact by its fact_id (never a page slug). Idempotent; the audit trail is kept.',
   params: {
     request_id: WRITE_REQUEST_PARAM,
-    id: { type: 'string', required: true, description: 'Opaque fact id from remember/recall (facts[].fact_id). Never a page slug.' },
-    reason: { type: 'string', description: 'Optional reason, written to the fact\'s audit trail. Default: "forgotten".' },
+    id: { type: 'string', required: true, description: 'fact_id from remember or recall.' },
+    reason: { type: 'string', description: 'Audit note (default "forgotten").' },
+    semantic_review: { type: 'boolean', description: 'false: skip overnight rewording review.', fullSurfaceOnly: true },
   },
   mutating: true,
   scope: 'write',
@@ -413,6 +441,28 @@ const SYNTHESIS_STATUS_ENUM = [
   'ok', 'empty_answer', 'not_json', 'output_truncated', 'no_llm', 'model_unusable', 'llm_error', 'extractive_fallback',
 ];
 
+/** `coverage` on entity cards and misses (mentions/coverage.ts). */
+const COVERAGE_SCHEMA = {
+  type: 'object',
+  required: ['state', 'pending_pages', 'last_pass_at'],
+  properties: {
+    state: { type: 'string', enum: ['complete', 'pending', 'disabled', 'type_not_linkable', 'failed'] },
+    pending_pages: { type: 'integer' },
+    last_pass_at: { type: ['string', 'null'] },
+    degraded: { type: 'boolean', const: true },
+  },
+} as const;
+
+/** One `referenced_by` row (mentions/referrers.ts). */
+const REFERENCE_ROW_SCHEMA = {
+  type: 'object',
+  required: ['slug', 'title', 'type', 'canonical_type', 'date', 'date_source', 'preview'],
+  properties: {
+    slug: { type: 'string' }, title: { type: 'string' }, type: { type: ['string', 'null'] }, canonical_type: { type: 'string' },
+    date: { type: ['string', 'null'] }, date_source: { type: 'string' }, preview: { type: 'string' },
+  },
+} as const;
+
 const RECALL_BUDGET_ARM_SCHEMA = {
   type: 'object',
   required: ['candidates', 'kept', 'dropped', 'used'],
@@ -464,7 +514,7 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
           },
         },
       },
-      search_degraded: { type: 'string', description: 'Present when the search arm fell back to keyword-only (no embedding provider).' },
+      search_degraded: { type: 'string', description: 'Present when the search arm fell back to keyword-only: keyword_only_no_embedding_provider (no embedding provider) or keyword_only_embedding_disabled (embeddings off by choice; no query text sent to a provider).' },
       budget_tokens: { type: 'integer', description: 'Present for a positive finite numeric budget, including when its floor is zero.' },
       budget_used: { type: 'integer' },
       dropped_count: { type: 'integer' },
@@ -497,6 +547,8 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
       warnings: { type: 'array', items: { type: 'string', enum: ['NO_ENTITY', 'ENTITY_LINK_FAILED'] },
         description: 'NO_ENTITY: saved unattributed. ENTITY_LINK_FAILED: an inferred entity could not be linked; saved unattributed.' },
       hint: { type: 'string', description: 'Present with warnings: how to attribute the fact (pass `entity`).' },
+      superseded_fact_id: { type: 'string', description: 'Present on status=superseded: the fact this one replaced.' },
+      replaced_by_caller: { type: 'boolean', description: 'Present (true) when the caller named the replaced fact with `replaces`.' },
       write_request: WRITE_RECEIPT_SCHEMA,
     },
   },
@@ -556,13 +608,37 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
                 direction: { type: 'string', enum: ['out', 'in'] },
                 slug: { type: 'string' },
                 context: { type: ['string', 'null'] },
+                // Temporal typed edges — ADDITIVE OPTIONAL (frozen-v1 legal).
+                status: { type: 'string' },
+                since: { type: ['string', 'null'] },
+                until: { type: ['string', 'null'] },
               },
             },
           },
           backlink_count: { type: 'integer' },
           active_fact_count: { type: 'integer' },
+          relationship_note: { type: 'string' },
+          // Entity recall — ADDITIVE OPTIONAL (frozen-v1 legal); the `entity`
+          // verb sets them, ambient callers (context_pack, delta) do not.
+          referenced_by_count: { type: 'integer' },
+          referenced_by: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['canonical_type', 'total', 'rows'],
+              properties: {
+                canonical_type: { type: 'string' },
+                total: { type: 'integer' },
+                rows: { type: 'array', items: REFERENCE_ROW_SCHEMA },
+                next: { type: 'object', required: ['tool', 'arguments'], properties: {
+                  tool: { type: 'string', const: 'get_backlinks' }, arguments: { type: 'object' }, requires_surface: { type: 'string', enum: ['starter'] } } },
+              },
+            },
+          },
+          coverage: COVERAGE_SCHEMA,
         },
       },
+      coverage: COVERAGE_SCHEMA,
       suggestions: {
         type: 'array',
         items: {
@@ -582,7 +658,10 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
     required: ['answer', 'sources', 'cost', 'protocol_version'],
     properties: {
       protocol_version: { type: 'integer', const: MEMORY_VERBS_VERSION },
-      answer: { type: 'string' },
+      answer: { type: 'string', description: 'Quoted words not found in the evidence are unquoted and marked [unverified]; never present them as quotes.' },
+      answer_raw: { type: 'string', description: 'With think.quote_verify on and quotes in the answer: the answer as the model wrote it.' },
+      quote_check: { type: 'object', properties: { grounded: { type: 'integer' }, repaired: { type: 'integer' }, unverified: { type: 'integer' } } },
+      unverified_quotes: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, reason: { type: 'string' } } } },
       sources: { type: 'array', items: { type: 'string' } },
       gaps: { type: 'array', items: { type: 'string' } },
       cost: {
@@ -618,6 +697,16 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
       expired: { type: 'boolean', description: 'true = this call expired the fact; false = it was ALREADY expired (idempotent re-forget).' },
       reason: { type: ['string', 'null'] },
       write_request: WRITE_RECEIPT_SCHEMA,
+      similar_active: {
+        type: 'object',
+        description: 'Active facts about the same entity close in meaning to the withdrawn claim (ids and scores only; zero model calls). Similarity is not sameness: ask the user before forgetting any of them.',
+        properties: {
+          state: { type: 'string', enum: ['checked', 'not_checked_no_embedding', 'not_checked_pending'] },
+          candidates: { type: 'array', items: { type: 'object', properties: { fact_id: { type: 'string' }, similarity: { type: 'number' } } } },
+          semantic_review: { type: 'string', enum: ['scheduled', 'off', 'unavailable', 'opted_out'] },
+          next: { type: 'string' },
+        },
+      },
     },
   },
   // v0.45.7 (issue #1) — ambient recall. World-only by default; include_private
@@ -666,10 +755,14 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
                   direction: { type: 'string', enum: ['out', 'in'] },
                   slug: { type: 'string' },
                   context: { type: ['string', 'null'] },
+                  status: { type: 'string' },
+                  since: { type: ['string', 'null'] },
+                  until: { type: ['string', 'null'] },
                 },
               },
             },
             backlink_count: { type: 'integer' },
+            relationship_note: { type: 'string' },
           },
         },
       },
@@ -718,12 +811,16 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
     properties: {
       protocol_version: { type: 'integer', const: MEMORY_VERBS_VERSION },
       since: { type: 'string', description: 'The ISO cursor this delta was computed against.' },
-      has_more: { type: 'boolean', description: 'True when changes beyond the fetch limit or budget were NOT delivered; with session_id the cursor advanced only to the last delivered page, so the tail surfaces on the next wake.' },
+      has_more: { type: 'boolean', description: 'True when more content is waiting (a fetch limit or the budget); each arm advanced only through what it delivered, so the rest surfaces on the next wake. Failure is degraded_reason, never has_more.' },
       next_cursor: {
         type: 'object',
         required: ['since', 'slug'],
-        description: 'Keyset to resume from (stateless callers pass back as since + since_slug).',
-        properties: { since: { type: 'string' }, slug: { type: 'string' } },
+        description: 'Where to resume. `cursor` (opaque, both arms exact) is passed back as cursor; older clients pass since + since_slug, which is conservative (may re-deliver, never skips): it holds while any arm failed and stays strictly before the oldest undelivered fact.',
+        properties: { since: { type: 'string' }, slug: { type: 'string' }, cursor: { type: 'string' } },
+      },
+      cursor_arms: {
+        type: 'object',
+        description: 'Replay audit trail: each arm\'s start and next keyset (pages: since + slug; facts: since + id).',
       },
       pages: {
         type: 'array',
@@ -744,6 +841,7 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
           type: 'object',
           required: ['fact', 'kind'],
           properties: {
+            id: { type: 'integer', description: 'Fact id (dedupe key for replay).' },
             fact: { type: 'string' },
             kind: { type: 'string' },
             entity_slug: { type: ['string', 'null'] },
@@ -765,7 +863,7 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
         },
       },
       text: { type: 'string' },
-      degraded_reason: { type: 'string' },
+      degraded_reason: { type: 'string', description: 'Comma-joined incomplete parts: deadline, pages, facts, threads, session_state. No cursor moved past anything undelivered; a delta_incomplete notice carries the retry step.' },
       budget_tokens: { type: 'integer' },
       budget_used: { type: 'integer' },
       dropped_count: { type: 'integer' },

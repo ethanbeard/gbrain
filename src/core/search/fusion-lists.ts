@@ -67,6 +67,12 @@ export interface FusionListEntry {
   list: SearchResult[];
   k: number;
   weight?: number;
+  /**
+   * Arm INSTANCE label for explain attribution (`vector`, `vector_variant#2`,
+   * `vector_clause#1`, `image`, `keyword`, `title`, `relational`). Labels
+   * never affect fusion math.
+   */
+  arm?: string;
 }
 
 /** Tag-and-append helper: the single way hybrid.ts adds a vector arm. */
@@ -180,13 +186,17 @@ export function composeFusionLists(input: ComposeFusionListsInput): FusionListEn
     budget === null || votingExpansionArms === 0 ? undefined : budget / votingExpansionArms;
 
   const out: FusionListEntry[] = [];
+  const seenByRole = new Map<VectorArmRole, number>();
   for (const arm of arms) {
+    const n = (seenByRole.get(arm.role) ?? 0) + 1;
+    seenByRole.set(arm.role, n);
+    const label = arm.role === 'original' ? 'vector' : arm.role === 'image' ? 'image' : `vector_${arm.role}#${n}`;
     if (arm.role === 'image') {
-      out.push({ list: arm.list, k: imageK });
+      out.push({ list: arm.list, k: imageK, arm: label });
     } else if (isExpansionRole(arm.role) && expansionWeight !== undefined && arm.list.length > 0) {
-      out.push({ list: arm.list, k: textK, weight: expansionWeight });
+      out.push({ list: arm.list, k: textK, weight: expansionWeight, arm: label });
     } else {
-      out.push({ list: arm.list, k: textK });
+      out.push({ list: arm.list, k: textK, arm: label });
     }
   }
   // Arm-confidence weighting (arm-confidence.ts): the keyword AND title
@@ -204,12 +214,12 @@ export function composeFusionLists(input: ComposeFusionListsInput): FusionListEn
     // Meta stamping must never break fusion.
   }
   const lexicalWeight = lexical.weight === undefined ? {} : { weight: lexical.weight };
-  out.push({ list: keywordFusionList, k: ks.keywordK, ...lexicalWeight });
+  out.push({ list: keywordFusionList, k: ks.keywordK, ...lexicalWeight, arm: 'keyword' });
   if (titleFusionList.length > 0) {
-    out.push({ list: titleFusionList, k: ks.keywordK, ...lexicalWeight });
+    out.push({ list: titleFusionList, k: ks.keywordK, ...lexicalWeight, arm: 'title' });
   }
   if (includeRelational && relationalList.length > 0) {
-    out.push({ list: relationalList, k: ks.baseRrfK });
+    out.push({ list: relationalList, k: ks.baseRrfK, arm: 'relational' });
   }
   return out;
 }

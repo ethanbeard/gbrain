@@ -1,10 +1,14 @@
-/** #5449: the outermost PGLite write transaction checkpoints before BEGIN; savepoints never do. */
+/**
+ * #5449: the outermost PGLite write transaction checkpoints before BEGIN; savepoints never do.
+ * An autocommit write statement (executeRaw outside engine.transaction()) takes the same guard:
+ * the PGLite 20k scale tier wedged in its raw vector UPDATEs once WAL crossed the trigger.
+ */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { CHECKPOINT_GUARD_MAX_BYTES, PgliteCheckpointGuard, checkpointGuardThreshold } from '../src/core/pglite-engine/checkpoint-guard.ts';
+import { CHECKPOINT_GUARD_MAX_BYTES, PgliteCheckpointGuard, checkpointGuardThreshold, writesWal } from '../src/core/pglite-engine/checkpoint-guard.ts';
 import { GBrainError } from '../src/core/types.ts';
 
 const MB = 1024 * 1024;
@@ -173,4 +177,49 @@ describe('guarded transactions and shutdown', () => {
     await engine.transaction(async tx => { await tx.executeRaw('SELECT 1'); });
     expect(guarded._checkpointGuard).not.toBe(before);
   });
+});
+
+describe('autocommit write statements take the guard', () => {
+  let engine: PGLiteEngine;
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.executeRaw('CREATE TABLE autocommit_probe (id int PRIMARY KEY, v text)');
+  });
+  afterAll(async () => { await engine.disconnect(); });
+
+  test('writes, DML in a WITH and DDL are guarded; reads and transaction control are not', () => {
+    for (const sql of ['INSERT INTO t VALUES (1)', ' update t set v = 1', 'DELETE FROM t', 'WITH x AS (UPDATE t SET v = 1 RETURNING id) SELECT * FROM x',
+      'CREATE INDEX i ON t (v)', 'ANALYZE t', 'VACUUM t']) expect(writesWal(sql)).toBe(true);
+    for (const sql of ['SELECT 1', '  select * from t', 'WITH x AS (SELECT 1) SELECT * FROM x', 'EXPLAIN SELECT 1', 'SHOW max_wal_size',
+      'BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT s', 'SET search_path = public', 'CHECKPOINT']) expect(writesWal(sql)).toBe(false);
+  });
+
+  test('an autocommit write past the threshold checkpoints before the next statement; a read never does', async () => {
+    const spy = install(engine, { threshold: 0 });
+    await engine.executeRaw("INSERT INTO autocommit_probe VALUES (1, 'guarded')");
+    expect(spy.checkpoints()).toBe(1);
+    await engine.executeRaw('SELECT * FROM autocommit_probe');
+    expect(spy.checkpoints()).toBe(1);
+  });
+
+  test('statements keep their issue order: a read issued after an unawaited write sees it', async () => {
+    install(engine, { threshold: 0 });
+    const write = engine.executeRaw("UPDATE autocommit_probe SET v = 'ordered' WHERE id = 1");
+    const read = engine.executeRaw<{ v: string }>('SELECT v FROM autocommit_probe WHERE id = 1');
+    await write;
+    expect((await read)[0]?.v).toBe('ordered');
+  });
+
+  test('about 200 MB of autocommit WAL past a 64 MB max_wal_size completes instead of wedging', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-autocommit-wal-'));
+    try {
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, 'fixtures', 'pglite-autocommit-wal-worker.ts'), dir], { stdout: 'pipe', stderr: 'pipe' });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 90_000);
+      const [stdout, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+      clearTimeout(timer);
+      expect(code).toBe(0);
+      expect(stdout).toContain('done 200');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 120_000);
 });

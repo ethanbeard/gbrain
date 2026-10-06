@@ -2,7 +2,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { getCliOptions } from '../core/cli-options.ts';
-import { isThinClient, loadConfig } from '../core/config.ts';
+import { loadConfig } from '../core/config.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { loadMounts } from '../core/brain-registry.ts';
 import { writeStdoutFinal, setCliExitVerdict } from '../core/cli-force-exit.ts';
@@ -12,6 +12,7 @@ import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
 import { assertTopologyCommitted } from '../core/persistence/managed-sources.ts';
 import { parseSourceLifecycleArgs, type ParsedSourceLifecycle } from './sources-lifecycle-args.ts';
 import { reportPersistenceCliError } from './persistence-delegate.ts';
+import { adminHostConfig } from './persistence-admin.ts';
 
 export const SOURCE_LIFECYCLE_HELP = `Managed source administration:
   gbrain sources add <id> [--path <directory> | --url <https-url> | --kind github|google]
@@ -63,9 +64,8 @@ export async function runSourceLifecycleCli(args: string[], getEngine: () => Pro
     try { parsed = parseSourceLifecycleArgs(args); } catch (error) { parseError = error; }
     // Global CLI routing has already consumed --brain; parsing retains it for direct callers too.
     const brainId = resolveBrainId(parsed?.brain ?? getCliOptions().brain);
-    const config = persistenceConfigForBrain(loadConfig(), brainId, brainId === 'host' ? [] : loadMounts());
-    if (!config) throw new OperationError('invalid_params', 'No brain is configured. Run gbrain init first.');
-    if (isThinClient(config)) throw new OperationError('permission_denied', 'Source administration runs locally on the selected brain host; an ordinary remote token is not administration authority.');
+    const config = adminHostConfig(persistenceConfigForBrain(loadConfig(), brainId, brainId === 'host' ? [] : loadMounts()), brainId,
+      'Source administration', `sources ${args[0] ?? ''}`.trim());
     if (args[0] === 'set-path' && args.includes('--clear')) {
       const { runSetPath } = await import('./sources-set-path.ts');
       await runSetPath(await getEngine(), args.slice(1));

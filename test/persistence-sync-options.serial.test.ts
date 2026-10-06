@@ -684,7 +684,10 @@ for (const boundary of ['retry-discovery', 'retry-commit', 'missing-manifest', '
   if (boundary !== 'completed-cleanup') {
     writeFileSync(join(f.root, 'records/example-0.md'), '---\ntitle: [broken\n---\nSynthetic invalid document.\n');
     f.git.commitAll('Add synthetic failed import');
-    expect(await performSync(engine, f.opts)).toMatchObject({ status: 'blocked_by_failures' });
+    // #5988: sync holds unreadable YAML by default; sync.holds=fail keeps the failed receipt this retry path needs.
+    await engine.setConfig('sync.holds', 'fail');
+    try { expect(await performSync(engine, f.opts)).toMatchObject({ status: 'blocked_by_failures' }); }
+    finally { await engine.unsetConfig('sync.holds'); }
     writeFileSync(join(f.root, 'records/example-0.md'), body);
     f.git.commitAll('Repair synthetic failed import');
   } else expect(await performSync(engine, f.opts)).toMatchObject({ status: 'first_sync', added: 1 });

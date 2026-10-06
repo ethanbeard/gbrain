@@ -119,10 +119,10 @@ describe('composeFusionLists — expansion variant budget (the 38-point gap)', (
       arms, keywordFusionList: [], titleFusionList: [], relationalList: [],
       includeRelational: true, ks: KS, knobs: { expansionVariantBudget: 1.0 },
     });
-    expect(lists[0]).toEqual({ list: [gold], k: 60 });
-    expect(lists[1]).toEqual({ list: [distractor], k: 60, weight: 0.5 });
-    expect(lists[2]).toEqual({ list: [], k: 60 });
-    expect(lists[3]).toEqual({ list: [distractor], k: 60, weight: 0.5 });
+    expect(lists[0]).toEqual({ list: [gold], k: 60, arm: 'vector' });
+    expect(lists[1]).toEqual({ list: [distractor], k: 60, weight: 0.5, arm: 'vector_variant#1' });
+    expect(lists[2]).toEqual({ list: [], k: 60, arm: 'vector_variant#2' });
+    expect(lists[3]).toEqual({ list: [distractor], k: 60, weight: 0.5, arm: 'vector_clause#1' });
   });
 
   test('original missing (its embed or searchVector failed) → survivors are variants sharing the budget', () => {
@@ -160,11 +160,14 @@ describe('composeFusionLists — null deep-equals the pre-role allLists mapping'
     // Today's mapping, verbatim (hybrid.ts pre-wave):
     //   [...vectorLists.map(list => ({ list, k: vectorK })), { list: keywordFusionList, k: keywordK }]
     //   + title (keywordK) if non-empty + relational (baseRrfK) if non-empty && modality !== 'image'
+    // Plus the explain-only `arm` instance label (never read by fusion math).
     const legacy: FusionListEntry[] = [
-      ...[orig, v1, v2].map((list) => ({ list, k: KS.vectorK })),
-      { list: kw, k: KS.keywordK },
-      { list: title, k: KS.keywordK },
-      { list: rel, k: KS.baseRrfK },
+      { list: orig, k: KS.vectorK, arm: 'vector' },
+      { list: v1, k: KS.vectorK, arm: 'vector_variant#1' },
+      { list: v2, k: KS.vectorK, arm: 'vector_variant#2' },
+      { list: kw, k: KS.keywordK, arm: 'keyword' },
+      { list: title, k: KS.keywordK, arm: 'title' },
+      { list: rel, k: KS.baseRrfK, arm: 'relational' },
     ];
     expect(got).toEqual(legacy);
     // No `weight` key anywhere in legacy mode (byte-identical shape).
@@ -178,7 +181,7 @@ describe('composeFusionLists — null deep-equals the pre-role allLists mapping'
       arms, keywordFusionList: kw, titleFusionList: [], relationalList: rel,
       includeRelational: false, ks: KS, knobs: { expansionVariantBudget: null },
     });
-    expect(got).toEqual([{ list: orig, k: KS.vectorK }, { list: kw, k: KS.keywordK }]);
+    expect(got).toEqual([{ list: orig, k: KS.vectorK, arm: 'vector' }, { list: kw, k: KS.keywordK, arm: 'keyword' }]);
   });
 
   test('both mode (image arm present): text arms at textRrfK, image arm at imageRrfK', () => {
@@ -191,10 +194,10 @@ describe('composeFusionLists — null deep-equals the pre-role allLists mapping'
       includeRelational: true, ks: KS, knobs: { expansionVariantBudget: null },
     });
     expect(got).toEqual([
-      { list: orig, k: KS.textRrfK },
-      { list: v1, k: KS.textRrfK },
-      { list: img, k: KS.imageRrfK },
-      { list: kw, k: KS.keywordK },
+      { list: orig, k: KS.textRrfK, arm: 'vector' },
+      { list: v1, k: KS.textRrfK, arm: 'vector_variant#1' },
+      { list: img, k: KS.imageRrfK, arm: 'image' },
+      { list: kw, k: KS.keywordK, arm: 'keyword' },
     ]);
   });
 
@@ -207,9 +210,9 @@ describe('composeFusionLists — null deep-equals the pre-role allLists mapping'
       arms, keywordFusionList: kw, titleFusionList: [], relationalList: [],
       includeRelational: true, ks: KS, knobs: { expansionVariantBudget: 0.5 },
     });
-    expect(got[2]).toEqual({ list: img, k: KS.imageRrfK });
-    expect(got[1]).toEqual({ list: v1, k: KS.textRrfK, weight: 0.5 });
-    expect(got[0]).toEqual({ list: orig, k: KS.textRrfK });
+    expect(got[2]).toEqual({ list: img, k: KS.imageRrfK, arm: 'image' });
+    expect(got[1]).toEqual({ list: v1, k: KS.textRrfK, weight: 0.5, arm: 'vector_variant#1' });
+    expect(got[0]).toEqual({ list: orig, k: KS.textRrfK, arm: 'vector' });
   });
 
   test('image-only mode (sole image arm): fuses at vectorK, exactly as the single-list mapping did', () => {
@@ -219,7 +222,7 @@ describe('composeFusionLists — null deep-equals the pre-role allLists mapping'
       arms, keywordFusionList: [], titleFusionList: [], relationalList: rel,
       includeRelational: false, ks: KS, knobs: { expansionVariantBudget: null },
     });
-    expect(got).toEqual([{ list: img, k: KS.vectorK }, { list: [], k: KS.keywordK }]);
+    expect(got).toEqual([{ list: img, k: KS.vectorK, arm: 'image' }, { list: [], k: KS.keywordK, arm: 'keyword' }]);
   });
 
   test('CORRECTED corner: both mode whose image branch fell open with two text lists → no list gets imageRrfK', () => {

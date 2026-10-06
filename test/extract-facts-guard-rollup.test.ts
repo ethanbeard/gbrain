@@ -31,6 +31,8 @@ function mkEngine(legacyCount: number): { calls: CapturedCall[]; engine: BrainEn
     async getPage() { return null; },
     async deleteFactsForPage() { return { deleted: 0 }; },
     async insertFacts() { return { inserted: 0, ids: [], warnings: [], deleted: 0 }; },
+    // Unmanaged fact expiry runs in a maintenance transaction; the stub is its own transaction engine.
+    async transaction<T>(fn: (tx: BrainEngine) => Promise<T>): Promise<T> { return fn(engine); },
   } as unknown as BrainEngine;
   return { calls, engine };
 }

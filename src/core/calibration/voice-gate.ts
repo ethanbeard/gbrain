@@ -164,6 +164,7 @@ export async function defaultJudge(input: {
     // install without Anthropic credit judges with a provider it has.
     model: resolveTierDefault('utility'),
     maxTokens: 100,
+    allowFallback: false,
   });
   return parseJudgeOutput(result.text);
 }

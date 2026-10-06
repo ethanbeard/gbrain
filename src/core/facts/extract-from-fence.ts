@@ -38,6 +38,7 @@
  *     warning surfaced by extract-facts, not a parse failure.
  */
 
+import { attributionCompatible } from './attribution.ts';
 import type { NewFact, FactKind, FactVisibility } from '../engine.ts';
 import type { ParsedFact } from '../facts-fence.ts';
 
@@ -70,6 +71,27 @@ export type FenceExtractedFact = NewFact & {
  * fencing pre-v51 DB facts that have no `source` recorded.
  */
 export const FENCE_SOURCE_DEFAULT = 'fence:reconcile';
+
+/**
+ * #1781: duplicate ACTIVE fence rows (same claim and source) index once.
+ * Rows two different known speakers asserted are not duplicates (attribution.ts).
+ * Returns the row numbers of the later copies, which extract_facts leaves
+ * out of the index. A struck history row never collapses with an active row
+ * that carries the same text, so a claim that reverts to an earlier value
+ * stays active.
+ */
+export function duplicateActiveFenceRows(facts: ParsedFact[]): Set<number> {
+  const seen = new Map<string, Array<ParsedFact['attributedTo']>>();
+  const duplicates = new Set<number>();
+  for (const f of facts) {
+    if (!f.active) continue;
+    const key = `${f.claim}\u0000${f.source ?? FENCE_SOURCE_DEFAULT}`;
+    const speakers = seen.get(key) ?? [];
+    if (speakers.some(s => attributionCompatible(s, f.attributedTo))) duplicates.add(f.rowNum);
+    else seen.set(key, [...speakers, f.attributedTo]);
+  }
+  return duplicates;
+}
 
 function parseValidDate(s: string | undefined): Date | undefined {
   if (!s) return undefined;
@@ -253,6 +275,7 @@ export function extractFactsFromFenceText(
       claim_value:  f.claimValue ?? null,
       claim_unit:   f.claimUnit ?? null,
       claim_period: f.claimPeriod ?? null,
+      attributed_to: f.attributedTo ?? null,
     };
     return row;
   });

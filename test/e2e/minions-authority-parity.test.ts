@@ -26,7 +26,12 @@ suite('Postgres queued authority parity', () => {
     await withEnv({ GBRAIN_HOME: sandbox }, async () => { await setupDB(); await runMigrations(getEngine()); });
     queue = new MinionQueue(getEngine());
   }, 120_000);
-  afterAll(async () => { await teardownDB(); if (sandbox) rmSync(sandbox, { recursive: true, force: true }); });
+  afterAll(async () => {
+    // Later files on the same database start real workers, which refuse to run while any unreviewed job remains.
+    await getEngine().executeRaw('DELETE FROM minion_jobs');
+    await teardownDB();
+    if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+  });
   beforeEach(async () => {
     await getEngine().executeRaw('DELETE FROM minion_jobs');
     await getEngine().executeRaw("DELETE FROM oauth_clients WHERE client_id = 'authority-test-client'");

@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { runCli } from './helpers/cli-spawn.ts';
 import {
   parseRunAllArgs,
   estimateRunCost,
@@ -25,10 +26,11 @@ afterAll(() => {
 });
 
 describe('parseRunAllArgs', () => {
-  test('defaults: all modes, longmemeval+replay suites, seed=42', () => {
+  test('defaults: all modes, the wired suites (brainbench), seed=42', () => {
     const opts = parseRunAllArgs([]);
     expect(opts.modes).toEqual(['conservative', 'balanced', 'tokenmax']);
-    expect(opts.suites).toEqual(['longmemeval', 'replay']);
+    expect(opts.suites).toEqual(['brainbench']);
+    expect(opts.suitesExplicit).toBe(false);
     expect(opts.seed).toBe(42);
     expect(opts.parallel).toBe(1);
     expect(opts.budgetUsdRetrieval).toBe(5);
@@ -48,6 +50,7 @@ describe('parseRunAllArgs', () => {
   test('--suites filters; rejects unknown', () => {
     const opts = parseRunAllArgs(['--suites', 'longmemeval']);
     expect(opts.suites).toEqual(['longmemeval']);
+    expect(opts.suitesExplicit).toBe(true);
     expect(() => parseRunAllArgs(['--suites', 'foo'])).toThrow(/not a recognized suite/);
   });
 
@@ -70,6 +73,32 @@ describe('parseRunAllArgs', () => {
   test('--yes flag toggles', () => {
     expect(parseRunAllArgs(['--yes']).yes).toBe(true);
     expect(parseRunAllArgs(['-y']).yes).toBe(true);
+  });
+
+  // #5933 (absorbed in agent contract v1 D4): NaN/out-of-range numeric flags
+  // are invalid_params usage errors, so the cost guard can't be bypassed.
+  test('--limit requires a positive safe integer', () => {
+    for (const value of ['NaN', 'Infinity', '1.5', '0', '-1', '9007199254740992']) {
+      expect(() => parseRunAllArgs(['--limit', value]), `--limit ${value}`).toThrow(/--limit/);
+    }
+    expect(() => parseRunAllArgs(['--limit', 'NaN'])).toThrow(expect.objectContaining({ code: 'invalid_params' }));
+  });
+
+  test('--seed requires a safe integer and allows zero', () => {
+    expect(parseRunAllArgs(['--seed', '0']).seed).toBe(0);
+    for (const value of ['NaN', 'Infinity', '1.5', '9007199254740992']) {
+      expect(() => parseRunAllArgs(['--seed', value]), `--seed ${value}`).toThrow(/--seed/);
+    }
+  });
+
+  test('budget caps require finite non-negative amounts', () => {
+    expect(parseRunAllArgs(['--budget-usd-answer', '0']).budgetUsdAnswer).toBe(0);
+    expect(parseRunAllArgs(['--budget-usd-retrieval', '0.25']).budgetUsdRetrieval).toBe(0.25);
+    for (const flag of ['--budget-usd-retrieval', '--budget-usd-answer']) {
+      for (const value of ['NaN', 'Infinity', '-Infinity', '-1']) {
+        expect(() => parseRunAllArgs([flag, value]), `${flag} ${value}`).toThrow(new RegExp(flag));
+      }
+    }
   });
 });
 
@@ -252,5 +281,27 @@ describe('persistRunRecord audit trail', () => {
     expect(parsed.mode).toBe('n/a');
     expect(parsed.suite).toBe('brainbench');
     expect(parsed.params.mode_independent).toBeUndefined();
+  });
+});
+
+describe('eval run-all with a suite it does not run (CLI)', () => {
+  test('explicit --suites longmemeval,replay exits 1 with eval_suite_unwired, the per-suite commands as fix, and no record', async () => {
+    const out = join(tmp, 'unwired');
+    const r = await runCli(['eval', 'run-all', '--suites', 'longmemeval,replay', '--modes', 'balanced', '--yes', '--json', '--output', out]);
+    expect(r.exitCode).toBe(1);
+    const env = JSON.parse(r.stdout);
+    expect(env.code).toBe('eval_suite_unwired');
+    expect(env.fix.argv.slice(0, 7)).toEqual(['gbrain', 'eval', 'longmemeval', '<dataset.jsonl>', '--mode', '<mode>', '--record']);
+    expect(env.fix.next).toBe('ask_user');
+    expect(env.fix.then.argv.slice(0, 5)).toEqual(['gbrain', 'eval', 'replay', '--mode', '<mode>']);
+    expect(r.stderr).toContain('Error [eval_suite_unwired]');
+    expect(existsSync(join(out, 'eval-results.jsonl'))).toBe(false);
+  });
+
+  test('gbrain errors eval_suite_unwired explains the code', async () => {
+    const r = await runCli(['errors', 'eval_suite_unwired']);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain('eval_suite_unwired (caller, exit 1)');
+    expect(r.stdout).toContain('does not run in-process');
   });
 });

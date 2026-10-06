@@ -49,6 +49,11 @@ export async function assertRetainedEmbeddingRebuildability(tx: BrainEngine, dim
     if (!Array.isArray(factColumns) || factColumns.length !== 1 || typeof factColumns[0].type !== 'string') throw new Error('Unknown fact schema');
     const factWidth = Number(factColumns[0].type.match(/^(?:vector|halfvec)\((\d+)\)$/)?.[1]);
     if (!Number.isSafeInteger(factWidth) || factWidth <= 0) throw new Error('Unknown fact dimensions');
+    const takeColumns = await tx.executeRaw<{ type: string }>(`SELECT format_type(atttypid,atttypmod) AS type
+      FROM pg_attribute WHERE attrelid='takes'::regclass AND attname='embedding' AND attnum>0 AND NOT attisdropped`);
+    if (!Array.isArray(takeColumns) || takeColumns.length !== 1 || typeof takeColumns[0].type !== 'string') throw new Error('Unknown take schema');
+    const takeWidth = Number(takeColumns[0].type.match(/^(?:vector|halfvec)\((\d+)\)$/)?.[1]);
+    if (!Number.isSafeInteger(takeWidth) || takeWidth <= 0) throw new Error('Unknown take dimensions');
     const schemaRebuild = model === undefined || width !== dimensions;
     const unavailablePage = `(s.archived IS DISTINCT FROM false OR p.deleted_at IS NOT NULL
       OR COALESCE(p.frontmatter,'{}'::jsonb) ? 'embed_skip'
@@ -70,7 +75,7 @@ export async function assertRetainedEmbeddingRebuildability(tx: BrainEngine, dim
         LEFT JOIN sources s ON s.id=p.source_id
         WHERE $8::boolean AND t.embedding IS NOT NULL AND t.active AND t.superseded_by IS NULL AND ${unavailablePage}) AS takes`,
     [['markdown', 'code'], [...AUDIT_ROW_SOURCES], schemaRebuild, model ?? '', dimensions, `${model ?? ''}:${dimensions}`,
-      schemaRebuild || factWidth !== dimensions || clearCompanions, clearCompanions]);
+      schemaRebuild || factWidth !== dimensions || clearCompanions, schemaRebuild || takeWidth !== dimensions || clearCompanions]);
     if (!row || (['pages', 'facts', 'takes'] as const).some(key => !Number.isSafeInteger(row[key]) || row[key] < 0)) {
       throw new Error('Unknown retained-vector census');
     }

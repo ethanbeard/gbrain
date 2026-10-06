@@ -71,9 +71,8 @@ Generic background submission requires a durable authenticated principal.
 Stdio agents should use the local CLI or a dedicated authorized operation.
 Local application maintenance retains its existing job and budget restrictions.
 
-`gbrain remote ping` previously submitted an `autopilot-cycle` job and now
-receives the generic-job denial. Run the existing maintenance workflow on the
-brain host, or use dedicated authorized operations such as `sync_brain` and
+`gbrain remote ping` submits an `autopilot-cycle` job, which the host refuses
+with the generic-job denial. Run maintenance on the brain host, or use dedicated authorized operations such as `sync_brain` and
 `connector_sync`. `gbrain remote doctor` remains available with its required
 scope.
 
@@ -101,8 +100,16 @@ no tools; only an absent trusted-local binding uses the default registry.
    installation, replace `vX.Y.Z.W` below with the exact release being installed:
 
    ```sh
+   bun remove --global gbrain
    bun install --global --ignore-scripts github:garrytan/gbrain#vX.Y.Z.W
    ```
+
+   Remove first. Installing a different tag over an existing global install
+   fails with `DependencyLoop` on Bun 1.3, and on Bun 1.4 it exits 0 without
+   swapping the code while it corrupts the global `package.json` and
+   `bun.lock` (#5034). If the install step fails after the removal, run it
+   again before restarting anything; `gbrain --version` must print the new
+   release.
 
    For a linked source checkout, update that checkout to the chosen release
    through its normal Git workflow, then run `bun install --ignore-scripts`.

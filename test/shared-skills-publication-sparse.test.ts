@@ -10,6 +10,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { activateSharedSkillPersistence } from '../src/core/persistence/skill-activation.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { adoptSharedSkillpack, submitSharedSkillMutation } from '../src/core/shared-skills/publication.ts';
@@ -191,7 +192,7 @@ test('an incomplete sealed inventory fails closed rather than dropping an unaffe
   const damaged = manifest(f.root); damaged.shared_skills.skills = damaged.shared_skills.skills.filter(skill => skill.name !== 'beta');
   await f.engine.transaction(async tx => {
     await declarePersistenceProtocol(tx);
-    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE shared_skill_packs SET manifest=$1::text::jsonb WHERE source_id='default'", [JSON.stringify(damaged)]));
+    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE shared_skill_packs SET manifest=$1::text::jsonb WHERE source_id='default'", [JSON.stringify(damaged)]), TEST_WRITE_ATTRIBUTION);
   });
   f.observe();
   await expect(f.put(f.editor, 'alpha', [prose('alpha', 'Must not commit')])).rejects.toMatchObject({ code: 'revision_conflict' });

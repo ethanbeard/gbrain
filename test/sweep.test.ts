@@ -670,15 +670,24 @@ describe('runMaintenanceSweep — bounded link resolution (no listAllPageRefs)',
       ['# TL', '', '## Timeline', '', '- **2026-03-04** | timeline only entry', ''].join('\n'),
     );
     const log: string[] = [];
-    const r = await runMaintenanceSweep(loggingEngine(engine, log), {
+    // A fresh GBRAIN_HOME holds no local CLI registration. Snapshot brains in
+    // one test process share a brain_id, so a registration another file wrote
+    // into the shared test home would add its verification query here.
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-sweep-home-'));
+    tmpDirs.push(home);
+    const r = await withEnv({ GBRAIN_HOME: home }, () => runMaintenanceSweep(loggingEngine(engine, log), {
       sourceId: 'default',
       capabilities: KEYLESS,
-    });
+    }));
     expect(r.timelineExtracted).toBe(1);
     expect(log).not.toContain('listAllPageRefs');
-    // Exactly two raw queries: the pass-1 fence scan and the pass-2 recency
-    // scan. No candidates ⇒ no third (ref-lookup) query.
-    expect(log.filter((m) => m === 'executeRaw').length).toBe(2);
+    // Exactly four raw queries: the pass-1 fence scan, the pass-2 recency
+    // scan, the managed-brain check that picks the timeline write path (a
+    // managed brain publishes per page through the coordinator) and the
+    // maintenance principal's brain_id lookup the attributed timeline batch
+    // makes (an installation with a CLI registration adds one query that
+    // verifies it, once per engine). No candidates ⇒ no ref-lookup query.
+    expect(log.filter((m) => m === 'executeRaw').length).toBe(4);
   });
 });
 
@@ -724,6 +733,7 @@ describe('runMaintenanceSweep — budget + never-throw', () => {
       linksExtracted: 1,
       linksRemoved: 0,
       timelineExtracted: 0,
+      corpus_files: [],
       skipped: [{ reason: 'budget_exhausted:corpus', count: 2 }],
       durationMs: 10,
     };

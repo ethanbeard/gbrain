@@ -27,12 +27,13 @@ test/e2e/backup-coverage-parity.test.ts
 test/e2e/chronicle-event-projection-parity.test.ts
 test/e2e/code-edges-read-parity.test.ts
 test/e2e/doctor-silent-death-parity.test.ts
-test/e2e/embedding-recovery-parity.test.ts	pooled-timeout=600
+test/e2e/embedding-recovery-parity.test.ts
 test/e2e/engine-parity-cjk.test.ts
 test/e2e/engine-parity-salience.test.ts
 test/e2e/engine-parity.test.ts
 test/e2e/fact-embedding-backfill-parity.test.ts
 test/e2e/fact-vector-repair-parity.test.ts
+test/e2e/engine-sql-health-parity.test.ts
 test/e2e/health-parity-postgres.test.ts
 test/e2e/minions-authority-parity.test.ts
 test/e2e/ontology-merge-parity.test.ts
@@ -45,3 +46,12 @@ test/e2e/projection-recovery-parity.test.ts
 test/e2e/takes-scorecard-parity.test.ts
 test/e2e/evidence-delivery-parity.test.ts
 test/e2e/apply-migrations-orchestration-lock.test.ts
+test/e2e/postgres-poisoned-connection.test.ts
+test/e2e/write-attribution-postgres.test.ts
+test/e2e/write-attribution-timeline-10k-postgres.test.ts
+test/e2e/write-attribution-read-parity.test.ts
+test/e2e/feedback-parity.test.ts
+test/e2e/mentions-parity.test.ts
+test/e2e/persistence-publish-lock-order-postgres.test.ts
+test/e2e/p8-memory-writes-postgres.test.ts
+test/e2e/delta-cursor-integrity-postgres.test.ts

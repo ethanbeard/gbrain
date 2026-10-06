@@ -163,12 +163,14 @@ export interface TimelineOrphanPruneResult {
  */
 async function retractCoordinated(engine: BrainEngine, pageId: number, slug: string, sourceId: string) {
   const { withCoordinatedWrite } = await import('./persistence/context.ts');
+  const { maintenanceAttribution } = await import('./persistence/attribution.ts');
+  const attribution = await maintenanceAttribution(engine);
   return engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], async () => {
     await tx.lockPageKeys([{ sourceId, slug }]);
     const [page] = await tx.executeRaw<{ compiled_truth: string; timeline: string | null }>(
       'SELECT compiled_truth, timeline FROM pages WHERE id = $1 AND deleted_at IS NULL', [pageId]);
     return page ? retractRemovedTimelineEntries(tx, slug, sourceId, `${page.compiled_truth}\n${page.timeline ?? ''}`) : [];
-  }));
+  }, attribution));
 }
 
 /**

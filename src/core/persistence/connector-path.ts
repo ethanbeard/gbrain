@@ -2,6 +2,7 @@ import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { isConnectorSourceKind } from './connector-identity.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { maintenanceAttribution } from './attribution.ts';
 
 /**
  * `gbrain sources set-path <id> --clear` (#5673): clear a connector source's
@@ -29,7 +30,7 @@ export async function clearConnectorLocalPath(engine: BrainEngine, sourceId: str
     if (source.local_path === null) return { prior: null };
     const [brain] = await tx.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
     const clear = () => tx.executeRaw('UPDATE sources SET local_path=NULL WHERE id=$1 AND incarnation=$2::uuid', [sourceId, source.incarnation]);
-    if (brain?.enabled) await withCoordinatedWrite(tx, [sourceId], clear);
+    if (brain?.enabled) await withCoordinatedWrite(tx, [sourceId], clear, await maintenanceAttribution(tx));
     else await clear();
     return { prior: source.local_path };
   });

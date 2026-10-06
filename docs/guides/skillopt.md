@@ -217,7 +217,7 @@ The reflect codes are emitted with a mode, as `reflect_failure_<class>` or
 | <a id="one_shot_rewrite_body_truncated"></a>`one_shot_rewrite_body_truncated` | One-shot refused: the body had to be truncated | Skill body larger than the optimizer's context | Lower the reflect cap (it shares the window), use a larger-window `--optimizer-model`, or use reflect mode |
 | <a id="one_shot_rewrite_empty_reply"></a>`one_shot_rewrite_empty_reply` | One-shot reply was empty | Optimizer is not following the rewrite contract | Try a different `--optimizer-model` |
 | <a id="one_shot_rewrite_failed"></a>`one_shot_rewrite_failed` | One-shot provider call failed | Provider/network/auth error | Check `gbrain models doctor`, then resume |
-| <a id="budget_exhausted"></a>`budget_exhausted` | Run aborted at the cost cap | Spend (including each call's full-cap reservation) reached `--max-cost-usd` | Raise `--max-cost-usd` (cycle: `cycle.skillopt.per_skill_cap_usd`), or lower the reflect cap |
+| <a id="budget_exhausted"></a>`budget_exhausted` | Run aborted at the cost cap | Spend (including each call's full-cap reservation) reached `--max-cost-usd`; or, when the detail says `no_pricing`, gbrain has no price for a model, so the cap cannot be enforced | Raise `--max-cost-usd` (cycle: `cycle.skillopt.per_skill_cap_usd`), or lower the reflect cap. For `no_pricing`: look up the model's price and run the `gbrain pricing set` command the receipt's `no_pricing.register_command` names, then resume ([registering a model price](../operations/spend-controls.md#registering-a-model-price)) |
 | <a id="runtime_exceeded"></a>`runtime_exceeded` | Run aborted at the wall-clock cap | `--max-runtime-min` reached | Raise `--max-runtime-min`, then resume |
 | <a id="reservation_exceeds_cap"></a>`reservation_exceeds_cap` | No model call made: one call alone reserves more than the cost cap | Reflect cap x optimizer price exceeds `--max-cost-usd` / `cycle.skillopt.per_skill_cap_usd` | Lower the reflect cap, pick a cheaper model, or raise the cost cap |
 
@@ -496,8 +496,8 @@ purpose:** the config dir also holds the CLI's session credentials, so the
 empty-dir form logs the child out wherever the CLI reads its session from the
 config dir — macOS included (observed with Claude Code 2.1.x). If rollouts
 start failing auth (`Not logged in · Please run /login`) after flipping this
-on, that is why: the run now ends `errored` with that message as the failure
-detail instead of finishing as a `no_improvement` with a 0.000 score. For a
+on, that is why: the run ends `errored` with that message as the failure
+detail, not as a `no_improvement` with a 0.000 score. For a
 hermetic run that stays authenticated, use the explicit-path form and
 pre-seed that directory with a logged-in config.
 

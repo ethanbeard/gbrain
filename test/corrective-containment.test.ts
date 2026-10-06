@@ -63,6 +63,8 @@ describe('remote history uses strict body sanitization', () => {
         const getVersions = mock(async () => [version]);
         const result = await operationsByName.get_versions.handler(context({
           getVersions: getVersions as never,
+          // Trusted local history also reads write attribution (Foundations 1 F1b); none is recorded here.
+          executeRaw: (async () => []) as never,
           // Even an operator opt-out cannot disable the Facts/Takes boundary.
           getConfig: async () => 'visible',
         }, { remote: remote as boolean, sourceId: 'default', takesHoldersAllowList }), { slug: 'example-page' }) as Array<{ compiled_truth: string }>;

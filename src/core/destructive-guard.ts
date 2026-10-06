@@ -23,7 +23,7 @@ import { isPathContained } from './path-confine.ts';
 import { defaultCloneDir } from './sources-ops.ts';
 import { gbrainPath } from './config.ts';
 import { isUndefinedColumnError, isUndefinedTableError } from './utils.ts';
-import { deleteSourceRow } from './source-delete.ts';
+import { deleteSourceRow, EXPIRED_ARCHIVE_SQL, UNVERIFIED_ARCHIVE_SQL, unverifiedArchiveReason } from './source-delete.ts';
 
 // ── Types ───────────────────────────────────────────────────
 
@@ -468,14 +468,18 @@ export interface PurgeExpiredResult {
  * table an EXISTS prefilter names, and the structured {purged, blocked}
  * return is what every caller + test in this tree consumes.)
  */
+async function unverifiedArchives(engine: BrainEngine): Promise<PurgeExpiredResult['blocked']> {
+  const rows = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources WHERE ${UNVERIFIED_ARCHIVE_SQL} ORDER BY id`);
+  return rows.map(({ id }) => ({ id, reason: unverifiedArchiveReason(id) }));
+}
+
 export async function purgeExpiredSources(
   engine: BrainEngine,
 ): Promise<PurgeExpiredResult> {
   if(await managedPersistenceEnabled(engine)){
     const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
-    const candidates=await engine.executeRaw<{id:string;incarnation:string}>(`SELECT id,incarnation FROM sources WHERE archived=true
-      AND archive_expires_at IS NOT NULL AND archive_expires_at<=now() ORDER BY id`);
-    const result:PurgeExpiredResult={purged:[],blocked:[]};
+    const candidates=await engine.executeRaw<{id:string;incarnation:string}>(`SELECT id,incarnation FROM sources WHERE ${EXPIRED_ARCHIVE_SQL} ORDER BY id`);
+    const result:PurgeExpiredResult={purged:[],blocked:await unverifiedArchives(engine)};
     for(const source of candidates){
       try{const receipt=await runManagedSourceLifecycle(engine,{operation:'purge',sourceId:source.id,expectedIncarnation:source.incarnation,confirmDestructive:true,expiredOnly:true});if(!receipt.noop)result.purged.push(source.id);}
       catch(error){result.blocked.push({id:source.id,reason:error instanceof Error?error.message:'Source lifecycle could not finish.'});}
@@ -484,14 +488,10 @@ export async function purgeExpiredSources(
   }
   await assertUnmanagedCanonicalWriter(engine, 'sources purge');
   const candidates = await engine.executeRaw<{ id: string; config: unknown; local_path: string | null }>(
-    `SELECT id, config, local_path FROM sources
-     WHERE archived = true
-       AND archive_expires_at IS NOT NULL
-       AND archive_expires_at <= now()
-     ORDER BY id`,
+    `SELECT id, config, local_path FROM sources WHERE ${EXPIRED_ARCHIVE_SQL} ORDER BY id`,
   );
   const purged: string[] = [];
-  const blocked: PurgeExpiredResult['blocked'] = [];
+  const blocked: PurgeExpiredResult['blocked'] = await unverifiedArchives(engine);
   const cloneRoot = gbrainPath('clones');
   for (const candidate of candidates) {
     const { id } = candidate;

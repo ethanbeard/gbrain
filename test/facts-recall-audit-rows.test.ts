@@ -307,4 +307,11 @@ describe('countUnconsolidatedFacts excludes audit checkpoint rows', () => {
   test('pending count is the one real fact, not real + audit checkpoints', async () => {
     expect(await engine3.countUnconsolidatedFacts('default')).toBe(1);
   });
+
+  // #5831: consolidate reads (source, entity) buckets only, so a fact with no
+  // entity is never drained and must not count as pending backlog.
+  test('a fact with no entity is not pending consolidation backlog', async () => {
+    await engine3.insertFact({ fact: 'small teams ship faster with written decisions', kind: 'fact', entity_slug: null, source: 'test' }, { source_id: 'default' });
+    expect(await engine3.countUnconsolidatedFacts('default')).toBe(1);
+  });
 });

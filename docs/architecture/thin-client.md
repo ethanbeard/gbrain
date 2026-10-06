@@ -31,9 +31,18 @@ receives only what its client row allows (`grantScopes` caps every request to
 the row's `scope`), so a read-only row still yields a read-only token. The hint
 lists `write` because some authorization_code clients (claude.ai custom
 connectors) request exactly the hinted scope and never step up after an
-`insufficient_scope` tool error, which left writer rows permanently read-only.
+`insufficient_scope` tool error, so a narrower hint would keep their writer rows
+read-only.
 Discovery excludes `agent`, which DCR cannot grant, while explicit DCR requests
 for delegation remain rejected.
+
+**Result rows:** the thin client sends `X-Gbrain-Client: gbrain-remote-cli/<version>`
+on every request, so hosts serve it full `search`/`query` rows (renderers and
+`--explain` read the ranking diagnostics) while other remote callers get lean
+rows. It never sends `fields`, so `mcp.strict_params=reject` hosts of any
+version accept its calls. The header is unverified and selects a row shape
+only; CLIs that predate it get lean rows unless the host sets
+`mcp.result_rows: full`.
 
 Keep general-purpose thin-client OAuth rows at `full` (or NULL). Native MCP
 configurations can deliberately use starter/verbs to expose fewer tools. Stdio
@@ -46,7 +55,9 @@ carries the routing-seam picture):
 - `src/cli.ts` — Routing seam INSIDE the existing op-dispatch path (no
   parallel `src/core/thin-client/` module; routing is a ~80-line conditional
   in `runThinClientRouted`). Detects `isThinClient(cfg)` BEFORE `connectEngine`
-  so thin-client installs never open the empty PGLite. localOnly ops on
+  so thin-client installs never open the empty PGLite; `connectEngine` itself
+  refuses a host connect on a thin client with no `database_url`, so a command
+  without its own route fails with its hint, never "No database URL". localOnly ops on
   thin-client refuse via `refuseThinClient` (with pinpoint hint table
   `THIN_CLIENT_REFUSE_HINTS`, which covers the full DB-bound command surface —
   sync, embed, extract, migrate, enrich, dream, jobs, sources, pages, files,
@@ -55,7 +66,7 @@ carries the routing-seam picture):
   non-TTY default). Exhaustive TS `never` switch on `RemoteMcpError.reason`
   for canned, actionable error messages. Renderer parity: the local-engine
   path runs `JSON.parse(JSON.stringify(result))` so renderers see the same
-  shape on both paths (kills the Date/bigint/Buffer drift class).
+  shape on both paths (no Date/bigint/Buffer drift between them).
   `applyThinClientSourceScope` maps `--source` / `GBRAIN_SOURCE` /
   `.gbrain-source` onto a declared `source_id` and returns the ambient binding
   it used; an empty array result from an op that declares `all_sources`
@@ -70,13 +81,15 @@ carries the routing-seam picture):
   Full symbol-level detail: the `src/core/mcp-client.ts` entry in
   [`KEY_FILES.md`](./KEY_FILES.md).
 - `src/commands/recall.ts` — explicit `--budget-policy` calls bypass the local
-  engine in the CLI dispatcher and use the remote recall operation. The dispatcher
-  reuses the command's parser, so a query value that resembles a policy flag does
-  not activate this route. An explicit `--brain` is rejected as on the shared
-  thin route. `--source`/`--source-id`, environment and dotfile scope use the
+  engine in the CLI dispatcher and use the remote recall operation, as do the
+  fact-list forms (no `--query`/`--budget-tokens`). An in-process `--query` or
+  `--budget-tokens` call without a policy is refused with a hint naming the
+  policy flag. The dispatcher reuses the command's parser, so a query value that
+  resembles a policy flag does not activate this route. An explicit `--brain` is
+  rejected as on the shared thin route. `--source`/`--source-id`, environment and dotfile scope use the
   engine-free resolver; an explicit `default` is forwarded, not dropped.
   The host's declared `recall.source_id` narrows both arms through the existing
-  authorization resolver. Omitted-policy CLI behavior is unchanged.
+  authorization resolver. On a local install, a call without a policy runs locally.
 - `src/core/cli-options.ts` — `parseGlobalFlags` supports `--timeout=Ns`
   (accepts `30s`, `2m`, `500ms`, plain ms). Default `null` = per-command
   default (30s for most ops, 180s for `think`). `parseTimeout(s)` exported

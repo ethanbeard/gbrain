@@ -21,6 +21,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { isolatedSharedSkillsEngine } from './helpers/shared-skills-engine.ts';
 import { requirePostgresTestDatabase } from './helpers/test-backends.ts';
@@ -115,7 +116,7 @@ test(`${backend}: a managed brain publishes the same way through the coordinator
   await registerLocalWriter(engine, 'cli');
   await activatePersistence(engine, { confirmQuiesced: true });
   const id = await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], async () =>
-    (await tx.insertFact({ fact: 'Basalt Example signed a pilot', kind: 'fact', entity_slug: null, visibility: 'world', source: 'chat' } as never, { source_id: 'default' })).id));
+    (await tx.insertFact({ fact: 'Basalt Example signed a pilot', kind: 'fact', entity_slug: null, visibility: 'world', source: 'chat' } as never, { source_id: 'default' })).id, TEST_WRITE_ATTRIBUTION));
   expect((await relink()).linked).toBe(1);
   const rowNum = await expectAdopted(id, 'companies/basalt-example');
   const file = parseFactsFence(readFileSync(join(repo, 'companies/basalt-example.md'), 'utf8')).facts;

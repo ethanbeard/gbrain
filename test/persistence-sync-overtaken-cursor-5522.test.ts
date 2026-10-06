@@ -10,6 +10,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -78,7 +79,7 @@ test('#5522 a foreign write to the page at that origin still refuses the resume'
   await performManagedSync(engine, f.base, { maxPages: 1, maxMs: 60_000 });
   await performManagedSync(engine, f.working);
   await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw(
-    "UPDATE pages SET compiled_truth='A foreign edit after the working-tree import.',content_hash='foreign' WHERE source_id=$1 AND slug='b'", [f.id])));
+    "UPDATE pages SET compiled_truth='A foreign edit after the working-tree import.',content_hash='foreign' WHERE source_id=$1 AND slug='b'", [f.id]), TEST_WRITE_ATTRIBUTION));
   await expect(performManagedSync(engine, f.base)).rejects.toMatchObject({ code: 'page_identity_changed' });
   expect(await imports(engine, f.id)).toEqual(['a', 'b', 'c']);
   expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toBe('A foreign edit after the working-tree import.');
@@ -88,7 +89,7 @@ test('#5522 a page soft-deleted at that origin, or a pinned page deleted and rec
   const deleted = await fixture(engine, ['a', 'b']);
   await performManagedSync(engine, deleted.base, { maxPages: 1, maxMs: 60_000 });
   await performManagedSync(engine, deleted.working);
-  await engine.transaction(tx => withCoordinatedWrite(tx, [deleted.id], () => tx.softDeletePage('b', { sourceId: deleted.id })));
+  await engine.transaction(tx => withCoordinatedWrite(tx, [deleted.id], () => tx.softDeletePage('b', { sourceId: deleted.id }), TEST_WRITE_ATTRIBUTION));
   await expect(performManagedSync(engine, deleted.base)).rejects.toMatchObject({ code: 'page_identity_changed' });
 
   // An entry enumerated against an existing page keeps its pinned identity.
@@ -98,7 +99,7 @@ test('#5522 a page soft-deleted at that origin, or a pinned page deleted and rec
   commit(pinned.root);
   await performManagedSync(engine, pinned.base, { maxPages: 1, maxMs: 60_000 });
   const before = await engine.getPage('b', { sourceId: pinned.id });
-  await engine.transaction(tx => withCoordinatedWrite(tx, [pinned.id], () => tx.softDeletePage('b', { sourceId: pinned.id })));
+  await engine.transaction(tx => withCoordinatedWrite(tx, [pinned.id], () => tx.softDeletePage('b', { sourceId: pinned.id }), TEST_WRITE_ATTRIBUTION));
   await performManagedSync(engine, pinned.working);
   const after = await engine.getPage('b', { sourceId: pinned.id });
   expect(after?.compiled_truth).toContain('Revised observation b');

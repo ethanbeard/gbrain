@@ -8,7 +8,7 @@
  * three resolution arms (alias hit / exact title / slug-suffix) + misses.
  *
  * Two gates:
- *   1. HARD ABSOLUTE — p99 < 100ms × GBRAIN_PERF_BUDGET_MULTIPLIER (default 1;
+ *   1. HARD ABSOLUTE — p99 < 100ms × GBRAIN_TEST_PERF_BUDGET_MULTIPLIER (default 1;
  *      loosen in CI only with evidence of runner noise). The protocol DOC
  *      promises this number; the bound is op-layer latency (transport
  *      excluded, as documented).
@@ -35,6 +35,15 @@
  * itself is already ratio-guarded above — an O(N) regression in the shared
  * arms trips the card gate first.
  *
+ * Entity recall: the `entity` verb's path (includeReferences: referenced_by
+ * groups + coverage) has two gates on the same corpus. Ordinary entities keep
+ * the p99 < 100ms budget. The hub page carries 10,000 inbound mention links, so
+ * its card necessarily enumerates 10,000 referrers; it is gated by a ratio to
+ * the irreducible enumeration (a distinct-referrer count over the same links)
+ * measured in the same process, which cancels runner speed and still trips on
+ * per-referrer work (a per-row subquery or hydrating every row reads as 10×+).
+ * The ambient gates below stay on the reference-free path.
+ *
  * .slow.test.ts suffix keeps it out of the fast loop (`bun run test:slow`).
  */
 
@@ -58,10 +67,10 @@ const WARMUP = 20;
 const MEASURED = 200;
 const TARGET_ENTITIES = 50; // pages the measured calls rotate over
 
-const P99_BUDGET_MS = 100 * (Number(process.env.GBRAIN_PERF_BUDGET_MULTIPLIER) || 1);
+const P99_BUDGET_MS = 100 * (Number(process.env.GBRAIN_TEST_PERF_BUDGET_MULTIPLIER) || 1);
 // v0.45.7 boundary verbs — MEMORY_VERBS_v1.md promises "zero-LLM, sub-second"
 // for context_pack and delta; same multiplier convention as the entity gate.
-const BOUNDARY_P99_BUDGET_MS = 1000 * (Number(process.env.GBRAIN_PERF_BUDGET_MULTIPLIER) || 1);
+const BOUNDARY_P99_BUDGET_MS = 1000 * (Number(process.env.GBRAIN_TEST_PERF_BUDGET_MULTIPLIER) || 1);
 const BOUNDARY_WARMUP = 10;
 const BOUNDARY_MEASURED = 100; // p99 index 98 — second-largest, not the raw max
 const DELTA_CHANGED_PAGES = 150; // realistic heartbeat slice (spec: ~50-200 changed)
@@ -72,6 +81,14 @@ const DELTA_CHANGED_FACTS = 100;
 // is divided by a sub-ms getPage median. 100× stays far below the ≥200× O(N)
 // regression signal.)
 const RATIO_CEILING = 100;
+const HUB_SLUG = 'companies/hub-company';
+const HUB_LINKS = 10_000;
+const HUB_SAMPLES = 30;
+// Hub card median ≤ 8× the distinct-referrer count's median (measured about 4× on 2026-10-05: hub card p50 ~59ms,
+// count p50 ~14ms on a 4-core cloud machine). Per-referrer regressions read as 10× or more.
+const HUB_RATIO_CEILING = 8;
+// Catastrophe backstop only; the ratio is the gate.
+const HUB_ABSOLUTE_CEILING_MS = 1000 * (Number(process.env.GBRAIN_TEST_PERF_BUDGET_MULTIPLIER) || 1);
 
 function percentile(sorted: number[], p: number): number {
   const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
@@ -154,6 +171,22 @@ beforeAll(async () => {
             'world', 'medium', NOW(), 'perf-seed', 1.0, NOW()
      FROM generate_series(0, ${TARGET_ENTITIES - 1}) t, generate_series(1, 20) g`,
   );
+  // Entity recall: a hub with 10,000 inbound mention links (the card's worst
+  // case for referenced_by), its referrers spread over five types, and a
+  // complete mention status row (the coverage read).
+  await engine.putPage(HUB_SLUG, { type: 'company', title: 'Hub Company', compiled_truth: '# Hub Company\n\nSynthetic hub.', frontmatter: {} }, { sourceId: 'default' });
+  await db.query(
+    `UPDATE pages SET type = (ARRAY['ticket','email','meeting','note','contract'])[(id % 5) + 1]
+      WHERE id IN (SELECT id FROM pages WHERE slug LIKE 'filler/%' ORDER BY id LIMIT ${HUB_LINKS})`,
+  );
+  await db.query(
+    `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
+     SELECT f.id, h.id, 'mentions', 'mentions'
+       FROM (SELECT id FROM pages WHERE slug LIKE 'filler/%' ORDER BY id LIMIT ${HUB_LINKS}) f,
+            (SELECT id FROM pages WHERE slug = '${HUB_SLUG}') h
+     ON CONFLICT DO NOTHING`,
+  );
+  await db.query(`INSERT INTO mention_index_status (source_id, state, pending, counted_at, last_pass_at) VALUES ('default', 'complete', 0, now(), now())`);
   await engine.executeRaw('ANALYZE pages, links, page_aliases, facts');
 }, 300_000);
 
@@ -207,6 +240,61 @@ describe('entity card p99 latency gate', () => {
 
     expect(p99).toBeLessThan(P99_BUDGET_MS);
     expect(p99 / pageP50).toBeLessThanOrEqual(RATIO_CEILING);
+  }, 300_000);
+});
+
+describe('entity verb with referenced_by (entity recall)', () => {
+  const opts = { remote: true, includeReferences: true };
+
+  it(`ordinary entities: p99 < ${P99_BUDGET_MS}ms with referenced_by and coverage`, async () => {
+    const names: string[] = [];
+    for (let i = 0; i < TARGET_ENTITIES; i++) names.push(`Target Person ${i}`, `tp${i}`, `zzz-absent-${i}`);
+    for (let i = 0; i < WARMUP; i++) await buildEntityCard(engine, 'default', names[i % names.length], opts);
+    const samples: number[] = [];
+    for (let i = 0; i < MEASURED; i++) {
+      const t0 = performance.now();
+      await buildEntityCard(engine, 'default', names[(i * 13) % names.length], opts);
+      samples.push(performance.now() - t0);
+    }
+    samples.sort((a, b) => a - b);
+    const p50 = percentile(samples, 50);
+    const p99 = percentile(samples, 99);
+    // eslint-disable-next-line no-console
+    console.log(`[entity-recall-perf] ordinary entity+references p50=${p50.toFixed(2)}ms p99=${p99.toFixed(2)}ms | budget=${P99_BUDGET_MS}ms`);
+    expect(p99).toBeLessThan(P99_BUDGET_MS);
+  }, 300_000);
+
+  it(`${HUB_LINKS}-link hub: card median ≤ ${HUB_RATIO_CEILING}× the distinct-referrer count`, async () => {
+    const countSql = `SELECT count(DISTINCT l.from_page_id)::int AS n FROM links l JOIN pages f ON f.id = l.from_page_id
+      WHERE l.to_page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = 'default') AND f.deleted_at IS NULL`;
+    for (let i = 0; i < 5; i++) {
+      await buildEntityCard(engine, 'default', 'Hub Company', opts);
+      await engine.executeRaw(countSql, [HUB_SLUG]);
+    }
+    // Interleave the two measurements so a burst of runner load lands on both.
+    const card: number[] = [];
+    const base: number[] = [];
+    let hubCard: Awaited<ReturnType<typeof buildEntityCard>>['card'];
+    for (let i = 0; i < HUB_SAMPLES; i++) {
+      let t0 = performance.now();
+      hubCard = (await buildEntityCard(engine, 'default', 'Hub Company', opts)).card;
+      card.push(performance.now() - t0);
+      t0 = performance.now();
+      await engine.executeRaw(countSql, [HUB_SLUG]);
+      base.push(performance.now() - t0);
+    }
+    card.sort((a, b) => a - b);
+    base.sort((a, b) => a - b);
+    const cardP50 = percentile(card, 50);
+    const baseP50 = Math.max(percentile(base, 50), 1);
+    // eslint-disable-next-line no-console
+    console.log(`[entity-recall-perf] hub=${HUB_LINKS} links card p50=${cardP50.toFixed(2)}ms p90=${percentile(card, 90).toFixed(2)}ms ` +
+      `| distinct-referrer count p50=${baseP50.toFixed(2)}ms | ratio=${(cardP50 / baseP50).toFixed(1)}x (ceiling ${HUB_RATIO_CEILING}x)`);
+    // Real work: the hub card carries every referrer in its count and at most 50 rows.
+    expect(hubCard?.referenced_by_count).toBe(HUB_LINKS);
+    expect(hubCard!.referenced_by!.reduce((n, g) => n + g.rows.length, 0)).toBeLessThanOrEqual(50);
+    expect(cardP50 / baseP50).toBeLessThanOrEqual(HUB_RATIO_CEILING);
+    expect(cardP50).toBeLessThan(HUB_ABSOLUTE_CEILING_MS);
   }, 300_000);
 });
 

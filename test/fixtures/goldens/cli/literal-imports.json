@@ -46,6 +46,12 @@
       "conversation-parser": [
         "./commands/conversation-parser.ts"
       ],
+      "core": [
+        "./commands/core.ts"
+      ],
+      "edge-proposals": [
+        "./commands/edge-proposals.ts"
+      ],
       "edges-backfill": [
         "./commands/edges-backfill.ts"
       ],
@@ -70,6 +76,9 @@
       ],
       "features": [
         "./commands/features.ts"
+      ],
+      "feedback": [
+        "./commands/feedback.ts"
       ],
       "files": [
         "./commands/files.ts"
@@ -100,6 +109,7 @@
       ],
       "migrate": [
         "./commands/migrate-embeddings.ts",
+        "./commands/migrate-graduation.ts",
         "./commands/migrate-engine.ts"
       ],
       "models": [
@@ -116,6 +126,9 @@
       ],
       "pages": [
         "./commands/pages.ts"
+      ],
+      "pricing": [
+        "./commands/pricing.ts"
       ],
       "quarantine": [
         "./commands/quarantine.ts"

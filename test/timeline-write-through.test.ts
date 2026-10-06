@@ -130,6 +130,24 @@ describe('add_timeline_entry on an FS-canonical brain (#1856)', () => {
     expect(page?.timeline ?? '').toContain('Manual milestone added via timeline-add');
   });
 
+  test('helper splices into a canonical file whose basename is near NAME_MAX (D-NEW-3, #5861)', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = `notes/${'a'.repeat(240)}`;
+    const filePath = await seedPage(slug);
+    expect(Buffer.byteLength(path.basename(filePath))).toBe(243);
+
+    const out = await writeTimelineEntryThrough(engine, slug, 'default', {
+      date: '2026-07-15',
+      summary: 'Milestone on a long page name',
+      source: 'meetings/2026-07-15',
+    });
+
+    expect(out.error).toBeUndefined();
+    expect(out.handled).toBe(true);
+    expect(fs.readFileSync(filePath, 'utf8')).toContain('Milestone on a long page name');
+    expect(fs.readdirSync(path.dirname(filePath)).filter((name) => name.includes('.tmp.'))).toEqual([]);
+  });
+
   test('FS→DB rebuild recovers the entry from the file (the P0 loss mode)', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const slug = 'notes/rebuild-example';
@@ -562,15 +580,20 @@ describe('writeTimelineEntryThrough helper', () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const slug = 'notes/helper-throw';
     await seedPage(slug);
-    const broken = new Proxy(engine, {
+    // The row insert runs on the maintenance transaction's engine, so the fault is injected there too.
+    const failing = <T extends object>(base: T): T => new Proxy(base, {
       get(target, prop, receiver) {
         if (prop === 'addTimelineEntry') {
           return async () => { throw new Error('boom'); };
         }
+        if (prop === 'transaction') {
+          return (fn: (tx: PGLiteEngine) => Promise<unknown>) => (target as PGLiteEngine).transaction(tx => fn(failing(tx as PGLiteEngine)));
+        }
         const v = Reflect.get(target, prop, receiver);
         return typeof v === 'function' ? v.bind(target) : v;
       },
-    }) as unknown as PGLiteEngine;
+    });
+    const broken = failing(engine);
     const out = await writeTimelineEntryThrough(broken, slug, 'default', {
       date: '2026-07-15',
       summary: 'x',

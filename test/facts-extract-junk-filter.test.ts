@@ -223,6 +223,8 @@ afterAll(() => {
 
 describe('extraction_prompt_appendix — composes with BOTH prompt variants (#3852)', () => {
   const APPENDIX = 'Durable-vs-ephemeral rubric: work-session narration is never a fact.';
+  // extraction.date_grounding and facts.attribution default on, so an unconfigured brain gets both variants.
+  const GROUNDED = { dateGrounding: true, attribution: true } as const;
 
   async function systemSentFor(
     engine: BrainEngine,
@@ -247,19 +249,19 @@ describe('extraction_prompt_appendix — composes with BOTH prompt variants (#38
 
   test('label-honestly variant (no admission) gets the appendix appended verbatim', async () => {
     const engine = stubEngine({ 'facts.extraction_prompt_appendix': APPENDIX });
-    expect(await systemSentFor(engine)).toBe(`${buildExtractorSystem(true)}\n\n${APPENDIX}`);
+    expect(await systemSentFor(engine)).toBe(`${buildExtractorSystem(true, GROUNDED)}\n\n${APPENDIX}`);
   });
 
   test('skip-low variant (high-only admission) gets the SAME appendix', async () => {
     const engine = stubEngine({ 'facts.extraction_prompt_appendix': APPENDIX });
     expect(await systemSentFor(engine, { allowed: ['high'], invalid: 'drop' }))
-      .toBe(`${buildExtractorSystem(false)}\n\n${APPENDIX}`);
+      .toBe(`${buildExtractorSystem(false, GROUNDED)}\n\n${APPENDIX}`);
   });
 
   test('unset / empty appendix leaves the precomputed prompt untouched', async () => {
-    expect(await systemSentFor(stubEngine({}))).toBe(buildExtractorSystem(true));
+    expect(await systemSentFor(stubEngine({}))).toBe(buildExtractorSystem(true, GROUNDED));
     expect(await systemSentFor(stubEngine({ 'facts.extraction_prompt_appendix': '   ' })))
-      .toBe(buildExtractorSystem(true));
+      .toBe(buildExtractorSystem(true, GROUNDED));
   });
 });
 

@@ -39,7 +39,8 @@
  */
 import type { BrainEngine } from './engine.ts';
 import { getCompanyBrainProfile } from './company-brain/profile.ts';
-import { OperationError } from './ops/contract.ts';
+import { opError } from './ops/contract.ts';
+import { readFix } from './ops/op-fix.ts';
 import { embedBackfillWorkerSurface } from './minions/embed-backfill-admission.ts';
 import { MinionQueue } from './minions/queue.ts';
 import { parseUsdLimit, resolveSpendPosture, type SpendPosture } from './spend-posture.ts';
@@ -137,7 +138,10 @@ export async function submitEmbedBackfill(
   // a row so the undrainable job cannot also cooldown-block a later attempt.
   const surface = embedBackfillWorkerSurface(engine);
   if (surface.status === 'no_worker_surface') return surface;
-  if (await getCompanyBrainProfile(engine, sourceId)) throw new OperationError('source_profile_no_backfill', 'This source profile disables automatic embedding backfill. Enable enrichment only through a separate explicit action.');
+  if (await getCompanyBrainProfile(engine, sourceId)) throw opError('source_profile_no_backfill', 'This source profile disables automatic embedding backfill. Enable enrichment only through a separate explicit action.',
+    `Source ${sourceId} uses the company-brain import profile, which never queues embedding backfill; keyword search keeps working. Embedding it is a separate action the user approves; do not edit the stored profile.`,
+    { docs: 'docs/guides/company-brain-ingestion.md#what-stays-opt-in',
+      fix: readFix(`Shows source ${sourceId}'s profile and import state, read-only.`, { argv: ['gbrain', 'sources', 'status', sourceId, '--json'] }) });
 
   const now = opts.nowMs ?? Date.now();
   const cooldownMin =

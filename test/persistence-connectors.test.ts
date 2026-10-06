@@ -15,6 +15,14 @@ import { importFromContent } from '../src/core/import-file.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
+import { renderFactsTable } from '../src/core/facts-fence.ts';
+import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
+import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { prepareConnectorMutation } from '../src/core/persistence/connector-sync.ts';
+import { publishMutation } from '../src/core/persistence/coordinator.ts';
+import { claimNextWrite } from '../src/core/persistence/journal.ts';
+import { localHostId } from '../src/core/persistence/identity.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { createConnectorFixture, options, json, googleConfig, githubConfig, contact, issueFixture, githubFetch, sourceCheckpoint, connectorPendingSet } from './helpers/connector-fixture.ts';
 
 const { home, engines, env, source, boundSource, setup, teardown } = createConnectorFixture();
@@ -496,5 +504,39 @@ test('aged live connector cursors survive actual checkpoint purge and normal inc
     expect((await run()).status).not.toBe('partial');
     expect(calls.some(url => connector === 'google' ? url.includes('syncToken=retained-contacts-cursor')
       : new URL(url).pathname.endsWith('/issues') && new URL(url).searchParams.has('since'))).toBe(true);
+  }
+}), 120_000);
+
+test('a fact withdrawn between bound connector preparation and publication leaves the canonical file and page unchanged', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const f = await boundSource(engine, githubConfig);
+    const claim = 'withdrawn between connector preparation and publication';
+    let body = 'Original bound body';
+    const fetcher = async (url: string) => new URL(url).pathname.endsWith('/issues/1') ? json({ ...issueFixture, body }) : githubFetch()(url);
+    const run = () => runGitHubSync(engine, f.id, parseGitHubSourceConfig(githubConfig, f.dir), { ...options, githubItem: { repo: 'acme-example/app', number: 1, kind: 'issue' } }, fetcher);
+    await run();
+    await disposePersistenceConsumer(engine);
+    const slug = 'gh/acme-example/app/1', path = join(f.dir, `${slug}.md`);
+    const original = readFileSync(path, 'utf8'), before = (await engine.readPageSnapshot(slug, { sourceId: f.id }))!;
+    await engine.executeRaw("UPDATE persistence_worktrees SET state='draining' WHERE id=$1::uuid", [f.binding.worktree_id]);
+    body = `Facts: ${renderFactsTable([{ rowNum: 1, claim, kind: 'fact', confidence: 1, visibility: 'world', notability: 'medium', active: true, context: 'test evidence' }])}`;
+    expect(await run()).toMatchObject({ status: 'partial', reason: 'writer_pending' });
+    await disposePersistenceConsumer(engine);
+    await engine.executeRaw("UPDATE persistence_worktrees SET state='active' WHERE id=$1::uuid", [f.binding.worktree_id]);
+    const claimed = (await claimNextWrite(engine, localHostId()))!;
+    expect(claimed.intent?.kind).toBe('connector_v2_import');
+    const prepared = await prepareConnectorMutation(engine, claimed);
+    expect(prepared.file?.content).toContain(claim);
+    const fact = await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () =>
+      tx.insertFact({ fact: claim, source: 'remember', visibility: 'world' }, { source_id: f.id }), TEST_WRITE_ATTRIBUTION));
+    await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => recordFactWithdrawal(tx, fact.id, f.id, true), TEST_WRITE_ATTRIBUTION));
+    const boundaries: string[] = [];
+    const outcome = await publishMutation(engine, claimed, prepared, localHostId(), {
+      boundary: async name => { boundaries.push(name); }, fileBoundary: name => { boundaries.push(name); } });
+    expect(outcome).toMatchObject({ state: 'conflict', error_code: 'revision_conflict' });
+    expect(boundaries).not.toContain('before_publication');
+    expect(boundaries).not.toContain('before_file');
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    expect((await engine.readPageSnapshot(slug, { sourceId: f.id }))?.revision).toBe(before.revision);
   }
 }), 120_000);

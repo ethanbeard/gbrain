@@ -47,7 +47,7 @@ test('a planted bypass in a converted writer or a new file fails the census', ()
     ['src/core/cycle/synthesize-concepts.ts', `${concepts}\nawait importFromContent(engine, slug, md, { sourceId });`],
     ['src/core/cycle/new-writer.ts', 'await engine.putPage(slug, page);'],
   ], inventory)).toEqual([
-    'src/core/ops/links.ts: 4 write references; reviewed ceiling 3',
+    'src/core/ops/links.ts: 5 write references; reviewed ceiling 4',
     'src/core/cycle/synthesize-concepts.ts: 3 write references; reviewed ceiling 2',
     'src/core/cycle/new-writer.ts: 1 write references; reviewed ceiling 0',
   ]);

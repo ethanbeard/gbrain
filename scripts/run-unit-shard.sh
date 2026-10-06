@@ -28,6 +28,8 @@ unset DATABASE_URL GBRAIN_DATABASE_URL
 unset GBRAIN_HOME
 
 cd "$(dirname "$0")/.."
+. scripts/lib/test-env.sh
+receipts_init unit
 
 # --max-concurrency=N is forwarded to `bun test`. v0.26.4: invoked by
 # run-unit-parallel.sh; safe to call without (defaults to bun's default cap).
@@ -79,13 +81,23 @@ else
   files=("${all_files[@]}")
 fi
 
-if [ "${#files[@]}" -eq 0 ]; then
-  echo "[unit-shard ${RUNNER_SHARD:-(unsharded)}] no files; exiting clean."
+if [ "$DRY_RUN" = "1" ]; then
+  [ "${#files[@]}" -eq 0 ] || printf '%s\n' "${files[@]}"
   exit 0
 fi
 
-if [ "$DRY_RUN" = "1" ]; then
-  printf '%s\n' "${files[@]}"
+RECEIPT_SHARD=""
+RECEIPT_OF=""
+RECEIPT_TAG="all"
+if [ -n "$RUNNER_SHARD" ]; then
+  RECEIPT_SHARD="$shard_n"
+  RECEIPT_OF="$shard_m"
+  RECEIPT_TAG="s${shard_n}of${shard_m}"
+fi
+
+if [ "${#files[@]}" -eq 0 ]; then
+  echo "[unit-shard ${RUNNER_SHARD:-(unsharded)}] no files; exiting clean."
+  receipt_empty "$RECEIPT_TAG" "$RECEIPT_SHARD" "$RECEIPT_OF"
   exit 0
 fi
 
@@ -121,12 +133,14 @@ for ((offset=0, group=1; offset<${#files[@]}; offset+=GROUP_SIZE, group++)); do
   log="$GROUP_LOG_DIR/$group.log"
   printf '%s\n' "${group_files[@]}" > "$GROUP_LOG_DIR/$group.assigned"
   echo "__gbrain_unit_group_start__ group=$group/$GROUPS_TOTAL files=${#group_files[@]}"
+  receipt_begin primary "$RECEIPT_TAG-g$group" "$RECEIPT_SHARD" "$RECEIPT_OF" "" "${group_files[@]}"
   set +e
-  bun "${TEST_ARGS[@]}" "${group_files[@]}" 2>&1 | tee "$log"
+  bun "${TEST_ARGS[@]}" ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "${group_files[@]}" 2>&1 | tee "$log"
   statuses=("${PIPESTATUS[@]}")
   set -e
   bun_rc=${statuses[0]}
   tee_rc=${statuses[1]}
+  receipt_end "$bun_rc"
   sed "s/${ESC}\\[[0-9;]*[a-zA-Z]//g" "$log" > "$GROUP_LOG_DIR/$group.clean"
   # Child tests can print their own Bun summaries. Use the final block, require
   # its exact selected-file count, and independently check every file header.

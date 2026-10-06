@@ -14,7 +14,9 @@ import { WORKER_EXIT_CONFIGURATION } from './worker-exit-codes.ts';
 export const CHILD_READINESS_PROTOCOL_VERSION = 1;
 export const CHILD_READINESS_TIMEOUT_MS = 20_000;
 export const CHILD_READINESS_MAX_BYTES = 64 * 1024;
-export const CHILD_READINESS_FEATURES = ['local-configuration-outcome-v1', 'postgres-cancellation-v1'] as const;
+export const CHILD_READINESS_FEATURES = ['local-configuration-outcome-v1', 'postgres-cancellation-v1', 'spend-enforcement-v1'] as const;
+/** Every child must advertise these; `spend-enforcement-v1` only gates spend-authorized rows (child-job-runner.ts). */
+const REQUIRED_CHILD_FEATURES = ['local-configuration-outcome-v1', 'postgres-cancellation-v1'] as const;
 
 export interface ChildReadinessOptions {
   invocation: ChildCliInvocation;
@@ -24,7 +26,7 @@ export interface ChildReadinessOptions {
   signal?: AbortSignal;
 }
 
-export function parseChildReadiness(raw: string): { version: string; versionSkew: boolean } {
+export function parseChildReadiness(raw: string): { version: string; versionSkew: boolean; features: string[] } {
   let response: unknown;
   try { response = JSON.parse(raw); } catch {
     throw childConfigurationError('child_protocol_incompatible');
@@ -34,7 +36,7 @@ export function parseChildReadiness(raw: string): { version: string; versionSkew
   if (r.protocolVersion !== CHILD_READINESS_PROTOCOL_VERSION ||
       typeof r.version !== 'string' || !/^\d+(?:\.\d+){2,3}$/.test(r.version) || r.version.length > 80 ||
       !Array.isArray(r.features) || !r.features.every((feature) => typeof feature === 'string') ||
-      !CHILD_READINESS_FEATURES.every((feature) => (r.features as unknown[]).includes(feature))) {
+      !REQUIRED_CHILD_FEATURES.every((feature) => (r.features as unknown[]).includes(feature))) {
     throw childConfigurationError('child_protocol_incompatible');
   }
   if (r.status === 'configuration_error' && isChildConfigurationReason(r.reasonCode)) {
@@ -42,10 +44,22 @@ export function parseChildReadiness(raw: string): { version: string; versionSkew
   }
   if (r.status === 'transient_error') throw new Error('Selected job child readiness failed transiently; no jobs were admitted.');
   if (r.status !== 'ready') throw childConfigurationError('child_protocol_incompatible');
-  return { version: r.version, versionSkew: r.version !== VERSION };
+  return { version: r.version, versionSkew: r.version !== VERSION, features: r.features as string[] };
 }
 
-export async function checkChildReadiness(options: ChildReadinessOptions): Promise<{ version: string; versionSkew: boolean }> {
+/**
+ * Runs the selected child's readiness handshake under a deadline.
+ *
+ * Timeout contract: at `timeoutMs - min(250, timeoutMs / 10)` the selected
+ * process is SIGKILLed. Beneath tini that means every process group tini
+ * started (the selected grandchild), and tini then reaps the grandchild and
+ * exits. The confirmed failure ("timed out; no jobs were admitted") settles
+ * only from the wrapper's `close`, so the selected process has already exited
+ * and been reaped (or is a zombie awaiting its new parent). If `close` does not
+ * arrive by `timeoutMs`, the call settles with "cleanup unconfirmed" and makes
+ * no claim about the process.
+ */
+export async function checkChildReadiness(options: ChildReadinessOptions): Promise<{ version: string; versionSkew: boolean; features: string[] }> {
   const timeoutMs = options.timeoutMs ?? CHILD_READINESS_TIMEOUT_MS;
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error('Invalid child readiness deadline.');
   if (options.signal?.aborted) throw new Error('Selected job child readiness was interrupted.');
@@ -63,7 +77,7 @@ export async function checkChildReadiness(options: ChildReadinessOptions): Promi
     let groupObserver: ReturnType<typeof setInterval> | undefined;
     const processGroups = new Set<number>();
     let child: ReturnType<typeof spawn>;
-    const finish = (error?: unknown, result?: { version: string; versionSkew: boolean }): void => {
+    const finish = (error?: unknown, result?: { version: string; versionSkew: boolean; features: string[] }): void => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);

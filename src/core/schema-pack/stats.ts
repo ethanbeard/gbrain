@@ -19,6 +19,7 @@ import type { BrainEngine } from '../engine.ts';
 import { loadActivePackBestEffort } from './best-effort.ts';
 import type { OperationContext } from '../operations.ts';
 import { isUndefinedTableError } from '../utils.ts';
+import { storedTypeMissesPack, type TypeUsagePack } from './type-usage.ts';
 
 export interface StatsOpts {
   /** Single source scope. Omit + omit sourceIds for whole-brain aggregate. */
@@ -39,6 +40,12 @@ export interface PerSourceStats {
   total_pages: number;
   typed_pages: number;
   untyped_pages: number;
+  /** Pages whose non-empty type the active pack neither declares nor aliases
+   *  (0 when no pack resolved). */
+  undeclared_pages: number;
+  /** Share of pages whose type matches the active pack (declared or alias);
+   *  untyped and undeclared pages both count against it. Without a resolved
+   *  pack: share of pages with a non-empty type. */
   coverage: number;
   by_type: TypeStats[];
 }
@@ -73,19 +80,20 @@ function computeCoverage(typed: number, total: number): number {
   return Math.round((typed / total) * 10000) / 10000;
 }
 
-function aggregateRows(rows: RawCountRow[]): PerSourceStats[] {
-  const bySource = new Map<string, { typed: number; untyped: number; total: number; byType: Map<string, number> }>();
+function aggregateRows(rows: RawCountRow[], pack: TypeUsagePack | null): PerSourceStats[] {
+  const bySource = new Map<string, { typed: number; untyped: number; undeclared: number; total: number; byType: Map<string, number> }>();
   for (const r of rows) {
     const sid = r.source_id ?? 'default';
     const cnt = parseInt(r.cnt, 10) || 0;
     if (!bySource.has(sid)) {
-      bySource.set(sid, { typed: 0, untyped: 0, total: 0, byType: new Map() });
+      bySource.set(sid, { typed: 0, untyped: 0, undeclared: 0, total: 0, byType: new Map() });
     }
     const bucket = bySource.get(sid)!;
     if (r.type === null || r.type === '') {
       bucket.untyped += cnt;
     } else {
       bucket.typed += cnt;
+      if (pack && storedTypeMissesPack(r.type, pack)) bucket.undeclared += cnt;
       bucket.byType.set(r.type, (bucket.byType.get(r.type) ?? 0) + cnt);
     }
     bucket.total += cnt;
@@ -97,7 +105,8 @@ function aggregateRows(rows: RawCountRow[]): PerSourceStats[] {
       total_pages: b.total,
       typed_pages: b.typed,
       untyped_pages: b.untyped,
-      coverage: computeCoverage(b.typed, b.total),
+      undeclared_pages: b.undeclared,
+      coverage: computeCoverage(b.typed - b.undeclared, b.total),
       by_type: [...b.byType.entries()]
         .map(([type, count]) => ({ type, count }))
         .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type)),
@@ -109,11 +118,12 @@ function aggregateRows(rows: RawCountRow[]): PerSourceStats[] {
 }
 
 function mergeAggregate(per: PerSourceStats[]): PerSourceStats {
-  let typed = 0, untyped = 0, total = 0;
+  let typed = 0, untyped = 0, undeclared = 0, total = 0;
   const byType = new Map<string, number>();
   for (const s of per) {
     typed += s.typed_pages;
     untyped += s.untyped_pages;
+    undeclared += s.undeclared_pages;
     total += s.total_pages;
     for (const t of s.by_type) byType.set(t.type, (byType.get(t.type) ?? 0) + t.count);
   }
@@ -122,7 +132,8 @@ function mergeAggregate(per: PerSourceStats[]): PerSourceStats {
     total_pages: total,
     typed_pages: typed,
     untyped_pages: untyped,
-    coverage: computeCoverage(typed, total),
+    undeclared_pages: undeclared,
+    coverage: computeCoverage(typed - undeclared, total),
     by_type: [...byType.entries()]
       .map(([type, count]) => ({ type, count }))
       .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type)),
@@ -234,13 +245,13 @@ export async function runStatsCore(
   opts: StatsOpts = {},
 ): Promise<StatsResult> {
   const rows = await fetchCountRows(ctx.engine, opts);
-  const per_source = aggregateRows(rows);
+  // Pack identity, conformance + dead-prefix scan — best-effort.
+  const pack = await loadActivePackBestEffort(ctx);
+  const per_source = aggregateRows(rows, pack?.manifest ?? null);
   const aggregate = mergeAggregate(per_source);
 
-  // Pack identity + dead-prefix scan — best-effort.
   let pack_identity: string | null = null;
   let dead_prefixes: DeadPrefixHint[] = [];
-  const pack = await loadActivePackBestEffort(ctx);
   if (pack) {
     pack_identity = pack.identity;
     dead_prefixes = await detectDeadPrefixes(ctx.engine, pack, opts);

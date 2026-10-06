@@ -34,6 +34,14 @@ describe('rrf page-grain fusion (pure)', () => {
     expect(out[2].score).toBeCloseTo((1 / 60) / (2 / 60), 12);
   });
 
+  test('A4-2: a chunk is OR-relaxed after fusion only when every list that held it was relaxed', () => {
+    const relaxedKeyword = [row('a', 1, { keyword_relaxed: true, keyword_hit: true }), row('b', 10, { keyword_relaxed: true, keyword_hit: true })];
+    const strictTitle = [row('a', 1, { keyword_hit: true })];
+    const out = rrfFusion([relaxedKeyword, strictTitle], 60, false);
+    expect(out.find(r => r.slug === 'a')?.keyword_relaxed).toBeUndefined();
+    expect(out.find(r => r.slug === 'b')?.keyword_relaxed).toBe(true);
+  });
+
   test('a page\'s second chunk never crowds out another page\'s lead', () => {
     const vector = [row('a', 1), row('b', 10), row('c', 20)];
     const keyword = [row('a', 2), row('b', 10), row('c', 20)];

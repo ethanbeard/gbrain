@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { OperationContext } from '../ops/contract.ts';
-import { OperationError, verbError } from '../ops/contract.ts';
+import { opError, OperationError, verbError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { enforceClientSlugFence, enforceSubagentSlugFence, validatePageSlug } from '../ops/context.ts';
 import { isNullLikeEntity } from '../facts/write-single.ts';
 import { isFactWithdrawn, recordFactWithdrawal, type WithdrawalCommit } from '../facts/withdrawal.ts';
@@ -13,16 +14,24 @@ import { authorizeStoredRequest, submissionAuthority } from './authority.ts';
 import { admitWrite, admitWriteInTransaction, assertPageRequestIdentity, assertReplayIntent, completeWrite, getWriteRequest, intentDigest } from './journal.ts';
 import { assertPersistenceAccepting, registerMutationPreparer, waitForWrite, writeResponse } from './service.ts';
 import { claimWorktree } from './ownership.ts';
+import { declareDurablePersistence } from './protocol.ts';
 import { resolveFactWriteTarget } from './fact-write-target.ts';
 import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { parseMutationPrecondition } from './preconditions.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { requestAttribution } from './attribution.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { prepareMemoryMutation } from './memory-prepare.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
 
 export { prepareMemoryMutation } from './memory-prepare.ts';
 /** Only semantic appends without an explicit caller revision can be recomputed. */
+function sourceInactive(sourceId: string): OperationError {
+  return opError('source_changed', 'The write source is not active.',
+    `Source ${sourceId} is archived or missing, so nothing was saved. Write to an active source, or ask the user to restore ${sourceId}.`,
+    { fix: readFix('Lists sources with their archived state, read-only.', { argv: ['gbrain', 'sources', 'list', '--json'], mcp: { tool: 'sources_list', arguments: {} } }) });
+}
+
 export function isSemanticMemoryMutation(row: WriteRequest): boolean {
   return row.operation === 'remember' && row.intent?.expected_revision === undefined;
 }
@@ -34,7 +43,8 @@ async function submission(ctx: OperationContext, operation: string, params: Reco
   const requestId = typeof p.request_id === 'string' ? p.request_id : randomUUID();
   const sourceId = typeof p.source_id === 'string' ? p.source_id : ctx.sourceId ?? 'default';
   if (ctx.remote !== false && sourceId !== (ctx.auth?.sourceId ?? ctx.sourceId ?? 'default')) {
-    throw new OperationError('permission_denied', 'This source is outside the current write grant.');
+    throw opError('permission_denied', 'This source is outside the current write grant.',
+      `This connection may write only to source ${ctx.auth?.sourceId ?? ctx.sourceId ?? 'default'}. Omit source_id to write there, or ask the brain host's operator to grant source ${sourceId}.`);
   }
   await initializeLocalPersistence(ctx);
   const principal = await requestPrincipalForContext(ctx);
@@ -69,7 +79,8 @@ async function planRememberTarget(ctx: OperationContext, sourceId: string, sourc
   const snapshot = await ctx.engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
   if (snapshot && (snapshot.page.deleted_at || ctx.remote !== false &&
     !await ctx.engine.readPageSnapshot(slug, { sourceId, excludePrivate: authority.excludePrivate }))) {
-    throw new OperationError('page_not_found', 'The target entity is not writable by this caller.');
+    throw opError('page_not_found', 'The target entity is not writable by this caller.',
+      `Entity page ${slug} in source ${sourceId} is deleted or not visible to this caller, so nothing was saved. Remember the fact against a visible entity, or without an entity (it is then filed under memory/unattributed).`);
   }
   if (inferred && !snapshot) throw new InferredTargetRejected('NO_ENTITY');
   if (inferred && (await isFactWithdrawn(ctx.engine, sourceId, inferred.visibility, inferred.fact, slug)
@@ -133,11 +144,11 @@ async function inferRememberTarget(ctx: OperationContext, sourceId: string, sour
 export async function submitRememberMutation(ctx: OperationContext, params: Record<string, unknown>, waitMs?: number): Promise<Record<string, unknown>> {
   registerMutationPreparer('remember', prepareMemoryMutation);
   const sub = await submission(ctx, 'remember', params);
-  if (sub.prior) return writeResponse(await waitForWrite(ctx.engine, sub.prior, ctx.config, waitMs));
+  if (sub.prior) return writeResponse(await waitForWrite(ctx.engine, sub.prior, ctx.config, waitMs ?? ctx.writeWaitMs));
   const { p, sourceId, principal, callerIntent, requestId } = sub;
   const [source] = await ctx.engine.executeRaw<RememberSource>(
     "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
-  if (!source || source.archived) throw new OperationError('source_changed', 'The write source is not active.');
+  if (!source || source.archived) throw sourceInactive(sourceId);
   const { parseTtlParam } = await import('../ops/facts.ts');
   const validUntil = parseTtlParam(p.ttl);
   const entity = typeof p.entity === 'string' && !isNullLikeEntity(p.entity) ? p.entity.trim() : null;
@@ -149,12 +160,18 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
   // A source-scoped absent identity serializes subjectless facts. Bound writers
   // cannot use it to escape their namespace grant.
   const { slug, authority, snapshot, fence, binding, writeThrough } = linked?.target ?? await planRememberTarget(ctx, sourceId, source, entitySlug, null);
+  if (p.replaces !== undefined && p.replaces !== null) {
+    // Fail fast on an invalid target; the coordinator re-checks it under the row lock before publishing.
+    const { decideReplacement } = await import('../facts/single-prepare.ts');
+    await decideReplacement(ctx.engine, sourceId, { fact: String(p.fact).trim(), kind: (p.kind ?? 'fact') as never,
+      visibility: (p.visibility ?? 'world') as never, entity_slug: entitySlug }, Number(p.replaces), { pageSlug: slug, remote: ctx.remote !== false });
+  }
   const row = await admitWrite(ctx.engine, { principal, operation: 'remember', sourceId, sourceIncarnation: source.incarnation,
     slug, pageId: snapshot?.page.id ?? null, requestId, callerIntent,
     intent: { ...callerIntent, entity_slug: entitySlug, fence, valid_from: new Date().toISOString(), valid_until: validUntil?.toISOString() ?? null,
       ...(linked ? { entity_inferred: linked.via } : {}), ...(inference && 'warning' in inference ? { entity_warning: inference.warning } : {}) },
     authority, worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null });
-  return writeResponse(await waitForWrite(ctx.engine, row, ctx.config, waitMs));
+  return writeResponse(await waitForWrite(ctx.engine, row, ctx.config, waitMs ?? ctx.writeWaitMs));
 }
 
 interface WithdrawalTarget { id: number; entity_slug: string | null; source_markdown_slug: string | null; expired_at: Date | null; }
@@ -162,8 +179,9 @@ interface WithdrawalTarget { id: number; entity_slug: string | null; source_mark
 /** Withdrawal commits independently of filesystem ownership and request FIFO. */
 export async function submitForgetMutation(ctx: OperationContext, operation: 'forget' | 'forget_fact', params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const sub = await submission(ctx, operation, params);
-  if (sub.prior) return writeResponse(sub.prior);
+  if (sub.prior) return withSimilarActive(ctx, operation, sub.sourceId, sub.p, writeResponse(sub.prior));
   const { p, sourceId, principal, callerIntent, requestId } = sub;
+  const semanticReview = p.semantic_review !== false;
   const id = Number(p.id);
   const rawId = String(p.id).trim();
   const reason = typeof p.reason === 'string' && p.reason.trim() ? p.reason.trim() : null;
@@ -174,13 +192,12 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
   let withdrawn: WithdrawalCommit['pages'] = [];
   const done = await retryWriteAdmission(requestId, remaining => ctx.engine.transaction(async tx => {
     withdrawn = [];
-    await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)",
-      [`${Math.min(1000, remaining)}ms`, `${remaining}ms`]);
-    // Source -> current grant -> counters/request -> sorted page keys -> facts.
+    await declareDurablePersistence(tx, `${Math.min(1000, remaining)}ms`, `${remaining}ms`);
+    // Brain row -> source -> current grant -> counters/request -> sorted page keys -> facts.
     // Do not acquire a shared source lock first and upgrade it after admission.
     const [source] = await tx.executeRaw<{ incarnation: string; archived: boolean }>(
       'SELECT incarnation,archived FROM sources WHERE id=$1 FOR UPDATE', [sourceId]);
-    if (!source || source.archived) throw new OperationError('source_changed', 'The write source is not active.');
+    if (!source || source.archived) throw sourceInactive(sourceId);
     // Another same-ID caller may have completed while we waited for the source.
     const prior = await getWriteRequest(tx, principal, requestId);
     if (prior) {
@@ -202,7 +219,7 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
     return withCoordinatedWrite(tx, [sourceId], async () => {
       // Even an expired legacy fact acquires a ledger so a stale import cannot
       // reactivate it. Internal affected-page identities never enter the receipt.
-      withdrawn = (await recordFactWithdrawal(tx, id, sourceId, ctx.remote !== false, { requestId: row.id })).pages;
+      withdrawn = (await recordFactWithdrawal(tx, id, sourceId, ctx.remote !== false, { requestId: row.id, semanticReview })).pages;
       if (reason) await tx.executeRaw(`UPDATE facts SET context=concat_ws(' | ',NULLIF(context,''),$3::text)
         WHERE id=$1 AND source_id=$2`, [id, sourceId, `forgotten: ${reason}`]);
       if (operation === 'forget_fact' && fact.expired_at !== null) {
@@ -212,7 +229,7 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
         ? { id: rawId, expired: fact.expired_at === null, reason, protocol_version: 1 }
         : { id, expired: true, path: 'legacy_db', reason: reason ?? 'forgotten' };
       return completeWrite(tx, row, 'committed', { ...outcome, persistence: { mode: 'database' } });
-    });
+    }, requestAttribution(row));
   }));
   // The commit removed the withdrawn pages' chunks. Rebuild them before
   // acknowledging: a CLI process exits without a resident projection worker.
@@ -221,5 +238,19 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
   for (let start = 0; start < slugs.length; start += 100) {
     await rebuildPendingPageProjections(ctx.engine, 100, { pages: { sourceId, slugs: slugs.slice(start, start + 100) } }).catch(() => undefined);
   }
-  return writeResponse(done);
+  return withSimilarActive(ctx, operation, sourceId, p, writeResponse(done));
+}
+
+/** `forget` responses carry `similar_active` (ids and scores only, zero model calls); best-effort, never fails the forget. */
+async function withSimilarActive(ctx: OperationContext, operation: 'forget' | 'forget_fact', sourceId: string,
+  p: Record<string, unknown>, response: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (operation !== 'forget') return response;
+  const factId = Number(p.id);
+  if (!Number.isSafeInteger(factId)) return response;
+  try {
+    const { similarActiveAfterForget } = await import('../facts/similar-active.ts');
+    const committed = (response.write_request as { state?: string } | undefined)?.state === 'committed' || response.state === 'committed';
+    return { ...response, similar_active: await similarActiveAfterForget(ctx.engine, {
+      sourceId, factId, remote: ctx.remote !== false, committed, semanticReview: p.semantic_review !== false }) };
+  } catch { return response; }
 }

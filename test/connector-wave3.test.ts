@@ -19,6 +19,7 @@ import { resolveRepairScope, runRepair } from '../src/core/repair/core.ts';
 import { performSync } from '../src/commands/sync.ts';
 import { handleToolCall } from '../src/mcp/server.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { inspectUnchanged } from '../src/core/persistence/noop-kernel.ts';
 import { ALL_SOURCES } from '../src/core/source-id.ts';
 import type { WriteRequest } from '../src/core/persistence/model.ts';
@@ -280,7 +281,7 @@ test('mixed versions: a v2 receipt refused by an old consumer names the consumer
     const denied = refusal(receipt('permission_denied', kind));
     expect(denied.code).toBe('permission_denied');
     expect(denied.detail).toBeUndefined();
-    expect(denied.suggestion).toBe('Inspect this receipt before submitting a new request_id.');
+    expect(denied.suggestion).toMatch(/^The submit_job write \(request_id [0-9a-f-]{36}\) ended failed with permission_denied; it will not publish\. Read the receipt and the current state before deciding to submit again; a new attempt needs a new request_id\.$/);
   }
   // A binary that predates the v2 namespace falls through to the same code for any kind it does not know.
   await expect(preparePersistedMutation({} as BrainEngine, receipt('', 'connector_v3_import') as WriteRequest & { operation: string }, { engine: 'pglite' }))
@@ -441,7 +442,7 @@ test('#5470 connector kernel: a safe-chunk reseal, projection lag, a pending con
     // render (#5567): the first re-walk may materialize it into the page once; it survives, and later re-walks skip.
     const summaries = () => engine.executeRaw<{ summary: string }>('SELECT t.summary FROM timeline_entries t JOIN pages p ON p.id=t.page_id WHERE p.source_id=$1 AND p.slug=$2', [f.id, slug]);
     expect(await admitted(() => engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () =>
-      tx.addTimelineEntry(slug, { date: '2026-01-02', summary: 'Met to review the example plan', source: 'meetings/2026-01-02' }, { sourceId: f.id }))))).toBeLessThanOrEqual(1);
+      tx.addTimelineEntry(slug, { date: '2026-01-02', summary: 'Met to review the example plan', source: 'meetings/2026-01-02' }, { sourceId: f.id }), TEST_WRITE_ATTRIBUTION)))).toBeLessThanOrEqual(1);
     expect(await admitted(async () => {})).toBe(0);
     expect(await summaries()).toEqual([{ summary: 'Met to review the example plan' }]);
     expect(await admitted(() => engine.executeRaw('UPDATE pages SET text_projection_revision=gen_random_uuid() WHERE source_id=$1 AND slug=$2', [f.id, slug]))).toBe(1);

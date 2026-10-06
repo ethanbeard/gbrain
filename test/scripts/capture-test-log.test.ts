@@ -158,3 +158,58 @@ setInterval(() => {}, 1000);
     }, 10000);
   }
 });
+
+describe('failure step summary (B13)', () => {
+  // Real Bun runs through the capture wrapper: the summary must carry the
+  // file, the test, the first error block and a command that reproduces it.
+  async function failing(name: string, source: string) {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-capture-summary-'));
+    roots.push(root);
+    writeFileSync(join(root, name), source);
+    const summary = join(root, 'summary.md');
+    const proc = Bun.spawn([process.execPath, SCRIPT, '--job', 'test (3)', '--out', join(root, 'unit.log'), '--',
+      process.execPath, 'test', '--timeout=300', name], {
+      cwd: root, stdout: 'ignore', stderr: 'ignore', env: { ...process.env, GITHUB_STEP_SUMMARY: summary },
+    });
+    const code = await proc.exited;
+    return { code, summary: readFileSync(summary, 'utf8') };
+  }
+
+  it('an assertion failure shows the diff and a -t repro for exactly that test', async () => {
+    const r = await failing('math.test.ts', `import { describe, test, expect } from 'bun:test';
+describe('math', () => { test('adds (carry)', () => { expect(1 + 1).toBe(3); }); test('passes', () => {}); });`);
+    expect(r.code).toBe(1);
+    expect(r.summary).toContain('### test (3): exited 1');
+    expect(r.summary).toContain('#### math.test.ts › math > adds (carry)');
+    expect(r.summary).toContain('Expected: 3');
+    expect(r.summary).toContain('Received: 2');
+    expect(r.summary).toContain("Reproduce: `bun test --timeout=60000 math.test.ts -t 'math adds \\(carry\\)'`");
+    expect(r.summary).not.toContain('passes');
+  }, 30000);
+
+  it('a timeout names the test and keeps the timeout message', async () => {
+    const r = await failing('slow.test.ts', `import { test } from 'bun:test';
+test('waits forever', async () => { await new Promise(() => {}); });`);
+    expect(r.code).toBe(1);
+    expect(r.summary).toContain('#### slow.test.ts › waits forever');
+    expect(r.summary).toMatch(/timed out after 300ms/);
+  }, 30000);
+
+  it('a setup failure with no (fail) line falls back to the last log lines', async () => {
+    const r = await failing('broken.test.ts', `import './missing-module';\nimport { test } from 'bun:test';\ntest('never', () => {});`);
+    expect(r.code).not.toBe(0);
+    expect(r.summary).toContain('No `(fail)` lines were printed');
+    expect(r.summary).toContain('missing-module');
+  }, 30000);
+
+  it('green runs and runs outside Actions write no summary', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-capture-summary-'));
+    roots.push(root);
+    const summary = join(root, 'summary.md');
+    const proc = Bun.spawn([process.execPath, SCRIPT, '--job', 'test (1)', '--out', join(root, 'unit.log'), '--', process.execPath, '-e', '0'], {
+      stdout: 'ignore', stderr: 'ignore', env: { ...process.env, GITHUB_STEP_SUMMARY: summary },
+    });
+    expect(await proc.exited).toBe(0);
+    expect(existsSync(summary)).toBe(false);
+  });
+});

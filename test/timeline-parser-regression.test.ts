@@ -4,6 +4,7 @@ import { extractLinksFromFile, extractTimelineFromContent } from '../src/command
 import { extractEntityRefs, extractPageLinks, parseTimelineEntries } from '../src/core/link-extraction.ts';
 import { stripCodeBlocks } from '../src/core/markdown-code.ts';
 import { parseInlineCitationTimelineEntries } from '../src/core/timeline-citations.ts';
+import { emailCitation, timelineLine } from '../src/core/output/scaffold.ts';
 
 describe('timeline prefix compatibility', () => {
   test('keeps optional bullets, whitespace, date spellings, and separator runs', () => {
@@ -158,5 +159,72 @@ test('inline masking preserves bare CR and the existing unmatched/multiline back
 
 test('fence masking preserves mixed LF, CRLF, and bare CR at exact offsets', () => {
   expect(stripCodeBlocks('before```md\r\n🧪\ra\n```after')).toBe('before     \r\n  \r \n   after');
-  expect(stripCodeBlocks('before```md\r\n🧪\ra\n')).toBe('before     \r\n  \r \n');
+  expect(stripCodeBlocks('before```md\r\n🧪\ra\n```')).toBe('before     \r\n  \r \n   ');
+});
+
+// #5483: a canonical emailCitation() is a Markdown link whose TARGET is the
+// Gmail URL, so the citation text strip must take the target with it — the
+// leftover `(url)` otherwise became the summary itself, and timeline rows
+// cannot be removed once written.
+describe('inline citation timeline dates', () => {
+  test('a citation dated in years 0001-0099 is kept', () => {
+    expect(parseInlineCitationTimelineEntries('Event happened. [Source: chronicle, 0099-01-01]\n')).toEqual([
+      { date: '0099-01-01', source: 'chronicle', summary: 'Event happened.' },
+    ]);
+  });
+
+  test('a calendar-invalid citation date is still dropped', () => {
+    expect(parseInlineCitationTimelineEntries('Event happened. [Source: chronicle, 2026-02-30]\n')).toEqual([]);
+  });
+});
+
+describe('inline citation link targets (#5483)', () => {
+  const cite = emailCitation({
+    account: 'user@example.com',
+    messageId: '18c0ffee12345678',
+    subject: 'Quarterly report',
+    dateISO: '2026-04-18',
+  });
+  const expected = { date: '2026-04-18', source: 'email "Quarterly report"' };
+
+  test('a citation alone on its line mints no URL-fragment row', () => {
+    for (const content of [
+      `# Quarterly report thread\n\n## Alice · 2026-04-18 09:12\n\n${cite}\n\nHere are the numbers.\n`,
+      `${cite}\n`,
+    ]) {
+      expect(parseInlineCitationTimelineEntries(content)).toEqual([]);
+      // Both real extract paths agree — the row never reaches the DB either.
+      expect(parseTimelineEntries(content)).toEqual([]);
+      expect(extractTimelineFromContent(content, 'email/thread')).toEqual([]);
+    }
+  });
+
+  test('prose around the citation survives; the URL never does', () => {
+    expect(parseInlineCitationTimelineEntries(`Here are the numbers. ${cite}`)).toEqual([
+      { ...expected, summary: 'Here are the numbers.' },
+    ]);
+    expect(parseInlineCitationTimelineEntries(`${cite} Here are the numbers.`)).toEqual([
+      { ...expected, summary: 'Here are the numbers.' },
+    ]);
+  });
+
+  test('the canonical timelineLine shape still yields exactly one row', () => {
+    const line = timelineLine({ dateISO: '2026-04-18', summary: 'Signed the deal', citation: cite });
+    // Both extract paths skip bullet lines in the citation pass (the bullet
+    // pass owns them), so the URL never becomes a second row's summary.
+    expect(extractTimelineFromContent(line, 'notes/example')).toHaveLength(1);
+    expect(parseTimelineEntries(line)).toHaveLength(1);
+  });
+
+  test('a URL with nested parens leaves no stray delimiter behind', () => {
+    expect(parseInlineCitationTimelineEntries(
+      'Read up. [Source: wiki, 2024-02-27](https://en.wikipedia.org/wiki/Foo_(bar))',
+    )).toEqual([{ date: '2024-02-27', source: 'wiki', summary: 'Read up.' }]);
+  });
+
+  test('prose parentheses after a bare citation are kept', () => {
+    expect(parseInlineCitationTimelineEntries(
+      'Reviewed (carefully). [Source: memo, 2024-02-27]',
+    )).toEqual([{ date: '2024-02-27', source: 'memo', summary: 'Reviewed (carefully).' }]);
+  });
 });

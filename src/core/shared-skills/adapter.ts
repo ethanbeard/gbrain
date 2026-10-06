@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, lstatSync
 import { isAbsolute, join } from 'node:path';
 import { assertNoSymlinks, checkedRoot, confinedPath, privateWrite, sha256 } from '../agent-install/state.ts';
 import { acquireNativeLock } from '../persistence/native-lock.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError, type OpErrorOpts } from '../ops/contract.ts';
+import type { RegistryCode } from '../error-registry.ts';
 import { harnessAdapter } from '../harness/registry.ts';
 import { installNativeRouter, prepareNativeRouter, recordedNativeSkillsDirectory, removeNativeRouter } from '../harness/native-router.ts';
 import { SHARED_SKILLS_DELIVERY_LIMITS, sharedSkillKey, type FollowPolicy, type MembershipSnapshot, type SharedSkillIdentity } from './membership-types.ts';
@@ -44,21 +45,26 @@ interface SkillFile { path: string; sha256: string; size?: number; content?: str
 interface SkillBundle extends SharedSkillIdentity { content?: string; body?: string; usable?: boolean; unavailable_requirements?: unknown[];
   delivery?: 'complete' | 'prose_only'; files?: SkillFile[]; manifest?: { files: SkillFile[] } }
 const MAX_BYTES = 32 * 1024 * 1024;
+const TROUBLESHOOT = 'docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover';
 
 export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
   const root = checkedRoot(options.root);
   const adapter = harnessAdapter(options.adapter);
-  if (options.launcher && (!isAbsolute(options.launcher) || /[\x00-\x1f]/.test(options.launcher))) throw new OperationError('invalid_params', 'The launcher must be an absolute installation-bound path.');
+  if (options.launcher && (!isAbsolute(options.launcher) || /[\x00-\x1f]/.test(options.launcher))) throw opError('invalid_params', 'The launcher must be an absolute installation-bound path.',
+    'Record the launcher as the absolute path of this installation\'s own gbrain binary, with no control characters; reinstalling the harness wiring writes one.');
   const receiptPath = join(root, 'receipt.json');
-  const fail = (code: string, message: string): never => { throw new OperationError(code, message); };
+  const fail = (code: RegistryCode, message: string, suggestion: string, opts: OpErrorOpts = { docs: TROUBLESHOOT }): never => { throw opError(code, message, suggestion, opts); };
+  const refreshAgain = 'Refresh again for the current authorized view; keep cached shared skills unused until a refresh succeeds. Memory keeps working.';
   const save = (receipt: SharedSkillsLocalReceipt) => privateWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
   function read(): SharedSkillsLocalReceipt | null {
     assertNoSymlinks(receiptPath);
     if (!existsSync(receiptPath)) return null;
     let receipt: SharedSkillsLocalReceipt;
     try { receipt = JSON.parse(readFileSync(receiptPath, 'utf8')); }
-    catch { return fail('local_conflict', 'The shared-skills ownership receipt is unreadable. Preserve it before recovery.'); }
-    if (receipt.format_version !== 1 || receipt.adapter !== adapter.id || !receipt.installation_id || !receipt.owned_files || !receipt.pending_files) fail('local_conflict', 'The cache belongs to a different or unknown installation.');
+    catch { return fail('local_conflict', 'The shared-skills ownership receipt is unreadable. Preserve it before recovery.',
+      `${receiptPath} is not valid JSON. Copy it aside for the user before anything rewrites it; following resumes after the user restores a valid receipt or clears ${root} and joins again.`); }
+    if (receipt.format_version !== 1 || receipt.adapter !== adapter.id || !receipt.installation_id || !receipt.owned_files || !receipt.pending_files) fail('local_conflict', 'The cache belongs to a different or unknown installation.',
+      `${receiptPath} was written for adapter ${String(receipt.adapter)}, not ${adapter.id}, or by an older format. Give this harness its own shared-skills directory, or leave from the installation that owns ${root}.`);
     for (const path of [...Object.keys(receipt.owned_files), ...Object.keys(receipt.pending_files)]) confinedPath(root, path);
     return receipt;
   }
@@ -66,30 +72,37 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
     const absolute = confinedPath(root, path);
     if (!existsSync(absolute)) return null;
     const stat = lstatSync(absolute);
-    if (!stat.isFile() || stat.size > MAX_BYTES) return fail('local_conflict', 'A managed file has been replaced by a non-file or oversized file.');
+    if (!stat.isFile() || stat.size > MAX_BYTES) return fail('local_conflict', 'A managed file has been replaced by a non-file or oversized file.',
+      `${absolute} is no longer the file gbrain installed. Move it aside after the user confirms, then refresh; gbrain never overwrites it.`);
     return sha256(readFileSync(absolute));
   }
   function preflight(receipt: SharedSkillsLocalReceipt, files: Map<string, Uint8Array | string>) {
     for (const path of new Set([...Object.keys(receipt.owned_files), ...files.keys()])) {
       const current = existingHash(path);
       const pending = receipt.pending_files[path];
-      if (current !== null && current !== receipt.owned_files[path] && current !== pending?.before && current !== pending?.after) fail('local_conflict', 'A managed artifact was edited; preserve it and resolve the native shadow copy before following updates.');
-      if (current !== null && path.startsWith('revisions/') && files.has(path) && current !== sha256(files.get(path)!)) fail('local_conflict', 'An immutable revision cannot be rewritten in place.');
+      if (current !== null && current !== receipt.owned_files[path] && current !== pending?.before && current !== pending?.after) fail('local_conflict', 'A managed artifact was edited; preserve it and resolve the native shadow copy before following updates.',
+        `${confinedPath(root, path)} was edited after gbrain installed it. Show the user the edit; once they keep a copy elsewhere and restore or remove the file, refresh again. gbrain never overwrites edits.`);
+      if (current !== null && path.startsWith('revisions/') && files.has(path) && current !== sha256(files.get(path)!)) fail('local_conflict', 'An immutable revision cannot be rewritten in place.',
+        `${confinedPath(root, path)} differs from the published revision. Move it aside after the user confirms; the next refresh writes the published bytes again.`);
     }
   }
   async function locked<T>(fn: () => Promise<T>): Promise<T> {
     assertNoSymlinks(root);
     mkdirSync(root, { recursive: true, mode: 0o700 });
     const lock = await acquireNativeLock(join(root, 'adapter.lock'), { timeoutMs: 5000 });
-    if (!lock) return fail('local_conflict', 'Another adapter update is in progress.');
+    if (!lock) return fail('local_conflict', 'Another adapter update is in progress.',
+      `Another join, refresh or leave of this installation holds ${join(root, 'adapter.lock')}. Wait for it to finish, then run this step again.`);
     try { return await fn(); } finally { await lock.release(); }
   }
   function assertSnapshot(snapshot: MembershipSnapshot, receipt?: SharedSkillsLocalReceipt) {
     if (snapshot.schema_version !== 2 || snapshot.complete !== true || !Array.isArray(snapshot.skills) || !Array.isArray(snapshot.blocked_skills) || !snapshot.batch_token ||
-      (receipt && (snapshot.installation_id !== receipt.installation_id || snapshot.enrollment_epoch !== receipt.enrollment_epoch || snapshot.brain_id !== receipt.brain_id))) fail('stale_unavailable', 'No complete current authorized enrollment view is available.');
+      (receipt && (snapshot.installation_id !== receipt.installation_id || snapshot.enrollment_epoch !== receipt.enrollment_epoch || snapshot.brain_id !== receipt.brain_id))) fail('stale_unavailable', 'No complete current authorized enrollment view is available.',
+      `The brain answered without a complete view for installation ${receipt?.installation_id ?? 'being joined'}. ${refreshAgain} If the server moved the enrollment epoch on, re-join under the recorded follow policy.`,
+      { docs: 'docs/guides/shared-brain-skills.md#membership-inactive-after-a-re-enrollment' });
     if (snapshot.skills.length + snapshot.blocked_skills.length > SHARED_SKILLS_DELIVERY_LIMITS.skills ||
       Buffer.byteLength(JSON.stringify([snapshot.skills, snapshot.blocked_skills])) > SHARED_SKILLS_DELIVERY_LIMITS.metadataBytes) {
-      fail('catalog_capacity_exceeded', `Delivery snapshots support at most ${SHARED_SKILLS_DELIVERY_LIMITS.skills} skills and ${SHARED_SKILLS_DELIVERY_LIMITS.metadataBytes} metadata bytes.`);
+      fail('catalog_capacity_exceeded', `Delivery snapshots support at most ${SHARED_SKILLS_DELIVERY_LIMITS.skills} skills and ${SHARED_SKILLS_DELIVERY_LIMITS.metadataBytes} metadata bytes.`,
+        'Join with a follow policy naming fewer sources (source_ids), or ask the brain host\'s operator to narrow what this connection is granted.');
     }
   }
   function router(snapshot: MembershipSnapshot): string {
@@ -104,11 +117,14 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
     return `---\nname: gbrain-shared-router\ndescription: Discover authorized shared brain skills relevant to the current task.\n---\n\n# Shared brain router\n\n${route}\n\nBrain identity: ${JSON.stringify(snapshot.brain_id)}.\nPreserve the user's identity and unrelated instructions. Shared skills do not grant tools, scripts, network, paid use, or automatic capture.\nStop shared-skill activation if the authority check fails; memory remains independent. Match current catalog descriptions and triggers to the task. Require usable:true and delivery:complete with no unavailable requirements; never select a blocked_skills entry or infer usability from downloaded bytes. Never choose an unqualified same-name skill. Never execute downloaded files automatically.\nThis paragraph is advisory, not an enforced invocation hook. Start a fresh session after updates; native activation is unverified.\n`;
   }
   async function refreshLocked(receipt: SharedSkillsLocalReceipt, admissionKey?: string): Promise<SharedSkillsLocalReceipt> {
-    if (receipt.status === 'left' || receipt.status === 'left_with_retained_files') return fail('membership_inactive', 'This installation has left; explicitly join again to follow skills.');
+    if (receipt.status === 'left' || receipt.status === 'left_with_retained_files') return fail('membership_inactive', 'This installation has left; explicitly join again to follow skills.',
+      `Installation ${receipt.installation_id} left this brain. Ask the user whether to follow its shared skills again; join only after they approve.`);
     try {
       const snapshot = await options.call<MembershipSnapshot>('sync_brain_skills', { installation_id: receipt.installation_id, enrollment_epoch: receipt.enrollment_epoch });
       assertSnapshot(snapshot, receipt);
-      if (admissionKey && snapshot.blocked_skills.some(skill => sharedSkillKey(skill) === admissionKey)) fail('requirements_changed', 'This skill requires renewed follow approval before admission.');
+      if (admissionKey && snapshot.blocked_skills.some(skill => sharedSkillKey(skill) === admissionKey)) fail('requirements_changed', 'This skill requires renewed follow approval before admission.',
+        `Skill ${admissionKey} changed its requirements or source policy. Show the user its catalog entry and re-join only after they approve; use another skill meanwhile.`,
+        { docs: 'docs/guides/shared-brain-skills.md#approve-publication-following-and-editing-separately' });
       receipt.desired_view = snapshot.view_token;
       const files = new Map<string, Uint8Array | string>();
       const references: Record<string, { revision: string; files: Record<string, string> }> = {};
@@ -119,7 +135,8 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
         const selector = { expected_brain_id: skill.brain_id, source_id: skill.source_id, source_incarnation: skill.source_incarnation,
           pack_id: skill.pack_id, name: skill.name, revision: skill.revision };
         const bundle = await options.call<SkillBundle>('get_skill', { ...selector, schema_version: 2 });
-        if (sharedSkillKey(bundle) !== sharedSkillKey(skill) || bundle.revision !== skill.revision) fail('stale_unavailable', 'The fetched skill does not match the issued immutable revision.');
+        if (sharedSkillKey(bundle) !== sharedSkillKey(skill) || bundle.revision !== skill.revision) fail('stale_unavailable', 'The fetched skill does not match the issued immutable revision.',
+          `The server returned another revision than ${skill.revision} for ${sharedSkillKey(skill)}. ${refreshAgain}`);
         if (skill.usable === false || bundle.usable !== true || bundle.delivery !== 'complete' ||
           (Array.isArray(skill.unavailable_requirements) && skill.unavailable_requirements.length > 0) || bundle.unavailable_requirements?.length) {
           blocked.push({ key: sharedSkillKey(skill), reason: 'requirements_changed' });
@@ -127,18 +144,22 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
           continue;
         }
         const manifest = bundle.manifest?.files ?? bundle.files ?? [];
-        if (!Array.isArray(manifest) || !manifest.length || manifest.length > 128) fail('stale_unavailable', 'The server did not return a bounded declared file manifest.');
+        if (!Array.isArray(manifest) || !manifest.length || manifest.length > 128) fail('stale_unavailable', 'The server did not return a bounded declared file manifest.',
+          `${sharedSkillKey(skill)} came with no file manifest or more than 128 files. Ask the brain host's operator to republish it with a declared manifest; the other skills and memory keep working.`);
         const paths = new Set<string>();
         const ref = { revision: skill.revision, files: {} as Record<string, string> };
         for (const file of manifest) {
           confinedPath(root, file.path);
-          if (paths.has(file.path) || !/^[a-f0-9]{64}$/.test(file.sha256)) fail('stale_unavailable', 'The declared dependency manifest is invalid.');
+          if (paths.has(file.path) || !/^[a-f0-9]{64}$/.test(file.sha256)) fail('stale_unavailable', 'The declared dependency manifest is invalid.',
+            `${sharedSkillKey(skill)} lists ${file.path} twice or without a SHA-256 digest. Ask the brain host's operator to republish the skill; nothing from it was installed.`);
           paths.add(file.path);
           const asset = await options.call<{ content: string; encoding?: string; sha256?: string }>('get_skill_asset', { ...selector, path: file.path });
-          if (typeof asset.content !== 'string' || !['utf8', 'base64', undefined].includes(asset.encoding)) fail('stale_unavailable', 'Unsupported asset encoding.');
+          if (typeof asset.content !== 'string' || !['utf8', 'base64', undefined].includes(asset.encoding)) fail('stale_unavailable', 'Unsupported asset encoding.',
+            `The server sent ${file.path} of ${sharedSkillKey(skill)} in an encoding other than utf8 or base64; the brain host likely runs another gbrain version. Ask its operator to upgrade, then refresh.`);
           const bytes = Buffer.from(asset.content, asset.encoding === 'base64' ? 'base64' : 'utf8');
           total += bytes.length;
-          if (total > MAX_BYTES || bytes.length > 2 * 1024 * 1024 || sha256(bytes) !== file.sha256 || (file.size !== undefined && bytes.length !== file.size)) fail('stale_unavailable', 'The approved bundle exceeded its bounds or failed a hash check.');
+          if (total > MAX_BYTES || bytes.length > 2 * 1024 * 1024 || sha256(bytes) !== file.sha256 || (file.size !== undefined && bytes.length !== file.size)) fail('stale_unavailable', 'The approved bundle exceeded its bounds or failed a hash check.',
+            `${file.path} of ${sharedSkillKey(skill)} is over its size bound or does not match its declared hash, so nothing from it was installed. ${refreshAgain}`);
           const cache = `revisions/${sha256(sharedSkillKey(skill))}/${sha256(skill.revision)}/${file.path}`;
           files.set(cache, bytes); ref.files[file.path] = cache;
         }
@@ -155,10 +176,12 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
       for (const path of Object.keys(receipt.owned_files)) {
         if (!files.has(path) && existsSync(confinedPath(root, path))) retainedBytes += lstatSync(confinedPath(root, path)).size;
       }
-      if (retainedBytes + total > MAX_BYTES) fail('cache_quota_exceeded', 'Retained immutable revisions reached the cache quota; leave after native sessions stop before clearing owned files.');
+      if (retainedBytes + total > MAX_BYTES) fail('cache_quota_exceeded', 'Retained immutable revisions reached the cache quota; leave after native sessions stop before clearing owned files.',
+        `${root} holds ${retainedBytes} bytes of older revisions. Once no harness session uses them, leave this installation (it removes unchanged owned files), then join again with the user's approval.`);
       const confirm = await options.call<MembershipSnapshot>('sync_brain_skills', { installation_id: receipt.installation_id, enrollment_epoch: receipt.enrollment_epoch });
       assertSnapshot(confirm, receipt);
-      if (confirm.view_token !== snapshot.view_token) fail('stale_unavailable', 'Authority or revisions changed during download; retry against the new catalog.');
+      if (confirm.view_token !== snapshot.view_token) fail('stale_unavailable', 'Authority or revisions changed during download; retry against the new catalog.',
+        `The catalog changed while it downloaded. ${refreshAgain}`);
       receipt.last_authority_check = new Date().toISOString();
       for (const [path, bytes] of files) receipt.pending_files[path] = { before: existingHash(path), after: sha256(bytes) };
       save(receipt);
@@ -170,7 +193,8 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
         }
         const pending = receipt.pending_files[path];
         const current = existingHash(path);
-        if (current !== pending.before && current !== pending.after) fail('local_conflict', 'An artifact changed during installation.');
+        if (current !== pending.before && current !== pending.after) fail('local_conflict', 'An artifact changed during installation.',
+          `Another writer changed ${confinedPath(root, path)} while gbrain installed it. Stop that writer, keep its version for the user, then refresh again.`);
         if (current !== pending.after) privateWrite(confinedPath(root, path), bytes);
         receipt.owned_files[path] = pending.after;
         delete receipt.pending_files[path];
@@ -186,7 +210,8 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
       const ack = await options.call<MembershipSnapshot>('sync_brain_skills', { installation_id: receipt.installation_id, enrollment_epoch: receipt.enrollment_epoch,
         acknowledgment: { batch_token: snapshot.batch_token, view_token: snapshot.view_token, evidence: { stage: partiallyInstalled ? 'fetched' : 'installed', revisions: snapshot.skills.map(({ brain_id, source_id, source_incarnation, pack_id, name, revision }) => ({ brain_id, source_id, source_incarnation, pack_id, name, revision })) } } });
       assertSnapshot(ack, receipt);
-      if (ack.view_token !== snapshot.view_token) fail('stale_unavailable', 'A newer authorized catalog is pending; the historical install is not current.');
+      if (ack.view_token !== snapshot.view_token) fail('stale_unavailable', 'A newer authorized catalog is pending; the historical install is not current.',
+        `A newer catalog was published during the install. ${refreshAgain}`);
       if (!partiallyInstalled) {
         receipt.acknowledged_view = snapshot.view_token;
         delete receipt.remote_membership_pending;
@@ -208,10 +233,12 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
     status: read,
     join: (follow_policy: FollowPolicy) => locked(async () => {
       const prior = read();
-      if (!prior && readdirSync(root).some(path => path !== 'adapter.lock')) fail('local_conflict', 'Refusing to adopt an unowned shared-skills directory.');
+      if (!prior && readdirSync(root).some(path => path !== 'adapter.lock')) fail('local_conflict', 'Refusing to adopt an unowned shared-skills directory.',
+        `${root} already holds files gbrain did not create. Join with an empty shared-skills directory, or have the user move those files aside first.`);
       const snapshot = await options.call<MembershipSnapshot>('join_brain', { adapter: adapter.id, follow_policy });
       assertSnapshot(snapshot);
-      if (prior && (prior.brain_id !== snapshot.brain_id || prior.installation_id !== snapshot.installation_id)) fail('local_conflict', 'The cache belongs to another principal or brain.');
+      if (prior && (prior.brain_id !== snapshot.brain_id || prior.installation_id !== snapshot.installation_id)) fail('local_conflict', 'The cache belongs to another principal or brain.',
+        `${root} belongs to installation ${prior.installation_id} on brain ${prior.brain_id}. Leave that enrollment first, or give this connection its own shared-skills directory.`);
       const receipt: SharedSkillsLocalReceipt = { ...prior, format_version: 1, adapter: adapter.id, brain_id: snapshot.brain_id, installation_id: snapshot.installation_id,
         enrollment_epoch: snapshot.enrollment_epoch, status: 'joined', native: 'unverified', router_path: join(root, 'router', 'SKILL.md'), native_registration: 'unverified',
         freshness: ['claude-code', 'codex', 'opencode'].includes(adapter.id) ? 'session_refresh' : 'advisory_refresh',
@@ -221,16 +248,21 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
     }),
     refresh: () => locked(async () => {
       const receipt = read();
-      if (!receipt) return fail('membership_inactive', 'Enroll before syncing this installation.');
+      if (!receipt) return fail('membership_inactive', 'Enroll before syncing this installation.',
+        `No enrollment receipt exists in ${root}. Joining needs the user's follow approval; until then keep using memory only.`);
       return refreshLocked(receipt);
     }),
     admit: (key: string) => locked(async () => {
       const receipt = read();
-      if (!receipt) return fail('membership_inactive', 'Enroll before using shared skills.');
+      if (!receipt) return fail('membership_inactive', 'Enroll before using shared skills.',
+        `No enrollment receipt exists in ${root}. Joining needs the user's follow approval; until then keep using memory only.`);
       await refreshLocked(receipt, key);
-      if (receipt.blocked_skills?.some(skill => skill.key === key)) fail('requirements_changed', 'This skill is blocked by current usability or dependency requirements.');
+      if (receipt.blocked_skills?.some(skill => skill.key === key)) fail('requirements_changed', 'This skill is blocked by current usability or dependency requirements.',
+        `Skill ${key} is blocked until its missing requirements or changed policy are approved. Show the user its blocked entry and use another skill meanwhile.`,
+        { docs: 'docs/guides/shared-brain-skills.md#approve-publication-following-and-editing-separately' });
       const reference = JSON.parse(readFileSync(confinedPath(root, 'active.json'), 'utf8'));
-      if (!reference.skills[key]) return fail('skill_unavailable', 'This qualified skill is not in the current authorized view.');
+      if (!reference.skills[key]) return fail('skill_unavailable', 'This qualified skill is not in the current authorized view.',
+        `Skill ${key} is not in installation ${receipt.installation_id}'s current view. List the catalog again and pick a usable entry with its exact qualified id.`);
       return { ...reference.skills[key], key, admission_view: reference.view_token, native_verified: false };
     }),
     leave: () => locked(async () => {
@@ -264,9 +296,14 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
         receipt.remote_membership_pending = false;
         delete receipt.remote_membership_reason;
       } catch (error) {
-        receipt.remote_membership_pending = true;
-        receipt.remote_membership_reason = error instanceof OperationError ? error.code : 'remote_unavailable';
-        receipt.next_action += ' Remote membership deactivation is pending; retry leave when the host can acknowledge it.';
+        if (error instanceof OperationError && error.code === 'membership_inactive') {
+          receipt.remote_membership_pending = false;
+          receipt.remote_membership_reason = 'superseded';
+        } else {
+          receipt.remote_membership_pending = true;
+          receipt.remote_membership_reason = error instanceof OperationError ? error.code : 'remote_unavailable';
+          receipt.next_action += ' Remote membership deactivation is pending; retry leave when the host can acknowledge it.';
+        }
       }
       save(receipt);
       return receipt;

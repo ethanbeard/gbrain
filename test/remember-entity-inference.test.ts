@@ -13,6 +13,7 @@ import { operationsByName } from '../src/core/operations.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
@@ -27,7 +28,7 @@ const remember = (params: Record<string, unknown>, ctx = context()) =>
 
 async function putEntity(slug: string, title: string, type: string, body = `# ${title}`, frontmatter: Record<string, unknown> = {}) {
   await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () =>
-    tx.putPage(slug, { type, title, compiled_truth: body, frontmatter }, { sourceId })));
+    tx.putPage(slug, { type, title, compiled_truth: body, frontmatter }, { sourceId }), TEST_WRITE_ATTRIBUTION));
 }
 async function factRow(id: string) {
   const [row] = await engine.executeRaw<{ entity_slug: string | null; context: string | null; row_num: number | null; expired_at: Date | null; superseded_by: number | null }>(

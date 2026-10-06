@@ -75,6 +75,8 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
       }
       // transaction: just call the fn with the same engine (no real DB transaction in tests)
       if (prop === 'transaction') return async (fn: (tx: BrainEngine) => Promise<any>) => fn(engine);
+      // Like a real engine, executeRaw always resolves to a row array.
+      if (prop === 'executeRaw' && !overrides.executeRaw) return (...args: any[]) => { calls.push({ method: prop, args }); return Promise.resolve([]); };
       return track(prop);
     },
   });
@@ -528,9 +530,12 @@ describe('importFile — CJK wave (v0.32.7)', () => {
     const calls = (engine as any)._calls;
     const putCall = calls.find((c: any) => c.method === 'putPage');
     expect(putCall.args[1].chunker_version).toBeUndefined();
+    // #5984: a non-empty replacement is sealed by its own upsert (after the insert); an empty one by one stamp.
     const stamps = calls.filter((c: any) => c.method === 'executeRaw' && isVersionStamp(c.args[0]));
-    expect(stamps).toHaveLength(1);
-    expect(stamps[0].args[1]).toEqual([MARKDOWN_CHUNKER_VERSION, 'default', slug]);
+    const sealedUpserts = calls.filter((c: any) => c.method === 'upsertChunks' && c.args[2]?.sealChunkerVersion !== undefined);
+    expect(stamps.length + sealedUpserts.length).toBe(1);
+    if (stamps.length) expect(stamps[0].args[1]).toEqual([MARKDOWN_CHUNKER_VERSION, 'default', slug]);
+    else expect(sealedUpserts[0].args).toMatchObject([slug, expect.any(Array), { sourceId: 'default', sealChunkerVersion: MARKDOWN_CHUNKER_VERSION }]);
   }
 
   test('REGRESSION: pure-CJK filename with NO frontmatter slug imports cleanly as CJK slug', async () => {

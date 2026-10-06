@@ -859,6 +859,13 @@ test('every CREATE INDEX column in PGLITE_SCHEMA_SQL is covered by CREATE TABLE 
 // ─────────────────────────────────────────────────────────────────
 
 const COLUMN_EXEMPTIONS = new Set<string>([
+  // page_aliases origin / case_sensitive / alias_text (entity mention index,
+  // migration v206): page_aliases is a PGLite bootstrap table and a
+  // Postgres migration-only table; no schema blob references these columns
+  // (no index or view reads them), so there is nothing to forward-reference.
+  'page_aliases.origin',
+  'page_aliases.case_sensitive',
+  'page_aliases.alias_text',
   // takes.embedding: the takes table is migration-only (no CREATE TABLE in
   // PGLITE_SCHEMA_SQL / src/schema.sql), so there is no schema-blob forward
   // reference for the bootstrap to trip on. The column is created inline in
@@ -868,6 +875,22 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // migration block. Fresh installs and upgrades both get the column + index
   // from the migration chain, never from the bootstrap.
   'takes.embedding',
+  // takes vector provenance (#5885, take_embedding_identity): same migration-only
+  // table, no schema-blob reference; fresh installs and upgrades get both
+  // columns from the migration chain.
+  'takes.embedding_model',
+  'takes.embedded_text_hash',
+  // Spend meter budget owner (v205): mcp_spend_reservations and mcp_spend_log
+  // are migration-only tables (no CREATE TABLE in the schema blob), so there is
+  // no blob forward reference; the migration chain adds the column and index.
+  'mcp_spend_reservations.budget_key',
+  'mcp_spend_log.budget_key',
+  // Spend fence columns (v205): migration-only, appended after every earlier
+  // migration-added column so fresh and upgraded catalogs agree. No blob index
+  // references them; the blob's queue-protocol trigger reads them only on a
+  // claim, after the migration chain has run.
+  'minion_jobs.spend_authorization',
+  'minion_jobs.spend_claim_token',
   // T7 — search_telemetry rank-1 drift columns (migration v111). search_telemetry
   // is created entirely by migration v57 (not in the schema blob), so the v57+v111
   // chain handles fresh + upgrade; no CREATE INDEX references these columns, so
@@ -894,6 +917,11 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'minion_jobs.quiet_hours',
   'minion_jobs.stagger_key',
   'sources.chunker_version',
+  // #5255/#5176: the upstream observation columns follow the same chain (PGLite
+  // gets them from migration sources_upstream_observation; no index uses them).
+  'sources.upstream_checked_at',
+  'sources.upstream_commit',
+  'sources.upstream_behind',
   'access_tokens.permissions',
   'takes.resolved_quality',
   'pages.emotional_weight_recomputed_at',
@@ -933,6 +961,10 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // brains is invisible to them). Migration is column-only, no FK,
   // no index — bootstrap probe would be pure overhead.
   'facts.event_type',
+  // migration v215 — speaker attribution. The facts table is migration-created
+  // (absent from PGLITE_SCHEMA_SQL), so no schema-blob forward reference can
+  // exist; nullable column only, no index or FK.
+  'facts.attributed_to',
   // v0.42.56.0 (migration v122, #2390) — Life Chronicle ontology columns.
   // Same precedent as facts.claim_metric et al: the `facts` table itself is
   // migration-created (absent from PGLITE_SCHEMA_SQL), so no schema-blob
@@ -1012,6 +1044,10 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'persistence_requests.consumer_host_id',
   'persistence_requests.published_at',
   'persistence_brain.writer_version_cutoff',
+  // #5974 (migration v198) — structured publication failure detail. Same
+  // posture as v178: persistence_requests is migration-created on PGLite, no
+  // index references the column, and every reader treats NULL as no detail.
+  'persistence_requests.error_detail',
   // #5455 (migration v183) — managed mode epoch. persistence_brain is
   // migration-created on PGLite; no index in either blob references it, and
   // pre-migration readers go through to_jsonb(persistence_brain)->'mode_epoch'.

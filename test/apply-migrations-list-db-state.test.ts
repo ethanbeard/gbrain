@@ -4,7 +4,7 @@
  * unreachable database used to print the identical all-pending plan (exit 0)
  * as a clean one. Covers the probe-summary formatter and the --require-db
  * flag parse; the end-to-end unreachable-DB spawn is in
- * test/apply-migrations-list-db-state.serial.test.ts.
+ * test/apply-migrations-list-db-state-cli.test.ts.
  */
 
 import { describe, test, expect } from 'bun:test';

@@ -19,6 +19,7 @@ import {
   uninstallWorkspace,
 } from '../src/core/bootstrap/uninstall.ts';
 import { BootstrapError } from '../src/core/bootstrap/lock.ts';
+import { readBootId, readPidNs } from '../src/core/pglite-lock.ts';
 import { readReceipt, writeReceipt, type InstallReceipt } from '../src/core/bootstrap/format.ts';
 
 let ws: string;
@@ -387,10 +388,16 @@ describe('probeLivePgliteHolder', () => {
     mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
     writeFileSync(
       join(dataDir, '.gbrain-lock', 'lock'),
-      JSON.stringify({ pid: process.pid, command: 'embed --stale', subcommand: 'embed' }),
+      JSON.stringify({
+        pid: process.pid,
+        command: 'embed --stale',
+        subcommand: 'embed',
+        pid_ns: readPidNs(),
+        boot_id: readBootId(),
+      }),
       'utf8',
     );
-    expect(probeLivePgliteHolder(dataDir)).toEqual({ pid: process.pid, serve: false });
+    expect(probeLivePgliteHolder(dataDir)).toEqual({ pid: process.pid, serve: false, isSelf: true });
   });
 
   test('legacy lock without subcommand falls back to command-string parsing', () => {
@@ -398,10 +405,10 @@ describe('probeLivePgliteHolder', () => {
     mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
     writeFileSync(
       join(dataDir, '.gbrain-lock', 'lock'),
-      JSON.stringify({ pid: process.pid, command: 'gbrain serve' }),
+      JSON.stringify({ pid: process.pid, command: 'gbrain serve', pid_ns: readPidNs(), boot_id: readBootId() }),
       'utf8',
     );
-    expect(probeLivePgliteHolder(dataDir)).toEqual({ pid: process.pid, serve: true });
+    expect(probeLivePgliteHolder(dataDir)).toEqual({ pid: process.pid, serve: true, isSelf: true });
   });
 
   test('absent or unreadable lock → null', () => {
@@ -410,6 +417,197 @@ describe('probeLivePgliteHolder', () => {
     mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
     writeFileSync(join(dataDir, '.gbrain-lock', 'lock'), 'not json', 'utf8');
     expect(probeLivePgliteHolder(dataDir)).toBeNull();
+  });
+
+  // #5481 review F6: a pid+namespace match alone is not proof THIS process
+  // acquired the lock. Within one boot session a dead process's pid can be
+  // reused by a later, unrelated live process (including this doctor
+  // invocation) -- a genuinely stale legacy lock left behind by the dead
+  // process can still block real database access via pglite-lock.ts's own
+  // acquisition-time reap logic, which sees the recycled pid as alive and
+  // correctly refuses to reclaim it. `acquired_at` predating this process's
+  // own start time proves the lock cannot be ours, regardless of matching
+  // pid/namespace evidence.
+  test('lock acquired before THIS process started → not self even with matching pid and namespace evidence (stale legacy lock, recycled pid)', () => {
+    const dataDir = join(home, 'brain.pglite');
+    mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+    writeFileSync(
+      join(dataDir, '.gbrain-lock', 'lock'),
+      JSON.stringify({
+        pid: process.pid,
+        subcommand: 'serve',
+        pid_ns: readPidNs(),
+        boot_id: readBootId(),
+        acquired_at: 1000,
+      }),
+      'utf8',
+    );
+    const holder = probeLivePgliteHolder(dataDir);
+    expect(holder).toEqual({ pid: process.pid, serve: true, isSelf: false });
+  });
+
+  test('lock acquired AFTER this process started (or acquired_at absent) → matching pid/namespace still reads as self', () => {
+    const dataDir = join(home, 'brain.pglite');
+    mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+    writeFileSync(
+      join(dataDir, '.gbrain-lock', 'lock'),
+      JSON.stringify({ pid: process.pid, subcommand: 'serve', pid_ns: readPidNs(), boot_id: readBootId(), acquired_at: Date.now() }),
+      'utf8',
+    );
+    const holder = probeLivePgliteHolder(dataDir);
+    expect(holder).toEqual({ pid: process.pid, serve: true, isSelf: true });
+  });
+
+  // #5481 review F1: `ourProcessStartTime`'s default path is anchored ONCE at
+  // module load (near real process start, since this module is a static
+  // top-level import), not recomputed from `Date.now() - process.uptime() *
+  // 1000` at probe-call time. A wall-clock jump (NTP correction, VM/container
+  // pause-resume) occurring AFTER module load but BEFORE a later check
+  // actually runs the probe must not retroactively move the start-time
+  // estimate later and false-flag a genuinely-self lock as foreign.
+  test('a wall-clock jump between module load and the probe call does not flip a genuinely-self lock to non-self', () => {
+    const dataDir = join(home, 'brain.pglite');
+    mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+    // This process's own lock, written at (simulated) true process start.
+    const trueAcquiredAt = Date.now();
+    writeFileSync(
+      join(dataDir, '.gbrain-lock', 'lock'),
+      JSON.stringify({ pid: process.pid, subcommand: 'serve', pid_ns: readPidNs(), boot_id: readBootId(), acquired_at: trueAcquiredAt }),
+      'utf8',
+    );
+    const realNow = Date.now;
+    try {
+      // Simulate a forward wall-clock jump discovered well after module
+      // load: if the default path still recomputed `Date.now() -
+      // process.uptime() * 1000` at call time (the pre-fix behavior), this
+      // jump alone would push the estimated start time past
+      // `trueAcquiredAt + ACQUIRED_AT_TOLERANCE_MS`, wrongly flagging the
+      // process's own lock as pre-existing (not self).
+      Date.now = () => realNow() + 10 * 60 * 1000;
+      const holder = probeLivePgliteHolder(dataDir);
+      expect(holder).toEqual({ pid: process.pid, serve: true, isSelf: true });
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  // #5481 review F2: on Linux, when THIS process's own /proc markers are
+  // unreadable (a hardened environment masking pid-namespace/boot-id), the
+  // doctor's own self-lock (which it wrote under the same restriction, so it
+  // stored the same unreadable evidence) must still read as self — namespace
+  // evidence can't verify anyone in that state, so pid equality alone must
+  // decide, exactly like the non-Linux fallback.
+  describe('Linux namespace-evidence edge cases (#5481 review F2)', () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+
+    function withLinuxPlatform<T>(fn: () => T): T {
+      Object.defineProperty(process, 'platform', { ...platformDescriptor, value: 'linux' });
+      try {
+        return fn();
+      } finally {
+        Object.defineProperty(process, 'platform', platformDescriptor);
+      }
+    }
+
+    // #5481 review F5: reverted the earlier both-unavailable-is-self fallback.
+    // Namespace evidence unreadable on BOTH sides (a restricted /proc that
+    // masks pid_ns/boot_id for a lock this process holds) cannot distinguish
+    // a genuine self-lock from a foreign lock under the SAME restriction, so
+    // it fails CLOSED (still warns) rather than risk a silent misclassification
+    // — matching pglite-lock.ts's own acquisition-time comparability guard,
+    // which likewise requires non-null matching before treating evidence as
+    // usable. This narrows self-detection to environments where namespace
+    // evidence is actually readable; a restricted-/proc doctor process will
+    // still see the original #5481 false positive about its own lock.
+    test('our own namespace markers unreadable + matching (null) stored markers → fails closed, still warns', () => {
+      withLinuxPlatform(() => {
+        const dataDir = join(home, 'brain.pglite');
+        mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+        writeFileSync(
+          join(dataDir, '.gbrain-lock', 'lock'),
+          JSON.stringify({ pid: process.pid, subcommand: 'embed', pid_ns: null, boot_id: null }),
+          'utf8',
+        );
+        const holder = probeLivePgliteHolder(dataDir, { readPidNs: () => null, readBootId: () => null });
+        expect(holder).toEqual({ pid: process.pid, serve: false, isSelf: false });
+      });
+    });
+
+    test('our own namespace markers ARE readable + stored markers foreign → still warns (no silent regression)', () => {
+      withLinuxPlatform(() => {
+        const dataDir = join(home, 'brain.pglite');
+        mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+        writeFileSync(
+          join(dataDir, '.gbrain-lock', 'lock'),
+          JSON.stringify({
+            pid: process.pid,
+            subcommand: 'embed',
+            pid_ns: 'pid:[99999999]',
+            boot_id: '00000000-0000-0000-0000-000000000000',
+          }),
+          'utf8',
+        );
+        const holder = probeLivePgliteHolder(dataDir, {
+          readPidNs: () => 'pid:[11111111]',
+          readBootId: () => '11111111-1111-1111-1111-111111111111',
+        });
+        expect(holder).toEqual({ pid: process.pid, serve: false, isSelf: false });
+      });
+    });
+
+    // #5481 review F1 (round 3): an unreadable marker on ONE side must never
+    // hide a definite mismatch on the OTHER, readable marker.
+    test('pid_ns unreadable on our side, boot_id readable and foreign → still warns', () => {
+      withLinuxPlatform(() => {
+        const dataDir = join(home, 'brain.pglite');
+        mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+        writeFileSync(
+          join(dataDir, '.gbrain-lock', 'lock'),
+          JSON.stringify({ pid: process.pid, subcommand: 'embed', pid_ns: 'pid:[99999999]', boot_id: 'foreign-boot' }),
+          'utf8',
+        );
+        const holder = probeLivePgliteHolder(dataDir, { readPidNs: () => null, readBootId: () => 'local-boot' });
+        expect(holder).toEqual({ pid: process.pid, serve: false, isSelf: false });
+      });
+    });
+
+    test('boot_id unreadable on our side, pid_ns readable and foreign → still warns', () => {
+      withLinuxPlatform(() => {
+        const dataDir = join(home, 'brain.pglite');
+        mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+        writeFileSync(
+          join(dataDir, '.gbrain-lock', 'lock'),
+          JSON.stringify({ pid: process.pid, subcommand: 'embed', pid_ns: 'foreign-ns', boot_id: '00000000-0000-0000-0000-000000000000' }),
+          'utf8',
+        );
+        const holder = probeLivePgliteHolder(dataDir, { readPidNs: () => 'local-ns', readBootId: () => null });
+        expect(holder).toEqual({ pid: process.pid, serve: false, isSelf: false });
+      });
+    });
+
+    // #5481 review F1 (round 4): a FOREIGN lock with null/missing namespace
+    // markers (an older binary, or a foreign container's own restricted
+    // /proc) must never be trusted as self just because OUR OWN readers
+    // happen to work — a genuine self-lock written by this same live process
+    // would have stored matching non-null values whenever our readers
+    // succeed, so a stored null next to our readable value is a foreign
+    // environment, not "no evidence to compare".
+    test('lock markers null/missing but OUR readers succeed → still warns (asymmetric availability is never self)', () => {
+      withLinuxPlatform(() => {
+        const dataDir = join(home, 'brain.pglite');
+        mkdirSync(join(dataDir, '.gbrain-lock'), { recursive: true });
+        writeFileSync(
+          join(dataDir, '.gbrain-lock', 'lock'),
+          JSON.stringify({ pid: process.pid, subcommand: 'embed', pid_ns: null, boot_id: null }),
+          'utf8',
+        );
+        const holder = probeLivePgliteHolder(dataDir, {
+          readPidNs: () => 'pid:[12345678]',
+          readBootId: () => '22222222-2222-2222-2222-222222222222',
+        });
+        expect(holder).toEqual({ pid: process.pid, serve: false, isSelf: false });
+      });
+    });
   });
 });
 

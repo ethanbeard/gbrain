@@ -51,6 +51,17 @@ export function classifyStoredType(type: string, pack: TypeUsagePack): StoredTyp
 }
 
 /**
+ * Does a stored `pages.type` miss the active pack? True for an empty type
+ * (untyped) and for a type the pack neither declares nor aliases. Every
+ * pack-conformance surface (orphan review, schema_stats coverage, doctor
+ * schema_pack_consistency, `gbrain lint`) uses this one predicate so they
+ * agree with `schema lint --with-db`'s `stored_type_undeclared` rule.
+ */
+export function storedTypeMissesPack(type: string | null | undefined, pack: TypeUsagePack): boolean {
+  return !type || classifyStoredType(type, pack).kind === 'undeclared';
+}
+
+/**
  * Type strings come from user/agent frontmatter and get echoed into terminal
  * warnings — strip control/non-printable characters (ANSI-escape hygiene) and
  * cap the length so a hostile or garbled value can't mangle the terminal.

@@ -39,7 +39,8 @@ This skill guarantees:
    ```yaml
    ---
    title: {report title}
-   type: report
+   type: note            # a type the default pack declares; `report` is undeclared
+   report_type: {category name}
    category: {category name}
    date: {YYYY-MM-DD}
    time: {HH:MM PT}
@@ -133,6 +134,14 @@ Report surfaces route through this gate by harness-routing convention (a
 routing rule the resolver applies, not a mechanical guarantee): morning
 briefings (`skills/briefing/SKILL.md`), meeting digests, research reports,
 and any saved report that carries external links.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A report link fails the delivery scan (broken, dead, indirect): fix it before delivery; a missing link is a warning, not a blocker.
+- Saving the report returns `write_pending` (exit 10): the link 404s until the write commits; poll `gbrain write-request <request_id>` before sharing it.
+- A report lookup (`gbrain search`) is empty with a degraded notice: say the search was keyword-only rather than "no prior report".
 
 ## Anti-Patterns
 

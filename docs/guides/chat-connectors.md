@@ -7,7 +7,7 @@ skill already documents: fetch replaces the manual download, and everything
 downstream (redaction, slugging, part-splitting, idempotency) is the exact
 `gbrain transcripts ingest` pipeline.
 
-Providers in v1: **ChatGPT** and **Claude** (both live). Perplexity has no live
+Live providers: **ChatGPT** and **Claude**. Perplexity has no live
 connector yet (no transcript adapter) — use the conversation-archive manual
 conversion for it.
 
@@ -34,8 +34,39 @@ gbrain config set connectors.chatgpt.auto_sync true
 gbrain autopilot --install
 ```
 
+A usage error (no provider, an unknown provider, or `--source` without a
+value) exits 2 with an `invalid_params` error; under `--json` it is one
+envelope whose `fix` is the corrected command (`gbrain connectors sync --help`
+prints the usage).
+
 `gbrain connectors status` shows credential provenance/expiry and sync state
 (never the secret). `gbrain connectors logout <provider>` removes a credential.
+
+### Headless lane (an agent without a terminal)
+
+The credential is the user's own browser session, so an agent cannot sign in
+for them. When `gbrain connectors auth <provider>` runs with no credential and
+nobody at the terminal (no TTY, `CI`, an agent process, or
+`GBRAIN_NON_INTERACTIVE=1`), it does not wait for a paste:
+
+- It prints an `[AGENT]` block (`actor: user`, `next: tell_user_to_run`) with
+  the provider's cookie checklist fenced in `[SHOW USER]` and the stdin command
+  to run, saves nothing, and exits 1.
+- `--try-oauth` never starts the loopback sign-in headless; it says OAuth
+  needs a person at a browser and hands over the same cookie checklist. With a person at the
+  terminal, `--no-browser` prints the sign-in URL instead of opening a browser.
+
+What the agent does: relay the `[SHOW USER]` text verbatim and ask the user to
+copy the cookie from a browser where they are logged in (never reuse, guess or
+search for one). The user can run `pbpaste | gbrain connectors auth <provider>
+--cookie -` themselves; if they hand the value over, pass it only on stdin
+(`printf '%s' "$COOKIE" | gbrain connectors auth <provider> --cookie -`), never
+in argv. A stdin that stays open without data ends after 30 seconds ("stdin
+was open but silent"; `GBRAIN_STDIN_TIMEOUT_MS` waits longer) and saves
+nothing. If the user would rather not share a session cookie, use the export
+lane (`gbrain transcripts ingest <export-file>`). Verify with
+`gbrain connectors status --json`. The full agent script lives in
+`skills/chat-connectors/SKILL.md`.
 
 ## How it works
 
@@ -78,6 +109,28 @@ after 7 days, which would wipe the watermark on any gap longer than a week and
 trigger a full re-fetch of your entire history — the exact traffic pattern most
 likely to trip a provider's anti-abuse. The config table is durable and never
 GC'd.
+
+## Feed imported conversations to Dream
+
+Every imported session (connectors, `gbrain transcripts ingest` of a Hermes
+`state.db`, Claude or ChatGPT export) is a `type: conversation` page. Dream's
+synthesize phase reads those pages from the database, in the cycle's source
+(`gbrain dream --source <id>`), beside any `dream.synthesize.session_corpus_dir`
+files. `--date` / `--from` / `--to` filter on the page's `date` frontmatter;
+`dream.synthesize.min_chars` and `exclude_patterns` apply as for corpus files;
+a page is judged and synthesized again only after its text changes.
+
+| Setting | Effect |
+| --- | --- |
+| `session_corpus_dir` set, `conversation_pages` unset | corpus files + conversation pages |
+| `gbrain config set dream.synthesize.conversation_pages true` | conversation pages, with or without a corpus dir |
+| `gbrain config set dream.synthesize.conversation_pages false` | corpus files only |
+
+With neither a corpus dir nor `conversation_pages` set, synthesis is not
+configured; when the source holds conversation pages the phase warns
+`conversation_pages_not_consumed` and names the opt-in command (synthesis makes
+paid model calls, so it never starts on its own). Setting the key to `false`
+silences the warning.
 
 ## Automation lanes
 
@@ -137,12 +190,15 @@ the export-file lane (`conversation-archive`) — it always works.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `forbidden` | Cloudflare/bot challenge on server-side fetch | Use the official export + `gbrain transcripts ingest` |
-| `auth_required` | cookie expired/invalid | Re-copy a fresh Cookie header, `gbrain connectors auth` |
-| `partial` | some fetches failed | Watermark not advanced; just re-run |
-| receipt shows drift | provider API shape changed | Affected threads skipped (not lost); export lane still works |
+<a id="chat-connectors-troubleshooting"></a>
+
+| Symptom | Cause | Fix | Who acts | Consent | Verify |
+|---|---|---|---|---|---|
+| `forbidden` | Cloudflare/bot challenge on server-side fetch | Use the official export + `gbrain transcripts ingest` | user (downloads the export); agent ingests it | none | `gbrain connectors status --json` |
+| `auth_required` | cookie expired/invalid | Re-copy a fresh Cookie header, `gbrain connectors auth` | user (copies a fresh Cookie header) | `credentials` | `gbrain connectors status --json` |
+| `connectors auth` exits 1 with an `[AGENT]` cookie checklist | no credential and nobody at the terminal ([headless lane](#headless-lane-an-agent-without-a-terminal)) | Relay the `[SHOW USER]` checklist; the user pipes the cookie into `gbrain connectors auth <provider> --cookie -` | user (copies the cookie) | `credentials` | `gbrain connectors status --json` |
+| `partial` | some fetches failed | Watermark not advanced; just re-run | agent | `egress` (fetches from the provider again) | `gbrain connectors status --json` |
+| receipt shows drift | provider API shape changed | Affected threads skipped (not lost); export lane still works | agent (reports it) | none | `gbrain connectors status --json` |
 
 ## v2 roadmap
 

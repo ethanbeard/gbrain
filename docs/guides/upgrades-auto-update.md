@@ -34,7 +34,7 @@ construction. The behavior is governed by one file-plane config key,
 | Mode | Behavior | Who it's for |
 |------|----------|--------------|
 | `notify` (default) | Emit the marker + a 4-option prompt; never apply without confirmation. | Interactive installs / anyone with a human in the loop. |
-| `auto` (opt-in) | Apply silently, but ONLY during quiet hours, ONLY when the brain is idle, doctor-gated, and never re-trying a known-bad version. | Headless / always-on installs (autopilot daemon, the `gbrain serve` host). |
+| `auto` (opt-in) | Apply silently, but ONLY during quiet hours, ONLY when the brain is idle, doctor-gated, never re-trying a known-bad version, and never installing a release the host's Bun cannot start ([Bun floor](#bun-floor)). | Headless / always-on installs (autopilot daemon, the `gbrain serve` host). |
 | `off` | Never check. | Air-gapped / pinned installs. |
 
 Enable hands-off upgrades on an always-on install with one line:
@@ -56,6 +56,81 @@ The quiet-hours *pattern* itself — gating any notification or background
 action on the user's local sleep window — is owned by
 [quiet-hours.md](quiet-hours.md); this doc only covers the self-upgrade
 hook into it.
+
+### Bun floor
+
+**Say to your agent:** *"gbrain says the upgrade needs a newer Bun. Upgrade Bun
+and finish the gbrain upgrade."* The agent runs `bun upgrade`, then
+`gbrain upgrade`, then `gbrain doctor` to confirm `self_upgrade_health` is ok.
+
+A source (bun-link) or package install runs the new release on the host's
+Bun, and a release refuses to start on a Bun below its `engines.bun` floor.
+So before swapping, `gbrain upgrade`, `gbrain self-upgrade` and the autopilot
+channel read the target's floor and compare it with the lower of the `bun` on
+PATH and the Bun the running process uses:
+
+- **bun-link clone:** `git fetch`, then `package.json` at the fetched upstream
+  commit; the swap fast-forwards to exactly that commit
+  (`git merge --ff-only <sha>`), so a floor raised upstream after the check is
+  not installed unchecked.
+- **global package (`bun`) and ClawHub:** `package.json` at the ref the
+  install's `github:` spec names (the default branch when unpinned) on
+  raw.githubusercontent.com.
+- **compiled binary:** exempt; it carries its own Bun.
+
+When the floor is above the host's Bun, a manual upgrade refuses and changes
+nothing (exit 78):
+
+```
+gbrain <target> requires Bun >=<floor>; bun on PATH (<path>) is <found>. Fix: bun upgrade, then gbrain upgrade. Docs: docs/guides/upgrades-auto-update.md#bun-floor
+```
+
+Run `bun upgrade`, then `gbrain upgrade` again. When the floor cannot be read
+(offline, no upstream branch, or a floor not of the form `>=X.Y.Z`), the
+refusal names the read that failed; after checking the target yourself,
+`gbrain upgrade --no-bun-floor-check` (or `gbrain self-upgrade
+--no-bun-floor-check`) upgrades without the check. The override is for manual
+upgrades only; autopilot never passes it.
+
+The autopilot channel holds instead of refusing: the tick records an
+`unsupported_runtime` audit row, `gbrain doctor` reports
+`Auto-upgrade to <target> held: …` under `self_upgrade_health` with the same
+fix line, and the target is not marked known-bad, so the first quiet-hours
+tick after `bun upgrade` applies it (an unreadable floor is retried on the
+next tick). A swap that `gbrain upgrade` itself refuses for the floor (for
+example, upstream raised it after the channel's check) is a hold too.
+
+After the swap, `gbrain upgrade` runs `gbrain --help` (a command that passes
+the startup Bun check, unlike `--version`). If the new release does not
+start, the upgrade exits non-zero and prints recovery: `bun upgrade`, then
+`gbrain post-upgrade`; or return to the previous release with
+`git -C <clone> checkout <previous sha> && bun install` (bun-link) or
+`bun remove -g gbrain && bun add -g github:garrytan/gbrain#v<previous>` (package; an in-place tag swap fails or silently corrupts the global lock on current Bun, #5034). Nothing is
+rolled back automatically, and the autopilot channel records that version as
+failed.
+
+Recovery when autopilot is holding an upgrade:
+
+```bash
+gbrain doctor                 # self_upgrade_health: Auto-upgrade to <target> held: ...
+bun upgrade                   # raise the host's Bun to the floor or above
+gbrain upgrade                # apply now instead of waiting for quiet hours
+gbrain doctor                 # self_upgrade_health ok
+```
+
+Restart `gbrain serve` and autopilot afterwards if a service manager does not
+restart them for you, so they run on the new Bun. Hosts still running a
+release from before this check do not run it, so a Bun floor raise reaches
+them only after they have upgraded past this release.
+
+`gbrain config set self_upgrade.<key>` writes `~/.gbrain/config.json` (the
+file plane every self-upgrade reader uses) and refuses a value the readers
+would ignore: an unknown key or mode, a quiet-hours window with an hour
+outside 0-23, equal bounds, or an unknown timezone. Versions are stored in the
+four-segment form (`0.57.1` becomes `0.57.1.0`). The keys are machine-local,
+so they work on a thin client too. Older versions wrote these keys to the
+database, where nothing reads them; the next `config set` or `config unset` of
+the key removes that row.
 
 ## Implementation
 

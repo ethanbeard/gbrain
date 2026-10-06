@@ -28,6 +28,7 @@ shopt -u nullglob
 
 if [ "${#PIN_DOCS[@]}" -eq 0 ]; then
   echo "check-pin-doc-privacy: SKIP (no docs/mcp/*-CLI-PIN.md yet)"
+  echo "GBRAIN_CHECK_SKIPPED: no docs/mcp/*-CLI-PIN.md"
   exit 0
 fi
 

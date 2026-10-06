@@ -14,6 +14,7 @@ import { type MetadataBoostGateDecision, decideMetadataBoosts, lexicalArmsVoted 
 import { type PostFusionOpts, RRF_K, cosineReScore, resolveWalkDedupCap, rrfFusionWeighted, runPostFusionStages, stampContentFlags, stampUnverifiedExtractions, textVectorArmNonEmpty } from '../hybrid.ts';
 import { type RelationalEvidenceSlotDecision, ensureRelationalEvidenceSlot } from '../relational-recall.ts';
 import { type RelationalRerankPinDecision, pinRelationalRows } from '../relational-rerank-pin.ts';
+import { applyFeedbackStage } from '../feedback-boost.ts';
 import { type RerankFailedReason, type RerankPassThroughReason, type RerankSkipReason, applyReranker } from '../rerank.ts';
 import type { RerankMeta } from '../../ai/gateway.ts';
 import { applyEvidenceGate, recordRerankReceipts, startRerankShadow } from '../decide-stage.ts';
@@ -23,7 +24,7 @@ import { applyAliasHop } from '../alias-hop.ts';
 import { effectiveRrfK } from '../intent-weights.ts';
 import { enforceTokenBudget } from '../token-budget.ts';
 import { expandAnchors, hydrateChunks } from '../two-pass.ts';
-import { parseRelationalQuery } from '../relational-intent.ts';
+import { isRelationalQuery } from '../relational-plan.ts';
 import { pushDegraded, stampBudgetStage } from './degraded.ts';
 import { requiresSafeChunks } from '../safe-chunks.ts';
 import { stampEvidence } from '../evidence.ts';
@@ -119,7 +120,7 @@ export async function fuseArms(
     titleFusionList,
     relationalList,
     includeRelational: effectiveModality !== 'image',
-    relationalQuery: parseRelationalQuery(query) !== null,
+    relationalQuery: isRelationalQuery(query, resolvedMode.relational_planner),
     onKeywordArmConfidence: (d) => { keywordArmConfidence = d; },
     ks: { vectorK, textRrfK, imageRrfK, keywordK, baseRrfK },
     knobs: {
@@ -128,11 +129,20 @@ export async function fuseArms(
     },
   });
 
+  // explain_target: per-arm presence (keyword before and after relaxed-row demotion).
+  const trace = opts?.explainTarget;
+  if (trace) {
+    trace.observe('arm:keyword_raw', keywordResults);
+    trace.observe('arm:title_raw', titleResults);
+    for (const entry of allLists) trace.observe(`arm:${entry.arm ?? 'list'}`, entry.list);
+  }
+
   // issue #160: stamp unverified auto-extracted stubs across ALL candidate
   // arms BEFORE fusion so the compiled-truth authority boost skips them.
   await stampUnverifiedExtractions(engine, allLists.flatMap((l) => l.list), opts);
 
-  let fused = rrfFusionWeighted(allLists, ctBoost);
+  const attribute = opts?.explain === true || trace !== undefined;
+  let fused = rrfFusionWeighted(allLists, ctBoost, attribute);
 
   // Cosine re-scoring before dedup so semantically better chunks survive.
   // v0.36 (D9): hydrate from the active embedding column so rescore happens
@@ -144,6 +154,7 @@ export async function fuseArms(
     fused = await cosineReScore(
       engine, fused, queryEmbedding, unifiedDone ? 'embedding_multimodal' : resolvedCol.name,
       imageQueryEmbedding && !unifiedDone ? { queryEmbedding: imageQueryEmbedding, column: 'embedding_image' } : undefined,
+      attribute,
     );
   }
 
@@ -170,6 +181,7 @@ export async function fuseArms(
     await applyIdentityBoosts(req, fused);
     fused.sort((a, b) => b.score - a.score);
   }
+  trace?.observe('fused', fused);
   return { fused, relaxedDropped, keywordArmConfidence, metadataBoostGate };
 }
 
@@ -239,7 +251,7 @@ export async function rerankAndPin(
   relationalList: SearchResult[],
   effectiveModality: ModalityMode,
 ) {
-  const { query, opts, resolvedMode, degraded } = req;
+  const { engine, query, opts, resolvedMode, degraded } = req;
   // v0.35.0.0+: cross-encoder reranker. Slots between dedup and slice so the
   // reranker sees the full candidate pool (its own topNIn caps how many
   // get sent upstream). Fail-open: any error returns deduped unchanged.
@@ -288,6 +300,7 @@ export async function rerankAndPin(
     : deduped;
   if (s1 && rerankerOpts.enabled) recordRerankReceipts(req.decide, query, reranked.slice(0, rerankerOpts.topNIn).filter((r) => s1Failure !== undefined || r.rerank_score !== undefined), s1Meta, s1Failure);
   if (s1Shadow) await s1Shadow(reranked);
+  const ordered = await applyFeedbackStage(engine, reranked, { reranked: reranked !== deduped });
 
   // Ranker wave (R1 receipt) — relational-arm rows bypass reranker DEMOTION:
   // re-pinned above the reranked text rows in fused order, bounded by
@@ -297,8 +310,8 @@ export async function rerankAndPin(
   // not fused there). Contract + tie policy: relational-rerank-pin.ts.
   let relationalRerankPin: RelationalRerankPinDecision | undefined;
   const rerankPinned = reranked !== deduped && effectiveModality !== 'image'
-    ? pinRelationalRows(reranked, relationalList, { max: resolvedMode.relational_rerank_pin, fusedOrder: deduped, onPin: (d) => { relationalRerankPin = d; } })
-    : reranked;
+    ? pinRelationalRows(ordered, relationalList, { max: resolvedMode.relational_rerank_pin, fusedOrder: deduped, onPin: (d) => { relationalRerankPin = d; } })
+    : ordered;
   return { rerankPinned, relationalRerankPin };
 }
 
@@ -417,7 +430,7 @@ export async function sizeReturnPool(
   if (relationalList.length > 0 && effectiveModality !== 'image') {
     const r = ensureRelationalEvidenceSlot(returnPool, relationalList, limit, offset, {
       cosineFloor: resolvedMode.evidence_cosine_floor,
-    });
+    }, resolvedMode.relational_chain_slots);
     returnPool = r.pool;
     relationalSlotDecision = r.decision;
   }
@@ -440,11 +453,13 @@ export async function finalizeHybridResults(
 ): Promise<SearchResult[]> {
   const { engine, opts, resolvedMode, resolvedCol, limit, offset, suggestions, detailResolved, degraded } = req;
   const sliced = returnPool.slice(offset, offset + limit);
+  opts?.explainTarget?.observe('limit_slice', sliced);
   // v0.32.3 search-lite: budget enforcement at the main return path.
   // hybridSearchCached used to be the only place this fired; now bare
   // hybridSearch enforces it too so eval-replay + eval-longmemeval see
   // the same budget behavior as the production query op.
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
+  opts?.explainTarget?.observe('token_budget', budgeted);
   await stampContentFlags(engine, budgeted, opts);
   req.lastResultsCount = budgeted.length;
   req.lastRank1Score = budgeted[0] ? (budgeted[0].base_score ?? budgeted[0].score) : undefined;

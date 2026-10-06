@@ -20,6 +20,7 @@ import { runExtract } from '../src/commands/extract.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-lifecycle-'));
 const engines: BrainEngine[] = [];
@@ -89,6 +90,24 @@ test('two files mapping to one slug skip the loser instead of blocking the whole
     expect(['synced', 'up_to_date']).toContain(full.status);
     expect(full.slugCollisions).toEqual([{ slug: 'notes/foo-bar', kept: 'notes/foo-bar.md', skipped: ['notes/Foo Bar.md'] }]);
     expect(await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND state<>'committed'", [f.id])).toEqual([]);
+  }
+}), 180_000);
+
+test('removing the skipped slug twin keeps the page its kept file backs (#5565)', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, {
+      'notes/Foo Bar.md': note('Foo Bar spaced', 'Apples and orchards.'),
+      'notes/foo-bar.md': note('foo-bar dashed', 'Oranges and groves.'),
+    });
+    expect(await performManagedSync(engine, { sourceId: f.id, noPull: true })).toMatchObject({ status: 'first_sync', added: 1 });
+    const kept = await engine.readPageSnapshot('notes/foo-bar', { sourceId: f.id });
+    expect(kept?.page.source_path).toBe('notes/foo-bar.md');
+    rmSync(join(f.root, 'notes/Foo Bar.md'));
+    const head = commit(f.root, 'remove the skipped twin');
+    expect(await performManagedSync(engine, { sourceId: f.id, noPull: true })).toMatchObject({ status: 'synced', deleted: 0, toCommit: head });
+    expect(await engine.readPageSnapshot('notes/foo-bar', { sourceId: f.id })).toEqual(kept);
+    expect(readFileSync(join(f.root, 'notes/foo-bar.md'), 'utf8')).toContain('Oranges');
+    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(head);
   }
 }), 180_000);
 
@@ -270,7 +289,7 @@ test('a managed brain prunes timeline rows an earlier page version left behind, 
     expect(await summaries()).toEqual(['Joined Acme Example']);
     // A row left over from before timeline reconciliation: an earlier version produced it, the current text does not.
     await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.addTimelineEntry('people/bea-example',
-      { ...left, detail: '' }, { sourceId: f.id })));
+      { ...left, detail: '' }, { sourceId: f.id }), TEST_WRITE_ATTRIBUTION));
     expect(await summaries()).toEqual(['Joined Acme Example', 'Left Acme Example']);
     expect((await timelineHistoryCheck(engine, f.id)).details).toMatchObject({ materializable_rows: 0 });
     const printed: string[] = [];

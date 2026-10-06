@@ -36,3 +36,28 @@ export function resolveEmbedConcurrency(
   }
   return clamped;
 }
+
+/**
+ * Worker count for an embed-stale drain called without one (#5902): the
+ * embed-backfill job unpaced, and the remediation embed step. Each worker
+ * holds a connection across its read and upsert, and a worker job shares the
+ * engine's pool with the read-lane health probe, so the default leaves half
+ * of the engine's real pool (`getPoolDiagnostics().poolMax`, a worker's
+ * instance pool included) free: `min(20, max(1, floor(poolMax / 2)))`, or 20
+ * without a pool (PGLite). An explicit GBRAIN_EMBED_CONCURRENCY keeps the
+ * full-pool clamp and its warning; lowering the default stays silent.
+ */
+export function resolveStaleEmbedConcurrency(
+  engine: { kind: string; getPoolDiagnostics?: () => { poolMax: number | null } | null },
+  env: Record<string, string | undefined> = process.env,
+): number {
+  let poolMax: number | null | undefined;
+  try {
+    poolMax = engine.getPoolDiagnostics?.()?.poolMax;
+  } catch {
+    poolMax = null;
+  }
+  const pool = typeof poolMax === 'number' && poolMax > 0 ? poolMax : null;
+  if (env.GBRAIN_EMBED_CONCURRENCY) return resolveEmbedConcurrency(engine.kind, undefined, env, pool ?? resolvePoolSize());
+  return pool === null ? 20 : Math.min(20, Math.max(1, Math.floor(pool / 2)));
+}

@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 import { bootstrapDoctorChecks, type Check } from '../src/commands/doctor.ts';
+import { readBootId, readPidNs } from '../src/core/pglite-lock.ts';
 import { writeHarnessReceipt } from '../src/core/bootstrap/format.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
 import { VERSION } from '../src/version.ts';
@@ -353,6 +354,17 @@ describe('bootstrap_push_health', () => {
     expect(c?.message).toContain('last push ok');
   }, T);
 
+  test('fresh successful push but the workspace is AHEAD of origin → warn, never ok (#5063)', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ ahead: true });
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: new Date().toISOString(), ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('1 commit(s) not on origin');
+    expect(c?.message).toContain(ws);
+  }, T);
+
   test('last push FAILED → warn naming the reason (regardless of age)', async () => {
     const { parent, home } = makeHome();
     writePushStatus(home, JSON.stringify({ ts: new Date().toISOString(), ok: false, reason: 'push_failed' }));
@@ -496,23 +508,73 @@ describe('bootstrap_serve_lock', () => {
     writeFileSync(join(lockDir, 'lock'), JSON.stringify(lock));
   }
 
-  test('live serve holder → ok (hook IPC available), names the pid', async () => {
-    const { parent, home } = makeHome();
-    writeHeartbeat(home, [{ outcome: 'ok' }]); // open the gate
-    writeLock(home, { pid: process.pid, subcommand: 'serve' });
-    const c = byName(await run(parent), 'bootstrap_serve_lock');
-    expect(c?.status).toBe('ok');
-    expect(c?.message).toContain(String(process.pid));
-    expect(c?.message).toContain('live serve');
+  // #5481: a lock holder must be a GENUINELY FOREIGN live process to exercise
+  // the ok/warn paths meaningfully — `probeLivePgliteHolder` only requires
+  // liveness, and the fix under test distinguishes "this process's own pid"
+  // from every other case, so a foreign/self test pair needs two distinct
+  // real pids. Cross-platform: a JS timer via a spawned bun/node process,
+  // not a shelled-out POSIX command.
+  async function withLiveForeignProcess<T>(fn: (pid: number) => Promise<T>): Promise<T> {
+    const proc = Bun.spawn([process.execPath, '-e', 'setInterval(() => {}, 1000)'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    try {
+      return await fn(proc.pid);
+    } finally {
+      proc.kill();
+    }
+  }
+
+  test('live serve holder (foreign pid) → ok, names the pid', async () => {
+    await withLiveForeignProcess(async (foreignPid) => {
+      const { parent, home } = makeHome();
+      writeHeartbeat(home, [{ outcome: 'ok' }]); // open the gate
+      writeLock(home, { pid: foreignPid, subcommand: 'serve' });
+      const c = byName(await run(parent), 'bootstrap_serve_lock');
+      expect(c?.status).toBe('ok');
+      expect(c?.message).toContain(String(foreignPid));
+      expect(c?.message).toContain('live serve');
+    });
   }, T);
 
-  test('live NON-serve holder → warn (hook IPC blocked)', async () => {
+  test('live NON-serve holder (foreign pid) → warn (hook IPC blocked)', async () => {
+    await withLiveForeignProcess(async (foreignPid) => {
+      const { parent, home } = makeHome();
+      writeHeartbeat(home, [{ outcome: 'ok' }]);
+      writeLock(home, { pid: foreignPid, subcommand: 'sync' });
+      const c = byName(await run(parent), 'bootstrap_serve_lock');
+      expect(c?.status).toBe('warn');
+      expect(c?.message).toContain('non-serve');
+      expect(c?.message).toContain(String(foreignPid));
+    });
+  }, T);
+
+  test('#5481: live NON-serve holder whose pid IS this doctor process, matching namespace evidence → no check (self lock is not a foreign collision)', async () => {
     const { parent, home } = makeHome();
     writeHeartbeat(home, [{ outcome: 'ok' }]);
-    writeLock(home, { pid: process.pid, subcommand: 'sync' });
+    writeLock(home, { pid: process.pid, subcommand: 'sync', pid_ns: readPidNs(), boot_id: readBootId() });
+    expect(byName(await run(parent), 'bootstrap_serve_lock')).toBeUndefined();
+  }, T);
+
+  test('#5481: pid matches but namespace evidence is foreign → still warns (a shared-mount container cannot masquerade as self via pid reuse)', async () => {
+    const { parent, home } = makeHome();
+    writeHeartbeat(home, [{ outcome: 'ok' }]);
+    writeLock(home, {
+      pid: process.pid,
+      subcommand: 'sync',
+      pid_ns: 'pid:[99999999]',
+      boot_id: '00000000-0000-0000-0000-000000000000',
+    });
     const c = byName(await run(parent), 'bootstrap_serve_lock');
-    expect(c?.status).toBe('warn');
-    expect(c?.message).toContain('non-serve');
+    if (process.platform === 'linux') {
+      expect(c?.status).toBe('warn');
+      expect(c?.message).toContain('non-serve');
+    } else {
+      // Non-Linux platforms have no PID namespaces; a pid match alone is
+      // trusted there, matching pglite-lock.ts's own acquisition-time
+      // platform short-circuit.
+      expect(c).toBeUndefined();
+    }
   }, T);
 
   test('dead holder / no lock → no check (stale lock dir is inert)', async () => {

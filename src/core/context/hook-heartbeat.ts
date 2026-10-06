@@ -18,6 +18,7 @@ import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import type { ToolCallRecord } from '../transcripts/claude-code-jsonl.ts';
 import { ensureGbrainHome, resolveGbrainHome } from '../gbrain-home.ts';
+import { seatReasonHint } from './seat.ts';
 
 /** Heartbeat file line cap [S3#7]. */
 export const HEARTBEAT_MAX_LINES = 5000;
@@ -39,6 +40,11 @@ export interface HookHeartbeatEntry {
    * slugs/fact text [S3#7].
    */
   segment?: string;
+  /** Always-loaded core: chars and revision delivered by session-start (counts/digests only). */
+  core_chars?: number;
+  core_revision?: string;
+  /** Context-pressure notice: the fill percent when the notice fired (number only). */
+  pressure_pct?: number;
   /** Cathedral 5 — checkpoint-harvest fact counters (counts only) [S3#7].
    * The ambient-writeback lane (`event: 'writeback'`) reports the same
    * counters plus `superseded` — these are PERSISTED results from the
@@ -46,6 +52,8 @@ export interface HookHeartbeatEntry {
   inserted?: number;
   duplicate?: number;
   superseded?: number;
+  /** #5888 — `writeback_dedup` shadow count: near duplicates kept, never dropped (counts only). */
+  near_duplicate?: number;
   /**
    * Cathedral 5 — the compact hook's harvest-schedule ACK code
    * (`scheduled` / `skip_queue_full` / `skip_not_found` / `skip_bad_basename`
@@ -67,8 +75,8 @@ export interface HookHeartbeatEntry {
 /** The FULL key allowlist — CI greps the fixture against this [S3#7]. */
 export const HEARTBEAT_ALLOWED_KEYS = [
   'ts', 'event', 'outcome', 'reason', 'duration_ms', 'turns', 'bytes', 'redactions',
-  'segment', 'inserted', 'duplicate', 'superseded', 'links', 'flush',
-  'pattern', 'fingerprint', 'hint',
+  'segment', 'inserted', 'duplicate', 'superseded', 'near_duplicate', 'links', 'flush',
+  'pattern', 'fingerprint', 'hint', 'core_chars', 'core_revision', 'pressure_pct',
 ] as const;
 
 /**
@@ -158,11 +166,13 @@ export async function writeHeartbeat(
       ...(entry.segment !== undefined ? { segment: entry.segment } : {}),
       ...(entry.inserted !== undefined ? { inserted: entry.inserted } : {}),
       ...(entry.duplicate !== undefined ? { duplicate: entry.duplicate } : {}),
+      ...(entry.near_duplicate !== undefined ? { near_duplicate: entry.near_duplicate } : {}),
       ...(entry.links !== undefined ? { links: entry.links } : {}),
       ...(entry.flush !== undefined ? { flush: entry.flush } : {}),
       ...(entry.pattern !== undefined ? { pattern: entry.pattern } : {}),
       ...(entry.fingerprint !== undefined ? { fingerprint: entry.fingerprint } : {}),
-      ...(entry.hint !== undefined ? { hint: entry.hint } : {}),
+      // A seat reason carries its fixed recovery hint even when the writer did not attach one.
+      ...((entry.hint ?? seatReasonHint(entry.reason)) !== undefined ? { hint: entry.hint ?? seatReasonHint(entry.reason) } : {}),
     });
     appendFileSync(p, line + '\n', { mode: 0o600 });
     if (opts?.trim === false) return;

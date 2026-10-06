@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
+import type { Action } from '../agent-output.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import { cliOptsToProgressOptions, getCliOptions } from '../cli-options.ts';
 import { createProgress, type ProgressOptions } from '../progress.ts';
@@ -10,6 +12,7 @@ import { digest, sha256 } from './digest.ts';
 import { localHostId, persistenceHome } from './identity.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
+import { acquireShared, yieldLease } from './worktree-lease.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { assertPhysicalRoot, claimPhysicalRoot, isPhysicalRootMetadata, preparePhysicalRootTransfer, readPhysicalRootReservation, restampPhysicalRoot } from './physical-root.ts';
 import { readPhysicalRootStamp } from './physical-root-record.ts';
@@ -17,6 +20,10 @@ import { canonicalFilesystemPath, nativeFilesystemPath } from './root-registry.t
 import { assertWriterAdminState } from './admin-intent.ts';
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
 import { inspectPhysicalRootRecovery, repairPhysicalRoot, type PhysicalRootRecovery } from './physical-root-recovery.ts';
+
+const writerStatusFix = (sourceId: string): Action => readFix(
+  `Shows source ${sourceId}'s owner host, epoch, worktree state, admin_state and any publication still recovering, read-only.`,
+  { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] });
 
 export interface WorktreeBinding {
   worktree_id: string;
@@ -51,7 +58,9 @@ export async function getWorktreeBinding(engine: SqlEngine, sourceId: string, ho
 export async function claimWorktree(engine: BrainEngine, sourceId: string, path: string, hostId = localHostId(), expectedAdminState?: string,
   options: { automatic?: boolean } = {}): Promise<WorktreeBinding> {
   if(await managedPersistenceEnabled(engine)) {
-    if(hostId!==localHostId()) throw new OperationError('permission_denied','A source can be claimed only by the local registered host.');
+    if(hostId!==localHostId()) throw opError('permission_denied','A source can be claimed only by the local registered host.',
+      `Source ${sourceId} can only be claimed from the host that will own its checkout; nothing was claimed. Run the claim in a terminal on that host after reviewing writer status there.`,
+      { fix: writerStatusFix(sourceId) });
     const { runManagedSourceLifecycle }=await import('./source-lifecycle.ts');
     await runManagedSourceLifecycle(engine,{operation:'claim',sourceId,path,expectedAdminState,automaticClaim:options.automatic});
     return (await getWorktreeBinding(engine,sourceId,hostId))!;
@@ -72,7 +81,9 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
   const candidateId = existingPhysical?.worktreeId ?? randomUUID();
   const lockPath = existingPhysical?.coordinationPath ?? canonicalFilesystemPath(join(persistenceHome(), 'locks', `${candidateId}.lock`));
   const probe = await tryAcquireNativeLock(lockPath);
-  if (!probe) throw new OperationError('writer_lock_unavailable', 'Cannot acquire the new worktree coordination lock.');
+  if (!probe) throw opError('writer_lock_unavailable', 'Cannot acquire the new worktree coordination lock.',
+    `Another gbrain process holds the coordination lock for this checkout, so source ${sourceId} was not claimed. Check writer status and run the claim again once that process has finished.`,
+    { fix: writerStatusFix(sourceId) });
   await probe.release();
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
@@ -80,7 +91,9 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
     await assertWriterAdminState(tx, expectedAdminState);
     if (!options.automatic) await assertWriterAdminUnlocked(tx);
     const [source] = await tx.executeRaw<{ incarnation: string; archived: boolean }>('SELECT incarnation,archived FROM sources WHERE id=$1 FOR UPDATE', [sourceId]);
-    if (!source || source.archived) throw new OperationError('source_changed', 'Only an active registered source can claim a worktree.');
+    if (!source || source.archived) throw opError('source_changed', 'Only an active registered source can claim a worktree.',
+      `Source ${sourceId} is missing or archived, so it cannot own a checkout; nothing was claimed. Check the registered sources; restoring an archived source is the user's decision.`,
+      { fix: readFix('Lists the registered sources with their archived state, read-only.', { argv: ['gbrain', 'sources', 'list', '--json'] }) });
     const current = await getWorktreeBinding(tx, sourceId, hostId);
     if (current) {
       if (current.source_incarnation !== source.incarnation || current.owner_host_id !== hostId || current.local_path !== root) {
@@ -119,6 +132,17 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
  */
 export async function acquireWorktree(binding: WorktreeBinding, waitMs = 0, signal?: AbortSignal, engine?: BrainEngine): Promise<NativeLockHandle | null> {
   if (!binding.local_path || !binding.coordination_path) return null;
+  // #5984 lanes: an exclusive writer drains this process's lane lease first; while lanes still hold it the worktree is busy.
+  if (!await yieldLease(binding.coordination_path, waitMs, signal)) return null;
+  return lockWorktree(binding, waitMs, signal, engine);
+}
+/** #5984 lanes: database-only lane publications share one native lock in this process (worktree-lease.ts). */
+export async function acquireWorktreeShared(binding: WorktreeBinding, engine: BrainEngine): Promise<NativeLockHandle | null> {
+  if (!binding.local_path || !binding.coordination_path) return null;
+  return acquireShared(binding.coordination_path, () => lockWorktree(binding, 0, undefined, engine));
+}
+async function lockWorktree(binding: WorktreeBinding, waitMs: number, signal: AbortSignal | undefined, engine: BrainEngine | undefined): Promise<NativeLockHandle | null> {
+  if (!binding.coordination_path || !binding.local_path) return null;
   const lock = await (waitMs > 0 ? acquireNativeLock(binding.coordination_path, { timeoutMs: waitMs, signal })
     : tryAcquireNativeLock(binding.coordination_path));
   if (!lock) return null;
@@ -139,6 +163,22 @@ export async function acquireWorktree(binding: WorktreeBinding, waitMs = 0, sign
     } catch (failure) { await lock.release(); throw failure; }
   }
 }
+/**
+ * How long a managed writer's preflight probe waits for the worktree lock.
+ * This process's own persistence consumer holds it while it finishes
+ * publishing the previous write, after that write's receipt already reads
+ * committed, so a zero-wait probe refused on our own writer. A holder still
+ * busy after the wait is a real conflict.
+ */
+export const MANAGED_WRITER_PROBE_WAIT_MS = 1000;
+
+/** Acquire-and-release probe of the worktree lock within MANAGED_WRITER_PROBE_WAIT_MS; false when it stayed busy. */
+export async function probeWorktreeWriter(binding: WorktreeBinding, engine?: BrainEngine): Promise<boolean> {
+  const lock = await acquireWorktree(binding, MANAGED_WRITER_PROBE_WAIT_MS, undefined, engine);
+  if (!lock) return false;
+  await lock.release();
+  return true;
+}
 export async function guardOwnership(tx: SqlEngine, row: WriteRequest, hostId: string): Promise<WorktreeBinding | null> {
   if (!row.worktree_id) return null;
   const [owner] = await tx.executeRaw<{ owner_host_id: string; owner_epoch: string | number; state: string }>(
@@ -146,7 +186,9 @@ export async function guardOwnership(tx: SqlEngine, row: WriteRequest, hostId: s
   const binding = await getWorktreeBinding(tx, row.source_id, hostId);
   if (!owner || !binding || binding.worktree_id !== row.worktree_id || binding.source_incarnation !== row.source_incarnation ||
     owner.owner_host_id !== hostId || owner.state !== 'active' || String(binding.topology_generation) !== String(row.topology_generation)) {
-    throw new OperationError('owner_unavailable', 'The accepted worktree ownership or source topology changed.');
+    throw opError('owner_unavailable', 'The accepted worktree ownership or source topology changed.',
+      `Source ${row.source_id}'s owner, epoch or topology changed after request ${row.request_id} was accepted, so this host did not publish it. Inspect the owner and the request's receipt (on the channel that submitted it) before resubmitting anything.`,
+      { fix: writerStatusFix(row.source_id) });
   }
   return binding;
 }
@@ -171,7 +213,8 @@ export function worktreeManifest(root: string, opts: { progress?: ProgressOption
     for (const name of readdirSync(dir).sort()) {
       if (name === '.git' || name === '.gbrain-managed' || isPhysicalRootMetadata(name)) continue;
       const path = join(dir, name), info = lstatSync(path);
-      if (info.isSymbolicLink()) throw new OperationError('writer_manifest_unsafe', 'Canonical worktree transfer requires a symlink-free manifest.');
+      if (info.isSymbolicLink()) throw opError('writer_manifest_unsafe', 'Canonical worktree transfer requires a symlink-free manifest.',
+        `${relative(canonical, path).split(sep).join('/')} in the checkout is a symlink, so no manifest was recorded. Ask the user to replace it with a real file or directory (or remove it), then run the transfer step again.`);
       if (info.isDirectory()) visit(path);
       else if (info.isFile()) paths.push(path);
     }
@@ -202,10 +245,16 @@ export function compactStoredManifest<T extends { digest: string; files?: Record
 export async function prepareWriterTransfer(engine: BrainEngine, sourceId: string, hostId = localHostId(), expectedAdminState?: string,
   opts: { selfTransfer?: boolean; dryRun?: boolean } = {}): Promise<{ worktree_id: string; owner_epoch: string; manifest: StoredWorktreeManifest }> {
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
-  if (!binding || binding.owner_host_id !== hostId || !binding.local_path) throw new OperationError('permission_denied', 'Only the current owner can prepare this transfer.');
-  if (!binding.coordination_path) throw new OperationError('recovery_required', 'The recorded coordination path is missing.');
+  if (!binding || binding.owner_host_id !== hostId || !binding.local_path) throw opError('permission_denied', 'Only the current owner can prepare this transfer.',
+    `This host does not own source ${sourceId}'s checkout, so nothing was prepared. Check which host owns it; transfer preparation runs in a terminal on that host.`,
+    { fix: writerStatusFix(sourceId) });
+  if (!binding.coordination_path) throw opError('recovery_required', 'The recorded coordination path is missing.',
+    `Source ${sourceId}'s host binding has no coordination lock path, so no transfer was prepared. Inspect writer status and show it to the user; repairing the binding is a deliberate topology change (docs/architecture/topologies.md).`,
+    { fix: writerStatusFix(sourceId) });
   const lock = opts.selfTransfer ? await acquireNativeLock(binding.coordination_path, { timeoutMs: 5000 }) : await acquireWorktree(binding, 5000);
-  if (!lock) throw new OperationError('write_pending', 'The worktree is busy; retry transfer preparation.');
+  if (!lock) throw opError('write_pending', 'The worktree is busy; retry transfer preparation.',
+    `A write still holds source ${sourceId}'s worktree lock, so nothing was prepared. Wait until writer status shows no write in flight, then run transfer prepare again.`,
+    { fix: writerStatusFix(sourceId) });
   try {
     // The native lock already excludes writers, so hash before checking out a
     // connection. A hashing failure surfaces after the root checks below, as before.
@@ -216,12 +265,18 @@ export async function prepareWriterTransfer(engine: BrainEngine, sourceId: strin
       await assertWriterAdminUnlocked(tx);
       const [owner] = await tx.executeRaw<{ owner_host_id: string; owner_epoch: string; state: string }>('SELECT owner_host_id,owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid FOR UPDATE', [binding.worktree_id]);
       const current = await getWorktreeBinding(tx, sourceId, hostId);
-      if (!owner || owner.owner_host_id !== hostId || JSON.stringify(current) !== JSON.stringify(binding)) throw new OperationError('owner_unavailable', 'Ownership changed during transfer.');
-      if (owner.state !== 'active' && owner.state !== 'draining') throw new OperationError('writer_transfer_conflict', 'Finish publication recovery before preparing a transfer.');
+      if (!owner || owner.owner_host_id !== hostId || JSON.stringify(current) !== JSON.stringify(binding)) throw opError('owner_unavailable', 'Ownership changed during transfer.',
+        `Source ${sourceId}'s owner or binding changed while the transfer was being prepared, so nothing was recorded. Inspect writer status again before deciding on any transfer.`,
+        { fix: writerStatusFix(sourceId) });
+      if (owner.state !== 'active' && owner.state !== 'draining') throw opError('writer_transfer_conflict', 'Finish publication recovery before preparing a transfer.',
+        `Source ${sourceId}'s worktree is in state ${owner.state}, not active, so no transfer was prepared. Let the owner finish publication recovery (writer status shows it), then prepare again.`,
+        { fix: writerStatusFix(sourceId) });
       const pending = await tx.executeRaw(`SELECT id FROM persistence_requests WHERE worktree_id=$1::uuid AND
         (state IN ('running','recovering') OR recovery IS NOT NULL) LIMIT 1`, [binding.worktree_id]);
       const mirrors = await tx.executeRaw('SELECT id FROM persistence_effects WHERE worktree_id=$1::uuid AND recovery IS NOT NULL LIMIT 1', [binding.worktree_id]);
-      if (pending.length || mirrors.length) throw new OperationError('recovery_required', 'Resolve outstanding publication before transfer.');
+      if (pending.length || mirrors.length) throw opError('recovery_required', 'Resolve outstanding publication before transfer.',
+        `Source ${sourceId}'s worktree still has a write or mirror effect publishing or recovering, so no transfer was prepared. Inspect writer status and wait for it to settle on the owner before preparing again.`,
+        { fix: writerStatusFix(sourceId) });
       const [brain] = await tx.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
       const recovery = opts.selfTransfer ? inspectPhysicalRootRecovery(binding.local_path!, { brainId: brain.brain_id,
         worktreeId: binding.worktree_id, hostId, coordinationPath: binding.coordination_path! }) : undefined;
@@ -237,26 +292,44 @@ export async function acceptWriterTransfer(engine: BrainEngine, sourceId: string
   opts: { selfTransfer?: boolean; dryRun?: boolean } = {}): Promise<void> {
   const root = realpathSync(resolve(path));
   const binding = await getWorktreeBinding(engine, sourceId, hostId);
-  if (!binding) throw new OperationError('not_found', 'Source has no worktree owner.');
-  if (opts.selfTransfer && binding.owner_host_id !== hostId) throw new OperationError('permission_denied', 'Self-transfer requires the current owner host.');
-  if (opts.selfTransfer && root !== binding.local_path) throw new OperationError('source_changed', 'Self-transfer must target the recorded canonical path.');
+  if (!binding) throw opError('not_found', 'Source has no worktree owner.',
+    `Source ${sourceId} has no canonical owner to transfer from, so nothing was accepted. Check writer status; a source without an owner is claimed, not transferred, and claiming is the user's decision.`,
+    { fix: writerStatusFix(sourceId) });
+  if (opts.selfTransfer && binding.owner_host_id !== hostId) throw opError('permission_denied', 'Self-transfer requires the current owner host.',
+    `This host does not own source ${sourceId}, so a self-transfer cannot run here; nothing was accepted. Run it on the owner host, or accept an ordinary transfer prepared by the owner.`,
+    { fix: writerStatusFix(sourceId) });
+  if (opts.selfTransfer && root !== binding.local_path) throw opError('source_changed', 'Self-transfer must target the recorded canonical path.',
+    `A self-transfer of source ${sourceId} only repairs its recorded checkout, so nothing was accepted. Pass --path ${binding.local_path ?? 'with the recorded canonical path from writer status'} instead.`,
+    { fix: writerStatusFix(sourceId) });
   const coordination = opts.selfTransfer ? binding.coordination_path : readPhysicalRootReservation(root)?.coordinationPath ?? join(persistenceHome(), 'locks', `${binding.worktree_id}.lock`);
-  if (!coordination) throw new OperationError('recovery_required', 'The recorded coordination path is missing.');
+  if (!coordination) throw opError('recovery_required', 'The recorded coordination path is missing.',
+    `Source ${sourceId}'s host binding has no coordination lock path, so no transfer was accepted. Inspect writer status and show it to the user; repairing the binding is a deliberate topology change (docs/architecture/topologies.md).`,
+    { fix: writerStatusFix(sourceId) });
   const lock = await acquireNativeLock(coordination, { timeoutMs: 5000 });
-  if (!lock) throw new OperationError('write_pending', 'Successor worktree is busy.');
+  if (!lock) throw opError('write_pending', 'Successor worktree is busy.',
+    `Another gbrain process holds the successor checkout's coordination lock, so source ${sourceId}'s transfer was not accepted. Run transfer accept again once that process has finished.`,
+    { fix: writerStatusFix(sourceId) });
   try {
     if (worktreeManifest(root, { progress: humanManifestProgress() }).digest !== expectedManifest)
-      throw new OperationError('writer_manifest_mismatch', 'Successor checkout differs from the recorded canonical manifest.');
+      throw opError('writer_manifest_mismatch', 'Successor checkout differs from the recorded canonical manifest.',
+        `The checkout at ${root} does not hash to manifest ${expectedManifest} that the owner recorded for source ${sourceId}; nothing was accepted. Bring it to exactly the prepared content (same files, no extras or deletions), then accept again.`,
+        { fix: writerStatusFix(sourceId) });
     await engine.transaction(async tx => {
       await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
       await assertWriterAdminState(tx, expectedAdminState);
       await assertWriterAdminUnlocked(tx);
       const [owner] = await tx.executeRaw<{ owner_epoch: string; state: string; manifest: { digest: string; self_transfer?: PhysicalRootRecovery } }>('SELECT owner_epoch,state,manifest FROM persistence_worktrees WHERE id=$1::uuid FOR UPDATE', [binding.worktree_id]);
-      if (!owner || owner.state !== 'draining' || String(owner.owner_epoch) !== expectedEpoch || owner.manifest?.digest !== expectedManifest) throw new OperationError('writer_transfer_conflict', 'Transfer preparation or epoch changed.');
-      if (!!owner.manifest.self_transfer !== !!opts.selfTransfer || JSON.stringify(await getWorktreeBinding(tx, sourceId, hostId)) !== JSON.stringify(binding)) throw new OperationError('writer_transfer_conflict', 'The prepared transfer mode or binding changed.');
+      if (!owner || owner.state !== 'draining' || String(owner.owner_epoch) !== expectedEpoch || owner.manifest?.digest !== expectedManifest) throw opError('writer_transfer_conflict', 'Transfer preparation or epoch changed.',
+        `Source ${sourceId} is no longer prepared at epoch ${expectedEpoch} with manifest ${expectedManifest}, so nothing was accepted. Read writer status and use the epoch and manifest of the current preparation, or have the owner prepare again.`,
+        { fix: writerStatusFix(sourceId) });
+      if (!!owner.manifest.self_transfer !== !!opts.selfTransfer || JSON.stringify(await getWorktreeBinding(tx, sourceId, hostId)) !== JSON.stringify(binding)) throw opError('writer_transfer_conflict', 'The prepared transfer mode or binding changed.',
+        `Source ${sourceId} was prepared ${owner.manifest.self_transfer ? 'as' : 'without'} a self-transfer, or its binding changed since then, so nothing was accepted. Accept with the same --self-transfer choice used at prepare, after re-reading writer status.`,
+        { fix: writerStatusFix(sourceId) });
       const pending = await tx.executeRaw(`SELECT id FROM persistence_requests WHERE worktree_id=$1::uuid AND (state IN ('running','recovering') OR recovery IS NOT NULL) LIMIT 1`, [binding.worktree_id]);
       const mirrors = await tx.executeRaw('SELECT id FROM persistence_effects WHERE worktree_id=$1::uuid AND recovery IS NOT NULL LIMIT 1', [binding.worktree_id]);
-      if (pending.length || mirrors.length) throw new OperationError('recovery_required', 'Transfer state changed; prepare again.');
+      if (pending.length || mirrors.length) throw opError('recovery_required', 'Transfer state changed; prepare again.',
+        `A write or mirror effect started publishing in source ${sourceId}'s worktree after preparation, so nothing was accepted. Wait for writer status to show it settled, then have the owner prepare the transfer again.`,
+        { fix: writerStatusFix(sourceId) });
       if (opts.selfTransfer) repairPhysicalRoot(root, owner.manifest.self_transfer!, { hostId, worktreeId: binding.worktree_id, coordinationPath: coordination }, opts.dryRun);
       else if (!opts.dryRun) await preparePhysicalRootTransfer(tx, root, { hostId, worktreeId: binding.worktree_id, coordinationPath: coordination, expectedEpoch });
       if (opts.dryRun) return;

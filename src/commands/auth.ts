@@ -25,11 +25,14 @@ import { createEngine } from '../core/engine-factory.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { assertAllowedScopes } from '../core/scope.ts';
 import { generateToken, isUndefinedColumnError, isUndefinedTableError } from '../core/utils.ts';
-import { TOKEN_ID_RE } from '../core/token-mint.ts';
+import { TOKEN_ID_RE, insertUnifiedToken } from '../core/token-mint.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
-import { sqlQueryForEngine, executeRawJsonb, type SqlQuery } from '../core/sql-query.ts';
+import { sqlQueryForEngine, type SqlQuery } from '../core/sql-query.ts';
 import { readClientGrant, rescopeClientGrant, resolveGrantProfile, type GrantPatch } from '../core/grants/service.ts';
-import { parseRescopeGrantArgs } from '../core/grants/cli.ts';
+import { parseClientRescopeArgs, parseRescopeGrantArgs, splitRescopeTarget, type RescopeGrantArgs } from '../core/grants/cli.ts';
+import { GRANT_PROFILES, GrantError, TOKEN_TTL_MAX_SECONDS, TOKEN_TTL_MIN_SECONDS, grantFromClient } from '../core/grants/model.ts';
+import { cliRenderContext, renderAction, type RenderedAction } from '../core/agent-output.ts';
+import { migrateLegacyTokens, parseRescopeTokenArgs, renderLegacyGrantAxis, rescopeLegacyToken, resolveRescopeTarget, type MigrateLegacyResult, type RescopeTokenResult } from '../core/grants/legacy-token.ts';
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -92,34 +95,14 @@ async function create(name: string, opts: { takesHolders?: string[]; scopes?: st
       const takesHolders = opts.takesHolders && opts.takesHolders.length > 0
         ? opts.takesHolders
         : ['world'];
-      const permissions = { takes_holders: takesHolders };
-      // JSONB write: pass the object via executeRawJsonb with an explicit
-      // ::jsonb cast in the SQL string. Both engines round-trip the object
-      // through the wire-protocol type oid without the v0.12.0 double-encode
-      // bug class (verified by test/e2e/auth-permissions.test.ts:67 on
-      // Postgres and test/sql-query.test.ts on PGLite).
-      //
-      // Scopes (when given) land in the original-schema scopes TEXT[] column
-      // via an array literal through a TEXT param — values are allowlisted,
-      // so the literal needs no quoting and runs identically on both engines.
-      // Omitted → NULL → the historical grandfathered full-access grant.
-      if (opts.scopes !== undefined) {
-        await executeRawJsonb(
-          engine,
-          `INSERT INTO access_tokens (name, token_hash, permissions, scopes)
-           VALUES ($1, $2, $4::jsonb, $3::text[])`,
-          [name, hash, `{${opts.scopes.join(',')}}`],
-          [permissions],
-        );
-      } else {
-        await executeRawJsonb(
-          engine,
-          `INSERT INTO access_tokens (name, token_hash, permissions)
-           VALUES ($1, $2, $3::jsonb)`,
-          [name, hash],
-          [permissions],
-        );
-      }
+      // F3: the token is born on the unified grant shape (columns + the
+      // permissions JSONB mirror older binaries read). Scopes land in the
+      // original-schema scopes TEXT[] column; omitted → NULL → the historical
+      // grandfathered full-access grant.
+      await insertUnifiedToken(engine, {
+        name, tokenHash: hash, ...(opts.scopes !== undefined ? { scopes: opts.scopes } : {}),
+        grant: { sources: { kind: 'default' }, takesHolders, allowedOperations: null },
+      });
       const scopeLine = opts.scopes !== undefined
         ? `scopes=${JSON.stringify(opts.scopes)}`
         : 'scopes=full access (grandfathered — pass --scopes read,write to narrow)';
@@ -127,7 +110,7 @@ async function create(name: string, opts: { takesHolders?: string[]; scopes?: st
       console.log(`  ${token}\n`);
       console.log('Save this token — it will not be shown again.');
       console.log(`Revoke with: gbrain auth revoke "${name}" (or gbrain auth revoke --id <id> from auth list)`);
-      console.log(`Update visibility: gbrain auth permissions "${name}" set-takes-holders world,garry`);
+      console.log(`Change its grants: gbrain auth rescope --token "${name}" --takes-holders world,garry (or --sources, --operations)`);
     });
   } catch (e: any) {
     if (e.code === '23505') {
@@ -139,48 +122,13 @@ async function create(name: string, opts: { takesHolders?: string[]; scopes?: st
   }
 }
 
+/** `auth permissions <name> set-takes-holders <list>`: alias of `auth rescope --token <name> --takes-holders <list>`. */
 async function permissions(name: string, action: string, value: string | undefined) {
   if (!name || action !== 'set-takes-holders' || !value) {
-    console.error('Usage: auth permissions <name> set-takes-holders world,garry,brain');
+    console.error('Usage: auth permissions <name> set-takes-holders world,garry,brain  (alias of: gbrain auth rescope --token <name> --takes-holders <list>)');
     process.exit(1);
   }
-  try {
-    await withConfiguredSql(async (sql, engine) => {
-      const list = value.split(',').map(s => s.trim()).filter(Boolean);
-      if (list.length === 0) {
-        console.error('takes-holders list cannot be empty (use "world" for default-deny on private)');
-        process.exit(1);
-      }
-      const perms = { takes_holders: list };
-      // JSONB UPDATE via executeRawJsonb — same pattern as create() above.
-      // MERGE, never whole-object replace: `SET permissions = $2::jsonb`
-      // would silently DELETE every other grant key (source_id federation,
-      // and any future key) on a routine takes-holders edit — the grant-wipe
-      // class the #4043 review caught.
-      // The jsonb_typeof guard repairs rows carrying historical double-encode
-      // damage (a jsonb string/array scalar): `scalar || object` would produce
-      // a jsonb ARRAY and silently strand every grant, so a damaged left
-      // operand is reset to '{}' on edit — the old whole-replace semantics for
-      // damaged rows, merge semantics for healthy object rows.
-      const result = await executeRawJsonb(
-        engine,
-        `UPDATE access_tokens
-            SET permissions = (CASE WHEN jsonb_typeof(permissions) = 'object' THEN permissions ELSE '{}'::jsonb END) || $2::jsonb
-            WHERE name = $1
-            RETURNING id`,
-        [name],
-        [perms],
-      );
-      if (result.length === 0) {
-        console.error(`Token "${name}" not found.`);
-        process.exit(1);
-      }
-      console.log(`Updated "${name}": takes_holders = ${JSON.stringify(list)}`);
-    });
-  } catch (e: any) {
-    console.error('Error:', e.message);
-    process.exit(1);
-  }
+  await runRescope(['--token', name, '--takes-holders', value]);
 }
 
 /** Render a token row's scope grant honestly (#4043: NULL = grandfathered).
@@ -436,11 +384,10 @@ export interface RegisterClientArgs {
   tokenTtlSeconds: number | undefined;
 }
 
-/** --token-ttl bounds: 1 minute .. 90 days. The SERVER default for CLI-minted
+/** --token-ttl bounds: 1 minute .. 90 days (defined in src/core/grants/model.ts). The SERVER default for CLI-minted
  * access tokens is 3600s (oauth-provider.ts tokenTtl) — NOT 30 days; callers
  * that promise long-lived tokens must write oauth_clients.token_ttl. */
-export const TOKEN_TTL_MIN_SECONDS = 60;
-export const TOKEN_TTL_MAX_SECONDS = 7_776_000;
+export { TOKEN_TTL_MIN_SECONDS, TOKEN_TTL_MAX_SECONDS };
 
 /**
  * Shared --token-ttl value parser (auth register-client + agent register).
@@ -830,37 +777,114 @@ export function parseRescopeSurfaceValue(value: string): 'verbs' | 'starter' | '
 }
 
 async function rescopeClient(clientId: string, args: string[]) {
-  if (!clientId) { console.error('Usage: auth rescope-client <client_id> [--profile PROFILE] [grant flags] [--repair] [--dry-run] [--json]'); process.exit(1); }
+  if (!clientId) { console.error('Usage: auth rescope-client <client_id> [--profile PROFILE] [grant flags] [--repair] [--dry-run] [--json]  (alias of: gbrain auth rescope --client <client_id>)'); process.exit(1); }
+  await runRescope(['--client', clientId, ...args], parseRescopeGrantArgs);
+}
+
+/** `gbrain auth rescope-token`: alias of `gbrain auth rescope --token` (src/core/grants/legacy-token.ts). */
+async function rescopeToken(args: string[]) {
+  await runRescope(args, undefined, true);
+}
+
+/**
+ * F3 `gbrain auth rescope`: one grant editor for legacy tokens and OAuth
+ * clients (src/core/grants/cli.ts splits the target). Refusals print the
+ * reason and the next command; with --json they also print a JSON error on
+ * stdout so an agent never has to read stderr.
+ */
+async function runRescope(args: string[], clientParser?: (args: string[]) => RescopeGrantArgs, tokenArgs = false) {
+  const json = args.includes('--json');
   try {
-    const parsed = parseRescopeGrantArgs(args);
+    const command = tokenArgs ? { kind: 'token' as const, args } : splitRescopeTarget(args);
     await withConfiguredSql(async (_sql, engine) => {
-      const existing = await readClientGrant(engine, clientId);
-      const profile = parsed.profile ? resolveGrantProfile({
-        profile: parsed.profile, existing, sourceId: parsed.patch.sourceId ?? existing.sourceId ?? 'default',
-        boundTools: parsed.patch.boundTools ?? undefined,
-        federatedRead: parsed.patch.federatedRead,
-        boundSlugPrefixes: parsed.patch.boundSlugPrefixes,
-        delegatedSlugPrefixes: parsed.patch.delegatedSlugPrefixes ?? undefined,
-        delegatedNamespace: parsed.patch.delegatedNamespace,
-      }) : {};
-      const result = await rescopeClientGrant(engine, clientId, { ...profile, ...parsed.patch }, {
-        actor: 'operator:cli', expectedRevision: parsed.expectedRevision ?? existing.revision,
-        repair: parsed.repair, dryRun: parsed.dryRun,
-      });
-      if (parsed.json) { console.log(JSON.stringify(result, null, 2)); return; }
-      console.log(`OAuth client ${parsed.dryRun ? 'grant preview' : 'rescoped'}: ${result.after.clientName} (${clientId})`);
-      console.log(`  Revision: ${result.before.revision} -> ${result.after.revision}`);
-      console.log(`  Scopes: ${result.after.scopes.join(' ') || '<none>'}`);
-      console.log(`  Write source: ${result.after.sourceId}`);
-      console.log(`  Federated reads: ${result.after.federatedRead.join(', ')}`);
-      console.log(`  Tool surface: ${result.after.surface ?? '<server default>'}`);
-      console.log(`  Delegated spending: ${result.after.budgetUsdPerDay === null ? 'unlimited' : '$' + result.after.budgetUsdPerDay + '/day'}`);
-      console.log('Restrictions apply on the next request. Added scopes require a new access token; the client secret is unchanged.');
+      if (command.kind === 'migrate-legacy') return printMigrateLegacy(await migrateLegacyTokens(engine, { dryRun: command.dryRun }), command.json);
+      const target = command.kind === 'bare' ? await resolveRescopeTarget(engine, command.name) : command.kind === 'client' ? command : { kind: 'token' as const };
+      if (target.kind === 'client') {
+        const clientId = target.clientId;
+        return rescopeClientWith(engine, clientId, clientParser ? clientParser(command.args) : parseClientRescopeArgs(clientId, command.args));
+      }
+      const tokenArgv = command.kind === 'bare' ? [command.name, ...command.args] : command.args;
+      const parsed = parseRescopeTokenArgs(tokenArgv);
+      printTokenRescope(await rescopeLegacyToken(engine, parsed), parsed.json);
     });
   } catch (error) {
-    console.error('Error:', error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    if (json) {
+      const grantError = error instanceof GrantError ? error : undefined;
+      console.log(JSON.stringify({ error: { code: grantError?.code ?? 'rescope_failed', reasons: grantError?.reasons ?? [], message } }, null, 2));
+    }
+    console.error('Error:', message);
     process.exit(1);
   }
+}
+
+async function rescopeClientWith(engine: BrainEngine, clientId: string, parsed: RescopeGrantArgs) {
+  const existing = await readClientGrant(engine, clientId);
+  const profile = parsed.profile ? resolveGrantProfile({
+    profile: parsed.profile, existing, sourceId: parsed.patch.sourceId ?? existing.sourceId ?? 'default',
+    boundTools: parsed.patch.boundTools ?? undefined,
+    federatedRead: parsed.patch.federatedRead,
+    boundSlugPrefixes: parsed.patch.boundSlugPrefixes,
+    delegatedSlugPrefixes: parsed.patch.delegatedSlugPrefixes ?? undefined,
+    delegatedNamespace: parsed.patch.delegatedNamespace,
+  }) : {};
+  const result = await rescopeClientGrant(engine, clientId, { ...profile, ...parsed.patch }, {
+    actor: 'operator:cli', expectedRevision: parsed.expectedRevision ?? existing.revision,
+    repair: parsed.repair, dryRun: parsed.dryRun,
+  });
+  if (parsed.json) { console.log(JSON.stringify({ ...result, principal_grant: grantFromClient(result.after) }, null, 2)); return; }
+  console.log(`OAuth client ${parsed.dryRun ? 'grant preview' : 'rescoped'}: ${result.after.clientName} (${clientId})`);
+  console.log(`  Revision: ${result.before.revision} -> ${result.after.revision}`);
+  console.log(`  Scopes: ${result.after.scopes.join(' ') || '<none>'}`);
+  console.log(`  Write source: ${result.after.sourcesNone ? 'none (every read and write refused)' : result.after.sourceId}`);
+  console.log(`  Federated reads: ${result.after.federatedRead.join(', ') || '<none>'}`);
+  console.log(`  Takes holders: ${result.after.takesHolders === null ? 'world (default)' : result.after.takesHolders.join(', ') || 'none (every take hidden)'}`);
+  console.log(`  Tool surface: ${result.after.surface ?? '<server default>'}`);
+  console.log(`  Delegated spending: ${result.after.budgetUsdPerDay === null ? 'unlimited' : '$' + result.after.budgetUsdPerDay + '/day'}`);
+  console.log('Restrictions apply on the next request. Added scopes require a new access token; the client secret is unchanged.');
+}
+
+function printTokenRescope(result: RescopeTokenResult, json: boolean) {
+  if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+  const verb = !result.changed ? 'grants' : result.dryRun ? 'grant preview' : 'rescoped';
+  console.log(`Legacy token ${verb}: ${result.name} (${result.id})`);
+  const rows: Array<[string, keyof typeof result.before]> = [['Sources', 'sources'], ['Takes holders', 'takesHolders'], ['Operations', 'operations']];
+  for (const [label, key] of rows) {
+    const before = renderLegacyGrantAxis(result.before[key]);
+    const after = renderLegacyGrantAxis(result.after[key]);
+    console.log(`  ${label}: ${before === after ? after : `${before} -> ${after}`}`);
+  }
+  console.log(`  Grant revision: ${result.revision.before === result.revision.after ? result.revision.after : `${result.revision.before} -> ${result.revision.after}`}`);
+  if (result.drift.length && !result.written) {
+    console.log(`  Drift: ${result.drift.join(', ')} deny every request (the permissions JSON disagrees with the grant columns). `
+      + `Ask the user which grant is intended, then run gbrain auth rescope --token ${result.name} --adopt-permissions or --adopt-columns.`);
+  }
+  if (result.shape === 'legacy_permissions' && !result.written) {
+    console.log(`  Shape: legacy permissions JSON (still enforced). The next grant edit migrates it, or run gbrain auth rescope --migrate-legacy.`);
+  }
+  if (result.migrated) console.log('  Migrated to the unified grant columns; the permissions JSON is kept as a mirror for older gbrain binaries.');
+  if (result.refresh) {
+    const { available, added, unregistered } = result.refresh;
+    console.log(`  New operations available: ${available.length ? available.join(', ') : 'none'}`);
+    if (unregistered.length) console.log(`  Granted but no longer registered: ${unregistered.join(', ')}`);
+    if (added.length) console.log(`  Added: ${added.join(', ')}`);
+    else if (available.length) {
+      const add = available.length <= 8 ? `--add ${available.join(',')}` : '--add <op,...>';
+      console.log(`  Nothing widened. Grant them with: gbrain auth rescope --token ${result.name} --refresh-operations ${add} (or --all-new)`);
+    }
+  }
+  if (result.changed && !result.dryRun) console.log('Grants apply on the next request; the token secret is unchanged.');
+}
+
+function printMigrateLegacy(result: MigrateLegacyResult, json: boolean) {
+  if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+  const verb = result.dryRun ? 'Would migrate' : 'Migrated';
+  console.log(`${verb} ${result.migrated.length} legacy token(s) to the unified grant columns; no effective grant changes.`);
+  for (const t of result.migrated) {
+    console.log(`  ${t.name} (${t.id}): sources ${renderLegacyGrantAxis(t.grant.sources)}; takes holders ${renderLegacyGrantAxis(t.grant.takesHolders)}; operations ${renderLegacyGrantAxis(t.grant.operations)}`);
+  }
+  for (const t of result.skipped) console.log(`  Skipped ${t.name} (${t.id}): ${t.reason}. Fix: ${t.fix}`);
+  if (result.dryRun && result.migrated.length) console.log('Apply with: gbrain auth rescope --migrate-legacy');
 }
 
 /**
@@ -903,6 +927,64 @@ export interface ClientRow {
   surface_set_by: string | null;
   source_id: string | null;
   federated_read: string[] | null;
+  /** The operation snapshot: NULL = none stored; absent = the brain predates the column. */
+  allowed_operations?: string[] | null;
+  /** Soft-revoke stamp (`auth` lifecycle revoke); absent on schemas without it. */
+  deleted_at?: string | Date | null;
+}
+
+/** The operation-snapshot axis of one client, as `auth clients` reports it. */
+export interface ClientOperationsView {
+  /** 'all' = no snapshot (SQL NULL); [] = deny-all; a list = pinned; 'unavailable' = old schema. */
+  operations: 'all' | string[] | 'unavailable';
+  operations_state: 'all' | 'none' | 'list' | 'unavailable';
+  /** true only for 'all': operations later upgrades add are reachable without a regrant. */
+  includes_future_operations: boolean | null;
+  revoked: boolean;
+  /** The re-pin command for a live client with no snapshot. */
+  fix?: RenderedAction;
+}
+
+/**
+ * Four distinct operation states (#6008 visibility): SQL NULL is `all` on the
+ * operation-snapshot axis only (scopes, surface and source limits still
+ * apply); an empty array refuses every operation; a list is pinned; a schema
+ * without the column is `unavailable`, never guessed.
+ */
+export function clientOperationsView(row: ClientRow): ClientOperationsView {
+  const revoked = row.deleted_at != null;
+  const ops = row.allowed_operations;
+  if (ops === undefined) return { operations: 'unavailable', operations_state: 'unavailable', includes_future_operations: null, revoked };
+  if (ops === null) {
+    const view: ClientOperationsView = { operations: 'all', operations_state: 'all', includes_future_operations: true, revoked };
+    if (revoked) return view;
+    view.fix = renderAction({
+      argv: ['gbrain', 'auth', 'rescope', '--client', row.client_id, '--operations', '<OPERATIONS>'],
+      inputs: [{ name: 'OPERATIONS', how: `Ask the user which operations this client should keep (comma-separated, e.g. search,get_page,remember), or pin a profile instead: gbrain auth rescope --client ${row.client_id} --profile <profile> (${GRANT_PROFILES.join(', ')}).` }],
+      consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'This client has no operation snapshot, so it reaches every operation its scopes and surface allow, including operations later upgrades add. A pinned list or profile keeps new operations from arriving without a regrant.',
+      verify: { argv: ['gbrain', 'auth', 'clients', '--json'] },
+    }, cliRenderContext());
+    return view;
+  }
+  return { operations: ops, operations_state: ops.length === 0 ? 'none' : 'list', includes_future_operations: false, revoked };
+}
+
+/** Text lines for the operation axis (and revocation) of one client. */
+export function clientOperationsLines(row: ClientRow): string[] {
+  const view = clientOperationsView(row);
+  const lines: string[] = [];
+  if (view.revoked) lines.push(`  revoked: ${row.deleted_at instanceof Date ? row.deleted_at.toISOString() : String(row.deleted_at)} (credentials no longer work)`);
+  if (view.operations_state === 'unavailable') lines.push('  operations: unavailable (this brain predates per-client operation snapshots)');
+  else if (view.operations_state === 'none') lines.push('  operations: none (deny-all snapshot)');
+  else if (view.operations_state === 'list') {
+    const ops = view.operations as string[];
+    lines.push(`  operations: ${ops.length} pinned (${ops.slice(0, 8).join(', ')}${ops.length > 8 ? ', ...' : ''})`);
+  } else {
+    lines.push('  operations: all (no snapshot; includes operations later upgrades add; scopes, surface and source limits still apply)');
+    if (view.fix) lines.push(`    re-pin: gbrain auth rescope --client ${row.client_id} --operations <op,...>  (or --profile <profile>)`);
+  }
+  return lines;
 }
 
 /**
@@ -920,8 +1002,17 @@ export async function listClientRows(engine: BrainEngine): Promise<ClientRow[]> 
   // 42703 by code; the column list covers message-only (code-less) variants.
   const isSchemaShapeError = (e: unknown): boolean =>
     isUndefinedTableError(e) ||
-    ['surface', 'surface_set_by', 'source_id', 'federated_read']
+    ['allowed_operations', 'deleted_at', 'surface', 'surface_set_by', 'source_id', 'federated_read']
       .some(col => isUndefinedColumnError(e, col));
+  try {
+    return await engine.executeRaw<ClientRow>(
+      `SELECT client_id, client_name, scope, surface, surface_set_by, source_id, federated_read, allowed_operations, deleted_at
+         FROM oauth_clients ORDER BY client_name, client_id`,
+    );
+  } catch (e) {
+    // Brain predates the operation-snapshot columns: operations read `unavailable`.
+    if (!isSchemaShapeError(e)) throw e;
+  }
   try {
     return await engine.executeRaw<ClientRow>(
       `SELECT client_id, client_name, scope, surface, surface_set_by, source_id, federated_read
@@ -947,6 +1038,19 @@ export async function listClientRows(engine: BrainEngine): Promise<ClientRow[]> 
   return bare.map(r => ({ ...r, surface: null, surface_set_by: null, source_id: null, federated_read: null }));
 }
 
+/** Clients whose stored or outstanding access-token lifetime an upgrade brought inside the 90-day maximum. */
+export async function tokenLifetimeClampedClients(engine: BrainEngine): Promise<Set<string>> {
+  try {
+    const rows = await engine.executeRaw<{ client_id: string }>(
+      `SELECT DISTINCT client_id FROM oauth_grant_audit WHERE actor = 'migration' AND action IN ('clamp_token_ttl', 'shorten_access_tokens')`,
+    );
+    return new Set(rows.map(r => r.client_id));
+  } catch (e) {
+    if (isUndefinedTableError(e)) return new Set();
+    throw e;
+  }
+}
+
 async function clientsCmd(args: string[]) {
   const usageLine = 'Usage: auth clients [--usage] [--days N] [--json]';
   let parsed: { usage: boolean; days: number; json: boolean };
@@ -962,6 +1066,7 @@ async function clientsCmd(args: string[]) {
       // Degrade ladder lives in listClientRows: a pre-migration brain still
       // gets the listing (missing columns render as null) instead of an error.
       const clients = await listClientRows(engine);
+      const lifetimeClamped = await tokenLifetimeClampedClients(engine);
 
       const { readClientOpUsage } = await import('../core/mcp-usage.ts');
       const usage = parsed.usage ? await readClientOpUsage(engine, { days: parsed.days }) : [];
@@ -981,6 +1086,9 @@ async function clientsCmd(args: string[]) {
             surface_set_by: c.surface_set_by,
             source_id: c.source_id,
             federated_read: c.federated_read,
+            ...clientOperationsView(c),
+            revoked_at: c.deleted_at ?? null,
+            token_lifetime_clamped: lifetimeClamped.has(c.client_id),
             usage: usageByToken.get(c.client_id) ?? null,
           })),
           // Legacy bearer tokens seen in the window (no oauth_clients row).
@@ -1003,6 +1111,8 @@ async function clientsCmd(args: string[]) {
           : '<server/config resolution>';
         console.log(`  scopes: ${c.scope ?? '<none>'}    surface: ${surfaceStr}`);
         console.log(`  write source: ${c.source_id ?? '<none>'}    federated reads: ${(c.federated_read ?? []).join(', ') || '<none>'}`);
+        for (const line of clientOperationsLines(c)) console.log(line);
+        if (lifetimeClamped.has(c.client_id)) console.log('  access-token lifetime: clamped to the 90-day maximum by an upgrade (docs/mcp/ADMIN.md#access-token-lifetime)');
         if (parsed.usage) {
           if (u) {
             const auto = u.likely_automation ? '    [automation-shaped: >90% context_pack/delta]' : '';
@@ -1092,8 +1202,36 @@ Usage:
   gbrain auth list                                         List all tokens (id, scopes, usage)
   gbrain auth revoke <name>                                Revoke a legacy token (ALL active rows with that name)
   gbrain auth revoke --id <uuid>                           Revoke exactly one token by id (names are not unique)
+  gbrain auth rescope --token <name>|--id <uuid>|--client <client_id>|<name> [options]
+                                                          Change a legacy token's or OAuth client's grants in
+                                                          place. Only the flags you pass change; the secret is
+                                                          unchanged. With no grant flag it prints the stored
+                                                          grants. A bare name matching both a token and a
+                                                          client refuses; pass --token or --client.
+     --sources <id1,id2,...|none>                         Source grant (first = write source; 'none' = deny-all,
+                                                          scopes and secret unchanged)
+     --read-sources <id1,id2,...>                         Client only: a read set that differs from --sources
+     --takes-holders <h1,h2,...|none>                     Takes-holder allow-list (default world; 'none' = deny-all)
+     --operations <op1,op2,...|none|all>                  Operation snapshot ('none' = deny-all). Client only:
+                                                          'all' = no snapshot: every operation the scopes and the
+                                                          surface allow, including ones later upgrades add; clears
+                                                          the profile (tokens: --reset-default operations)
+     --scopes <read,write,...>                            Replace the scopes
+     --reset-default <sources,takes-holders,operations>   Token only: restore the auth create default for those axes
+     --refresh-operations [--add <op,...>|--all-new]      Token only: preview operations added since the snapshot;
+                                                          widen only by the ones --add names (or all with --all-new)
+     --if-version <N>                                     Refuse unless the stored grant revision is N
+     --adopt-permissions | --adopt-columns                Token only: resolve grant drift by keeping the permissions
+                                                          JSON (an older gbrain's edit) or restoring the columns
+     --dry-run / --json                                   Preview without writing / machine-readable output
+                                                          (--json also prints refusals as JSON on stdout)
+     Client-only flags of rescope-client (--surface, --bound-*, --profile, ...) pass through.
+  gbrain auth rescope --migrate-legacy [--dry-run] [--json]
+                                                          Write the unified grant columns for every token still on
+                                                          the permissions-JSON shape; changes no effective grant
+  gbrain auth rescope-token <name>|--id <uuid> [options]  Alias of: auth rescope --token <name> [options]
   gbrain auth permissions <name> set-takes-holders <h1,h2,h3>
-                                                          Update visibility for an existing token
+                                                          Alias of: auth rescope --token <name> --takes-holders
   gbrain auth register-client <name> [options]             Register an OAuth 2.1 client (v0.26+)
      --grant-types <client_credentials,authorization_code>  (default: client_credentials;
                                                             auto-set to authorization_code,refresh_token
@@ -1117,9 +1255,10 @@ Usage:
                                                           unavailable to a bound client. Omit = full-source writes.
      --bound-max-concurrent <n>                            Bound submit_agent concurrency (default: 1)
      --budget-usd-per-day <usd>                            Bound submit_agent daily spend cap
-  gbrain auth rescope-client <client_id> [options]        Change an existing client's source scope (e.g. a DCR
-                                                          client stuck on the 'default' source). Only the flags
-                                                          you pass change; the other axes are left as-is.
+  gbrain auth rescope-client <client_id> [options]        Alias of: auth rescope --client <client_id>, with these
+                                                          legacy flags. Change an existing client's source scope
+                                                          (e.g. a DCR client stuck on the 'default' source). Only
+                                                          the flags you pass change; the other axes are left as-is.
      --source <id>                                        New write source
      --federated-read <id1,id2,...>                       New read-scope source list
      --bound-slug-prefixes <p1,p2|none>                   Replace the slug-prefix write fence ('none' clears it)
@@ -1128,7 +1267,9 @@ Usage:
                                                           so server/config resolution applies again). Always
                                                           bounded by the server's --surface ceiling.
   gbrain auth clients [--usage] [--days N] [--json]       List OAuth clients with scopes, write source, federated
-                                                          reads + tool surface. --usage
+                                                          reads, tool surface + operation snapshot ('all' = no
+                                                          snapshot, includes future operations; re-pin with
+                                                          auth rescope --client <id> --operations|--profile). --usage
                                                           joins per-client op-call counts, top ops, and last-seen
                                                           from mcp_request_log (default 30d window; HTTP clients
                                                           only — stdio use is not logged). Automation-shaped
@@ -1181,6 +1322,8 @@ export async function runAuth(args: string[]): Promise<void> {
     }
     case 'register-client': await registerClient(rest[0], rest.slice(1)); return;
     case 'rescope-client': await rescopeClient(rest[0], rest.slice(1)); return;
+    case 'rescope-token': await rescopeToken(rest); return;
+    case 'rescope': await runRescope(rest); return;
     case 'revoke-client': await revokeClient(rest[0]); return;
     case 'clients': await clientsCmd(rest); return;
     case 'test': {

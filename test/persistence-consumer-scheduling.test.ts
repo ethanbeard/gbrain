@@ -5,13 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { PersistenceConsumer } from '../src/core/persistence/consumer.ts';
-import { admitWrite, getWriteRequestById } from '../src/core/persistence/journal.ts';
+import { admitWrite, getWriteRequestById, WRITE_PROGRESS_SQL } from '../src/core/persistence/journal.ts';
 import { cancelWriteRequest } from '../src/core/persistence/control.ts';
 import { acquireWorktree } from '../src/core/persistence/ownership.ts';
 import { admission, assertCommittedSnapshot, assertConservation, fixtures, initializeFixtures, prepared, selectFixtureHost, type HarnessConfig } from '../scripts/persistence/harness.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { waitFor } from './helpers/wait-for.ts';
-import { disposePersistenceConsumer, startPersistenceConsumer, waitForWrite } from '../src/core/persistence/service.ts';
+import { awaitWrite, disposePersistenceConsumer, registerMutationPreparer, startPersistenceConsumer, waitForWrite } from '../src/core/persistence/service.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-consumer-scheduling-'));
 const config: HarnessConfig = {
@@ -40,7 +40,7 @@ test('simultaneous bounded waiters retain one unresolved receipt read until sett
   let reads = 0;
   const proxy = new Proxy(engine, { get(target, key) {
     if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
-      if (sql === 'SELECT * FROM persistence_requests WHERE id=$1::uuid') { reads++; return release.promise; }
+      if (sql === WRITE_PROGRESS_SQL) { reads++; return release.promise; }
       return target.executeRaw(sql, params);
     };
     const value = Reflect.get(target, key);
@@ -66,7 +66,7 @@ test('shutdown drains an uncancellable receipt read without scheduling another',
   let reads = 0, stopped = false;
   const proxy = new Proxy(engine, { get(target, key) {
     if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
-      if (sql === 'SELECT * FROM persistence_requests WHERE id=$1::uuid') { reads++; return release.promise; }
+      if (sql === WRITE_PROGRESS_SQL) { reads++; return release.promise; }
       return target.executeRaw(sql, params);
     };
     const value = Reflect.get(target, key);
@@ -92,7 +92,7 @@ test.each(['queued', 'committed'] as const)('coalesced receipt reads preserve ea
   const rows = Array.from({ length: 2 }, () => ({ id: randomUUID(), request_id: randomUUID(), state: 'queued' } as import('../src/core/persistence/model.ts').WriteRequest));
   const proxy = new Proxy(engine, { get(target, key) {
     if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
-      if (sql === 'SELECT * FROM persistence_requests WHERE id=$1::uuid') {
+      if (sql === WRITE_PROGRESS_SQL) {
         await Bun.sleep(20);
         return [{ ...rows.find(row => row.id === params?.[0]), state: params?.[0] === rows[0].id ? firstState : 'committed' }];
       }
@@ -116,7 +116,7 @@ test('a stalled receipt read does not hide another request that already committe
   let entered = false;
   const proxy = new Proxy(engine, { get(target, key) {
     if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
-      if (sql === 'SELECT * FROM persistence_requests WHERE id=$1::uuid') {
+      if (sql === WRITE_PROGRESS_SQL) {
         if (params?.[0] === rows[0].id) { entered = true; return release.promise; }
         return [{ ...rows[1], state: 'committed' }];
       }
@@ -144,7 +144,7 @@ test.each([false, true])('a shorter receipt waiter cannot abort another caller\'
   const proxy = new Proxy(engine, { get(target, key) {
     if (key === 'kind') return 'postgres';
     if (key === 'executeRaw') return async (...args: Parameters<typeof engine.executeRaw>) => {
-      if (args[0] === 'SELECT * FROM persistence_requests WHERE id=$1::uuid') {
+      if (args[0] === WRITE_PROGRESS_SQL) {
         if (args[1]?.[0] === row.id) ownerSignal = args[2]?.signal;
         return release.promise;
       }
@@ -168,7 +168,7 @@ test('distinct stalled receipt reads stay capped and shutdown drains every retai
   let reads = 0, stopped = false;
   const proxy = new Proxy(engine, { get(target, key) {
     if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
-      if (sql === 'SELECT * FROM persistence_requests WHERE id=$1::uuid') {
+      if (sql === WRITE_PROGRESS_SQL) {
         const release = releases[reads++];
         expect(release).toBeDefined();
         return release.promise;
@@ -225,6 +225,29 @@ for (const cooperates of [true, false]) test(`preparation deadline retains track
     expect((await getWriteRequestById(engine, row.id))?.state).toBe('queued');
     expect(await engine.readPageSnapshot(row.slug, { sourceId: row.source_id })).toBeNull();
     await assertConservation(engine);
+  } finally {
+    release.resolve();
+    await consumer.stop();
+    await cancelWriteRequest(engine, { kind: 'local_cli', id: config.principalIds[0] }, row.request_id);
+  }
+}), 5000);
+
+test('an edit_page preparation shares the preparation deadline (#5616)', async () => withEnv(env, async () => {
+  const sources = await fixtures(engine, config);
+  const row = await admitWrite(engine, admission(config, sources[0], 'edit-page-deadline', 'edited body', 0, { operation: 'edit_page' }));
+  const release = Promise.withResolvers<void>();
+  let aborted = false;
+  const consumer = new PersistenceConsumer(engine, { engine: 'pglite' }, async (_e, current, _c, signal?: AbortSignal) => {
+    signal?.addEventListener('abort', () => { aborted = true; release.resolve(); }, { once: true });
+    await release.promise;
+    signal?.throwIfAborted();
+    return prepared(current, sources);
+  }, { hostId: config.hostId, pollMs: 60_000, preparationMs: 50 });
+  try {
+    consumer.start();
+    await waitFor(() => aborted);
+    await waitFor(() => consumer.status().active_preparations === 0);
+    expect((await getWriteRequestById(engine, row.id))?.state).toBe('queued');
   } finally {
     release.resolve();
     await consumer.stop();
@@ -527,3 +550,113 @@ test('a local waiter wakes an idle owner for a claim-only tick instead of waitin
     await waiter;
   } finally { await disposePersistenceConsumer(engine); }
 }), 5000);
+
+/** #5984 (CEO-A7, DX-A3): classified waits with an in-process completion handoff. */
+function countingProxy(target: PGLiteEngine, onRead?: (sql: string, params?: unknown[]) => unknown) {
+  const counts = { progress: 0, full: 0 };
+  const proxy = new Proxy(target, { get(base, key) {
+    if (key === 'executeRaw') return async (sql: string, params?: unknown[], opts?: unknown) => {
+      if (sql === WRITE_PROGRESS_SQL) counts.progress++;
+      // Only the waiter's own reads count; publication itself reads its receipt (clearResolvedRecovery).
+      if (sql === 'SELECT * FROM persistence_requests WHERE id=$1::uuid' && new Error().stack?.includes('awaitWrite')) counts.full++;
+      const replaced = onRead?.(sql, params);
+      if (replaced !== undefined) return replaced;
+      return base.executeRaw(sql, params as unknown[], opts as never);
+    };
+    const value = Reflect.get(base, key);
+    return typeof value === 'function' ? value.bind(base) : value;
+  } });
+  return { proxy, counts };
+}
+
+test('a write this process publishes resolves from the consumer handoff with zero request reads', async () => withEnv(env, async () => {
+  const sources = await fixtures(engine, config);
+  registerMutationPreparer('test_wait_handoff', async (_e, row) => { await Bun.sleep(400); return prepared(row, sources); });
+  const { proxy, counts } = countingProxy(engine);
+  startPersistenceConsumer(proxy, { engine: 'pglite' });
+  try {
+    await Bun.sleep(300);
+    const row = await admitWrite(engine, admission(config, sources[0], 'wait-handoff', 'handoff body', 0, { operation: 'test_wait_handoff' }));
+    const before = { ...counts };
+    const started = performance.now();
+    const waited = await awaitWrite(proxy, row, { engine: 'pglite' }, { waitMs: 10_000 });
+    expect(performance.now() - started).toBeGreaterThan(300);
+    expect(waited.kind).toBe('terminal');
+    expect(waited.row).toEqual((await getWriteRequestById(engine, row.id))!);
+    expect(waited.row.state).toBe('committed');
+    expect(counts).toEqual(before);
+  } finally { await disposePersistenceConsumer(proxy); }
+}), 15_000);
+
+test('a write another consumer publishes resolves through progress polling with the full terminal row', async () => withEnv(env, async () => {
+  const sources = await fixtures(engine, config);
+  const row = await admitWrite(engine, admission(config, sources[0], 'wait-cross-process', 'cross body'));
+  const { proxy, counts } = countingProxy(engine);
+  const local = startPersistenceConsumer(proxy, { engine: 'pglite' });
+  (local as unknown as { doTick(): Promise<void> }).doTick = async () => {};
+  const other = new PersistenceConsumer(engine, { engine: 'pglite' }, async (_e, current) => prepared(current, sources), { hostId: config.hostId });
+  try {
+    const waiting = awaitWrite(proxy, row, { engine: 'pglite' }, { waitMs: 10_000 });
+    other.start();
+    const waited = await waiting;
+    expect(waited.kind).toBe('terminal');
+    expect(waited.row).toEqual((await getWriteRequestById(engine, row.id))!);
+    expect(waited.row.intent).toEqual(row.intent);
+    expect(counts.progress).toBeGreaterThan(0);
+    expect(counts.full).toBe(1);
+  } finally { await other.stop(); await disposePersistenceConsumer(proxy); }
+}), 15_000);
+
+test('an authentication failure during a wait is classified, not reported as still pending', async () => withEnv(env, async () => {
+  const sources = await fixtures(engine, config);
+  const row = await admitWrite(engine, admission(config, sources[0], 'wait-auth-failure', 'auth body'));
+  const { proxy, counts } = countingProxy(engine, sql => {
+    if (sql === WRITE_PROGRESS_SQL) throw Object.assign(new Error('password authentication failed for user "example"'), { code: '28P01' });
+  });
+  (startPersistenceConsumer(proxy, { engine: 'pglite' }) as unknown as { doTick(): Promise<void> }).doTick = async () => {};
+  try {
+    const started = performance.now();
+    const waited = await awaitWrite(proxy, row, { engine: 'pglite' }, { waitMs: 5000 });
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(waited).toMatchObject({ kind: 'read_failed', request_id: row.request_id, reason: 'auth_failed', transient: false, attempts: 1 });
+    expect(counts.progress).toBe(1);
+  } finally {
+    await disposePersistenceConsumer(proxy);
+    await cancelWriteRequest(engine, { kind: 'local_cli', id: config.principalIds[0] }, row.request_id);
+  }
+}), 10_000);
+
+test('repeated connection resets during a wait are classified with their attempt count', async () => withEnv(env, async () => {
+  const sources = await fixtures(engine, config);
+  const row = await admitWrite(engine, admission(config, sources[0], 'wait-connection-reset', 'reset body'));
+  const { proxy, counts } = countingProxy(engine, sql => {
+    if (sql === WRITE_PROGRESS_SQL) throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+  });
+  (startPersistenceConsumer(proxy, { engine: 'pglite' }) as unknown as { doTick(): Promise<void> }).doTick = async () => {};
+  try {
+    const waited = await awaitWrite(proxy, row, { engine: 'pglite' }, { waitMs: 1200 });
+    expect(waited).toMatchObject({ kind: 'read_failed', request_id: row.request_id, reason: 'conn_dropped', transient: true });
+    expect(waited.kind === 'read_failed' && waited.attempts).toBe(counts.progress);
+    expect(counts.progress).toBeGreaterThan(2);
+    expect(waited.row.state).toBe('queued');
+  } finally {
+    await disposePersistenceConsumer(proxy);
+    await cancelWriteRequest(engine, { kind: 'local_cli', id: config.principalIds[0] }, row.request_id);
+  }
+}), 10_000);
+
+test('a recovery-blocked pending head is classified as blocked with its request ID and inspection command', async () => withEnv(env, async () => {
+  const sources = await fixtures(engine, config);
+  const row = await admitWrite(engine, admission(config, sources[0], 'wait-recovery-blocked', 'blocked body'));
+  await engine.executeRaw("UPDATE persistence_requests SET blocked_reason='recovery_required' WHERE id=$1::uuid", [row.id]);
+  (startPersistenceConsumer(engine, { engine: 'pglite' }) as unknown as { doTick(): Promise<void> }).doTick = async () => {};
+  try {
+    const waited = await awaitWrite(engine, row, { engine: 'pglite' }, { waitMs: 600 });
+    expect(waited).toMatchObject({ kind: 'blocked', request_id: row.request_id, cause: 'recovery_required',
+      command: `gbrain sources writer status ${sources[0].id} --json` });
+    expect(await waitForWrite(engine, row, { engine: 'pglite' }, 100)).toMatchObject({ id: row.id, state: 'queued', blocked_reason: 'recovery_required' });
+  } finally {
+    await disposePersistenceConsumer(engine);
+    await cancelWriteRequest(engine, { kind: 'local_cli', id: config.principalIds[0] }, row.request_id);
+  }
+}), 10_000);

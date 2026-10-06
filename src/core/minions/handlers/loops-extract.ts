@@ -17,6 +17,20 @@ export function makeLoopsExtractHandler(engine: BrainEngine): MinionHandler {
     if (!slug || !sourceId) throw new Error('loops_extract job requires data.slug and data.sourceId');
     const threadId = typeof job.data.threadId === 'string' ? job.data.threadId : undefined;
     const { runLoopsExtract } = await import('../../google/loops-extract.ts');
-    return await runLoopsExtract(engine, { slug, sourceId, ...(threadId ? { threadId } : {}) });
+    const result = await runLoopsExtract(engine, { slug, sourceId, ...(threadId ? { threadId } : {}) });
+    // #5867 (E9): the revision-bound outcome is the catch-up's evidence, not job completion.
+    // A failed record never fails the job (that would repeat a paid extraction); the catch-up then re-checks the thread.
+    try {
+      const { loopsExtractRevision, recordLoopsExtractOutcome } = await import('../../google/loop-catchup.ts');
+      const rev = await loopsExtractRevision(engine, sourceId, slug, job.data.newestMs);
+      if (rev !== null) {
+        await recordLoopsExtractOutcome(engine, sourceId, slug, {
+          rev, outcome: result.status === 'extracted' ? 'extracted' : `${result.status}:${result.reason ?? 'unknown'}`, catchup: job.data.catchup === true,
+        });
+      }
+    } catch (e) {
+      console.warn(`[loops_extract] could not record the outcome for ${slug}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return result;
   };
 }

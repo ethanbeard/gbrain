@@ -16,6 +16,7 @@
  * Both isTTY and stderr.write are restored in finally.
  */
 
+import { withEnv } from './helpers/with-env.ts';
 import { describe, test, expect } from 'bun:test';
 import { runInitNudge } from '../src/core/onboard/init-nudge.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -60,18 +61,21 @@ function stubEngine(counts: ProbeCounts): BrainEngine {
  * captured. Restores both in finally so no other test sees the patch.
  */
 async function runNudgeCaptured(engine: BrainEngine): Promise<string> {
+  // Agent contract v1 (F7): the nudge is a notice on every surface — stderr
+  // lines on a terminal, an [AGENT] block on stdout otherwise — so capture both.
   const origIsTTY = process.stderr.isTTY;
   const origWrite = process.stderr.write;
+  const origOut = process.stdout.write;
   let out = '';
+  const sink = ((chunk: unknown) => { out += String(chunk); return true; }) as typeof process.stderr.write;
   try {
     (process.stderr as unknown as { isTTY: boolean }).isTTY = true;
-    process.stderr.write = ((chunk: unknown) => {
-      out += String(chunk);
-      return true;
-    }) as typeof process.stderr.write;
+    process.stderr.write = sink;
+    process.stdout.write = sink as typeof process.stdout.write;
     await runInitNudge(engine);
   } finally {
     process.stderr.write = origWrite;
+    process.stdout.write = origOut;
     (process.stderr as unknown as { isTTY: boolean | undefined }).isTTY = origIsTTY;
   }
   return out;
@@ -136,5 +140,48 @@ describe('runInitNudge — non-empty brain opportunities', () => {
     expect(out).toContain("Run 'gbrain onboard --check' to see the plan");
     // All 6 probes succeeded — no partial-checks suffix.
     expect(out).not.toContain('checks complete');
+  });
+});
+
+describe('runInitNudge — agents get the nudge too (F7)', () => {
+  test('a non-interactive caller gets an [AGENT] coaching block naming the command', async () => {
+    const out = await withEnv({ GBRAIN_NON_INTERACTIVE: '1', GBRAIN_INTERACTIVE: undefined }, () => runNudgeCaptured(
+      stubEngine({ stale: 0, entities: 0, linked: 0, timeline: 0, takes: 0, pages: 10 }),
+    ));
+    expect(out).toContain('[AGENT]');
+    expect(out).toContain('[onboard_opportunities]');
+    expect(out).toContain('gbrain onboard --check');
+  });
+});
+
+describe('shared collector (collectOnboardOpportunities)', () => {
+  test('init output is byte-identical to the pre-collector nudge', async () => {
+    const full = await withEnv({ GBRAIN_NON_INTERACTIVE: '1', GBRAIN_INTERACTIVE: undefined }, () => runNudgeCaptured(
+      stubEngine({ stale: 3, entities: 10, linked: 5, timeline: 2, takes: 0, pages: 20 })));
+    expect(full).toBe("[AGENT]\nwhy: [onboard_opportunities] Brain has opportunities: 3 stale chunks, link coverage 50%, timeline coverage 20%, 0 takes. Run 'gbrain onboard --check' to see the plan.\nactor: agent\nnext: run: gbrain onboard --check\n[/AGENT]\n");
+    const partial = await withEnv({ GBRAIN_NON_INTERACTIVE: '1', GBRAIN_INTERACTIVE: undefined }, () => runNudgeCaptured(
+      stubEngine({ stale: 0, entities: 4, linked: new Error('linked probe failed'), timeline: 4, takes: 2, pages: 9 })));
+    expect(partial).toBe("[AGENT]\nwhy: [onboard_opportunities] Brain has opportunities: link coverage 0%. Run 'gbrain onboard --check' to see the plan. (5/6 checks complete; run gbrain onboard --check for full recommendations)\nactor: agent\nnext: run: gbrain onboard --check\n[/AGENT]\n");
+  });
+
+  test('sequential (background refresh) and parallel (init) runs return the same counts; a failed probe is null, never a gap', async () => {
+    const { collectOnboardOpportunities, onboardGaps } = await import('../src/core/onboard/mcp-onboarding.ts');
+    const engine = stubEngine({ stale: 3, entities: 10, linked: new Error('linked probe failed'), timeline: 2, takes: 0, pages: 20 });
+    let yields = 0;
+    const parallel = await collectOnboardOpportunities(engine, new AbortController().signal);
+    const sequential = await collectOnboardOpportunities(engine, new AbortController().signal, async () => { yields++; });
+    expect(sequential).toEqual(parallel);
+    expect(yields).toBe(6);
+    expect(parallel).toMatchObject({ staleChunks: 3, entities: 10, linkedEntities: null, linkCoverage: null, timelineCoverage: 0.2, takes: 0, pages: 20, partial: true, checksRan: 5, checksAttempted: 6 });
+    expect(onboardGaps(parallel)).toEqual({ stale_chunks: true, link_coverage: false, timeline_coverage: true, no_takes: true });
+  });
+
+  test('an aborted sequential run stops issuing counts', async () => {
+    const { collectOnboardOpportunities } = await import('../src/core/onboard/mcp-onboarding.ts');
+    const controller = new AbortController();
+    controller.abort();
+    const counts = await collectOnboardOpportunities(stubEngine({ stale: 1, pages: 2 }), controller.signal, async () => {});
+    expect(counts.checksRan).toBe(0);
+    expect(counts.partial).toBe(true);
   });
 });

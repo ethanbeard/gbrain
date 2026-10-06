@@ -3,6 +3,9 @@
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 
+/** `ts.getTokenAtPosition` is exported at runtime but absent from typescript's public declarations. */
+const tsInternal = ts as typeof ts & { getTokenAtPosition(sourceFile: ts.SourceFile, position: number): ts.Node };
+
 const MARKER = 'engine-dynamic-import-ok';
 const MARKER_TOKEN_CHAR = /[\p{ID_Continue}$-]/u;
 const files = process.argv.slice(2);
@@ -29,8 +32,9 @@ for (const file of files) {
   const lines = sourceText.split(/\r?\n/);
   const markerLines = new Set<number>();
 
-  if (sourceFile.parseDiagnostics.length > 0) {
-    const diagnostics = sourceFile.parseDiagnostics
+  const { parseDiagnostics } = sourceFile as ts.SourceFile & { parseDiagnostics: readonly ts.Diagnostic[] };
+  if (parseDiagnostics.length > 0) {
+    const diagnostics = parseDiagnostics
       .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, ' '))
       .join('; ');
     readErrors.push(`ERROR: cannot parse input file ${file}: ${diagnostics}`);
@@ -41,7 +45,7 @@ for (const file of files) {
     const after = Array.from(sourceText.slice(markerPos + MARKER.length))[0];
     const standaloneMarker = (!before || !MARKER_TOKEN_CHAR.test(before))
       && (!after || !MARKER_TOKEN_CHAR.test(after));
-    const token = ts.getTokenAtPosition(sourceFile, markerPos);
+    const token = tsInternal.getTokenAtPosition(sourceFile, markerPos);
     const insideToken = token.getStart(sourceFile) <= markerPos && markerPos < token.end;
     if (standaloneMarker && !insideToken) {
       markerLines.add(sourceFile.getLineAndCharacterOfPosition(markerPos).line);

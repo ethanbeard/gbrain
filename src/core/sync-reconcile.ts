@@ -122,6 +122,13 @@ export interface HardDeadlineResolution {
   graceMs: number;
   /** Where the deadline came from (for the armed-log line + tests). */
   reason: string;
+  /**
+   * Progress-aware window (ms). Set for the default and env deadlines: past
+   * the deadline the run continues while it keeps importing, and stops only
+   * after this long without progress. Absent for the explicit `--hard-deadline`
+   * and `--timeout` flags, which stay strict wall-clock caps.
+   */
+  progressWindowMs?: number;
 }
 
 /**
@@ -152,7 +159,8 @@ export function resolveStallAbortSeconds(
  * flag, or an explicit opt-out / 0).
  *
  * Precedence: --no-hard-deadline > --hard-deadline > --timeout(non-all) > env >
- * non-TTY default (3600s) > none.
+ * non-TTY default (3600s) > none. The env and default deadlines are
+ * progress-aware (`progressWindowMs`); the explicit flags are strict.
  */
 export function resolveSyncHardDeadline(
   args: string[],
@@ -181,15 +189,70 @@ export function resolveSyncHardDeadline(
     if (sec && sec > 0) return mk(sec, 'flag:--timeout');
   }
 
+  // A large first sync legitimately outlives the default hour, so these two
+  // deadlines never stop a run that is still importing: past the deadline they
+  // extend while progress keeps arriving, for up to one stall window between
+  // progress notes (the same window the in-band stall watchdog uses).
+  const stallSec = resolveStallAbortSeconds(env);
+  const progressAware = (res: HardDeadlineResolution | null): HardDeadlineResolution | null =>
+    res && { ...res, progressWindowMs: (stallSec > 0 ? stallSec : DEFAULT_SYNC_STALL_ABORT_SEC) * 1000 };
+
   const envRaw = env.GBRAIN_SYNC_MAX_RUNTIME_SECONDS;
   if (envRaw !== undefined && envRaw !== '') {
     const n = Number(envRaw);
-    if (Number.isFinite(n)) return mk(n, 'env:GBRAIN_SYNC_MAX_RUNTIME_SECONDS'); // n<=0 disables
+    if (Number.isFinite(n)) return progressAware(mk(n, 'env:GBRAIN_SYNC_MAX_RUNTIME_SECONDS')); // n<=0 disables
   }
 
-  if (!opts.isTty) return mk(opts.defaultNonTtySec ?? 3600, 'default:non-tty');
+  if (!opts.isTty) return progressAware(mk(opts.defaultNonTtySec ?? 3600, 'default:non-tty'));
 
   return null;
+}
+
+/**
+ * The `gbrain sync` watchdog installation for a resolved deadline: the
+ * `installProcessWatchdog` options (progress window and stop notice included)
+ * and the stderr line announcing it.
+ */
+export function syncWatchdogPlan(args: string[], res: HardDeadlineResolution): {
+  watchdog: { deadlineMs: number; graceMs: number; label: string; heartbeatMs: number; progressWindowMs?: number; stopNotice: string };
+  armedLine: string;
+} {
+  return {
+    watchdog: { deadlineMs: res.deadlineMs, graceMs: res.graceMs, label: 'sync-watchdog', heartbeatMs: 60_000,
+      progressWindowMs: res.progressWindowMs, stopNotice: syncDeadlineStopNotice(args, res) },
+    armedLine: `[sync-watchdog] hard deadline armed: ${Math.round(res.deadlineMs / 1000)}s + ${Math.round(res.graceMs / 1000)}s grace (${res.reason})` +
+      (res.progressWindowMs ? `; extends while the sync keeps progressing (stops after ${Math.round(res.progressWindowMs / 1000)}s without progress)` : '') +
+      '; disable with --no-hard-deadline\n',
+  };
+}
+
+/**
+ * #5984: the shell-quoted `gbrain sync` command that resumes this run with the
+ * same brain, source and cursor-defining options (`args` are the sync argv).
+ */
+export function syncResumeCommand(args: string[], brain: string | null = null): string {
+  return ['gbrain', ...(brain ? ['--brain', brain] : []), 'sync', ...args].map(a => /^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
+}
+
+/**
+ * The stdout notice the sync watchdog prints when it stops a run, so the agent
+ * sees why the sync ended and the exact command that resumes it (a SIGTERMed
+ * process prints no summary of its own). One JSON object under `--json`.
+ */
+export function syncDeadlineStopNotice(args: string[], res: HardDeadlineResolution): string {
+  const deadlineSec = Math.round(res.deadlineMs / 1000);
+  const windowSec = res.progressWindowMs ? Math.round(res.progressWindowMs / 1000) : null;
+  const resume = syncResumeCommand(args);
+  const cause = windowSec
+    ? `the ${deadlineSec}s sync deadline (${res.reason}) passed and the run made no progress for ${windowSec}s`
+    : `the ${deadlineSec}s sync deadline (${res.reason}) passed`;
+  const fix = 'Pages imported before the stop are kept and a rerun skips them. Resume with: ' + resume +
+    '. If the stop was wrong for this brain, rerun with --hard-deadline <seconds> or --no-hard-deadline.';
+  if (args.includes('--json')) {
+    return JSON.stringify({ status: 'stopped', code: 'sync_deadline_stop', reason: res.reason, deadline_seconds: deadlineSec,
+      progress_window_seconds: windowSec, cause, resume_command: resume, fix });
+  }
+  return `gbrain sync stopped (code=sync_deadline_stop): ${cause}. ${fix}`;
 }
 
 /**

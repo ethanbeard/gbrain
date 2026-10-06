@@ -117,9 +117,13 @@ function dedupByTextSimilarity(results: SearchResult[], threshold: number): Sear
     let tooSimilar = false;
 
     for (const kWords of samePageKept) {
-      const intersection = new Set([...rWords].filter(w => kWords.has(w)));
-      const union = new Set([...rWords, ...kWords]);
-      const jaccard = intersection.size / union.size;
+      // |A ∩ B| by iterating the smaller set; |A ∪ B| = |A| + |B| - |A ∩ B|.
+      // Same value as building intersection/union Sets, without allocating.
+      const [smaller, larger] = rWords.size <= kWords.size ? [rWords, kWords] : [kWords, rWords];
+      let intersectionSize = 0;
+      for (const w of smaller) if (larger.has(w)) intersectionSize++;
+      const unionSize = rWords.size + kWords.size - intersectionSize;
+      const jaccard = unionSize === 0 ? 0 : intersectionSize / unionSize;
 
       if (jaccard > threshold) {
         tooSimilar = true;
@@ -187,33 +191,30 @@ function capPerPage(results: SearchResult[], maxPerPage: number): SearchResult[]
  * away matching evidence (a 0.90 hit replaced by a 0.10 summary chunk).
  */
 function guaranteeCompiledTruth(results: SearchResult[], preDedup: SearchResult[]): SearchResult[] {
-  // Group results by composite page key (source_id, slug).
-  const byPage = new Map<string, SearchResult[]>();
+  // Per composite page key (source_id, slug): does the kept set already hold
+  // a compiled_truth chunk? Insertion order = first appearance in results.
+  const hasTruth = new Map<string, boolean>();
   for (const r of results) {
     const k = pageKey(r);
-    const existing = byPage.get(k) || [];
-    existing.push(r);
-    byPage.set(k, existing);
+    hasTruth.set(k, hasTruth.get(k) === true || r.chunk_source === 'compiled_truth');
+  }
+
+  // One pre-dedup scan: the best compiled_truth chunk for each page that
+  // lacks one (first-seen max wins on ties). The composite key keeps two
+  // same-slug pages in different sources from borrowing each other's chunk.
+  const best = new Map<string, SearchResult>();
+  for (const r of preDedup) {
+    if (r.chunk_source !== 'compiled_truth') continue;
+    const k = pageKey(r);
+    if (hasTruth.get(k) !== false) continue;
+    const cur = best.get(k);
+    if (cur === undefined || r.score > cur.score) best.set(k, r);
   }
 
   const output = [...results];
-
-  for (const [key, pageChunks] of byPage) {
-    const hasCompiledTruth = pageChunks.some(c => c.chunk_source === 'compiled_truth');
-    if (hasCompiledTruth) continue;
-
-    // Find the best compiled_truth chunk from pre-dedup input for this
-    // (source_id, slug) combination. Pre-v0.17 single-source match was
-    // "r.slug === slug"; now it's the composite key so two same-slug
-    // pages in different sources don't mistakenly swap chunks across.
-    const candidate = preDedup
-      .filter(r => pageKey(r) === key && r.chunk_source === 'compiled_truth')
-      .sort((a, b) => b.score - a.score)[0];
-
-    if (!candidate) continue;
-
-    output.push(candidate);
+  for (const [k, truth] of hasTruth) {
+    const candidate = truth ? undefined : best.get(k);
+    if (candidate) output.push(candidate);
   }
-
   return output;
 }

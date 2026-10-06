@@ -40,6 +40,8 @@ async function runLegacyCancel({ args, engine }: JobsCommandContext): Promise<vo
 export async function runJobsCancel(ctx: JobsCommandContext): Promise<void> {
   const { args, queue } = ctx;
   if (args.includes('--select')) return runLegacyCancel(ctx);
+  const groupId = parseFlag(args, '--group');
+  if (groupId !== undefined) return cancelSpendGroup(ctx, groupId);
   const id = parseInt(args[1], 10);
   if (isNaN(id)) { console.error('Error: job ID required.'); process.exit(1); }
 
@@ -53,4 +55,18 @@ export async function runJobsCancel(ctx: JobsCommandContext): Promise<void> {
     console.error(`Could not cancel job #${id} (may already be completed/dead).`);
     process.exit(1);
   }
+}
+
+/** `jobs cancel --group <id>`: cancels every unfinished job of a spend group (finished rows are left as they are). */
+async function cancelSpendGroup({ args, engine, queue }: JobsCommandContext, groupId: string): Promise<void> {
+  const { groupJobs } = await import('../../core/minions/spend-authorization.ts');
+  const jobs = await groupJobs(engine, groupId);
+  const cancelled: number[] = [];
+  for (const job of jobs) {
+    if (['completed', 'failed', 'dead', 'cancelled'].includes(job.status)) continue;
+    if (await queue.cancelJob(job.id)) cancelled.push(job.id);
+  }
+  if (args.includes('--json')) { console.log(JSON.stringify({ group_id: groupId, cancelled_ids: cancelled, jobs: jobs.length }, null, 2)); return; }
+  if (!jobs.length) { console.error(`No jobs in spend group ${groupId}; check the id with: gbrain jobs list --group ${groupId} --json`); process.exit(1); }
+  console.log(`Cancelled ${cancelled.length} unfinished job(s) of spend group ${groupId}${cancelled.length ? `: ${cancelled.join(', ')}` : ''}.`);
 }

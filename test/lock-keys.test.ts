@@ -133,8 +133,10 @@ describe('createEntity advisory lock — transaction scope + key routing', () =>
 
     // Every statement in the TOCTOU window (lock, registry getPage probe,
     // putPage) flowed through the tx engine — the xact lock spans them all.
-    expect(calls.length).toBeGreaterThanOrEqual(3);
-    for (const c of calls) expect(c.onTx).toBe(true);
+    // The maintenance principal lookup runs before the transaction opens.
+    const inWindow = calls.filter((c) => !c.sql?.includes('FROM persistence_brain'));
+    expect(inWindow.length).toBeGreaterThanOrEqual(3);
+    for (const c of inWindow) expect(c.onTx).toBe(true);
     expect(calls.map((c) => c.method)).toContain('putPage');
   });
 

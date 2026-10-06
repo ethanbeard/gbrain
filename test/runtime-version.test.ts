@@ -40,7 +40,7 @@ describe('Bun runtime floor', () => {
   });
 
   test('the floor and newer releases start', () => {
-    for (const version of ['1.4.0', '1.4.2', '1.5.0', '2.0.0', '1.4.2+abc123']) {
+    for (const version of ['1.4.0', '1.4.2', '1.5.0', '2.0.0', '1.4.2+abc123', '1.5.0-canary.3+abc123']) {
       expect(unsupportedBunMessage(version)).toBeNull();
       expect(() => assertSupportedBun(version)).not.toThrow();
     }

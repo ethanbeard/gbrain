@@ -16,6 +16,7 @@ import { parseMarkdown } from '../../src/core/markdown.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { configureGateway } from '../../src/core/ai/gateway.ts';
 import { runSchemaTransition } from '../../src/core/embedding-migration.ts';
+import { buildDeferredAnnIndexes } from '../../src/core/embedding-ann-build.ts';
 import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
 
 // Local opt-in configuration; container CI must not import developer credentials.
@@ -180,7 +181,9 @@ export async function setupLegacyEmbeddingDB(): Promise<PostgresEngine> {
     throw new Error('Legacy embedding fixture requires all four text embedding columns');
   }
   if (columns.some(column => column.table_name !== 'takes' && Number(column.dims) !== dims)) {
-    await runSchemaTransition(target, dims);
+    // #5088: the transition defers HNSW builds to the migration's build phase; the fixture builds them now.
+    let pending = await runSchemaTransition(target, dims);
+    await buildDeferredAnnIndexes(target, { targetDims: dims, readPending: async () => pending, writePending: async next => { pending = next; }, log: () => {} });
   }
   const takes = columns.find(column => column.table_name === 'takes')!;
   if (Number(takes.dims) !== dims) {

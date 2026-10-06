@@ -30,6 +30,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import type { ExtractAtomsOpts } from './extract-atoms.ts';
 import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
 import { redactFindings } from '../secret-scan.ts';
 import { ensureWellFormed, truncateUtf8 } from '../text-safe.ts';
@@ -147,6 +148,19 @@ export type DrainStop =
   | 'no_progress' | 'max_batches' | 'provider_failure';
 
 export const DRAIN_COUNT_TIMEOUT_MS = 60_000;
+
+/**
+ * #5856: dead-letter text of a drain the atom session preflight refused before any spend
+ * (`owner_unavailable` / `permission_denied`). The auto-drain cap does not count such a job.
+ */
+export const STRUCTURAL_REFUSAL_PREFIX = 'structural_refusal:';
+
+/** The non-retryable dead-letter text for a structural preflight refusal, or null for any other error. */
+export function structuralAtomRefusal(error: unknown): string | null {
+  if (!(error instanceof Error) || error.name !== 'OperationError') return null;
+  const code = (error as Error & { code?: unknown }).code;
+  return code === 'owner_unavailable' || code === 'permission_denied' ? `${STRUCTURAL_REFUSAL_PREFIX} ${code}: ${error.message}` : null;
+}
 /** setTimeout fires at once past 2^31-1 ms; a longer window or deadline waits the maximum. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
@@ -443,22 +457,29 @@ export async function runExtractAtomsDrainForSource(
   opts: DrainForSourceOpts,
 ): Promise<ExtractAtomsDrainResult> {
   const { withRefreshingLock } = await import('../db-lock.ts');
-  const { runPhaseExtractAtoms, countExtractAtomsBacklog } = await import('./extract-atoms.ts');
+  const { countExtractAtomsBacklog } = await import('./extract-atoms.ts');
+  const { runPhaseExtractAtomsStamped } = await import('./extract-atoms-stamp.ts');
   const { cycleLockIdFor } = await import('../cycle.ts');
+
+  const { MaintenanceWriteWait } = await import('../persistence/maintenance-wait.ts');
 
   const extractionSourceId = opts.sourceId ?? 'default';
   const lockId = cycleLockIdFor(opts.sourceId);
+  // #5856/#5854: one call is one attempt; its batches share one BudgetTracker
+  // (the per-run cap holds for the whole attempt) and one publish wait.
+  const attempt: NonNullable<ExtractAtomsOpts['attempt']> = { writeWait: new MaintenanceWriteWait(opts.deadlineAtMs ?? null) };
 
   return runExtractAtomsDrain(
     {
       withLock: (work) => withRefreshingLock(engine, lockId, (signal) => work(signal), { ttlMinutes: 5 }),
       runBatch: async ({ signal, stopSignal }) => {
-        const r = await runPhaseExtractAtoms(engine, {
+        const r = await runPhaseExtractAtomsStamped(engine, {
           sourceId: extractionSourceId,
           dryRun: false,
           brainDir: opts.brainDir,
           signal,
           stopSignal,
+          attempt,
         });
         const d = (r.details ?? {}) as Record<string, unknown>;
         // issue #3218: `r.status` collapses to 'warn' whether ONE item failed

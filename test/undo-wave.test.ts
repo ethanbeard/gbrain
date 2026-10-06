@@ -79,6 +79,8 @@ function buildMockEngine(state: Partial<MockEngineState>): { engine: BrainEngine
       }
       return [];
     },
+    // The take un-resolution runs in a maintenance transaction; the mock is its own transaction engine.
+    async transaction<T>(fn: (tx: BrainEngine) => Promise<T>): Promise<T> { return fn(engine); },
   } as unknown as BrainEngine;
   return { engine, sqls };
 }

@@ -2,11 +2,12 @@ import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runPhaseSynthesize } from '../src/core/cycle/synthesize.ts';
-import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
+import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
@@ -353,4 +354,46 @@ test('partial multi-output recovery indexes every finalized output without repub
       expect(summaryBytes).toContain(`[[${slug}]]`);
     }
   }, 2);
+}, 120_000);
+
+test('#5854: a postprocess publish still pending after its wait is deferred, then finished by the next ordinary cycle', async () => {
+  await fixture(async ({ engine, sourceId, root, opts, calls }) => {
+    const corpus = join(root, '..', 'corpus');
+    mkdirSync(corpus);
+    writeFileSync(join(corpus, basename(opts.inputFile)), readFileSync(opts.inputFile));
+    await engine.setConfig('dream.synthesize.session_corpus_dir', corpus);
+    const ordinary = { brainDir: root, sourceId, dryRun: false };
+    await interruptAfterChild(engine, sourceId, ordinary);
+    const slug = await outputSlug(engine, sourceId);
+    await engine.executeRaw("DELETE FROM config WHERE key='dream.synthesize.last_completion_ts'");
+    const jobsBefore = await engine.executeRaw('SELECT id FROM minion_jobs ORDER BY id');
+    const spent = calls();
+    const lock = (await acquireWorktree((await getWorktreeBinding(engine, sourceId))!, 1000))!;
+    __setMaintenanceWriteWaitForTests(300);
+    let deferred: Awaited<ReturnType<typeof runPhaseSynthesize>>;
+    try { deferred = await runPhaseSynthesize(engine, ordinary); }
+    finally { __setMaintenanceWriteWaitForTests(null); await lock.release(); }
+    expect(deferred.status).toBe('warn');
+    expect(deferred.details.publish_pending).toBe(1);
+    expect(deferred.details.publish_deferred).toBe('publish deferred (writer busy); finishes next cycle, no action needed');
+    expect(deferred.details.pages_written).toBe(0);
+    expect(await engine.getConfig('dream.synthesize.last_completion_ts')).toBeNull();
+    const [pending] = await engine.executeRaw<{ request_id: string }>(
+      "SELECT request_id::text FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND intent->>'kind'='managed_maintenance_page'", [sourceId, slug]);
+    expect(pending).toBeDefined();
+    await disposePersistenceConsumer(engine);
+    const next = await runPhaseSynthesize(engine, ordinary);
+    expect(next.status).toBe('ok');
+    expect(next.details.publish_pending).toBeUndefined();
+    expect(next.details.written_slugs).toEqual([slug]);
+    expect(calls()).toBe(spent);
+    expect(await engine.executeRaw('SELECT id FROM minion_jobs ORDER BY id')).toEqual(jobsBefore);
+    expect(await engine.executeRaw<{ request_id: string; state: string }>(
+      "SELECT request_id::text, state FROM persistence_requests WHERE source_id=$1 AND slug=$2 AND intent->>'kind'='managed_maintenance_page'", [sourceId, slug]))
+      .toEqual([{ request_id: pending.request_id, state: 'committed' }]);
+    const snapshot = (await engine.readPageSnapshot(slug, { sourceId }))!;
+    expect(snapshot.page.frontmatter.dream_generated).toBe(true);
+    expect(snapshot.page.compiled_truth).not.toContain('"an entirely invented');
+    expect(await engine.getConfig('dream.synthesize.last_completion_ts')).not.toBeNull();
+  });
 }, 120_000);

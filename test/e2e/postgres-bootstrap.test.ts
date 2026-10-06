@@ -27,7 +27,7 @@ import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { LATEST_VERSION } from '../../src/core/migrate.ts';
 import { readFactsEmbeddingDim } from '../../src/core/embedding-dim-check.ts';
 import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
-import { applyPostgresForwardReferenceBootstrap } from '../../src/core/postgres-engine/forward-reference-bootstrap.ts';
+import { applyPostgresForwardReferenceBootstrap } from '../../src/core/engine-sql/bootstrap.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const skip = !DATABASE_URL;

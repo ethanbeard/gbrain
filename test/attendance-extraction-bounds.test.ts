@@ -185,3 +185,22 @@ for (const body of [`**Attendees:** [[${person}]] (Acme)`, `- **Attendees:** [[$
     expect(db.candidates.filter(row => row.canonicalAttendance)).toEqual([]);
   });
 }
+
+// gbrain-evals N12-6: a Participants line or section is attendance evidence
+// like its Attendees twin (the N12 generator writes `Participants: <links>`).
+for (const body of [
+  `Participants: [[${person}]]`,
+  `**Participants:** [[${person}]]`,
+  `## Participants\n- [[${person}]]\n## Notes`,
+]) {
+  test(`N12-6: ${JSON.stringify(body)} is attendance evidence`, async () => {
+    expect(hasAttendanceEvidence(attendanceEvidenceRanges(body), body.indexOf(`[[${person}]]`))).toBe(true);
+    const result = await extractPageLinks(meeting, body, {}, 'meeting', resolver, { targetType: slug => types.get(slug) });
+    expect(result.candidates.filter(row => row.canonicalAttendance).map(row => row.targetSlug)).toEqual([person]);
+  });
+}
+
+test('N12-6: a participant named only in prose stays a mention', async () => {
+  const body = `The participants included [[${person}]] at the start.`;
+  expect(hasAttendanceEvidence(attendanceEvidenceRanges(body), body.indexOf(`[[${person}]]`))).toBe(false);
+});

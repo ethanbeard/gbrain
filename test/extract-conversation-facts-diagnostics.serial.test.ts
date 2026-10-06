@@ -53,6 +53,7 @@ beforeEach(async () => {
   await engine.executeRaw('TRUNCATE facts, pages, op_checkpoints, extract_rollup_7d CASCADE');
   await engine.executeRaw('DELETE FROM gbrain_cycle_locks');
   await engine.setConfig('facts.extraction_enabled', 'true');
+  await engine.setConfig('facts.extraction_model', 'anthropic:claude-sonnet-4-6');
   await engine.setConfig('conversation_parser.llm_fallback_enabled', 'false');
   await engine.setConfig('cycle.conversation_facts_backfill.enabled', 'true');
   await engine.setConfig('cycle.conversation_facts_backfill.workers', '3');
@@ -72,6 +73,33 @@ beforeEach(async () => {
 });
 
 describe('#5364 diagnostics across workers, sources, CLI, and cycle', () => {
+  // #5823: execute CLI diagnostics and parsing, not source-text assertions.
+  test('explicit unpriced cap names pricing recovery rather than recommending a larger cap', async () => {
+    await engine.setConfig('facts.extraction_model', 'anthropic:synthetic-unpriced-model');
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const exit = spyOn(process, 'exit').mockImplementation(((code: number) => { throw new Error(`exit:${code}`); }) as never);
+    try {
+      await expect(runExtractConversationFacts(engine, ['--source-id', 'speaker-a', '--max-cost-usd', '0.1', '--sleep', '0'])).rejects.toThrow('exit:1');
+      const summary = log.mock.calls.map(call => call.join(' ')).join('\n');
+      expect(summary).toContain('no_pricing: anthropic:synthetic-unpriced-model');
+      expect(summary).toContain('pricing.overrides');
+      expect(summary).not.toContain('Re-run with a higher --max-cost-usd');
+      expect(calls).toBe(0);
+    } finally {
+      exit.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  test.each(['0', '-1', 'invalid', '1junk', 'Infinity', undefined])('invalid explicit cap %s is rejected before extraction or background submission', async value => {
+    // Agent contract v1 D4: a usage error (invalid_params, exit 2 via renderCliError), not print + exit(1).
+    const args = ['--source-id', 'speaker-a', '--max-cost-usd', ...(value === undefined ? [] : [value])];
+    await expect(runExtractConversationFacts(engine, args))
+      .rejects.toMatchObject({ code: 'invalid_params', message: expect.stringContaining('--max-cost-usd requires a positive finite number') });
+    await expect(runExtractConversationFacts(engine, ['--background', ...args])).rejects.toThrow('--max-cost-usd requires a positive finite number');
+    expect(calls).toBe(0);
+  });
+
   test('dry-run help promises segmentation without model calls', async () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     try {
@@ -127,6 +155,34 @@ describe('#5364 diagnostics across workers, sources, CLI, and cycle', () => {
     }
   });
 
+  test('#5448: --json (a universal registry flag) prints one JSON envelope on stdout instead of Unknown flag', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const exit = spyOn(process, 'exit').mockImplementation(((code: number) => { throw new Error(`exit:${code}`); }) as never);
+    try {
+      await runExtractConversationFacts(engine, ['--dry-run', '--sleep', '0', '--types', 'conversation', '--json']);
+      expect(log.mock.calls).toHaveLength(1);
+      const envelope = JSON.parse(String(log.mock.calls[0]![0]));
+      expect(envelope).toMatchObject({
+        dry_run: true,
+        outcome: '(dry run) segmentation only; no facts extracted',
+        pages_considered: 10,
+        pages_processed: 6,
+        segments_processed: 6,
+        pages_skipped: 4,
+        spent_usd: 0,
+        budget_exhausted: false,
+        no_pricing_models: [],
+      });
+      expect([...envelope.sources].sort()).toEqual(['default', 'speaker-a', 'speaker-b']);
+      expect(calls).toBe(0);
+    } finally {
+      exit.mockRestore();
+      error.mockRestore();
+      log.mockRestore();
+    }
+  });
+
   test('cycle totals equal exact per-source subsets in dry-run and durable replay', async () => {
     const dry = await runPhaseConversationFactsBackfill(engine, { dryRun: true });
     expect(dry.status).toBe('ok');
@@ -168,7 +224,7 @@ describe('#5364 diagnostics across workers, sources, CLI, and cycle', () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     const exit = spyOn(process, 'exit').mockImplementation(((code: number) => { throw new Error(`exit:${code}`); }) as never);
     try {
-      await expect(runExtractConversationFacts(engine, ['--source-id', 'speaker-a', '--types', 'conversation', '--sleep', '0'])).rejects.toThrow('exit:3');
+      await expect(runExtractConversationFacts(engine, ['--source-id', 'speaker-a', '--types', 'conversation', '--sleep', '0'])).rejects.toThrow('exit:1'); // agent contract v1 A3: lock skips exit 1 (retryable); 3 means confirmation_required
       expect(log.mock.calls.map(call => call.join(' ')).join('\n')).toContain('Skipped 1 page(s) held by another worker');
     } finally {
       exit.mockRestore();

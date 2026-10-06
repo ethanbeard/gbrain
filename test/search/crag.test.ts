@@ -8,6 +8,8 @@ import {
   shouldEscalateRetrieval,
   confidenceRank,
   DEFAULT_CRAG_MIN_TOP,
+  RELAXED_CORROBORATION_DEPTH,
+  relaxedTopCorroborated,
 } from '../../src/core/search/crag.ts';
 import type { SearchResult } from '../../src/core/types.ts';
 
@@ -94,5 +96,77 @@ describe('shouldEscalateRetrieval / confidenceRank (#1663)', () => {
   test('rank ordering: strong > moderate > weak', () => {
     expect(confidenceRank('strong')).toBeGreaterThan(confidenceRank('moderate'));
     expect(confidenceRank('moderate')).toBeGreaterThan(confidenceRank('weak'));
+  });
+});
+
+// gbrain-evals A4-2: on the keyword path every natural question graded
+// moderate, although the rank-1 row was an OR-relaxed match for 120 of 120
+// unanswerable questions (and 80 of 120 answerable ones).
+describe('A4-2: an OR-relaxed keyword top is weak', () => {
+  test('keyword_relaxed top → weak / keyword_relaxed_top, even when labelled keyword_exact upstream', () => {
+    const g = gradeRetrievalConfidence([r({ keyword_relaxed: true, evidence: 'keyword_exact' })]);
+    expect(g).toEqual({ level: 'weak', reason: 'keyword_relaxed_top', top_evidence: 'keyword_exact' });
+  });
+  test('a strict keyword top stays moderate; identity and rerank signals still win over relaxed', () => {
+    expect(gradeRetrievalConfidence([r({ evidence: 'keyword_exact' })]).reason).toBe('keyword_exact_top');
+    expect(gradeRetrievalConfidence([r({ keyword_relaxed: true, evidence: 'exact_title_match' })]).level).toBe('strong');
+    expect(gradeRetrievalConfidence([r({ keyword_relaxed: true, rerank_score: 0.9 })]).reason).toBe('rerank_top');
+  });
+});
+
+// #5919: a relaxed top is moderate only when the top rows corroborate it.
+describe('#5919: corroborating an OR-relaxed keyword top', () => {
+  const relaxed = (title: string, chunk_text: string) => r({ keyword_relaxed: true, evidence: 'weak_semantic', title, chunk_text });
+  const profile = relaxed('Quillon Example', 'Quillon Example is headquartered in Varnholt. Quillon Example has 212 employees.');
+  const note = relaxed('Diligence note: Pellar Example', 'Diligence note on Pellar Example. Pellar Example was founded in March 1998.');
+  const other = relaxed('Brisk Example', 'Brisk Example is headquartered in Ostrel.');
+
+  test('one framing word the corpus never writes, rest co-located in one row → moderate', () => {
+    const query = 'Which city is Quillon Example headquartered in?';
+    expect(relaxedTopCorroborated([profile, other], query)).toBe(true);
+    expect(gradeRetrievalConfidence([profile, other], { query })).toEqual({
+      level: 'moderate', reason: 'keyword_relaxed_corroborated', top_evidence: 'weak_semantic',
+    });
+  });
+
+  test('the corroborating row may sit lower in the top five', () => {
+    const query = 'How many employees does Quillon Example have?';
+    expect(gradeRetrievalConfidence([other, note, profile], { query }).level).toBe('moderate');
+  });
+
+  test('inflections compare equal ("headquarters" vs "headquartered")', () => {
+    expect(relaxedTopCorroborated([profile], 'Which city has the Quillon Example headquarters?')).toBe(true);
+  });
+
+  test('entity in one row, attribute only in others (missing attribute) → weak', () => {
+    const query = 'Which city is Pellar Example headquartered in?';
+    expect(relaxedTopCorroborated([note, other], query)).toBe(false);
+    expect(gradeRetrievalConfidence([note, other], { query })).toMatchObject({ level: 'weak', reason: 'keyword_relaxed_top' });
+  });
+
+  test('a name in the question that no row mentions (absent entity) → weak', () => {
+    const query = 'When was Corvane Example founded?';
+    expect(relaxedTopCorroborated([note], query)).toBe(false);
+    expect(relaxedTopCorroborated([note], 'when was corvane example founded?')).toBe(true);
+  });
+
+  test('more than one unmatched content term (attribute phrased in words the evidence never uses) → weak', () => {
+    const arr = relaxed('Quillon Example', 'Quillon Example reports $4.2M ARR.');
+    expect(relaxedTopCorroborated([arr], 'What is the annual recurring revenue of Quillon Example?')).toBe(false);
+  });
+
+  test('a framing word written in another window row is treated like an attribute written elsewhere → weak', () => {
+    const cityRow = relaxed('Brisk Example', 'Brisk Example is headquartered in a coastal city.');
+    expect(relaxedTopCorroborated([profile, cityRow], 'Which city is Quillon Example headquartered in?')).toBe(false);
+  });
+
+  test('only rows inside the top five count', () => {
+    const query = 'Which city is Quillon Example headquartered in?';
+    const filler = Array.from({ length: RELAXED_CORROBORATION_DEPTH }, () => relaxed('Brisk Example', 'Brisk Example sells kites.'));
+    expect(relaxedTopCorroborated([...filler, profile], query)).toBe(false);
+  });
+
+  test('without the query text a relaxed top stays weak', () => {
+    expect(gradeRetrievalConfidence([profile]).reason).toBe('keyword_relaxed_top');
   });
 });

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // Freeze selection before setup; workers execute exactly the supplied argv.
 // selector -> exclusions -> weighted matrix -> isolated sequential workers
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve, relative, isAbsolute } from "node:path";
 import { loadWeights, partition, type WeightMap } from "./sharding.ts";
 
@@ -12,11 +12,21 @@ export const PERSISTENCE_VALIDATION_OWNED = new Set([
   'test/e2e/reconcile-crash.test.ts',
   'test/e2e/reconcile-crash-unactivated.test.ts',
 ]);
+// PR owner of every test/e2e/ row of scripts/e2e-backend-matrix.txt (`!` rows
+// stay out of the matrix) is e2e.yml's tier1-backend-matrix job: it runs each
+// file on direct Postgres and again through PgBouncer, so Selected E2E's
+// direct-only run of the same file was a duplicate (C3).
+export const BACKEND_MATRIX_OWNED = new Set(
+  readFileSync(resolve(import.meta.dir, "e2e-backend-matrix.txt"), "utf8").split("\n")
+    .filter(row => row.startsWith("test/e2e/"))
+    .map(row => row.split("\t")[0]),
+);
 export function exclusionNotice(file: string): string {
-  return PERSISTENCE_VALIDATION_OWNED.has(file)
-    ? `excluded: ${file} (owned by persistence-validation.yml)`
-    : `excluded (named-job / live-key lane): ${file}`;
+  if (PERSISTENCE_VALIDATION_OWNED.has(file)) return `excluded: ${file} (owned by persistence-validation.yml)`;
+  if (BACKEND_MATRIX_OWNED.has(file)) return `excluded: ${file} (owned by the Tier 1 backend matrix, scripts/e2e-backend-matrix.txt)`;
+  return `excluded (named-job / live-key lane): ${file}`;
 }
+export const MAX_E2E_WORKERS = 8;
 export const E2E_EXCLUSIONS = new Set([
   'test/e2e/op-checkpoint-jsonb-parity.test.ts',
   'test/e2e/jsonb-roundtrip.test.ts',
@@ -31,7 +41,24 @@ export const E2E_EXCLUSIONS = new Set([
   'test/e2e/skills.test.ts',
   'test/e2e/voyage-rerank-live.test.ts',
   'test/e2e/voyage-multimodal.test.ts',
+  // Engine graduation: run once by tier1's graduation step (direct Postgres + PgBouncer).
+  'test/e2e/graduation-cli.test.ts',
+  'test/e2e/graduation-cli-topologies.test.ts',
+  'test/e2e/graduation-cli-history.test.ts',
+  'test/e2e/graduation-cli-zero-mutation-1.test.ts',
+  'test/e2e/graduation-cli-zero-mutation-2.test.ts',
+  'test/e2e/graduation-cli-zero-mutation-3.test.ts',
+  'test/e2e/graduation-clients.test.ts',
+  'test/e2e/graduation-clients-serve.test.ts',
+  'test/e2e/graduation-crash-run-1.test.ts',
+  'test/e2e/graduation-crash-run-2.test.ts',
+  'test/e2e/graduation-crash-run-3.test.ts',
+  'test/e2e/graduation-crash-rollback-1.test.ts',
+  'test/e2e/graduation-crash-rollback-2.test.ts',
+  'test/e2e/graduation-faults.test.ts',
+  'test/e2e/graduation-legacy-copy.test.ts',
   ...PERSISTENCE_VALIDATION_OWNED,
+  ...BACKEND_MATRIX_OWNED,
 ]);
 export interface E2ERow { shard: number; files: string[]; empty: boolean }
 function validatePath(file: unknown): asserts file is string {
@@ -48,12 +75,12 @@ export function prepareMatrix(files: string[], weights: WeightMap): { include: E
     return false;
   });
   if (!selected.length) return { include: [{ shard: 1, files: [], empty: true }] };
-  return { include: partition(selected, weights, Math.min(4, selected.length)).map((files, i) => ({ shard: i + 1, files, empty: false })) };
+  return { include: partition(selected, weights, Math.min(MAX_E2E_WORKERS, selected.length)).map((files, i) => ({ shard: i + 1, files, empty: false })) };
 }
 export function validateRow(value: unknown, root: string): E2ERow {
   if (!value || typeof value !== "object") throw new Error("missing E2E matrix row");
   const row = value as E2ERow;
-  if (!Number.isInteger(row.shard) || row.shard < 1 || row.shard > 4 || !Array.isArray(row.files) || typeof row.empty !== "boolean") throw new Error("malformed E2E matrix row");
+  if (!Number.isInteger(row.shard) || row.shard < 1 || row.shard > MAX_E2E_WORKERS || !Array.isArray(row.files) || typeof row.empty !== "boolean") throw new Error("malformed E2E matrix row");
   if (row.empty !== (row.files.length === 0) || (row.empty && row.shard !== 1)) throw new Error("invalid empty E2E sentinel");
   if (new Set(row.files).size !== row.files.length) throw new Error("duplicate E2E worker file");
   const base = realpathSync(root);

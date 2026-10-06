@@ -9,15 +9,17 @@ import { computeContentHash } from '../ingestion/types.ts';
 import { resolveSlugForPath } from '../sync.ts';
 import { scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { sha256 } from './digest.ts';
-import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
-import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequest, intentDigest } from './journal.ts';
+import { assertPersistenceAccepting, estimatedRetryAfterMs, waitForWrite, writeResponse } from './service.ts';
+import { parseWireWriteWaitMs } from './write-wait.ts';
+import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequest, intentDigest, type WriteAdmission } from './journal.ts';
 import { submissionAuthority, authorizeStoredRequest } from './authority.ts';
-import { currentVerifiedLocalWriter, localHostId, readLocalWriter, registerLocalWriter } from './identity.ts';
+import { currentVerifiedLocalWriter, localHostId, readLocalWriter, registerLocalWriter, withVerifiedLocalRegistration } from './identity.ts';
+import type { BrainEngine } from '../engine.ts';
 import { claimWorktree, getWorktreeBinding } from './ownership.ts';
 import { parseMutationPrecondition } from './preconditions.ts';
 import { assertPurgeParams } from './purge-params.ts';
-import type { Principal } from './model.ts';
-import { normalizeSubagentPageInput } from './page-input.ts';
+import type { Principal, WriteRequest } from './model.ts';
+import { normalizeSubagentPageInput, undeclaredPageTypeWarning, type PageTypeWarning } from './page-input.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { isUnboundSourcePage, readUnboundWritePolicy, unboundSourceError } from './unbound-source.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
@@ -37,12 +39,61 @@ export async function requestPrincipalForContext(ctx: OperationContext): Promise
 export async function initializeLocalPersistence(ctx: OperationContext): Promise<void> {
   if (!ctx.auth && !currentVerifiedLocalWriter()) await registerLocalWriter(ctx.engine, ctx.remote === false ? 'cli' : 'stdio');
 }
+const flatSql = (sql: string) => sql.replace(/\s+/g, ' ').trim();
+/**
+ * Pre-admission reads every page of one batch makes with the same arguments:
+ * the source row, the worktree binding, the writer registration, the shared
+ * skillpack roots, the persistence identity and config values. All of them
+ * are rechecked under lock by the admission transaction.
+ */
+const BATCH_SHARED_READS = new Set([
+  "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1",
+  'SELECT s.source_id,s.source_incarnation,s.worktree_id,s.relative_path, s.topology_generation::text AS topology_generation,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state, h.local_path,h.coordination_path FROM persistence_source_bindings s JOIN persistence_worktrees w ON w.id=s.worktree_id LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid WHERE s.source_id=$1',
+  'SELECT lane,revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid',
+  'SELECT local_path FROM sources WHERE id=$1 AND incarnation=$2::uuid',
+  'SELECT brain_id FROM persistence_brain WHERE singleton=1',
+  'SELECT value FROM config WHERE key=$1',
+]);
+function batchSharedReads(engine: BrainEngine): BrainEngine {
+  const reads = new Map<string, Promise<unknown>>();
+  const once = <T>(id: string, read: () => Promise<T>): Promise<T> => {
+    let value = reads.get(id) as Promise<T> | undefined;
+    if (!value) { value = read(); reads.set(id, value); value.catch(() => reads.delete(id)); }
+    return value;
+  };
+  return new Proxy(engine, { get(target, key) {
+    if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) =>
+      BATCH_SHARED_READS.has(flatSql(sql)) ? once(JSON.stringify([flatSql(sql), params ?? null]), () => target.executeRaw(sql, params, opts)) : target.executeRaw(sql, params, opts);
+    if (key === 'getConfig') return (name: string) => once(`config:${name}`, () => target.getConfig(name));
+    const value = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+/**
+ * #6007: prepares one batch's page admissions under one writer verification
+ * and one read snapshot. `run` gets the caller's context (for a page that may
+ * claim the source's worktree) and a context whose engine answers the batch's
+ * shared pre-admission reads once; the local writer is verified once for the
+ * whole call instead of once per page.
+ */
+export async function withBatchAdmission<T>(ctx: OperationContext, run: (own: OperationContext, shared: OperationContext) => Promise<T>): Promise<T> {
+  const shared: OperationContext = { ...ctx, engine: batchSharedReads(ctx.engine) };
+  if (ctx.auth || currentVerifiedLocalWriter()) return run(ctx, shared);
+  await initializeLocalPersistence(ctx);
+  const registration = await readLocalWriter(ctx.engine, ctx.remote === false ? 'cli' : 'stdio');
+  return withVerifiedLocalRegistration(ctx.engine, registration, () => run(ctx, shared));
+}
 /** Validate explicit routing before any admission, including dry-run adapters. */
 export function pageMutationSource(ctx: OperationContext, params: Record<string, unknown>, operation: string): string {
   const sourceId = parseSourceIdParam(params.source_id, operation) ?? ctx.sourceId ?? 'default';
-  if (sourceId === '__all__') throw new OperationError('invalid_params', 'A mutation must target exactly one source.');
-  if (ctx.remote !== false && sourceId !== (ctx.auth?.sourceId ?? ctx.sourceId ?? 'default')) {
-    throw new OperationError('permission_denied', 'This source is outside the current write grant.');
+  if (sourceId === '__all__') {
+    throw new OperationError('invalid_params', 'A mutation must target exactly one source.',
+      `Pass source_id as one source (for example ${ctx.sourceId && ctx.sourceId !== '__all__' ? ctx.sourceId : 'default'}); writes never fan out across sources.`);
+  }
+  const granted = ctx.auth?.sourceId ?? ctx.sourceId ?? 'default';
+  if (ctx.remote !== false && sourceId !== granted) {
+    throw new OperationError('permission_denied', 'This source is outside the current write grant.',
+      `This connection writes only to source ${granted}. Pass source_id ${granted} (or omit it), or ask the brain host's operator to grant write access to ${sourceId}.`);
   }
   return sourceId;
 }
@@ -52,7 +103,9 @@ export function pageMutationSource(ctx: OperationContext, params: Record<string,
  * that file, so only a capture under that slug binds the file as its origin.
  */
 async function resolveCaptureFile(ctx: OperationContext, sourceId: string, p: Record<string, unknown>): Promise<string | null> {
-  if (Object.hasOwn(p, 'capture_path')) throw new OperationError('invalid_params', 'capture_path is reserved for the capture owner.');
+  if (Object.hasOwn(p, 'capture_path')) {
+    throw new OperationError('invalid_params', 'capture_path is reserved for the capture owner.', 'Drop capture_path and pass the text as content; gbrain sets the capture path itself.');
+  }
   if (p.local_file === undefined) return null;
   if (ctx.remote !== false || typeof p.local_file !== 'string' || !isAbsolute(p.local_file)) {
     throw new OperationError('invalid_params', 'Capture file paths are accepted only from the trusted local CLI.',
@@ -76,17 +129,50 @@ async function resolveCaptureFile(ctx: OperationContext, sourceId: string, p: Re
   return resolveSlugForPath(scannerSourcePath(canonicalRoot, join(canonicalRoot, capturePath), await scannerSlugRootMode(ctx.engine, sourceId, canonicalRoot)));
 }
 
+function pendingAwareResponse(ctx: OperationContext, row: WriteRequest): Record<string, unknown> {
+  return writeResponse(row, { retryAfterMs: estimatedRetryAfterMs(ctx.engine, 1) });
+}
+
+/** Owner-internal `put_page` kinds the trusted local file writers (import, frontmatter repair) submit; every other caller is refused them. */
+const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 'managed_file_repair']);
+
+/** #6007: a `put_pages` child: its batch, its position and the batch size are part of its identity. */
+export interface PageBatchMember { id: string; index: number; size: number; requestId: string }
+
 export async function submitPageMutation(ctx: OperationContext,
   input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true }): Promise<Record<string, unknown>> {
+  assertPersistenceAccepting(ctx.engine);
+  // #6007: wait_ms is a reply deadline from arrival, never part of the write's identity.
+  const arrived = performance.now();
+  const { wait_ms: wireWait, ...params } = input.params;
+  const wireWaitMs = parseWireWriteWaitMs(wireWait);
+  const waitMs = () => wireWaitMs !== undefined ? Math.max(0, wireWaitMs - (performance.now() - arrived)) : input.waitMs ?? ctx.writeWaitMs;
+  const prepared = await preparePageAdmission(ctx, { ...input, params });
+  if (prepared.prior) return pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs()));
+  const row = await admitWrite(ctx.engine, prepared.admission);
+  const response = pendingAwareResponse(ctx, await waitForWrite(ctx.engine, row, ctx.config, waitMs()));
+  return prepared.typeWarning ? { ...response, type_warning: prepared.typeWarning } : response;
+}
+
+/**
+ * Every check a page mutation passes before it is journaled, without admitting
+ * it: either the authorized prior request with this request_id (a replay), or
+ * the admission to submit. `put_pages` admits several of these together.
+ */
+export async function preparePageAdmission(ctx: OperationContext,
+  input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember }
+): Promise<{ prior: WriteRequest; admission?: undefined; typeWarning?: undefined } | { prior?: undefined; admission: WriteAdmission; typeWarning: PageTypeWarning | null }> {
   if (input.operation === 'put_page' && ['kind', 'preview', 'backup_reference'].some(key => Object.hasOwn(input.params, key))) {
-    if (ctx.remote !== false || input.managedFileImport !== true || input.params.kind !== 'managed_file_import' ||
+    if (ctx.remote !== false || input.managedFileImport !== true || !OWNER_FILE_INTENTS.has(String(input.params.kind)) ||
       ['preview', 'backup_reference'].some(key => Object.hasOwn(input.params, key))) {
-      throw new OperationError('invalid_params', 'Reserved persistence fields cannot be submitted through put_page. Use trusted local reconciliation administration.');
+      throw new OperationError('invalid_params', 'Reserved persistence fields cannot be submitted through put_page. Use trusted local reconciliation administration.',
+        'Drop kind, preview and backup_reference from put_page; reconciling a canonical file runs through gbrain sources reconcile on the brain host.');
     }
   }
-  assertPersistenceAccepting(ctx.engine);
-  const p: Record<string, unknown> = { ...input.params, ...parseMutationPrecondition(input.params) };
-  const requestId = typeof p.request_id === 'string' ? p.request_id : randomUUID();
+  const { page_batch: _forged, ...params } = input.params;
+  const p: Record<string, unknown> = { ...params, ...parseMutationPrecondition(params) };
+  if (input.batch) p.page_batch = { id: input.batch.id, index: input.batch.index, size: input.batch.size };
+  const requestId = input.batch ? input.batch.requestId : typeof p.request_id === 'string' ? p.request_id : randomUUID();
   const sourceId = pageMutationSource(ctx, p, input.operation);
   await initializeLocalPersistence(ctx);
   const captureSlug = input.operation === 'capture' ? await resolveCaptureFile(ctx, sourceId, p) : null;
@@ -99,20 +185,26 @@ export async function submitPageMutation(ctx: OperationContext,
     await submissionAuthority(ctx, prior.operation, prior.source_id, prior.source_incarnation, prior.slug);
     await authorizeStoredRequest(ctx.engine, prior);
     assertReplayIntent(prior, intentDigest({ operation: input.operation, sourceId, slug: prior.slug, callerIntent }));
-    return writeResponse(await waitForWrite(ctx.engine, prior, ctx.config, input.waitMs));
+    return { prior };
   }
   if (input.operation === 'delete_page') assertPurgeParams(p, ctx.remote);
   const [source] = await ctx.engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null; kind: string | null }>(
     "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
-  if (!source || source.archived) throw new OperationError('source_changed', 'The write source is not active.');
+  if (!source || source.archived) {
+    throw new OperationError('source_changed', 'The write source is not active.',
+      `Source ${sourceId} is archived or not registered, so nothing was written. Write to an active source (sources_list shows them).`);
+  }
   let slug = typeof p.slug === 'string' ? p.slug.toLowerCase() : '';
-  const intent = ['takes_add','takes_update','takes_supersede','takes_resolve'].includes(input.operation)
+  const intent = ['takes_add','takes_update','takes_supersede','takes_resolve','takes_remove'].includes(input.operation)
     ? await (await import('./takes-prepare.ts')).normalizeTakesIntent(ctx,p) : { ...p };
   delete intent.request_id;
   if (input.operation === 'put_page') await normalizeSubagentPageInput(ctx, intent);
+  const typeWarning = input.operation === 'put_page' && input.managedFileImport !== true
+    ? await undeclaredPageTypeWarning(ctx, { ...intent, slug }, sourceId) : null;
   if (input.operation === 'capture') {
     if (typeof p.content !== 'string' || !normalizeForHash(p.content) || detectBinaryNullByte(Buffer.from(p.content)) !== -1) {
-      throw new OperationError('invalid_params', 'Capture requires nonempty text without binary NUL bytes.');
+      throw new OperationError('invalid_params', 'Capture requires nonempty text without binary NUL bytes.',
+        'Pass content as non-empty text; binary files are not captured (store them with file_upload instead).');
     }
     const explicitType = explicitCaptureType(p.content, typeof p.type === 'string' ? p.type : undefined);
     if (explicitType) {
@@ -146,6 +238,13 @@ export async function submitPageMutation(ctx: OperationContext,
   const authority = await submissionAuthority(ctx, input.operation, sourceId, source.incarnation, slug);
   await assertKnowledgePublicationAllowed(ctx.engine, { source_id: sourceId, source_incarnation: source.incarnation, slug });
   const snapshot = await ctx.engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+  // #5616: typed edit refusals before admission; publication repeats them on the locked snapshot.
+  if (input.operation === 'edit_page') {
+    const { applyPageEdits, assertEditRevision, parsePageEdits } = await import('./page-edit.ts');
+    if (!snapshot || snapshot.page.deleted_at) throw new OperationError('page_not_found', `Page not found: ${slug}`, 'edit_page changes an existing page; create it with put_page.');
+    assertEditRevision(snapshot.revision, p.expected_revision);
+    applyPageEdits(snapshot.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits));
+  }
   let binding = await getWorktreeBinding(ctx.engine, sourceId);
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
   const configuredWriteThrough = !/^(false|0|off|no)$/i.test(await ctx.engine.getConfig('sync.write_through') ?? 'true');
@@ -193,8 +292,9 @@ export async function submitPageMutation(ctx: OperationContext,
     && !publishesDatabaseOnly(join(binding.local_path, binding.relative_path), slug, snapshot)) {
     throw colonSlugWindowsRefusal(slug, sourceId);
   }
-  const row = await admitWrite(ctx.engine, { principal, operation: input.operation, sourceId, sourceIncarnation: source.incarnation,
+  return { typeWarning, admission: { principal, operation: input.operation, sourceId, sourceIncarnation: source.incarnation,
     slug, pageId: snapshot?.page.id ?? null, requestId, callerIntent, intent, authority,
-    worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null });
-  return writeResponse(await waitForWrite(ctx.engine, row, ctx.config, input.waitMs));
+    ...(input.operation === 'edit_page' ? { terminalReservation: Math.max(16_384, Buffer.byteLength(JSON.stringify(authority)) + 8192)
+      + (await import('./page-edit.ts')).EDIT_PAGE_RECEIPT_RESERVE } : {}),
+    worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null } };
 }

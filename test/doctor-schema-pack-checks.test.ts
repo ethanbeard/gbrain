@@ -6,7 +6,8 @@
  *   - consistency picks the WORST source by untyped percentage;
  *   - warn fires at >= 10% (exactly 10.0% warns), stays ok at 9.9%;
  *   - empty brain -> ok / N-A;
- *   - engine.executeRaw throwing -> check stays OK (fail-open, "Skipped: ...");
+ *   - engine.executeRaw throwing -> warn "Not verified" with the reason in
+ *     details (#5432: a check that read nothing never reports ok);
  *   - soft-deleted pages are excluded (deleted_at IS NULL filter);
  *   - source drift: 0 or same-value schema_pack.source.* config rows -> ok,
  *     2 distinct values -> warn naming the distinct-pack count.
@@ -125,11 +126,13 @@ describe('schema_pack_consistency', () => {
     expect(check.message).toBe('All pages match the active schema pack across every source.');
   });
 
-  test('engine.executeRaw throwing -> check stays ok (fail-open), never throws', async () => {
+  test('engine.executeRaw throwing -> warn not verified (#5432), never throws', async () => {
     const check = await checkSchemaPackConsistency(throwingEngine);
     expect(check.name).toBe('schema_pack_consistency');
-    expect(check.status).toBe('ok'); // pinned: fail-open, NOT warn/fail
-    expect(check.message).toBe('Skipped: boom-executeRaw');
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('Not verified');
+    expect(check.message).toContain('boom-executeRaw');
+    expect(check.details).toMatchObject({ code: 'not_verified', verified: false, reason: 'boom-executeRaw' });
   });
 });
 
@@ -167,9 +170,10 @@ describe('schema_pack_source_drift', () => {
     expect(check.message).toContain('gbrain sources list');
   });
 
-  test('engine.executeRaw throwing -> check stays ok (fail-open), never throws', async () => {
+  test('engine.executeRaw throwing -> warn not verified (#5432), never throws', async () => {
     const check = await checkSchemaPackSourceDrift(throwingEngine);
-    expect(check.status).toBe('ok'); // pinned: fail-open, NOT warn/fail
-    expect(check.message).toBe('Skipped: boom-executeRaw');
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('Not verified');
+    expect(check.details).toMatchObject({ code: 'not_verified', verified: false, reason: 'boom-executeRaw' });
   });
 });

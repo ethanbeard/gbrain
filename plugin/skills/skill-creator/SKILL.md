@@ -13,6 +13,7 @@ tools:
   - search
   - list_pages
 mutating: true
+when_to_use: "Use when the user asks: \"create a skill\", \"new skill\", \"improve this skill\"."
 ---
 
 # Skill Creator
@@ -58,6 +59,10 @@ mutating: {true|false}
 ## Output Format
 {What good output looks like}
 
+## When it fails
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+{2-5 concrete failures this skill hits — error codes, refusals, notices — and what to do and tell the user}
+
 ## Anti-Patterns
 {What NOT to do — 3-5 items}
 
@@ -72,6 +77,13 @@ mutating: {true|false}
 ## Output Format
 
 New `skills/{name}/SKILL.md` file + updated manifest + updated resolver.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `bun test test/skills-conformance.test.ts` fails: the new SKILL.md lacks a required section (Contract, Anti-Patterns, Output Format, When it fails) or frontmatter; add it and re-run.
+- `gbrain check-resolvable` reports the skill unreachable: add the RESOLVER row in a fitting category, then re-run.
 
 ## Anti-Patterns
 

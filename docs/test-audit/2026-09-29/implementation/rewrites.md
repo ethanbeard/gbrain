@@ -220,7 +220,7 @@ Also reported stale but NOT from this slice (already stale at HEAD): `distributi
 
 ## Commands run
 
-- `bash ~/.capy/drive/user-garry-tan/skills/gstack/scripts/install.sh --check` → failed (not installed); installer run → "Claude skills, GPT-6 Astra skills, and Chromium are ready"
+- `bash ~/.capy/drive/<user>/skills/gstack/scripts/install.sh --check` → failed (not installed); installer run → "Claude skills, GPT-6 Astra skills, and Chromium are ready"
 - `bun install --frozen-lockfile` → OK
 - each touched file alone: handlers 12/0, core/cycle.serial 41/0, phantom-redirect 42/0, asymmetric-encoding-contract 4/0, regression-strict-source-id 5/0, cycle-pack-gating 8/0, cycle-patterns 11/0, cli 20/0, upgrade.serial 25/0, extract-conversation-facts-diagnostics.serial 8/0
 - `bun run typecheck` → clean

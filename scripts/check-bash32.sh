@@ -14,7 +14,7 @@
 #   /bin/bash             when it is bash 3.x (stock macOS)
 #   Docker image bash:3.2 (GNU bash 3.2.57, digest-pinned)
 # GBRAIN_BASH32=docker forces the image. Without a parser the guard prints
-# one skip line and exits 0, unless GBRAIN_BASH32_REQUIRE=1 (CI), which
+# one skip line and exits 0, unless GBRAIN_TEST_BASH32_REQUIRE=1 (CI), which
 # turns that into exit 2.
 #
 # Run: bun run check:bash32
@@ -31,7 +31,14 @@ ROOT="$(pwd -P)"
 
 IMAGE='bash:3.2@sha256:0fd7cb8499c63a3c9345e7088a9cd83bb69f6e895e83833859aff838a0312091'
 DOCKER="${GBRAIN_BASH32_DOCKER:-docker}"
-REQUIRE="${GBRAIN_BASH32_REQUIRE:-0}"
+if [ -n "${GBRAIN_BASH32_REQUIRE:-}" ]; then
+  echo "✗ bash 3.2 parse: GBRAIN_BASH32_REQUIRE was renamed to GBRAIN_TEST_BASH32_REQUIRE." >&2
+  echo "Why: test opt-ins live under GBRAIN_TEST_ so the test preload's operator-env scrub keeps them; the old name is no longer read." >&2
+  echo "Fix: unset GBRAIN_BASH32_REQUIRE && export GBRAIN_TEST_BASH32_REQUIRE=${GBRAIN_BASH32_REQUIRE}" >&2
+  echo "Docs: docs/TESTING.md#test-isolation-lint-and-helpers" >&2
+  exit 2
+fi
+REQUIRE="${GBRAIN_TEST_BASH32_REQUIRE:-0}"
 
 FILES=()
 if [ -n "${GBRAIN_GUARD_ROOT:-}" ]; then
@@ -55,7 +62,7 @@ is_bash3() {
 
 unavailable() {
   if [ "$REQUIRE" = "1" ]; then
-    echo "✗ bash 3.2 parse: $1, and GBRAIN_BASH32_REQUIRE=1 forbids skipping" >&2
+    echo "✗ bash 3.2 parse: $1, and GBRAIN_TEST_BASH32_REQUIRE=1 forbids skipping" >&2
     exit 2
   fi
   echo "- bash 3.2 parse: skipped ($1; install Docker or set GBRAIN_BASH32 to a bash 3.2 binary)"

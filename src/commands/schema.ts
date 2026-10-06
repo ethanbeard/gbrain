@@ -53,8 +53,11 @@ import {
 import type { SchemaPackManifest, PackPrimitive } from '../core/schema-pack/manifest-v1.ts';
 import { PACK_PRIMITIVES } from '../core/schema-pack/manifest-v1.ts';
 import { bundledPackPath } from '../core/schema-pack/bundled-assets.ts';
-import { gbrainPath, loadConfig, configPath, toEngineConfig, type GBrainConfig } from '../core/config.ts';
+import { gbrainPath, loadConfig, configPath, toEngineConfig, isThinClient, type GBrainConfig } from '../core/config.ts';
+import { opError } from '../core/ops/contract.ts';
 import { readDbSchemaPack } from '../core/schema-pack/best-effort.ts';
+import { sanitizeTypeForDisplay } from '../core/schema-pack/type-usage.ts';
+import { yamlScalar } from '../core/frontmatter-inference.ts';
 
 export async function runSchema(args: string[]): Promise<void> {
   const sub = args[0];
@@ -78,6 +81,7 @@ export async function runSchema(args: string[]): Promise<void> {
     case 'downgrade': return runDowngradeCmd(args.slice(1));
     case 'usage':    return runUsageCmd(args.slice(1));
     case 'stats':    return runStatsCmd(args.slice(1));
+    case 'cardinality-preview': return runCardinalityPreviewCmd(args.slice(1));
     case 'sync':     return runSyncCmd(args.slice(1));
     case 'reload':   return runReloadCmd(args.slice(1));
     case 'add-type': return runAddTypeCmd(args.slice(1));
@@ -114,6 +118,8 @@ Inspection:
   graph                   Show type/primitive graph with link-verb edges
   lint [<pack>]           Lint a pack for duplicates, dangling refs, etc.
   stats [--source <id>]   Per-type page counts + typed-coverage from the DB
+  cardinality-preview [--source <id>]
+                          Pages with several live relationships of a declared single-value type, and what the dream cycle closes (read-only)
   explain <type>          Print resolved settings for a single type
   usage [--since N(d|w|m)] CLI invocation telemetry summary
 
@@ -150,6 +156,8 @@ Authoring (v0.40.6.0):
 
 Discovery + repair:
   detect                  Cluster pages by source_path → candidate page_types
+  detect --fields         Per page type: frontmatter keys, fact categories and
+                          relation types in use (100% required, >=25% optional)
   suggest                 Heuristic refinement on detect output
   review-candidates       Review disk-derived candidates; promote with --apply
   review-orphans          List pages with no active-pack type match
@@ -466,7 +474,14 @@ function parseFlags(args: string[]): ParsedFlags {
 
 async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
   const { createEngine } = await import('../core/engine-factory.ts');
-  const cfg = loadConfig() ?? { engine: 'pglite' as const };
+  const cfg: GBrainConfig = loadConfig() ?? { engine: 'pglite' };
+  // A thin client has no local database: refuse rather than die with "No
+  // database URL" or read an empty in-memory PGLite (#5102).
+  if (isThinClient(cfg) && !cfg.database_url) {
+    throw opError('requires_local_engine',
+      'This `gbrain schema` subcommand reads the brain database, which lives on the brain host; it is not routable from a thin client.',
+      'Use the matching schema_* MCP tool (e.g. `schema_stats`) from your agent, or run it on the brain host.');
+  }
   // PR #1321 (closed) defensive fix retained: build the EngineConfig once and
   // pass it to BOTH createEngine and engine.connect. The factory captures
   // config at construction; explicit re-pass at connect() is defense in depth
@@ -484,7 +499,8 @@ async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').B
 // ------------- T2: schema detect ----------------------------------
 
 async function runDetectCmd(args: string[]): Promise<void> {
-  const { json, source } = parseFlags(args);
+  const { json, source, positional } = parseFlags(args);
+  if (positional.includes('--fields')) return runFieldUsageCmd(json, source);
   const result = await withConnectedEngine((engine) => runDetect(engine, { sourceId: source }));
   if (json) {
     console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
@@ -502,6 +518,25 @@ async function runDetectCmd(args: string[]): Promise<void> {
   console.log('');
   console.log('Next: gbrain schema review-candidates  (decide promote / rename / ignore)');
   console.log('      gbrain schema suggest             (LLM refinement on this candidate)');
+}
+
+async function runFieldUsageCmd(json: boolean, source: string | undefined): Promise<void> {
+  const { runFieldUsage, REQUIRED_SHARE, OPTIONAL_SHARE } = await import('../core/schema-pack/field-usage.ts');
+  const types = await withConnectedEngine((engine) => runFieldUsage(engine, { sourceId: source }));
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, required_share: REQUIRED_SHARE, optional_share: OPTIONAL_SHARE, types }, null, 2));
+    return;
+  }
+  console.log(`Field usage by page type (required = on every sampled page, optional = on at least ${OPTIONAL_SHARE * 100}%).`);
+  console.log('Fields are frontmatter keys, [fact categories] and relation types -> from line-grammar lines.');
+  for (const t of types) {
+    console.log('');
+    console.log(`${t.type}  (${t.pages} pages, ${t.sampled} sampled)`);
+    console.log(`  required: ${t.required.join(', ') || '(none)'}`);
+    console.log(`  optional: ${t.optional.join(', ') || '(none)'}`);
+  }
+  console.log('');
+  console.log('Next: declare the relation types you rely on in your schema pack (gbrain schema add-link-type <name>) so relation lines use them.');
 }
 
 // ------------- T3: schema suggest ---------------------------------
@@ -596,7 +631,7 @@ async function runInitCmd(args: string[]): Promise<void> {
   };
   const yaml = `# Stub pack — extends gbrain-base by default. Add your own page_types below.
 api_version: ${stub.api_version}
-name: ${stub.name}
+name: ${yamlScalar(stub.name)}
 version: ${stub.version}
 gbrain_min_version: ${stub.gbrain_min_version}
 extends: gbrain-base
@@ -845,9 +880,13 @@ async function runReviewOrphansCmd(args: string[]): Promise<void> {
     console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
     return;
   }
-  console.log(`Orphan pages (no active-pack type match): ${result.orphan_count}`);
+  console.log(`Orphan pages (no active-pack type match): ${result.orphan_count}`
+    + (result.pack ? ` (pack ${result.pack})` : ' (no active pack resolved: only untyped pages checked)'));
+  for (const u of result.undeclared_types) {
+    console.log(`  type '${sanitizeTypeForDisplay(u.type)}' is not declared in the pack: ${u.count} page(s)`);
+  }
   for (const o of result.orphans.slice(0, 20)) {
-    console.log(`  ${o.slug}`);
+    console.log(`  ${o.slug}${o.reason === 'undeclared' ? ` (type ${sanitizeTypeForDisplay(o.type)})` : ' (untyped)'}`);
   }
   if (result.orphan_count > 20) {
     console.log(`  ... and ${result.orphan_count - 20} more (use --json to see all)`);
@@ -1005,8 +1044,11 @@ async function runStatsCmd(args: string[]): Promise<void> {
     }
     console.log(`Pack: ${result.pack_identity ?? '(no pack loaded)'}`);
     console.log(`Total pages: ${result.aggregate.total_pages}`);
-    console.log(`Typed: ${result.aggregate.typed_pages} (${(result.aggregate.coverage * 100).toFixed(1)}%)`);
+    console.log(`Typed: ${result.aggregate.typed_pages}; matching the active pack: ${(result.aggregate.coverage * 100).toFixed(1)}%`);
     console.log(`Untyped: ${result.aggregate.untyped_pages}`);
+    if (result.aggregate.undeclared_pages > 0) {
+      console.log(`Undeclared type: ${result.aggregate.undeclared_pages} (not a page type or alias of the active pack; list them with \`gbrain schema review-orphans\`)`);
+    }
     if (result.aggregate.by_type.length > 0) {
       console.log(`\nBy type:`);
       for (const t of result.aggregate.by_type) {
@@ -1025,6 +1067,28 @@ async function runStatsCmd(args: string[]): Promise<void> {
         console.log(`  ${dp.type.padEnd(20)} ${dp.prefix}`);
       }
     }
+  });
+}
+
+async function runCardinalityPreviewCmd(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
+  await withConnectedEngine(async (engine) => {
+    const { previewSingleValue } = await import('../core/link-single-value.ts');
+    const result = await previewSingleValue(engine, source);
+    if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+    if (Object.keys(result.declared).length === 0) {
+      console.log('No single-value relations declared. A pack declares one with `cardinality: one_per_from` on a state relation (docs/guides/temporal-edges.md#declared-single-value-relations).');
+      return;
+    }
+    for (const [src, types] of Object.entries(result.declared)) console.log(`Source ${src}: single-value ${types.join(', ')}`);
+    if (result.groups.length === 0) { console.log('No page holds more than one live relationship of a declared type.'); return; }
+    for (const g of result.groups) {
+      console.log(`\n${g.subject} ${g.link_type} (${g.source_id}): ${g.live.map(l => `${l.target}${l.since ? ` since ${l.since}` : ' (undated)'}`).join(', ')}`);
+      for (const c of g.would_close) console.log(`  closes ${c.target} on ${c.close_date} (superseded by ${c.superseded_by})`);
+      for (const u of g.undated) console.log(`  leaves ${u} open: no dated start; add one to the page timeline`);
+      for (const [a, b] of g.same_date) console.log(`  leaves ${a} and ${b} open: both start on the same date`);
+    }
+    console.log('\nThe dream cycle (edge_contradictions phase) applies the closures as timeline lines; `gbrain edge-proposals list` shows them, and deleting a line reopens the relationship.');
   });
 }
 

@@ -52,7 +52,7 @@ triggers:
   - "schema sync"
   - "schema author"
 brain_first: exempt
-writes_pages: []
+writes_pages: false
 ---
 
 # schema-author — evolve your schema pack
@@ -248,6 +248,14 @@ loadActivePack — v0.40.6.0 closed the cross-process invalidation gap).
 - **Idempotency:** every primitive is idempotent. `add-alias`/`add-prefix` no-op on duplicate; `sync --apply` finds nothing to update on second run.
 - **Trust:** CLI = local trust (no scope check). MCP = OAuth `admin` scope (write ops). Audit log captures `actor: mcp:<clientId8>` per mutation.
 - **Atomicity:** every mutation is wrapped in `withMutation`'s atomic write (`.tmp + fsync + rename`) + per-pack `O_CREAT|O_EXCL` lock. Crash mid-write leaves the original file untouched.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Mutation codes: `PACK_READONLY` → fork first (`gbrain schema fork gbrain-base mine`); `STILL_REFERENCED` → remove the named references first; `LOCK_BUSY` → wait about 30 seconds and retry.
+- Over MCP, a mutation returns `insufficient_scope`: schema writes need the `admin` scope, which only the brain host's operator grants; tell the user.
+- The pre-write lint gate rejects a change: read the error, fix the named prefix or alias collision, and re-run; never bypass lint.
 
 ## Anti-Patterns
 

@@ -18,6 +18,7 @@ import { withEnv } from './helpers/with-env.ts';
 
 type Call = { name: string; params: Record<string, unknown> };
 const calls: Call[] = [];
+let reply: unknown = [];
 
 const realConfig = await import('../src/core/config.ts');
 mock.module('../src/core/config.ts', () => ({
@@ -31,7 +32,7 @@ mock.module('../src/core/mcp-client.ts', () => ({
   ...realMcpClient,
   callRemoteTool: async (_cfg: unknown, name: string, params: Record<string, unknown>) => {
     calls.push({ name, params });
-    return { content: [{ type: 'text', text: JSON.stringify([]) }] };
+    return { content: [{ type: 'text', text: JSON.stringify(reply) }] };
   },
 }));
 
@@ -68,7 +69,7 @@ async function run(args: string[]): Promise<{ code: number; out: string[]; err: 
   }
 }
 
-beforeEach(() => { calls.length = 0; });
+beforeEach(() => { calls.length = 0; reply = []; });
 
 describe('graph-query --source on a thin-client install', () => {
   test('--source is rejected with exit 1 and never reaches the wire', async () => {
@@ -123,5 +124,24 @@ describe('graph-query --source on a thin-client install', () => {
     expect(stderr).toContain('scopes the walk to your grant');
     expect(calls).toHaveLength(1);
     expect(Object.keys(calls[0].params).sort()).toEqual(['depth', 'direction', 'link_type', 'slug']);
+  });
+});
+
+describe('graph-query --hop on a thin-client install', () => {
+  test('sends only slug + hops, and refuses a host that ignored hops (older gbrain)', async () => {
+    const r = await run(['people/alice-example', '--hop', 'invested_in:object', '--hop', 'founded:subject']);
+    expect(calls[0]).toEqual({ name: 'traverse_graph', params: { slug: 'people/alice-example', hops: [
+      { link_type: 'invested_in', toward: 'object' }, { link_type: 'founded', toward: 'subject' }] } });
+    expect(r.code).toBe(1);
+    expect(r.err.join('\n')).toContain('older gbrain without typed chains');
+  });
+
+  test('renders a chain response from a current host', async () => {
+    reply = { anchor: 'people/alice-example', answers: [{ slug: 'people/bob-example', source_id: 'default', path_count: 1, score: 1 }],
+      paths: [{ nodes: ['people/alice-example', 'companies/acme-example', 'people/bob-example'], edges: [] }],
+      diagnostics: { status: 'fired', per_hop: [], cap_hit: null } };
+    const r = await run(['people/alice-example', '--hop', 'invested_in:object', '--hop', 'founded:subject']);
+    expect(r.code).toBe(0);
+    expect(r.out.join('\n')).toContain('people/bob-example');
   });
 });

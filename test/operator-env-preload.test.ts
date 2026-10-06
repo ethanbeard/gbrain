@@ -173,6 +173,31 @@ describe('operator-env-preload (#4023)', () => {
     expect(r.report.GBRAIN_SOURCE).toBe('default');
   }, 30_000);
 
+  test('a renamed test opt-in set under its old name stops the run with the rename line', () => {
+    // Under the old names the scrub deleted these before any test read them,
+    // so the gated tests skipped silently (D7). The preload now exits first.
+    for (const [old, next] of [
+      ['GBRAIN_SKIP_SUBPROCESS_TESTS', 'GBRAIN_TEST_SKIP_SUBPROCESS'],
+      ['GBRAIN_BASH32_REQUIRE', 'GBRAIN_TEST_BASH32_REQUIRE'],
+    ]) {
+      // Also with the scrub disabled: the old-name check runs before it.
+      const r = runProbe({ [old]: '1', GBRAIN_TEST_KEEP_AMBIENT_ENV: '1' }, [old]);
+      expect(r.exitCode).toBe(2);
+      expect(r.stderr).toContain(`${old} was renamed to ${next}.`);
+      expect(r.stderr).toContain(`Fix: unset ${old} && export ${next}=1`);
+      expect(r.stderr).toContain('Docs: docs/TESTING.md#test-isolation-lint-and-helpers');
+      expect(r.report).toEqual({});
+    }
+  }, 60_000);
+
+  test('the new opt-in names survive the scrub', () => {
+    const probed = ['GBRAIN_TEST_SKIP_SUBPROCESS', 'GBRAIN_TEST_BASH32_REQUIRE', 'GBRAIN_TEST_PERF_BUDGET_MULTIPLIER'];
+    const ambient = { GBRAIN_TEST_SKIP_SUBPROCESS: '1', GBRAIN_TEST_BASH32_REQUIRE: '1', GBRAIN_TEST_PERF_BUDGET_MULTIPLIER: '3' };
+    const r = runProbe(ambient, probed);
+    expect(r.exitCode).toBe(0);
+    expect(r.report).toEqual(ambient);
+  }, 30_000);
+
   test('GBRAIN_DEBUG_PRELOAD=1 logs removed names, never values', () => {
     const r = runProbe(
       { GBRAIN_SOURCE: 'hunter2-not-for-logs', GBRAIN_DEBUG_PRELOAD: '1' },

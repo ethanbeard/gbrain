@@ -24,6 +24,7 @@ writes_pages: true
 writes_to:
   - people/
   - companies/
+when_to_use: "Use when the user asks: \"enrich\", \"create person page\", \"update company page\", \"who is this person\", \"look up this company\"."
 ---
 
 # Enrich Skill
@@ -312,6 +313,14 @@ After enrichment sweeps, save a report:
 
 This creates an audit trail for brain enrichment over time.
 
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- External enrichment APIs return `rate_limited` or an auth failure: back off for the stated delay; on auth failure stop and tell the user which key is missing. Never fill the gap with guessed facts.
+- `put_page` returns `revision_conflict`: re-read the entity page, merge, and save with the new revision.
+- `auto_links.errors` is non-empty on a write: the page saved but some links did not; list them in the report and add them with `add_link` after fixing the slugs.
+
 ## Anti-Patterns
 
 - Creating stub pages with no content
@@ -350,3 +359,12 @@ Both page types have bidirectional back-links to every entity they mention.
 - Retrieve raw data from gbrain (get_raw_data)
 - Link entities in gbrain (add_link)
 - Check backlinks in gbrain (get_backlinks)
+
+## Tools outside your MCP surface
+
+This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
+does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
+
+- `add_link` → `gbrain link`
+
+To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.

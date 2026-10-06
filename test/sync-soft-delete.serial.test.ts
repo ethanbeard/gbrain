@@ -164,10 +164,11 @@ describe('#4587 X3: decompose-on-batch-failure — run continues, never aborts',
 
     // Fail the BATCH call only (slugs.length > 1); the one-element decompose
     // calls succeed — a transient blip must not lose the whole batch.
-    const orig = engine.softDeletePages.bind(engine);
-    engine.softDeletePages = async (slugs, opts) => {
+    const orig = engine.softDeletePages;
+    // Unbound: the soft delete runs on a transaction engine that inherits this override.
+    engine.softDeletePages = async function (this: typeof engine, slugs, opts) {
       if (slugs.length > 1) throw new Error('injected transient batch failure');
-      return orig(slugs, opts);
+      return orig.call(this, slugs, opts);
     };
     let result;
     try {
@@ -195,7 +196,7 @@ describe('#4587 X3: decompose-on-batch-failure — run continues, never aborts',
     writeFileSync(join(repo, 'notes/fresh.md'), '# Fresh\n\nimports despite the delete outage\n');
     commitAll(repo, 'remove wedged, add fresh');
 
-    const orig = engine.softDeletePages.bind(engine);
+    const orig = engine.softDeletePages;
     engine.softDeletePages = async () => { throw new Error('injected permanent delete failure'); };
     let blocked;
     try {
@@ -381,7 +382,7 @@ describe('#4587: full-sync reconcile + unsyncable lane are SOFT, purge window is
     expect(result.status).not.toBe('blocked_by_failures');
 
     // The pin: swept via softDeletePages — EXISTS + tombstone, not absent.
-    // (test/sync-malformed-path.serial.test.ts only asserts not-live, which a
+    // (test/sync-malformed-path.test.ts only asserts not-live, which a
     // hard delete would also satisfy.)
     const swept = await rowState(JUNK_SLUG);
     expect(swept.exists).toBe(true);

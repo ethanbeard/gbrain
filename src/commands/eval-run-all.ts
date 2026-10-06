@@ -17,6 +17,12 @@
  * above cap with override hint; non-TTY needs --yes AND explicit
  * --budget-usd-* flags.
  *
+ * Wired suites (brainbench) run in-process; longmemeval and replay run only
+ * through their own commands. A bare run sweeps the wired suites and names
+ * the per-suite commands; an explicit `--suites` naming an unwired suite
+ * refuses with `eval_suite_unwired` (exit 1). Any wired suite whose record
+ * says `failed` makes the run exit 1, with the record already persisted.
+ *
  * Per-suite implementations are documented in src/commands/eval-*.ts.
  * This file is the dispatcher + bookkeeper.
  */
@@ -26,11 +32,17 @@ import { dirname, join } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { SEARCH_MODES, type SearchMode } from '../core/search/mode.ts';
 import { redactSecrets } from '../eval/longmemeval/run-config.ts';
+import { OperationError, opError } from '../core/ops/contract.ts';
+import type { Action } from '../core/agent-output.ts';
+import { usageError } from '../cli/cli-error.ts';
+import { intFlagValue, numberFlagValue } from '../cli/flag-values.ts';
 
 export interface RunAllOpts {
   help: boolean;
   modes: SearchMode[];
   suites: string[];
+  /** True when `--suites` named the suites; a bare run sweeps the wired ones. */
+  suitesExplicit: boolean;
   limit?: number;
   seed: number;
   parallel: number;
@@ -43,6 +55,13 @@ export interface RunAllOpts {
 
 const VALID_SUITES = ['longmemeval', 'replay', 'brainbench'] as const;
 type ValidSuite = (typeof VALID_SUITES)[number];
+const WIRED_SUITES = ['brainbench'] as const;
+type UnwiredSuite = Exclude<ValidSuite, (typeof WIRED_SUITES)[number]>;
+/** The per-suite command for each suite run-all does not execute in-process. */
+const UNWIRED_SUITE_ARGV: Record<UnwiredSuite, string[]> = {
+  longmemeval: ['gbrain', 'eval', 'longmemeval', '<dataset.jsonl>', '--mode', '<mode>', '--record'],
+  replay: ['gbrain', 'eval', 'replay', '--mode', '<mode>'],
+};
 
 const DEFAULT_BUDGET_USD_RETRIEVAL = 5;
 const DEFAULT_BUDGET_USD_ANSWER = 20;
@@ -53,7 +72,8 @@ export function parseRunAllArgs(args: string[]): RunAllOpts {
   const opts: RunAllOpts = {
     help: false,
     modes: [...SEARCH_MODES],
-    suites: ['longmemeval', 'replay'],
+    suites: [...WIRED_SUITES],
+    suitesExplicit: false,
     seed: DEFAULT_SEED,
     parallel: DEFAULT_PARALLEL,
     budgetUsdRetrieval: DEFAULT_BUDGET_USD_RETRIEVAL,
@@ -86,18 +106,20 @@ export function parseRunAllArgs(args: string[]): RunAllOpts {
         }
       }
       opts.suites = list;
+      opts.suitesExplicit = true;
       continue;
     }
-    if (a === '--limit') { opts.limit = Number(args[++i]); continue; }
-    if (a === '--seed') { opts.seed = Number(args[++i]); continue; }
+    // #5933 (D4): NaN/out-of-range values would bypass the cost guard; reject them (usage error, exit 2).
+    if (a === '--limit') { opts.limit = intFlagValue(args[++i], '--limit', { min: 1, example: 50 }); continue; }
+    if (a === '--seed') { opts.seed = intFlagValue(args[++i], '--seed', { example: 42 }); continue; }
     if (a === '--parallel') {
       const n = Number(args[++i]);
       if (!Number.isFinite(n) || n < 1) throw new Error('--parallel must be >= 1');
       opts.parallel = Math.min(n, SEARCH_MODES.length);
       continue;
     }
-    if (a === '--budget-usd-retrieval') { opts.budgetUsdRetrieval = Number(args[++i]); continue; }
-    if (a === '--budget-usd-answer') { opts.budgetUsdAnswer = Number(args[++i]); continue; }
+    if (a === '--budget-usd-retrieval') { opts.budgetUsdRetrieval = numberFlagValue(args[++i], a, { min: 0, example: 5 }); continue; }
+    if (a === '--budget-usd-answer') { opts.budgetUsdAnswer = numberFlagValue(args[++i], a, { min: 0, example: 5 }); continue; }
     if (a === '--yes' || a === '-y') { opts.yes = true; continue; }
     if (a === '--output' || a === '--output-dir') { opts.outputDir = args[++i]; continue; }
     if (a === '--json') { opts.jsonOutput = true; continue; }
@@ -111,12 +133,17 @@ export function parseRunAllArgs(args: string[]): RunAllOpts {
 function printHelp(): void {
   process.stderr.write(
     `gbrain eval run-all [flags]\n\n` +
-    `Sweeps every requested search-lite mode × eval suite. Writes per-run results to\n` +
-    `<repo>/.gbrain-evals/eval-results.jsonl. Personal brain is never touched.\n\n` +
+    `Runs the eval suites wired into the orchestrator (brainbench, once per sweep)\n` +
+    `and writes per-run results to <repo>/.gbrain-evals/eval-results.jsonl. Exits 1\n` +
+    `when a suite fails (its record is kept). Personal brain is never touched.\n\n` +
     `Flags:\n` +
     `  --modes M1,M2,M3              Modes to evaluate (default: conservative,balanced,tokenmax).\n` +
-    `  --suites S1,S2                Suites to run (default: longmemeval,replay).\n` +
-    `                                Valid: longmemeval, replay, brainbench.\n` +
+    `  --suites S1,S2                Suites to run (default: brainbench).\n` +
+    `                                run-all runs brainbench in-process. longmemeval and\n` +
+    `                                replay run through their own commands, once per mode:\n` +
+    `                                  ${UNWIRED_SUITE_ARGV.longmemeval.join(' ')}\n` +
+    `                                  ${UNWIRED_SUITE_ARGV.replay.join(' ')}\n` +
+    `                                Naming them here exits 1 (eval_suite_unwired).\n` +
     `  --limit N                     Limit each suite to N questions (default: full split).\n` +
     `  --seed N                      Random seed (default: 42).\n` +
     `  --parallel N                  Run N modes in parallel (default: 1; max ${SEARCH_MODES.length}).\n` +
@@ -128,6 +155,36 @@ function printHelp(): void {
     `  -h, --help                    Show this help.\n\n` +
     `Cost guard refuses non-TTY runs over the budget cap without --yes AND an\n` +
     `explicit --budget-usd-* flag (defense against agent loops + cron jobs).\n`,
+  );
+}
+
+function unwiredSuiteFix(suites: UnwiredSuite[], modes: SearchMode[]): Action {
+  const [suite, ...rest] = suites;
+  return {
+    argv: UNWIRED_SUITE_ARGV[suite],
+    consent: ['paid'],
+    actor: 'agent',
+    why: `run-all does not run ${suite} in-process; its own command runs it, once per mode.`,
+    inputs: [
+      ...(suite === 'longmemeval' ? [{ name: 'dataset.jsonl', how: 'The LongMemEval dataset file (https://huggingface.co/datasets/xiaowu0162/longmemeval).' }] : []),
+      { name: 'mode', how: `Each requested mode in turn: ${modes.join(', ')}.` },
+    ],
+    docs: 'docs/eval/SEARCH_MODE_METHODOLOGY.md#4-run-procedure',
+    requires_exclusive: false,
+    ...(rest.length ? { then: unwiredSuiteFix(rest, modes) } : {}),
+  };
+}
+
+/** The refusal for an explicit `--suites` that names a suite run-all does not run. */
+export function unwiredSuiteError(suites: string[], modes: SearchMode[]): OperationError | null {
+  const unwired = suites.filter((s): s is UnwiredSuite => s in UNWIRED_SUITE_ARGV);
+  if (unwired.length === 0) return null;
+  const commands = unwired.map(s => UNWIRED_SUITE_ARGV[s].join(' ')).join('; ');
+  return opError(
+    'eval_suite_unwired',
+    `gbrain eval run-all does not run ${unwired.join(' or ')}; nothing ran.`,
+    `Run ${unwired.length > 1 ? 'each suite' : 'it'} with its own command, once per mode: ${commands}. Or drop ${unwired.join(', ')} from --suites.`,
+    { fix: unwiredSuiteFix(unwired, modes) },
   );
 }
 
@@ -281,18 +338,20 @@ export function evaluateCostGuard(
   return { proceed: true, reason: 'over cap but --yes acknowledged' };
 }
 
-export async function runEvalRunAll(_engine: BrainEngine | null, args: string[]): Promise<void> {
+/** Runs the sweep; returns the exit code (0 all wired suites completed, 1 one failed). */
+export async function runEvalRunAll(_engine: BrainEngine | null, args: string[]): Promise<number> {
   let opts: RunAllOpts;
   try {
     opts = parseRunAllArgs(args);
   } catch (e) {
-    process.stderr.write(`Error: ${(e as Error).message}\n`);
-    process.exit(1);
+    throw e instanceof OperationError ? e : usageError((e as Error).message, 'Run `gbrain eval run-all --help` for the accepted flags and examples.');
   }
   if (opts.help) {
     printHelp();
-    return;
+    return 0;
   }
+  const unwired = unwiredSuiteError(opts.suites, opts.modes);
+  if (unwired) throw unwired;
 
   const repoRoot = getRepoRoot();
   const commit = getCommitSha();
@@ -315,6 +374,12 @@ export async function runEvalRunAll(_engine: BrainEngine | null, args: string[])
     process.stderr.write(`[eval run-all] cost estimate: retrieval=$${estimate.retrieval_usd.toFixed(2)} answer=$${estimate.answer_usd.toFixed(2)} total=$${estimate.total_usd.toFixed(2)}\n`);
     process.stderr.write(`[eval run-all] budget caps: retrieval=$${opts.budgetUsdRetrieval} answer=$${opts.budgetUsdAnswer}\n`);
   }
+  if (!opts.suitesExplicit) {
+    process.stderr.write(
+      `[eval run-all] running the wired suites (${WIRED_SUITES.join(', ')}). longmemeval and replay run through their own commands, once per mode:\n` +
+      Object.values(UNWIRED_SUITE_ARGV).map(argv => `[eval run-all]   ${argv.join(' ')}\n`).join(''),
+    );
+  }
 
   const guard = evaluateCostGuard(estimate, {
     budgetUsdRetrieval: opts.budgetUsdRetrieval,
@@ -330,31 +395,11 @@ export async function runEvalRunAll(_engine: BrainEngine | null, args: string[])
     process.stderr.write(`[eval run-all] ${guard.reason}, proceeding.\n`);
   }
 
-  // v0.32.3 Implementation note: per-suite execution is the operator's
-  // responsibility today — `gbrain eval run-all` is the orchestrator's
-  // shape + cost guard + audit trail. The per-suite per-mode calls land
-  // as a follow-up: each suite's CLI is already exposed (gbrain eval
-  // longmemeval --mode X, gbrain eval replay --mode X), so wiring them
-  // into a sequential or parallel sweep is mechanical glue once the
-  // benchmarking environment + dataset paths are configured.
-  //
-  // What ships in v0.32.3:
-  //   - Argv parser + budget guard + persist hook (audit trail)
-  //   - --json estimate-only mode (CI integration without spending)
-  //   - Per-suite hook surface (persistRunRecord)
-  //
-  // What's a v0.32.4 follow-up:
-  //   - In-process invocation of the longmemeval / replay / brainbench
-  //     runners with a streaming-progress aggregator
-  //   - --parallel N semaphore for the multi-mode sweep
-  //
-  // For v0.32.3 release-time, the operator runs the per-suite commands
-  // manually with the documented --mode flags and uses persistRunRecord
-  // to log each completion. The methodology doc names this explicitly.
+  const failed: EvalRunRecord[] = [];
   for (const suite of opts.suites) {
     // BrainBench is search-mode-independent (decision 16): run ONCE per
     // sweep, in-process, recorded under mode 'n/a' — never multiplied by
-    // modes. The other suites keep the documented operator-runs-CLI stub.
+    // modes. Unwired suites never reach this loop (unwiredSuiteError).
     if (suite === 'brainbench') {
       const startedAt = Date.now();
       const runId = `${commit}-brainbench-na-${opts.seed}`;
@@ -381,35 +426,9 @@ export async function runEvalRunAll(_engine: BrainEngine | null, args: string[])
       };
       if (core.error) record.error = core.error;
       persistRunRecord(repoRoot, record, opts.outputDir);
+      if (record.status === 'failed') failed.push(record);
       if (!opts.jsonOutput) {
-        process.stderr.write(`[eval run-all] ${runId}: ${record.status}\n`);
-      }
-      continue;
-    }
-    for (const mode of opts.modes) {
-      const startedAt = Date.now();
-      const runId = `${commit}-${suite}-${mode}-${opts.seed}`;
-      const record: EvalRunRecord = {
-        schema_version: 3,
-        run_id: runId,
-        ran_at: new Date().toISOString(),
-        suite: suite as ValidSuite,
-        mode,
-        commit,
-        seed: opts.seed,
-        limit: opts.limit,
-        params: {
-          budget_usd_retrieval: opts.budgetUsdRetrieval,
-          budget_usd_answer: opts.budgetUsdAnswer,
-          parallel: opts.parallel,
-        },
-        status: 'skipped',
-        duration_ms: Date.now() - startedAt,
-      };
-      record.error = 'orchestrator stub — invoke per-suite CLI manually for now (v0.32.4 wires the sweep)';
-      persistRunRecord(repoRoot, record, opts.outputDir);
-      if (!opts.jsonOutput) {
-        process.stderr.write(`[eval run-all] ${runId}: ${record.status}\n`);
+        process.stderr.write(`[eval run-all] ${runId}: ${record.status}${record.error ? ` (${redactSecrets(record.error)})` : ''}\n`);
       }
     }
   }
@@ -420,9 +439,13 @@ export async function runEvalRunAll(_engine: BrainEngine | null, args: string[])
       commit,
       modes: opts.modes,
       suites: opts.suites,
+      failed_runs: failed.map(r => r.run_id),
       output_path: evalResultsPath(repoRoot, opts.outputDir),
     }) + '\n');
+  } else if (failed.length > 0) {
+    process.stderr.write(`[eval run-all] FAILED: ${failed.map(r => r.run_id).join(', ')}. Records kept in ${evalResultsPath(repoRoot, opts.outputDir)}\n`);
   } else {
     process.stderr.write(`[eval run-all] complete. Audit trail: ${evalResultsPath(repoRoot, opts.outputDir)}\n`);
   }
+  return failed.length > 0 ? 1 : 0;
 }

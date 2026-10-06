@@ -92,13 +92,16 @@ describe('facts write-path failures (B-21)', () => {
 
   test('a failed page-cache mirror after a fence write is reported', async () => {
     await importFromContent(engine, 'people/alice-example', '---\ntitle: Alice Example\ntype: person\n---\n# Alice Example\n', { noEmbed: true });
-    const broken = new Proxy(engine, {
+    // The mirror runs on the maintenance transaction's engine, so the fault is injected there too.
+    const failing = (base: BrainEngine): BrainEngine => new Proxy(base, {
       get(target, prop, receiver) {
         if (prop === 'refreshPageBody') return async () => { throw new Error('mirror write failed'); };
+        if (prop === 'transaction') return <T>(fn: (tx: BrainEngine) => Promise<T>) => target.transaction(tx => fn(failing(tx)));
         const value = Reflect.get(target, prop, receiver);
         return typeof value === 'function' ? value.bind(target) : value;
       },
-    }) as unknown as BrainEngine;
+    });
+    const broken = failing(engine);
     const warn = spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const result = await writeFactsToFence(broken, { sourceId: 'default', localPath: brainDir, slug: 'people/alice-example', resolutionSource: 'exact_page' }, [input]);

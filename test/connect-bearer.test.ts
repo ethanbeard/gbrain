@@ -13,7 +13,7 @@
  *
  * Lane: unit. Run: `bun test test/connect-bearer.test.ts`. Moved from test/e2e/
  * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
- * docs/TESTING.md "Lane-move pilot".
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -104,9 +104,9 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
     // The `serve --http` lane builds its own per-request MCP Server — the
     // stdio and legacy-transport lanes are pinned elsewhere, but this lane
     // had no instructions coverage. A real SDK initialize against the live
-    // runServeHttp process must surface GBRAIN_MCP_INSTRUCTIONS verbatim.
+    // runServeHttp process must surface the contract for this token's tools.
     expect(serverReady).toBe(true);
-    const { GBRAIN_MCP_INSTRUCTIONS } = await import('../src/mcp/instructions.ts');
+    const { contractFor } = await import('./helpers/instructions-parity.ts');
     const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
     const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
 
@@ -119,7 +119,9 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
     );
     try {
       await client.connect(transport);
-      expect(client.getInstructions()).toBe(GBRAIN_MCP_INSTRUCTIONS);
+      // F1: the contract for exactly this token's tools/list (+ readiness tail).
+      const { tools } = await client.listTools();
+      expect(client.getInstructions()).toStartWith(contractFor(tools.map(t => t.name)));
     } finally {
       try { await client.close(); } catch { /* best-effort */ }
     }

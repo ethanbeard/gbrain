@@ -27,6 +27,7 @@ upstream: data-loss-gate@fc834ee
 # check backlinks / graph dependencies (get_backlinks, graph) so the card's
 # "what we'd lose" section is grounded in the actual target, not guesses.
 brain_first: true
+when_to_use: "Use when the user asks: \"bulk delete\", \"wipe the\", \"rm -rf\", \"purge the\", \"truncate\"."
 ---
 
 # Data Loss Gate — Confirmation Before Destructive Operations
@@ -174,6 +175,14 @@ still wrong because:
 3. The "cleanup" framing made it seem safe when it wasn't
 
 **The rule: if it's data and it's bulk, ASK FIRST. Always.**
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A destructive command exits 3 (`confirmation_required`) or asks for `--confirm-destructive`: that flag confirms the agent is sure, not the user. Show the recoverability card and wait for the user's explicit yes.
+- `gbrain purge-deleted` removes soft-deleted pages for good, so `gbrain restore` cannot bring them back afterwards: say so on the card. Never promise physical erasure or a recovery you cannot verify.
+- A delete or forget returns `write_pending` (exit 10): poll the receipt before writing the deletion log entry.
 
 ## Anti-Patterns
 

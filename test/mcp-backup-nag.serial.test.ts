@@ -111,13 +111,22 @@ type CallOpts = { remote?: boolean; transport?: 'stdio' | 'http' };
 
 // Default transport is 'stdio' — the ONLY transport the notice fires on.
 // Trust-pin tests pass 'http' / undefined explicitly.
-function callSearch(opts: CallOpts = {}) {
-  return dispatchToolCall(engineStub, 'search', { query: 'anything at all' }, {
+/** Remote callers get lean rows (C1): the fixture row minus its page_id diagnostic. */
+function leanResults(): unknown[] {
+  return nextResults.map(r => { const { page_id: _p, ...lean } = r as Record<string, unknown>; return lean; });
+}
+
+async function callSearch(opts: CallOpts = {}) {
+  const out = await dispatchToolCall(engineStub, 'search', { query: 'anything at all' }, {
     remote: true,
     transport: 'stdio',
     sourceId: 'default',
     ...opts,
   });
+  // F3's degraded_recall notice (this keyless stub searches keyword-only) is
+  // orthogonal to the backup block under test; it is pinned in
+  // test/mcp-notice-channels.test.ts.
+  return { ...out, content: out.content.filter(c => !c.text.startsWith('[gbrain notice degraded_recall ')) };
 }
 
 async function waitFor(pred: () => boolean, ms = 2000): Promise<boolean> {
@@ -171,7 +180,7 @@ describe('maybeAttachBackupNotice (stdio aggregate block)', () => {
     const first = await callSearch({ remote: true, transport: 'stdio' });
     expect(first.isError).toBeUndefined();
     // content[0] is UNCHANGED — still the bare op result.
-    expect(JSON.parse(first.content[0].text)).toEqual(nextResults);
+    expect(JSON.parse(first.content[0].text)).toEqual(leanResults());
     // The backup block rides as an EXTRA block.
     expect(first.content.length).toBe(2);
     const block = first.content[1].text;
@@ -182,7 +191,7 @@ describe('maybeAttachBackupNotice (stdio aggregate block)', () => {
     // Once per process: the second call carries NO backup block.
     const second = await callSearch({ remote: true, transport: 'stdio' });
     expect(second.content.length).toBe(1);
-    expect(JSON.parse(second.content[0].text)).toEqual(nextResults);
+    expect(JSON.parse(second.content[0].text)).toEqual(leanResults());
   });
 
   test("transport 'http' + warn cache → NO block (stdio-only notice); a later stdio call still gets it", async () => {
@@ -190,7 +199,7 @@ describe('maybeAttachBackupNotice (stdio aggregate block)', () => {
 
     const http = await callSearch({ remote: true, transport: 'http' });
     expect(http.content.length).toBe(1);
-    expect(JSON.parse(http.content[0].text)).toEqual(nextResults);
+    expect(JSON.parse(http.content[0].text)).toEqual(leanResults());
 
     // The http call must not burn the once-per-process flag or arm the
     // hourly latch — the first stdio call still attaches the block.
@@ -203,7 +212,7 @@ describe('maybeAttachBackupNotice (stdio aggregate block)', () => {
     saveBackupStatus(warnStatus());
     const out = await callSearch({ remote: true, transport: undefined });
     expect(out.content.length).toBe(1);
-    expect(JSON.parse(out.content[0].text)).toEqual(nextResults);
+    expect(JSON.parse(out.content[0].text)).toEqual(leanResults());
   });
 
   test('aggregate block never leaks local paths or source ids', async () => {

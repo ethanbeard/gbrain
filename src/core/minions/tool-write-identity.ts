@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { isWriteReceipt } from '../persistence/types.ts';
 import { isPersistenceIpcMutation } from '../persistence/ipc.ts';
 
@@ -18,7 +19,10 @@ export function assertToolWriteCommitted(output: unknown, toolName: string): voi
   if (!isPersistenceIpcMutation(toolName.replace(/^brain_/, '')) || !isWriteReceipt(output) || output.state === 'committed') return;
   const pending = ['queued', 'running', 'recovering'].includes(output.state);
   const code = pending ? 'write_pending' : 'storage_error';
-  const error = new OperationError(code, `Tool write ${output.request_id} is ${output.state}; inspect its durable receipt before retrying.`);
+  const error = opError(code, `Tool write ${output.request_id} is ${output.state}; inspect its durable receipt before retrying.`,
+    pending ? `The tool write is accepted and still ${output.state}; read its receipt until it is terminal. Do not repeat the tool call: the same request id replays it.`
+      : `The tool write ended ${output.state}; its receipt holds the recorded error. Read it before deciding whether a new write (with a new request id) is needed.`,
+    { fix: readFix(`Reads tool write ${output.request_id}'s durable receipt, read-only.`, { argv: ['gbrain', 'write-request', '--', output.request_id] }) });
   error.writeRequest = output; error.writeError = code; throw error;
 }
 export function isPendingToolWrite(error: unknown): error is OperationError {

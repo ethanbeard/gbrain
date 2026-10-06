@@ -25,6 +25,7 @@ import { runThink } from '../src/core/think/index.ts';
 import { formatDeliverySummary, formatResultsExplain } from '../src/core/search/explain-formatter.ts';
 import {
   conversationSignal,
+  assembleEvidenceForHits,
   countEvidenceTokens,
   deliverEvidence,
   deliveryVersionSkewWarning,
@@ -623,6 +624,16 @@ describe('ops', () => {
     expect(evidenceFingerprint(out.results)).toBe(evidenceFingerprint(viaSearch));
     const bad = await op('assemble_evidence').handler(ctxOf(), { hits: [{ source_id: 'nope', slug: 'chat/session-1', chunk_id: 1 }], return_unit: 'page' }) as { unresolved: number[] };
     expect(bad.unresolved).toEqual([0]);
+  });
+
+  test('malformed assemble_evidence hits name the parameter in the caller\'s own syntax', async () => {
+    await expect(op('assemble_evidence').handler(ctxOf(), { hits: 'chat/session-1' })).rejects.toMatchObject({
+      code: 'invalid_params', suggestion: expect.stringContaining('Pass --hits as a array'),
+    });
+    await expect(op('assemble_evidence').handler(ctxOf({ remote: true, transport: 'stdio' }), { hits: [{ slug: 'chat/session-1' }] })).rejects.toMatchObject({
+      code: 'invalid_params', suggestion: expect.stringContaining('assemble_evidence {"hits": [{"source_id":"default","slug":"chat/session-0412","chunk_id":8812}]}'),
+    });
+    await expect(assembleEvidenceForHits(engine, { hits: 'x' as never, return_unit: 'page' })).rejects.toMatchObject({ code: 'invalid_params', suggestion: expect.stringContaining('"chunk_id": 12') });
   });
 
   test('a fenced-code best hit delivers the page text for return_unit page, not the code chunk', async () => {

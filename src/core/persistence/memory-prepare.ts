@@ -1,10 +1,14 @@
 import type { BrainEngine, NewFact } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { OperationError } from '../ops/contract.ts';
+import type { Action } from '../agent-output.ts';
+import { opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
+import { pageIdentityError } from './page-identity.ts';
 import { assertPageRevision } from '../page-state/types.ts';
 import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, upsertFactRow, formatFenceDate } from '../facts-fence.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { assertFactNotWithdrawn, decideSingleFact, prepareFactEmbedding, type SingleFactIntent } from '../facts/single-prepare.ts';
+import { assertFactNotWithdrawn, decideReplacement, decideSingleFact, prepareFactEmbedding, type SingleFactIntent } from '../facts/single-prepare.ts';
+import { factEmbeddingDisabled } from '../embedding-disabled.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
 import { preparePageMutation } from './page-prepare.ts';
 import type { PreparedMutation } from './coordinator.ts';
@@ -12,17 +16,28 @@ import type { WriteRequest } from './model.ts';
 import { appendContextNote, type InferredVia } from '../facts/subject-infer.ts';
 import { inferenceNote } from '../facts/subject-infer-write.ts';
 
-function conflict(): never { throw new OperationError('revision_conflict', 'The memory changed during semantic preparation.'); }
+function receiptFix(row: WriteRequest): Action {
+  return row.principal_kind === 'local_cli'
+    ? readFix(`Reads request ${row.request_id}'s durable receipt: its state and outcome, read-only.`, { argv: ['gbrain', 'write-request', '--', row.request_id] })
+    : readFix(`Shows source ${row.source_id}'s writer and requests in flight, including ${row.request_id}, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', row.source_id, '--json'] });
+}
+function conflict(row: WriteRequest): never {
+  throw opError('revision_conflict', 'The memory changed during semantic preparation.',
+    `Another write changed the facts or entity page in source ${row.source_id} while remember request ${row.request_id} was prepared, so it did not save. Check that request's receipt; once it shows conflict, nothing was saved and remembering the fact again is safe.`,
+    { fix: receiptFix(row) });
+}
 function candidateState(value: Awaited<ReturnType<typeof decideSingleFact>>): string {
   const c = value.candidate;
   return JSON.stringify([value.status, c?.id, c?.fact, c?.kind, c?.visibility,
     c?.valid_until ? new Date(c.valid_until).toISOString() : null, c?.source_markdown_slug, c?.row_num]);
 }
 export const NO_ENTITY_HINT = 'Saved without an entity, so entity-scoped recall will not find it. Pass `entity` (the person, company or project this fact is about) to link it.';
-function outcome(id: number, status: 'inserted' | 'duplicate' | 'superseded', entitySlug: string | null, validUntil: Date | string | null, degraded: boolean, p: Record<string, unknown>) {
+function outcome(id: number, status: 'inserted' | 'duplicate' | 'superseded', entitySlug: string | null, validUntil: Date | string | null, degraded: boolean, p: Record<string, unknown>, supersededId?: number) {
   const statusText = status === 'inserted' ? `remembered as fact #${id}` : status === 'duplicate'
     ? `already knew this — kept fact #${id}` : `updated — fact #${id} supersedes the previous version`;
   return { id: String(id), status, status_text: statusText, entity_slug: entitySlug,
+    ...(status === 'superseded' && supersededId !== undefined ? { superseded_fact_id: String(supersededId) } : {}),
+    ...(status === 'superseded' && p.replaces !== undefined && p.replaces !== null ? { replaced_by_caller: true } : {}),
     valid_until: validUntil ? new Date(validUntil).toISOString() : null,
     ...(degraded ? { degraded_dedup: true } : {}),
     ...(entitySlug !== null && p.entity_inferred ? { entity_inferred: p.entity_inferred as InferredVia } : {}),
@@ -33,28 +48,37 @@ function outcome(id: number, status: 'inserted' | 'duplicate' | 'superseded', en
 /** Every retry renders the semantic append from the latest coherent snapshot. */
 export async function prepareMemoryMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig, signal?: AbortSignal): Promise<PreparedMutation> {
   signal?.throwIfAborted();
-  if (row.operation !== 'remember' || !row.intent) throw new OperationError('storage_error', 'Unknown memory mutation intent.');
+  if (row.operation !== 'remember' || !row.intent) {
+    throw opError('storage_error', 'Unknown memory mutation intent.',
+      `Request ${row.request_id} in source ${row.source_id} carries no remember intent, so the coordinator cannot apply it and nothing was saved. This is an internal fault: inspect the request, then report it to the user.`,
+      { fix: receiptFix(row) });
+  }
   const p = row.intent;
   const input: SingleFactIntent = { fact: String(p.fact).trim(), kind: (p.kind ?? 'fact') as SingleFactIntent['kind'],
     visibility: (p.visibility ?? 'world') as SingleFactIntent['visibility'], entity_slug: p.entity_slug as string | null };
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
-  if ((snapshot?.page.id ?? null) !== row.page_id) throw new OperationError('page_identity_changed', 'The accepted entity was deleted or recreated.');
+  if ((snapshot?.page.id ?? null) !== row.page_id) throw pageIdentityError(snapshot != null || row.page_id === null, 'The accepted entity was deleted or recreated.');
   if (p.expected_revision !== undefined) assertPageRevision(snapshot, engineMutationPrecondition(parseMutationPrecondition(p)));
   const observedRevision = snapshot?.revision ?? null;
   await assertFactNotWithdrawn(engine, row.source_id, input);
   signal?.throwIfAborted();
   const embeddingConfigSql = "SELECT key,value FROM config WHERE key IN ('embedding_model','embedding_dimensions') ORDER BY key";
   const observedEmbeddingConfig = JSON.stringify(await engine.executeRaw(embeddingConfigSql));
-  const { embedding, embedding_model, degraded } = await prepareFactEmbedding(input.fact, signal);
+  const { embedding, embedding_model, degraded } = await prepareFactEmbedding(input.fact, signal, await factEmbeddingDisabled(engine, config));
   signal?.throwIfAborted();
   // #5836: an inferred link dedups exact text only, so it never supersedes or drops a similar fact.
   const dedupEmbedding = p.entity_inferred ? null : embedding;
-  const decision = await decideSingleFact(engine, row.source_id, input, dedupEmbedding, embedding_model);
+  // `replaces`: the caller names the fact this one replaces (checked; the cosine rule does not apply).
+  const replaces = p.replaces !== undefined && p.replaces !== null ? Number(p.replaces) : null;
+  const decide = (e: BrainEngine, lock = false) => replaces !== null
+    ? decideReplacement(e, row.source_id, input, replaces, { pageSlug: row.slug, remote: row.authority.remote === true, lock })
+    : decideSingleFact(e, row.source_id, input, dedupEmbedding, embedding_model);
+  const decision = await decide(engine);
   const validate = async (tx: BrainEngine) => {
     await assertFactNotWithdrawn(tx, row.source_id, input);
-    if (embedding && JSON.stringify(await tx.executeRaw(`${embeddingConfigSql} FOR SHARE`)) !== observedEmbeddingConfig) conflict();
-    const current = await decideSingleFact(tx, row.source_id, input, dedupEmbedding, embedding_model);
-    if (candidateState(current) !== candidateState(decision)) conflict();
+    if (embedding && JSON.stringify(await tx.executeRaw(`${embeddingConfigSql} FOR SHARE`)) !== observedEmbeddingConfig) conflict(row);
+    const current = await decide(tx, true);
+    if (candidateState(current) !== candidateState(decision)) conflict(row);
   };
   if (decision.status === 'duplicate') {
     const duplicate = decision.candidate!;
@@ -69,7 +93,11 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   let rowNum: number | undefined;
   if (p.fence === true && snapshot) {
     const parsed = parseFactsFence(snapshot.page.compiled_truth);
-    if (parsed.warnings.length) throw new OperationError('storage_error', 'The entity facts fence is malformed; repair it before appending memory.');
+    if (parsed.warnings.length) {
+      throw opError('storage_error', 'The entity facts fence is malformed; repair it before appending memory.',
+        `The ## Facts table on ${row.slug} in source ${row.source_id} does not parse, so request ${row.request_id} saved nothing. Fix that table on the page (or ask the user to), then remember the fact again.`,
+        { fix: readFix(`Shows page ${row.slug} with its Facts table, read-only.`, { argv: ['gbrain', 'get', '--source', row.source_id, '--', row.slug] }) });
+    }
     const appended = upsertFactRow(snapshot.page.compiled_truth, { claim: input.fact, kind: input.kind, visibility: input.visibility,
       confidence: 1, notability: 'medium', validFrom: formatFenceDate(validFrom),
       validUntil: validUntil ? formatFenceDate(validUntil) : undefined, source: fact.source, context });
@@ -85,14 +113,18 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
     // Reuse the canonical parser/chunker and durable filesystem publication.
     // The original caller revision was checked above; this CAS binds this render.
     page = await preparePageMutation(engine, { ...row, intent: { ...p, content, expected_revision: observedRevision, force: false } }, config, undefined, signal);
-    if (page.observedRevision !== observedRevision) conflict();
+    if (page.observedRevision !== observedRevision) conflict(row);
   }
-  return { observedRevision, file: page?.file, validate: async tx => { await validate(tx); await page?.validate?.(tx); }, apply: async tx => {
+  return { observedRevision, file: page?.file, ...(page?.exclusiveSources ? { exclusiveSources: page.exclusiveSources } : {}), validate: async tx => { await validate(tx); await page?.validate?.(tx); }, apply: async tx => {
     await page?.apply(tx);
     let id: number;
     if (rowNum !== undefined) {
       const inserted = await tx.insertFacts([{ ...fact, row_num: rowNum, source_markdown_slug: row.slug }], { source_id: row.source_id }); // gbrain-allow-direct-insert: coordinator atomically publishes the prepared canonical fact fence and its new indexed row
-      if (inserted.ids.length !== 1) throw new OperationError('storage_error', 'The new canonical fact row was not indexed.');
+      if (inserted.ids.length !== 1) {
+        throw opError('storage_error', 'The new canonical fact row was not indexed.',
+          `The fact row for request ${row.request_id} in source ${row.source_id} was not indexed, so its transaction rolled back. Inspect the request before remembering again; if it repeats, run gbrain doctor --json and report it to the user.`,
+          { fix: receiptFix(row) });
+      }
       id = inserted.ids[0];
     } else {
       const inserted = await tx.insertFact(fact, { source_id: row.source_id }); // gbrain-allow-direct-insert: journaled source-scoped semantic publication for subjectless or unresolved entity memory
@@ -100,6 +132,6 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
     }
     if (decision.status === 'superseded') await tx.executeRaw(`UPDATE facts SET expired_at=now(),superseded_by=$3
       WHERE id=$1 AND source_id=$2 AND expired_at IS NULL`, [decision.candidate!.id, row.source_id, id]);
-    return outcome(id, decision.status, input.entity_slug, validUntil, degraded, p);
+    return outcome(id, decision.status, input.entity_slug, validUntil, degraded, p, decision.status === 'superseded' ? decision.candidate!.id : undefined);
   } };
 }

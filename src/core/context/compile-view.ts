@@ -43,6 +43,7 @@
  * whenever any entry fits.
  */
 
+import { loadRelationshipNotes, relationshipNoteKey } from '../link-relationship-notes.ts';
 import { createHash } from 'crypto';
 import { estimateTokens, packToBudget } from '../search/token-budget.ts';
 import { DEFAULT_SOURCE_BOOSTS } from '../search/source-boost.ts';
@@ -96,6 +97,8 @@ export const COMPILED_CONTEXT_ENVELOPE =
 export interface CompileViewEngine {
   listPages(filters?: PageFilters): Promise<Page[]>;
   getPage(slug: string, opts?: GetPageOpts): Promise<Page | null>;
+  /** Relationship notes (temporal typed edges); absent → entries render without them. */
+  executeRaw?<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<R[]>;
 }
 
 export interface CompileViewInput {
@@ -110,6 +113,16 @@ export interface CompileViewInput {
   includePrefixes?: string[];
   /** Pre-loaded sensitivity config — loader failures already threw upstream. */
   scanConfig: SensitivityScanConfig;
+  /**
+   * Always-loaded core block (core-memory.ts), rendered in full right after
+   * the envelope; its tokens come out of the budget first. The header then
+   * records the core revision and the command that refreshes it.
+   */
+  core?: { text: string; revision: string; command: string };
+  /** Slugs never selected by the arms: core pages, which only reach a compiled file through `core`. */
+  excludeSlugs?: ReadonlySet<string>;
+  /** Render the core block alone (no arms), e.g. the user-global codex file. */
+  coreOnly?: boolean;
 }
 
 export interface CompileViewScanDrop {
@@ -176,6 +189,7 @@ async function fetchCandidates(
 
   const add = (pages: Page[], pinned: boolean) => {
     for (const page of pages) {
+      if (input.excludeSlugs?.has(page.slug)) continue;
       const existing = bySlug.get(page.slug);
       if (existing) {
         existing.pinned = existing.pinned || pinned;
@@ -252,7 +266,7 @@ interface RenderedEntry {
   rendered: string;
 }
 
-function renderEntry(page: Page): RenderedEntry {
+function renderEntry(page: Page, relationshipNote?: string): RenderedEntry {
   const date = updatedDate(page);
   const excerpt = safeSynopsis(
     {
@@ -272,12 +286,14 @@ function renderEntry(page: Page): RenderedEntry {
   const title = page.title.replace(/\s+/g, ' ').trim();
   const lines = [`## ${title} (brain://${page.slug})`, `updated: ${date}`];
   if (excerpt) lines.push('', excerpt);
+  if (relationshipNote) lines.push('', `relationships: ${relationshipNote}`);
   const block = lines.join('\n');
   return { slug: page.slug, date, block, rendered: `\n\n${block}` };
 }
 
-function headerLine(digestHex16: string, target: string, budget: number): string {
-  return `<!-- gbrain:compiled-context digest=sha256:${digestHex16} target=${target} budget=${budget} -->`;
+function headerLine(digestHex16: string, target: string, budget: number, core?: CompileViewInput['core']): string {
+  const coreAttrs = core ? ` core_revision=${core.revision} refresh="${core.command}"` : '';
+  return `<!-- gbrain:compiled-context digest=sha256:${digestHex16} target=${target} budget=${budget}${coreAttrs} -->`;
 }
 
 function sha256Hex16(text: string): string {
@@ -301,7 +317,7 @@ function computeDigest(entries: RenderedEntry[]): string {
  * sensitivity config was loaded (and its failures thrown) upstream.
  */
 export async function compileView(input: CompileViewInput): Promise<CompileViewResult> {
-  const { candidates, anchor } = await fetchCandidates(input);
+  const { candidates, anchor } = input.coreOnly ? { candidates: [], anchor: null } : await fetchCandidates(input);
 
   // Total order: (score desc, slug asc).
   const scored = candidates
@@ -318,6 +334,12 @@ export async function compileView(input: CompileViewInput): Promise<CompileViewR
   // records the finding; a missing page (raced deletion) is a read error.
   const entries: RenderedEntry[] = [];
   const scanDrops: CompileViewScanDrop[] = [];
+  const raw = input.engine.executeRaw?.bind(input.engine);
+  const notes = !raw ? new Map<string, string>() : await loadRelationshipNotes(
+    { executeRaw: raw },
+    scored.map(({ c }) => ({ slug: c.page.slug, source_id: input.sourceId, summary: c.page.compiled_truth ?? '' })),
+    { excludePrivate: true },
+  ).catch(() => new Map<string, string>());
   for (const { c } of scored) {
     const page = await input.engine.getPage(c.page.slug, { sourceId: input.sourceId });
     if (!page) {
@@ -325,7 +347,7 @@ export async function compileView(input: CompileViewInput): Promise<CompileViewR
         `compile-context: page ${c.page.slug} vanished mid-run (source ${input.sourceId}) — aborting, no partial output`,
       );
     }
-    const entry = renderEntry(page);
+    const entry = renderEntry(page, notes.get(relationshipNoteKey(input.sourceId, page.slug)));
     const findings = scanSensitive(entry.rendered, input.scanConfig);
     if (findings.length > 0) {
       scanDrops.push({
@@ -341,8 +363,9 @@ export async function compileView(input: CompileViewInput): Promise<CompileViewR
   // Header cost: the digest value is FIXED-LENGTH (hex16), so a placeholder
   // of the same length prices the header before the kept set is known.
   const budget = input.budget;
-  const headerWithPlaceholder = headerLine('0'.repeat(16), input.target, budget);
-  const headerText = `${headerWithPlaceholder}\n${COMPILED_CONTEXT_ENVELOPE}`;
+  const headerWithPlaceholder = headerLine('0'.repeat(16), input.target, budget, input.core);
+  const coreText = input.core?.text ? `\n\n${input.core.text}` : '';
+  const headerText = `${headerWithPlaceholder}\n${COMPILED_CONTEXT_ENVELOPE}${coreText}`;
   const noFitComment = `\n\n<!-- no entries fit budget ${budget} -->`;
   // Count every non-entry byte (header, envelope, trailing newline).
   const headerCost = estimateTokens(`${headerText}\n`);
@@ -359,7 +382,7 @@ export async function compileView(input: CompileViewInput): Promise<CompileViewR
   }
 
   const digest = computeDigest(kept);
-  let text = `${headerLine(digest, input.target, budget)}\n${COMPILED_CONTEXT_ENVELOPE}`;
+  let text = `${headerLine(digest, input.target, budget, input.core)}\n${COMPILED_CONTEXT_ENVELOPE}${coreText}`;
   if (kept.length > 0) {
     text += kept.map((e) => e.rendered).join('');
   } else if (entries.length > 0) {

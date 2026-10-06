@@ -23,6 +23,8 @@ export function parseAdminGrantRequest(body: Record<string, unknown>, existing?:
     if (!Array.isArray(value) || !value.every(v => typeof v === 'string')) invalid(field, 'an array of strings');
     patch[field] = value as string[];
   }
+  // A null operation list is valid only without a profile: the profile is where the snapshot came from.
+  if (body.allowedOperations === null && body.profile === undefined) patch.profile = null;
   const source = body.sourceId ?? body.source;
   if (source !== undefined) {
     if (typeof source !== 'string' || !source.trim()) invalid('sourceId', 'a non-empty source ID');

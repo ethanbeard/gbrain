@@ -122,7 +122,7 @@ describe('isFactsBackstopEligible — eligible-types coverage', () => {
     });
   }
 
-  for (const t of ['person', 'company', 'deal', 'concept', 'project', 'image', 'code'] as PageType[]) {
+  for (const t of ['person', 'company', 'deal', 'concept', 'atom', 'project', 'image', 'code'] as PageType[]) {
     test(`type=${t} on non-rescued slug → rejected with kind:${t}`, () => {
       const f = fixture({ slug: 'wiki/whatever/x', type: t });
       const r = isFactsBackstopEligible(f.slug, f.parsed);

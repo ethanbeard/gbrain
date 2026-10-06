@@ -31,6 +31,7 @@ import {
   quoteIdentifier,
 } from './search/embedding-column.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
+import { resolveStaleEmbedConcurrency } from './embed-concurrency.ts';
 import { AbortError } from './abort-check.ts';
 
 /**
@@ -74,7 +75,7 @@ export interface StaleCursor {
 export interface EmbedStaleOpts {
   /** Chunks per cursor page. Default 2000 (matches the legacy CLI default). */
   batchSize?: number;
-  /** Max parallel slug-keys embedded inside a single batch. Default 20. */
+  /** Max parallel slug-keys embedded inside a single batch. Default: half the engine pool, at most 20 (`resolveStaleEmbedConcurrency`, #5902). */
   concurrency?: number;
   /** Resume cursor from a prior run. Default: from start. */
   cursor?: StaleCursor;
@@ -348,7 +349,7 @@ export async function embedStaleForSource(
   opts: EmbedStaleOpts = {},
 ): Promise<EmbedStaleResult> {
   const batchSize = opts.batchSize ?? 2000;
-  const concurrency = opts.concurrency ?? 20;
+  const concurrency = opts.concurrency ?? resolveStaleEmbedConcurrency(engine);
   const signal = opts.signal;
   const embedFn = opts.embedFn ?? ((texts, fnOpts) =>
     embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));

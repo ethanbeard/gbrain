@@ -8,7 +8,7 @@ import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts'
 import { withEnv } from '../helpers/with-env.ts';
 import { waitFor } from '../helpers/wait-for.ts';
 import { admission, assertCommittedSnapshot, assertConservation, fixtures, initializeFixtures, prepared, selectFixtureHost, type HarnessConfig } from '../../scripts/persistence/harness.ts';
-import { admitWrite, claimNextWrite, getWriteRequestById, prepareRecovery, renewWriteClaim } from '../../src/core/persistence/journal.ts';
+import { admitWrite, claimNextWrite, getWriteRequestById, prepareRecovery, renewWriteClaim, WRITE_PROGRESS_SQL } from '../../src/core/persistence/journal.ts';
 import { PersistenceConsumer } from '../../src/core/persistence/consumer.ts';
 import { disposePersistenceConsumer, startPersistenceConsumer, waitForWrite } from '../../src/core/persistence/service.ts';
 import { sha256 } from '../../src/core/persistence/digest.ts';
@@ -108,9 +108,9 @@ describe.skipIf(!url)('PostgreSQL persistence phase cancellation', () => {
     let entered = false;
     const proxy = new Proxy(engine, { get(target, key) {
       if (key === 'executeRaw') return async (...args: Parameters<typeof engine.executeRaw>) => {
-        if (args[0] === 'SELECT * FROM persistence_requests WHERE id=$1::uuid' && args[1]?.[0] === first.id) {
+        if (args[0] === WRITE_PROGRESS_SQL && args[1]?.[0] === first.id) {
           entered = true;
-          return target.executeRaw('SELECT r.* FROM persistence_requests r CROSS JOIN pg_sleep(20) WHERE r.id=$1::uuid', args[1], args[2]);
+          return target.executeRaw(WRITE_PROGRESS_SQL.replace('WHERE', 'CROSS JOIN pg_sleep(20) WHERE'), args[1], args[2]);
         }
         return target.executeRaw(...args);
       };

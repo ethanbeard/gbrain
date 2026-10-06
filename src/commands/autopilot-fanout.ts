@@ -81,6 +81,14 @@ export interface FanoutOpts {
   pathExists?: (path: string) => boolean;
 }
 
+/** True only for "the sources table does not exist" (pre-v0.18 brains). */
+export function isMissingSourcesTable(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (code === '42P01') return true;                       // Postgres undefined_table
+  const message = e instanceof Error ? e.message : String(e);
+  return /relation "?sources"? does not exist|no such table:? sources|sources table missing/i.test(message);
+}
+
 export interface FanoutResult {
   /** Source ids whose submission INSERTED a fresh job this tick. */
   dispatched: string[];
@@ -433,11 +441,36 @@ export async function dispatchPerSource(
     const all = connectorIds.size ? await engine.listAllSources() : sources;
     sources = all.filter(s => connectorIds.has(s.id) || checkouts.has(s.id));
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
     // Brand-new brain without sources table (pre-v0.18) — fall through
-    // to the legacy single-job path. The error path here also covers
-    // a misconfigured engine, but legacy fallback is safer than failing.
+    // to the legacy single-job path.
+    //
+    // Any OTHER error (connection timeout, pooler CONNECTION_CLOSED, …) is
+    // transient and says nothing about the brain's shape. Falling back then
+    // dispatched a legacy cycle against repoPath on a multi-source brain,
+    // which full-imported the repo root into the 'default' source and
+    // duplicated every page under a new slug prefix. Skip this tick instead;
+    // the next tick retries once the database is reachable.
+    if (!isMissingSourcesTable(e)) {
+      if (opts.jsonMode) {
+        emit(JSON.stringify({ event: 'fanout_skipped', reason: 'sources_unavailable', error: message }));
+      } else {
+        log(`[dispatch] skipped tick: could not list sources (${message}); retrying next tick`);
+      }
+      return {
+        dispatched: [],
+        coalesced: [],
+        skipped_fresh: [],
+        skipped_cap: [],
+        skipped_cooldown: [],
+        skipped_unavailable_path: [],
+        legacy_fallback: false,
+        all_sources_fresh: false,
+        all_sources_handled: false,
+      };
+    }
     if (opts.jsonMode) {
-      emit(JSON.stringify({ event: 'fanout_unavailable', error: e instanceof Error ? e.message : String(e) }));
+      emit(JSON.stringify({ event: 'fanout_unavailable', error: message }));
     }
     sources = [];
   }
@@ -659,6 +692,21 @@ export function isGlobalMaintenanceStale(lastGlobalAtIso: string | null, now = D
 }
 
 /**
+ * #4578: the global maintenance job deadline. Precedence:
+ * GBRAIN_GLOBAL_MAINTENANCE_TIMEOUT_MS > config autopilot.global_maintenance_timeout_ms
+ * > the autopilot full-cycle default. Values below one minute are ignored.
+ */
+export async function resolveGlobalMaintenanceTimeoutMs(engine: BrainEngine, fallbackMs: number): Promise<number> {
+  const parse = (raw: string | null | undefined) => {
+    const n = raw ? Number(raw) : NaN;
+    return Number.isSafeInteger(n) && n >= 60_000 ? n : null;
+  };
+  return parse(process.env.GBRAIN_GLOBAL_MAINTENANCE_TIMEOUT_MS)
+    ?? parse(await engine.getConfig('autopilot.global_maintenance_timeout_ms'))
+    ?? fallbackMs;
+}
+
+/**
  * #2194 fix #3 / #2227 bug #3 — dispatch the single brain-wide maintenance job
  * that runs the `mixed` + `global` cycle phases ONCE per
  * window, instead of N per-source cycles each running them concurrently (the
@@ -688,6 +736,7 @@ export async function dispatchGlobalMaintenance(
     return { dispatched: false, reason: 'fresh' };
   }
 
+  const timeoutMs = await resolveGlobalMaintenanceTimeoutMs(engine, opts.timeoutMs);
   const job = await queue.add(
     'autopilot-global-maintenance',
     { repoPath: opts.repoPath, phases: MAINTENANCE_PHASES },
@@ -698,7 +747,7 @@ export async function dispatchGlobalMaintenance(
       // brain-wide pass is still in flight — so duplicates never stack.
       idempotency_key: `autopilot-global:${opts.slot}`,
       max_attempts: 2,
-      timeout_ms: opts.timeoutMs,
+      timeout_ms: timeoutMs,
       maxPending: 1,
     },
   );

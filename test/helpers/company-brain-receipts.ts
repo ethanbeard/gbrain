@@ -11,6 +11,7 @@ import {
 import { SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL } from '../../src/core/company-brain/receipt-schema.ts';
 import { appendCompleted, clearOpCheckpoint, loadOpCheckpoint, purgeStaleCheckpoints } from '../../src/core/op-checkpoint.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../../src/core/link-extraction.ts';
+import { caught, envelopeFor, expectFunnelSuggestions } from './agent-envelope.ts';
 
 export function sourceIngestionReceiptTests(label: string, getEngine: () => BrainEngine): void {
   describe(label, () => {
@@ -287,6 +288,23 @@ export function sourceIngestionReceiptTests(label: string, getEngine: () => Brai
       await expect(transitionSourceIngestionReceipt(engine, { ...mutation(r, fence), phase: 'CONTENT' })).rejects.toMatchObject({ code: 'receipt_fence_changed' });
       await engine.executeRaw('UPDATE persistence_source_bindings SET source_incarnation=$2::uuid WHERE source_id=$1', [input.sourceId, input.sourceIncarnation]);
       expect((await transitionSourceIngestionReceipt(engine, { ...mutation(r, fence), phase: 'CONTENT' })).phase).toBe('CONTENT');
+    });
+
+    test('receipt refusals name their own next step: the status read, the resume command, the owner check', async () => {
+      expectFunnelSuggestions('src/core/company-brain/receipts.ts', 'fail', 20);
+      const r = await beginSourceIngestionReceipt(engine, input);
+      const stale = envelopeFor(await caught(() => transitionSourceIngestionReceipt(engine, { ...mutation(r), expectedRevision: r.revision + 1, phase: 'CONTENT' })));
+      expect(stale).toMatchObject({ code: 'receipt_conflict', fix: { argv: ['gbrain', 'sources', 'status', input.sourceId, '--json'], next: 'run' } });
+      expect(stale.suggestion).toContain(`gbrain sync --source ${input.sourceId} --no-embed --no-pull`);
+      let advanced = r;
+      for (const phase of ['CONTENT', 'GRAPH', 'VERIFY'] as const) advanced = await transitionSourceIngestionReceipt(engine, { ...mutation(advanced), phase });
+      const failed = envelopeFor(await caught(() => recordSourceIngestionOutcome(engine, { ...mutation(advanced), outcome: 'complete', contentCommitted: true,
+        graphCommitted: true, verificationPassed: true, counts: { failedFiles: 2 } })));
+      expect(failed).toMatchObject({ code: 'invalid_receipt_transition', fix: { argv: ['gbrain', 'sources', 'status', input.sourceId, '--json'] } });
+      expect(failed.suggestion).toContain('2 failed file(s)');
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      const fence = envelopeFor(await caught(() => beginSourceIngestionReceipt(engine, { ...input, id: randomUUID() })));
+      expect(fence).toMatchObject({ code: 'receipt_fence_required', fix: { argv: ['gbrain', 'sources', 'writer', 'status', input.sourceId, '--json'] } });
     });
   });
 }

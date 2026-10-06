@@ -76,7 +76,7 @@ beforeAll(async () => {
   delete process.env.OPENAI_API_KEY;
   // PGLite WASM cold start + full migration chain + 30-page seed can exceed
   // bun's default HOOK budget on loaded machines (bunfig's timeout=60s covers
-  // tests, not hooks) — same pattern as brain-allowlist.serial.test.ts.
+  // tests, not hooks) — same pattern as brain-allowlist.test.ts.
 }, 120_000);
 
 afterAll(async () => {

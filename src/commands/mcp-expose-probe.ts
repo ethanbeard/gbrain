@@ -21,6 +21,7 @@
 import { lookup } from 'node:dns/promises';
 import { createConnection, isIP } from 'node:net';
 import { TAILSCALE_ACCEPT_DNS_COMMAND } from '../core/tailscale.ts';
+import { liveStatusMarkerFor } from '../core/serve-http-status-marker.ts';
 
 export type ProbeFetch = (url: string, init?: { signal?: AbortSignal; redirect?: 'manual' | 'error' | 'follow' }) => Promise<{ ok: boolean; status: number }>;
 /** Bounded TCP connect to `host:port` (true on connect, false on refusal / timeout). */
@@ -167,4 +168,14 @@ export async function pollHealth(d: ProbeDeps, url: string, budgetMs: number): P
 /** `verify.tailnet` / `--status` detail when this host cannot resolve the MagicDNS name — a warn, never `pending`. */
 export function unresolvedDetail(dnsName: string): string {
   return `this host cannot resolve ${dnsName} (MagicDNS may be off here: \`${TAILSCALE_ACCEPT_DNS_COMMAND}\`); devices that do resolve it may already reach the server`;
+}
+
+/**
+ * `verify.local` detail when the server on `port` runs in status-only mode
+ * (its `/health` answers 503): the reason from its marker on this host, so
+ * the check reads "status-only" with the cause instead of a timeout.
+ */
+export function statusOnlyHealthDetail(port: number): string | null {
+  const m = liveStatusMarkerFor(port);
+  return m ? `status-only (${m.reason}): the server runs but cannot open its brain; \`gbrain doctor --only harness_wiring\` names the fix` : null;
 }

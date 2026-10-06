@@ -143,6 +143,73 @@ for (const kind of testBackends()) {
       expect(await effect(f.effectId)).toMatchObject({ state: 'committed', outcome: { embedding: 'superseded', reason: 'revision_changed', replaced_by: replacement.id } });
     });
 
+    // #5935: classic import/embed can advance a page without an outbox effect.
+    // Existing coverage only exercises replacement obligations or incomplete
+    // projections. These cases pin provider-free settlement and revalidation
+    // through the real repair runner; no new production seam is needed.
+    async function classicUpdate(sourceId: string) {
+      await engine.putPage('page', { type: 'note', title: 'Example', compiled_truth: 'Current' }, { sourceId });
+      const prepared = (await readProjectionSnapshot(engine, 'page', sourceId, { allowUnsealed: true }))!;
+      await installPageProjection(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Current' }], { seal: true });
+      return prepared.snapshot;
+    }
+
+    check('superseded: verified current vectors settle a failed old revision without a replacement obligation or provider work', async () => {
+      const f = await fixture('failed');
+      // Change the canonical revision, not just a receipt or projection flag.
+      await engine.putPage('page', { type: 'note', title: 'Changed', compiled_truth: 'Current' }, { sourceId: f.sourceId });
+      const current = await classicUpdate(f.sourceId);
+      await embedVectors(f.sourceId);
+      const before = await effect(f.effectId);
+      expect(current.revision).not.toBe(before.revision);
+      const preview = await repair(f.sourceId, false);
+      expect(preview.affected).toBe(1);
+      expect(preview.cost.embedding_usd).toBe(0);
+      expect(await effect(f.effectId)).toEqual(before);
+      expect((await repair(f.sourceId, true)).outcomes).toEqual({ superseded: 1 });
+      expect(await effect(f.effectId)).toMatchObject({ state: 'committed', attempts: 5, error_code: null,
+        outcome: { embedding: 'superseded', reason: 'current_vectors_verified', verified_revision: current.revision } });
+      let calls = 0;
+      await runOwner(f.effectId, async () => { calls++; throw new Error('repair must not request embeddings'); });
+      expect(calls).toBe(0);
+      expect((await staleEmbeddingEffectsCheck(engine, [f.sourceId])).status).toBe('ok');
+      expect(await listBlockingEffects(engine, { sourceId: f.sourceId })).toEqual([]);
+      await engine.executeRaw("UPDATE persistence_requests SET completed_at=now()-interval '30 days' WHERE id=$1::uuid", [f.row.id]);
+      await compactWriteReceipts(engine, 0);
+      expect((await engine.executeRaw<{ compacted: boolean }>('SELECT compacted FROM persistence_requests WHERE id=$1::uuid', [f.row.id]))[0].compacted).toBe(true);
+    });
+
+    check('superseded without an obligation: missing, stale and wrong-model vectors remain blocked, and apply rechecks preview and ownership', async () => {
+      const f = await fixture('failed');
+      await engine.putPage('page', { type: 'note', title: 'Changed', compiled_truth: 'Current' }, { sourceId: f.sourceId });
+      await classicUpdate(f.sourceId);
+      const candidate = { effect_id: f.effectId, state: 'failed' as const, attempts: 5 };
+      const settle = (dryRun: boolean, selectedConfig: GBrainConfig | null = config) => settleEmbeddingEffect(engine, candidate,
+        { dryRun, config: selectedConfig, hostId: localHostId() });
+      const before = await effect(f.effectId);
+      expect(await settle(false)).toMatchObject({ outcome: 'blocked', reason: 'no_replacement_obligation' });
+      const prepared = (await readProjectionSnapshot(engine, 'page', f.sourceId))!;
+      await installPageEmbeddings(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Current', embedding: vector(), model: 'openai:other-model' }], 'openai:other-model:1536');
+      expect(await settle(false)).toMatchObject({ outcome: 'blocked', reason: 'no_replacement_obligation' });
+      await embedVectors(f.sourceId);
+      expect(await settle(true)).toMatchObject({ outcome: 'superseded' });
+      expect(await settle(false, null)).toMatchObject({ outcome: 'blocked', reason: 'no_replacement_obligation' });
+      await engine.executeRaw("UPDATE content_chunks SET embedded_text_hash='stale' WHERE page_id=$1", [prepared.snapshot.page.id]);
+      expect(await settle(false)).toMatchObject({ outcome: 'blocked', reason: 'no_replacement_obligation' });
+      await embedVectors(f.sourceId);
+      await engine.executeRaw('UPDATE pages SET text_projection_revision=NULL WHERE source_id=$1', [f.sourceId]);
+      expect(await settle(false)).toMatchObject({ outcome: 'blocked', reason: 'no_replacement_obligation' });
+      expect(await effect(f.effectId)).toEqual(before);
+      await classicUpdate(f.sourceId);
+      await embedVectors(f.sourceId);
+      expect(await settle(true)).toMatchObject({ outcome: 'superseded' });
+      const [worktree] = await engine.executeRaw<{ id: string }>('INSERT INTO persistence_worktrees(owner_host_id) VALUES(gen_random_uuid()) RETURNING id');
+      await engine.executeRaw('UPDATE persistence_effects SET worktree_id=$2::uuid WHERE id=$1', [f.effectId, worktree.id]);
+      const foreign = await effect(f.effectId);
+      expect(await settle(false)).toEqual({ outcome: 'blocked', reason: 'owner_unavailable' });
+      expect(await effect(f.effectId)).toEqual(foreign);
+    });
+
     check('retry_queued: a stale queued effect without vectors is re-queued, doctor stays pending, and the owner run settles it', async () => {
       const f = await fixture('stale');
       const applied = await repair(f.sourceId, true);

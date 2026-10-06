@@ -31,7 +31,8 @@ function mockEngine(): BrainEngine {
       if (prop === 'transaction') return async (fn: (tx: BrainEngine) => Promise<any>) => fn(engine);
       return (...args: any[]) => {
         calls.push({ method: String(prop), args });
-        return Promise.resolve(null);
+        // Like a real engine, executeRaw always resolves to a row array.
+        return Promise.resolve(prop === 'executeRaw' ? [] : null);
       };
     },
   });
@@ -41,6 +42,56 @@ function mockEngine(): BrainEngine {
 
 describe('import YAML frontmatter validation', () => {
   test('importFromContent rejects invalid YAML frontmatter instead of importing it as body', async () => {
+    // #5988: an unquoted `Re: ...` value is read by quoting it (see the
+    // recoverable test below); a value spilling onto an unquoted second line
+    // can only be read by guessing, so it is still refused, by line, never
+    // echoing the value.
+    const content = `---
+type: note
+title: October booking
+continued on a stray line
+---
+
+Body text.
+`;
+
+    const engine = mockEngine();
+    const result = await importFromContent(engine, 'emails/reply-october-booking', content, { noEmbed: true });
+
+    expect(result.status).toBe('error');
+    expect(result.error).toContain('Invalid YAML frontmatter');
+    expect(result.error).toContain('line 3');
+    expect(result.error).not.toContain('stray line');
+    expect((engine as any)._calls).toEqual([]);
+  });
+
+  test('importFile rejects invalid YAML before frontmatter inference can wrap it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-invalid-yaml-'));
+    try {
+      const filePath = join(dir, 'reply.md');
+      writeFileSync(filePath, `---
+type: note
+title: October booking
+continued on a stray line
+---
+
+Body text.
+`);
+
+      const engine = mockEngine();
+      const result = await importFile(engine, filePath, 'emails/reply-october-booking.md', { noEmbed: true });
+
+      expect(result.status).toBe('skipped');
+      expect(result.error).toContain('Invalid YAML frontmatter');
+      expect(result.error).toContain('line 3');
+      expect(result.error).not.toContain('stray line');
+      expect((engine as any)._calls).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an unquoted colon-space value imports with its exact text (#5988)', async () => {
     const content = `---
 type: note
 title: Re: October booking
@@ -52,34 +103,9 @@ Body text.
     const engine = mockEngine();
     const result = await importFromContent(engine, 'emails/reply-october-booking', content, { noEmbed: true });
 
-    expect(result.status).toBe('error');
-    expect(result.error).toContain('Invalid YAML frontmatter');
-    expect(result.error).toContain('title: Re: October booking');
-    expect((engine as any)._calls).toEqual([]);
-  });
-
-  test('importFile rejects invalid YAML before frontmatter inference can wrap it', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'gbrain-invalid-yaml-'));
-    try {
-      const filePath = join(dir, 'reply.md');
-      writeFileSync(filePath, `---
-type: note
-title: Re: October booking
----
-
-Body text.
-`);
-
-      const engine = mockEngine();
-      const result = await importFile(engine, filePath, 'emails/reply-october-booking.md', { noEmbed: true });
-
-      expect(result.status).toBe('skipped');
-      expect(result.error).toContain('Invalid YAML frontmatter');
-      expect(result.error).toContain('title: Re: October booking');
-      expect((engine as any)._calls).toEqual([]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    expect(result.status).toBe('imported');
+    const putCall = (engine as any)._calls.find((call: any) => call.method === 'putPage');
+    expect(putCall.args[1].title).toBe('Re: October booking');
   });
 
   test('quoted frontmatter values with colon-space still import', async () => {

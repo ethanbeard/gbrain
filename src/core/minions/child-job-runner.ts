@@ -37,6 +37,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSpawnInvocation } from './spawn-helpers.ts';
+import { SpendEnforcementUnavailableError, childSpendEnforcementReady } from './spend-authorization.ts';
 import { LocalConfigurationError, isLocalConfigurationError } from './configuration-error.ts';
 import {
   UnrecoverableError,
@@ -109,6 +110,8 @@ const PER_JOB_ABORT_REASONS = new Set<string>([
 
 export interface RunJobInChildOpts {
   jobId: number;
+  /** The row carries a spend authorization: only a child with `spend-enforcement-v1` may run it. */
+  spendAuthorized?: boolean;
   jobName: string;
   lockToken: string;
   /** Per-job abort (timeout / cancel / lock-lost / lock-renewal-failed). */
@@ -141,6 +144,7 @@ interface ChildExit {
  * them verbatim).
  */
 export async function runJobInChild(opts: RunJobInChildOpts): Promise<unknown> {
+  if (opts.spendAuthorized && !childSpendEnforcementReady()) throw new SpendEnforcementUnavailableError();
   let executionStopped = false;
   let configurationError: LocalConfigurationError | undefined;
   try {

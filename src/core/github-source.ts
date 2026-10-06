@@ -1483,5 +1483,10 @@ function syncResult(
     embedded: summary.embedded,
     pagesAffected: summary.pagesAffected,
     ...(summary.failedFiles > 0 ? { failedFiles: summary.failedFiles } : {}),
+    // #5012: a partial sweep names its real cause and counts what it wrote.
+    ...(summary.status === 'partial' ? {
+      filesImported: summary.added + summary.modified,
+      reason: summary.failedFiles > 0 ? 'connector_item_failures' as const : opts.signal?.aborted ? 'timeout' as const : 'connector_partial' as const,
+    } : {}),
   };
 }

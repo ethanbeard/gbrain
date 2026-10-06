@@ -239,7 +239,7 @@ test('sync, remember, withdraw, metadata repair, migration, export and HTTP MCP 
       await client.connect(transport);
       for (const query of [vectorQuery, privateText, foreignText, retired]) {
         const callsBefore = embeddingCalls;
-        const result = await client.callTool({ name: 'search', arguments: { query, expand: false } });
+        const result = await client.callTool({ name: 'search', arguments: { query, expand: false, fields: 'full' } });
         expect(result.isError, stderr).not.toBe(true);
         const rows = JSON.parse((result.content as Array<{ text: string }>)[0].text) as Array<{ slug: string; source_id: string; cosine?: number }>;
         const meta = result._meta?.retrieval as { vector_enabled?: boolean; degraded?: unknown[]; projection_readiness: { status: string } };

@@ -15,6 +15,7 @@ import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { submitRememberMutation } from '../src/core/persistence/memory-mutations.ts';
 import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
 import { reviewedWriterIntent } from './helpers/writer-admin-intent.ts';
+import { caught, envelopeFor, expectFunnelSuggestions } from './helpers/agent-envelope.ts';
 
 let diskEngine: PGLiteEngine;
 beforeAll(() => { diskEngine = new PGLiteEngine(); });
@@ -39,6 +40,15 @@ describe('source lifecycle CLI', () => {
       google: { tokenEnv: 'EXAMPLE_TOKEN', access: 'env', services: ['calendar'], dir: process.cwd() } } });
     expect(() => parseSourceLifecycleArgs(['add', 'example', '--kind', 'github', '--scope', 'repos'])).toThrow('valid owner/name');
     expect(() => parseSourceLifecycleArgs(['add', 'example', '--kind', 'google', '--account', 'account@example.invalid', '--access', 'command'])).toThrow('access');
+  });
+
+  test('usage refusals name their own next step and offer the verb help', async () => {
+    expectFunnelSuggestions('src/commands/sources-lifecycle-args.ts', 'invalid', 20);
+    const misplaced = envelopeFor(await caught(() => parseSourceLifecycleArgs(['archive', 'example', '--force'])));
+    expect(misplaced).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'sources', 'archive', '--help'], next: 'run' } });
+    expect(misplaced.suggestion).toContain('Remove --force; sources archive accepts');
+    const githubOnly = envelopeFor(await caught(() => parseSourceLifecycleArgs(['add', 'example', '--repos', 'acme-example/notes'])));
+    expect(githubOnly.suggestion).toContain('Add --kind github for --repos');
   });
 
   test('actual CLI source writes use the resident owner, replay after deletion, and share page request identity', async () => {

@@ -41,6 +41,13 @@ import { discoverGitRoot } from '../core/sync-git.ts';
 const HOOK_BANNER = '# gbrain frontmatter pre-commit hook (v0.22.4+)';
 /** One line per guarded subdirectory (root-relative, trailing slash). No lines = whole repo. */
 const SCOPE_MARKER = '# gbrain-scope: ';
+const VERSION_MARKER = '# gbrain-hook-version: ';
+/**
+ * Bump when the generated script changes behavior. 2: one
+ * `gbrain frontmatter validate --staged` process checks the staged blobs.
+ * A gbrain hook without the marker is version 1 (validated working-tree bytes).
+ */
+export const FRONTMATTER_HOOK_VERSION = 2;
 
 const shellQuote = (s: string): string => `'${s.replace(/'/g, "'\\''")}'`;
 
@@ -64,10 +71,11 @@ const git = (root: string, args: string[]): string =>
   execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', env: process.env }).trim();
 
 /**
- * Render the hook script. Empty `scopes` = the whole repo (byte-identical to
- * the pre-#4600 script); otherwise `git diff --cached` is limited to the
- * listed pathspecs. Git runs hooks from the worktree root, so the
- * root-relative paths it lists resolve as-is for `gbrain frontmatter validate`.
+ * Render the hook script. Empty `scopes` = the whole repo; otherwise
+ * `git diff --cached` is limited to the listed pathspecs. Git runs hooks from
+ * the worktree root, so the root-relative paths it lists resolve as-is for
+ * `gbrain frontmatter validate --staged`, which checks the staged blobs (not
+ * the working-tree bytes) of all of them in one process.
  */
 function renderHookScript(scopes: string[]): string {
   scopes.forEach(assertNoLineTerminator);
@@ -75,7 +83,8 @@ function renderHookScript(scopes: string[]): string {
   const pathspec = scopes.length > 0 ? ` -- ${scopes.map(shellQuote).join(' ')}` : '';
   return `#!/bin/sh
 ${HOOK_BANNER}
-${marker}# Validates YAML frontmatter on staged .md / .mdx files. Bypass with
+${VERSION_MARKER}${FRONTMATTER_HOOK_VERSION}
+${marker}# Validates the staged YAML frontmatter of .md / .mdx files. Bypass with
 # 'git commit --no-verify'. Uninstall with 'gbrain frontmatter install-hook --uninstall'.
 
 set -e
@@ -88,27 +97,65 @@ fi
 # One path per line: -z disables git's quoting (a non-ASCII name would print
 # as "caf\\303\\251.md"), tr turns the NUL terminators into newlines, and the
 # read loop keeps spaces intact (a newline INSIDE a name is the one unsupported
-# shape). The heredoc keeps the loop in this shell so 'failed' survives it.
+# shape). The heredoc keeps the loop in this shell so the argument list survives it.
 staged=$(git diff --cached --name-only -z --diff-filter=ACM${pathspec} | tr '\\0' '\\n' | grep -E '\\.mdx?$' || true)
 [ -z "$staged" ] && exit 0
 
-failed=0
+set --
 while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  if ! gbrain frontmatter validate "$f" >/dev/null 2>&1; then
-    gbrain frontmatter validate "$f" >&2
-    failed=1
-  fi
+  if [ -n "$f" ]; then set -- "$@" "$f"; fi
 done <<EOF
 $staged
 EOF
+[ $# -eq 0 ] && exit 0
 
-if [ $failed -ne 0 ]; then
+if ! report=$(gbrain frontmatter validate --staged -- "$@" 2>&1); then
+  printf '%s\\n' "$report" >&2
   echo "" >&2
-  echo "Frontmatter validation failed. Run 'gbrain frontmatter validate <file> --fix' to repair, or 'git commit --no-verify' to bypass." >&2
+  echo "Frontmatter validation failed for the staged content above. Fix each file ('gbrain frontmatter validate <file> --fix'; on a managed brain 'gbrain repair frontmatter --source <id>'), then restage it with 'git add <file>'. Bypass once with 'git commit --no-verify'." >&2
   exit 1
 fi
 `;
+}
+
+/**
+ * The generated-script version of an installed hook: null when the content
+ * is not a gbrain frontmatter hook, 1 for gbrain hooks written before the marker.
+ */
+export function frontmatterHookVersion(hook: string): number | null {
+  if (!hook.includes(HOOK_BANNER)) return null;
+  const line = hook.split('\n').find((l) => l.startsWith(VERSION_MARKER));
+  const version = line ? Number(line.slice(VERSION_MARKER.length).trim()) : 1;
+  return Number.isInteger(version) && version > 0 ? version : 1;
+}
+
+export interface InstalledFrontmatterHook {
+  hookPath: string;
+  version: number;
+  current: boolean;
+  /** Present when outdated: refreshes the script (an existing gbrain hook is replaced without a .bak). */
+  fix?: string[];
+}
+
+/**
+ * The gbrain pre-commit hook guarding `localPath`, read-only: null when the
+ * path is outside git, the hook path is a symlink, or no gbrain hook is
+ * installed at its root. Doctor and post-upgrade use `current` to recommend
+ * `gbrain frontmatter install-hook --force`.
+ */
+export function inspectFrontmatterHook(localPath: string, sourceId?: string): InstalledFrontmatterHook | null {
+  let hookPath: string;
+  try {
+    hookPath = hookPaths(resolveHookTarget(localPath).root).hookPath;
+  } catch {
+    return null;
+  }
+  if (!existsSync(hookPath)) return null;
+  const version = frontmatterHookVersion(readFileSync(hookPath, 'utf8'));
+  if (version === null) return null;
+  const current = version >= FRONTMATTER_HOOK_VERSION;
+  return { hookPath, version, current,
+    ...(current ? {} : { fix: ['gbrain', 'frontmatter', 'install-hook', ...(sourceId ? ['--source', sourceId] : []), '--force'] }) };
 }
 
 function parseScopes(hook: string): string[] {

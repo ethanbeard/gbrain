@@ -121,6 +121,23 @@ describe('runTriagePass — cache validity (C8)', () => {
     expect(rows.get(`${t.filePath}|${t.contentHash}`)?.triage_version).toBe(TRIAGE_VERSION);
   });
 
+  test('a verdict a chat_fallback_chain model gave decides this run but is never cached', async () => {
+    const fake = makeFakeEngine();
+    const t = makeTranscript('fallback');
+    const judge: JudgeClient = {
+      create: async () => ({
+        content: [{ type: 'text', text: JSON.stringify({ score: 0.7, reasons: ['mock'] }) }],
+        stop_reason: 'end_turn',
+        answered_by: 'openai:gpt-example',
+      } as never),
+    };
+    const r = await runTriagePass(fake.engine, [t], baseCfg(judge));
+    expect(r.judged).toBe(1);
+    expect(fake.putCalls).toBe(0);
+    expect(r.reports[0]?.score).toBe(0.7);
+    expect(r.reports[0]?.worth).toBe(true);
+  });
+
   test('model mismatch is a MISS — switching models re-judges (C8)', async () => {
     const { engine, rows } = makeFakeEngine();
     const t = makeTranscript('model-switch');

@@ -23,6 +23,33 @@ import { isStatementTimeoutError, isRetryableConnError } from './retry-matcher.t
 // halving control flow stays intact (orthogonal to withRetry's per-call retry
 // shape) — the unification is at the sleep primitive only, per codex H-6.
 import { abortableSleep } from './retry.ts';
+import { GBrainError } from './types.ts';
+import { redactConnectionInfo } from './audit/redact-connection-info.ts';
+
+function brief(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  const message = redactConnectionInfo(err instanceof Error ? err.message : String(err)).slice(0, 200);
+  return typeof code === 'string' ? `${code} ${message}` : message;
+}
+
+/**
+ * #5730: a failed batch whose ROLLBACK also failed. The reserved connection's
+ * transaction state is unknown, so the run stops instead of retrying on it;
+ * the driver discards the connection when it is released. Nothing from the
+ * batch was committed and the checkpoint was not advanced.
+ */
+export class BackfillRollbackError extends GBrainError {
+  readonly code = 'backfill_rollback_failed';
+  constructor(name: string, batchError: unknown, rollbackError: unknown) {
+    super(
+      `Backfill ${name} stopped: ROLLBACK of a failed batch also failed`,
+      `batch error: ${brief(batchError)}; rollback error: ${brief(rollbackError)}`,
+      `gbrain backfill ${name} --resume`,
+      'docs/ENGINES.md#backfill-rollback-failed',
+    );
+    this.name = 'BackfillRollbackError';
+  }
+}
 
 export interface BackfillSpec<TRow = Record<string, unknown>> {
   /** Stable identifier — used in checkpoint key + CLI dispatch. */
@@ -155,7 +182,7 @@ export async function ensureBackfillIndex<TRow>(
     // semantics directly.
     await engine.withReservedConnection(async conn => {
       await conn.executeRaw(sql);
-    });
+    }, { selfContained: true });
     return { existed: false, created: true };
   } catch (err) {
     process.stderr.write(`[backfill] index creation failed: ${(err as Error).message}; will continue without partial index\n`);
@@ -260,11 +287,10 @@ export async function runBackfill<TRow = Record<string, unknown>>(
       try {
         await engine.withReservedConnection(async conn => {
           await conn.executeRaw(`BEGIN`);
+          let batchUpdated = 0;
           try {
             if (engine.kind === 'postgres') {
-              await conn.executeRaw(`SET LOCAL statement_timeout = '${perBatchTimeoutSec}s'`).catch(() => {
-                /* some Postgres tiers restrict SET LOCAL; falls through */
-              });
+              await conn.executeRaw(`SET LOCAL statement_timeout = '${perBatchTimeoutSec}s'`);
             }
             for (const { id, updates } of computedUpdates) {
               const setClauses: string[] = [];
@@ -280,15 +306,21 @@ export async function runBackfill<TRow = Record<string, unknown>>(
                 `UPDATE ${spec.table} SET ${setClauses.join(', ')} WHERE ${idCol} = $1`,
                 params,
               );
-              updated++;
+              batchUpdated++;
             }
             await conn.executeRaw(`COMMIT`);
+            updated += batchUpdated;
           } catch (err) {
-            await conn.executeRaw(`ROLLBACK`).catch(() => {});
+            try {
+              await conn.executeRaw(`ROLLBACK`);
+            } catch (rollbackErr) {
+              throw new BackfillRollbackError(spec.name, err, rollbackErr);
+            }
             throw err;
           }
-        });
+        }, { selfContained: true });
       } catch (err) {
+        if (err instanceof BackfillRollbackError) throw err;
         errors++;
         if (errors >= maxErrors) break;
         if (isStatementTimeoutError(err)) {

@@ -2,7 +2,7 @@
  * Picker unit tests — exercise the pure paths (env filtering, caveat
  * messaging, null returns on bad input). The real TTY-input flow (menu
  * rendering, typed selection, persistence) is covered by the real-PTY
- * serial test at test/init-picker-pty.serial.test.ts; mocking readLineSafe
+ * serial test at test/init-picker-pty.test.ts; mocking readLineSafe
  * at the unit boundary would leak across files in the shard process per
  * CLAUDE.md test-isolation rules.
  */

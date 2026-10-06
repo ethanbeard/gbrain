@@ -45,6 +45,9 @@ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from '
 import { join, relative } from 'node:path';
 import ts from 'typescript';
 
+/** `ts.getTokenAtPosition` is exported at runtime but absent from typescript's public declarations. */
+const tsInternal = ts as typeof ts & { getTokenAtPosition(sourceFile: ts.SourceFile, position: number): ts.Node };
+
 const ROOT = process.env.GBRAIN_GUARD_ROOT ?? join(import.meta.dir, '..');
 const BASELINE_REL = 'scripts/engine-sql-baseline.tsv';
 const ANCHOR = 'docs/TESTING.md#engine-sql-ratchet';
@@ -151,7 +154,7 @@ function markers(sf: ts.SourceFile): Map<number, string> {
   const out = new Map<number, string>();
   const re = new RegExp(String.raw`//\s*${MARKER}\b(:?)([^\n]*)`, 'g');
   for (let m = re.exec(text); m; m = re.exec(text)) {
-    const token = ts.getTokenAtPosition(sf, m.index);
+    const token = tsInternal.getTokenAtPosition(sf, m.index);
     if (token.getStart(sf) <= m.index && m.index < token.end) continue;
     out.set(sf.getLineAndCharacterOfPosition(m.index).line + 1, m[1] ? m[2].trim() : '');
   }

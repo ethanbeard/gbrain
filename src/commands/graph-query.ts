@@ -18,12 +18,17 @@ import type { BrainEngine } from '../core/engine.ts';
 import type { GraphPath } from '../core/types.ts';
 import { TRAVERSE_PATH_ROW_CAP } from '../core/engine-constants.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
-import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
+import { callRemoteTool, unpackToolResult, ignoredRemoteParams } from '../core/mcp-client.ts';
+import { CHAIN_LINK_TYPES, resolveChainAnchors, runRelationalChain, validateChainHops, type ChainDiagnostics, type ChainEvidenceEdge } from '../core/search/relational-chain.ts';
 import { resolveSourceId, resolveSourceIdEngineFree, ALL_SOURCES } from '../core/source-resolver.ts';
 
 interface Args {
   slug?: string;
   linkType?: string;
+  /** --hop <link_type>:<object|subject>, repeatable (a typed chain). */
+  hops: string[];
+  /** Flags the user passed explicitly (to reject combinations with --hop). */
+  explicit: Set<'type' | 'depth' | 'direction'>;
   depth: number;
   direction: 'in' | 'out' | 'both';
   showHelp: boolean;
@@ -32,12 +37,14 @@ interface Args {
 }
 
 function parseArgs(args: string[]): Args {
-  const out: Args = { depth: 5, direction: 'out', showHelp: false, includeForeign: false };
+  const out: Args = { depth: 5, direction: 'out', showHelp: false, includeForeign: false, hops: [], explicit: new Set() };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--type' && i + 1 < args.length) out.linkType = args[++i];
-    else if (a === '--depth' && i + 1 < args.length) out.depth = Number(args[++i]);
+    if (a === '--type' && i + 1 < args.length) { out.linkType = args[++i]; out.explicit.add('type'); }
+    else if (a === '--depth' && i + 1 < args.length) { out.depth = Number(args[++i]); out.explicit.add('depth'); }
+    else if (a === '--hop' && i + 1 < args.length) out.hops.push(args[++i]);
     else if (a === '--direction' && i + 1 < args.length) {
+      out.explicit.add('direction');
       const d = args[++i];
       if (d === 'in' || d === 'out' || d === 'both') out.direction = d;
     }
@@ -70,6 +77,16 @@ Options:
                          source. An unknown source is a hard error. Local
                          installs only: a thin client rejects it (the server
                          scopes the walk to your grant).
+  --hop <type>:<toward>  One hop of a typed chain; repeat for 2-3 hops. <toward>
+                         is 'object' (subject -> object, e.g. investor -> company)
+                         or 'subject' (object -> subject, e.g. company -> founder).
+                         Follows the relation's meaning, whichever page the edge
+                         was written on. Prints answers with the edges that prove
+                         each one. Cannot be combined with --type, --depth or
+                         --direction. MCP: traverse_graph {"hops":[{"link_type":
+                         "invested_in","toward":"object"}, ...]}. Chain link
+                         types: ${CHAIN_LINK_TYPES.join(', ')}.
+                         Guide: docs/guides/multi-hop.md
   --include-foreign      Include edges to pages in other sources (v0.37.7.0).
                          Off by default; the walk stays inside the resolved
                          source, and a footer reports the count of
@@ -86,6 +103,8 @@ Examples:
     -> Bob's direct connections
   gbrain graph-query people/bob --include-foreign
     -> include edges to pages in other sources
+  gbrain graph-query people/alice --hop invested_in:object --hop founded:subject
+    -> founders of the companies Alice invested in, with evidence
 `);
 }
 
@@ -148,7 +167,7 @@ export async function runGraphQuery(engine: BrainEngine, argv: string[]) {
   const args = parseArgs(argv);
   if (args.showHelp || !args.slug) {
     printHelp();
-    if (!args.slug) process.exit(1);
+    if (!args.slug && !args.showHelp) process.exit(1);
     return;
   }
 
@@ -173,6 +192,7 @@ export async function runGraphQuery(engine: BrainEngine, argv: string[]) {
     process.exit(1);
   }
   const cfg = loadConfig();
+  if (args.hops.length > 0) return runChainQuery(engine, args, cfg);
   if (isThinClient(cfg)) {
     // The remote traverse_graph op has no source_id param: the server scopes
     // the walk to the caller's grant. --source used to be dropped silently
@@ -282,4 +302,83 @@ function printTree(rootSlug: string, paths: GraphPath[], direction: 'in' | 'out'
   }
 
   walk(rootSlug, 0, new Set());
+}
+
+type ChainResponse = {
+  anchor: string;
+  answers: Array<{ slug: string; source_id: string; path_count: number; score: number }>;
+  paths: Array<{ nodes: string[]; edges: ChainEvidenceEdge[] }>;
+  diagnostics: ChainDiagnostics;
+};
+
+/** `--hop` chains: local runs the shared executor, a thin client calls traverse_graph with `hops`. */
+async function runChainQuery(engine: BrainEngine, args: Args, cfg: ReturnType<typeof loadConfig>) {
+  const conflicts = [...args.explicit].map(f => `--${f}`);
+  if (conflicts.length) {
+    console.error(`--hop cannot be combined with ${conflicts.join(', ')}: each hop names its link type and direction, and the chain length is the number of hops.`);
+    process.exit(1);
+  }
+  const rawHops = args.hops.map(h => {
+    const [link_type, toward] = h.split(':');
+    return { link_type, toward };
+  });
+  const parsed = validateChainHops(rawHops);
+  if (!parsed.ok) {
+    const at = /^hops\[(\d+)\]\.(\w+)$/.exec(parsed.path);
+    const where = at ? `--hop ${args.hops[Number(at[1])]} (${at[2] === 'toward' ? '<toward>' : '<link_type>'})` : '--hop';
+    console.error(`${where}: ${parsed.problem}. Write each hop as <link_type>:<toward>, e.g. --hop invested_in:object --hop founded:subject`);
+    process.exit(1);
+  }
+  let res: ChainResponse;
+  if (isThinClient(cfg)) {
+    if (args.source !== undefined || args.includeForeign) {
+      console.error('gbrain graph-query does not accept --source or --include-foreign on a thin-client install (the server scopes the chain to your grant).');
+      process.exit(1);
+    }
+    const raw = await callRemoteTool(cfg!, 'traverse_graph', { slug: args.slug, hops: rawHops }, { timeoutMs: 30_000 });
+    const body = unpackToolResult<unknown>(raw);
+    const isChain = !!body && typeof body === 'object' && !Array.isArray(body) && Array.isArray((body as ChainResponse).answers);
+    if (ignoredRemoteParams(raw).includes('hops') || !isChain) {
+      console.error('The brain host runs an older gbrain without typed chains (traverse_graph ignored "hops"). Upgrade it (`gbrain upgrade` on the host) to use --hop.');
+      process.exit(1);
+    }
+    res = body as ChainResponse;
+  } else {
+    const sourceId = await resolveSourceId(engine, args.source ?? null);
+    const policy = args.includeForeign || sourceId === ALL_SOURCES ? {} : { sourceId };
+    const anchors = await resolveChainAnchors(engine, args.slug!, policy);
+    const { rows, diagnostics } = await runRelationalChain(engine, anchors, { hops: parsed.hops, excludeAnchor: false }, policy);
+    const answers = rows.filter(r => r.role === 'answer');
+    res = {
+      anchor: args.slug!,
+      answers: answers.map(r => ({ slug: r.slug, source_id: r.source_id, path_count: r.path_count, score: r.score })),
+      paths: answers.map(r => r.best_path),
+      diagnostics,
+    };
+  }
+  printChain(res, args.hops);
+}
+
+function printChain(res: ChainResponse, hops: string[]) {
+  const status = res.diagnostics.status;
+  if (status === 'anchor_not_found') {
+    console.log(`No page "${res.anchor}" in the searched sources. Find its exact slug with: gbrain search "${res.anchor}"`);
+    return;
+  }
+  if (res.answers.length === 0) {
+    const hop = res.diagnostics.empty_hop ?? 1;
+    console.log(`No answers: hop ${hop} (${hops[hop - 1]}) found no typed edges. The relationship may only be written as plain mentions; inspect with: gbrain graph-query ${res.anchor} --depth 1`);
+    return;
+  }
+  console.log(`${res.answers.length} answer${res.answers.length === 1 ? '' : 's'} for ${res.anchor} ${hops.map(h => `--hop ${h}`).join(' ')}:`);
+  res.answers.forEach((a, i) => {
+    console.log(`\n${a.slug}  (paths ${a.path_count}, score ${a.score.toFixed(3)})`);
+    for (const e of res.paths[i]?.edges ?? []) {
+      const note = e.orientation === 'flipped' ? ' (written on the other page)' : e.orientation === 'uncertain' ? ' (direction uncertain)' : '';
+      console.log(`  ${e.stored_from} -${e.link_type}-> ${e.stored_to}${note}${e.context ? `: "${e.context}"` : ''}`);
+    }
+  });
+  if (res.diagnostics.cap_hit) {
+    console.error(`\n(chain ${res.diagnostics.cap_hit.cap} cap hit at hop ${res.diagnostics.cap_hit.hop}; lower-ranked answers were dropped. Narrow the chain or start from a more specific page.)`);
+  }
 }

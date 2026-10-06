@@ -72,12 +72,8 @@ describe("guard registration ⇒ execution coverage", () => {
   const EXECUTION_EXEMPT: Record<string, string> = {
     "check-bun-test-timeout.sh":
       "runs directly as a test.yml verify-job step (not via CHECKS — avoids a package.json edit)",
-    "check-jsonb-params.mjs":
-      "exercised by test/check-jsonb-params.test.ts + guard self-test fixtures",
     "check-admin-embedded.sh":
       "duplicates check:admin-build's vite+tsc build; embed freshness covered there",
-    "check-image-decoders-embedded.sh":
-      "runs its own bun build --compile — too heavy for per-verify cadence",
     "check-bash32.sh":
       "needs Docker or a native bash 3.2: runs as a test.yml verify-job step (bash:3.2 image) and in macos-validation.yml (/bin/bash), never in verify",
     "check-test-discriminates.sh":
@@ -251,7 +247,7 @@ describe("run-verify-parallel.sh — no-timeout-binary fallback rc capture (regr
   // gtimeout/timeout — forcing the fallback branch even where coreutils is
   // installed.
 
-  function makeFallbackHarness(): { root: string; env: Record<string, string> } {
+  function makeFallbackHarness(timeoutSecs = "5"): { root: string; env: Record<string, string> } {
     const root = mkdtempSync(join(tmpdir(), "verify-fallback-"));
     mkdirSync(join(root, "scripts", "lib"), { recursive: true });
     copyFileSync(SCRIPT, join(root, "scripts", "run-verify-parallel.sh"));
@@ -261,7 +257,7 @@ describe("run-verify-parallel.sh — no-timeout-binary fallback rc capture (regr
     const bin = join(root, "bin");
     mkdirSync(bin);
     // Everything the dispatcher and its subshells invoke, minus timeout bins.
-    for (const tool of ["bash", "sh", "env", "dirname", "mktemp", "date", "sleep", "cat", "tail", "head", "rm", "mkdir", "pkill", "grep", "sed", "awk", "wc", "tr"]) {
+    for (const tool of ["bash", "sh", "env", "dirname", "mktemp", "date", "sleep", "cat", "tail", "head", "rm", "mkdir", "pkill", "grep", "sed", "awk", "wc", "tr", "sort"]) {
       const p = Bun.which(tool);
       if (p) symlinkSync(p, join(bin, tool));
     }
@@ -271,7 +267,13 @@ describe("run-verify-parallel.sh — no-timeout-binary fallback rc capture (regr
       join(bin, "bun"),
       `#!/usr/bin/env bash
 name="\${2:-}"
+[ -n "\${STUB_LOG:-}" ] && echo "start $name" >> "$STUB_LOG"
+if [ -n "\${STUB_SLOW_CHECK:-}" ] && [ "$name" = "\${STUB_SLOW_CHECK}" ]; then sleep 2; fi
+[ -n "\${STUB_LOG:-}" ] && echo "end $name" >> "$STUB_LOG"
 echo "stub check OK: $name"
+if [ -n "\${STUB_SKIP_CHECK:-}" ] && [ "$name" = "\${STUB_SKIP_CHECK}" ]; then
+  echo "GBRAIN_CHECK_SKIPPED: subject absent in this checkout"
+fi
 if [ -n "\${STUB_FAIL_CHECK:-}" ] && [ "$name" = "\${STUB_FAIL_CHECK}" ]; then
   echo "stub check failing: $name" >&2
   exit 7
@@ -287,7 +289,7 @@ exit 0
         PATH: bin,
         HOME: process.env.HOME ?? root,
         TMPDIR: process.env.TMPDIR ?? "/tmp",
-        GBRAIN_VERIFY_TIMEOUT: "30",
+        GBRAIN_VERIFY_TIMEOUT: timeoutSecs,
         GBRAIN_VERIFY_LOG_DIR: join(root, "logs"),
       },
     };
@@ -309,6 +311,101 @@ exit 0
     }
   });
 
+  it("records every check's real outcome: a self-skip is a skip (not a pass) in outcomes.tsv and the receipt", () => {
+    const { root, env } = makeFallbackHarness();
+    try {
+      const receipts = join(root, "receipts");
+      const r = spawnSync("bash", [join(root, "scripts", "run-verify-parallel.sh")], {
+        encoding: "utf8",
+        env: { ...env, STUB_SKIP_CHECK: "check:grok-pin", STUB_FAIL_CHECK: "check:jsonb", GBRAIN_TEST_RECEIPT_DIR: receipts },
+      });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/fail=1 skip=1\b/);
+      expect(r.stderr).toContain("check:grok-pin: subject absent in this checkout");
+      const outcomes = readFileSync(join(root, "logs", "outcomes.tsv"), "utf8");
+      expect(outcomes).toContain("check:grok-pin\tskip\t0\tsubject absent in this checkout");
+      expect(outcomes).toContain("check:jsonb\tfail\t7\t");
+      expect(outcomes).toContain("check:privacy\tpass\t0\t");
+      const junit = readFileSync(join(receipts, "verify--all--primary.junit.xml"), "utf8");
+      expect(junit).toContain('<testcase name="check:grok-pin" classname="verify" file="verify"><skipped message="subject absent in this checkout" /></testcase>');
+      expect(junit).toContain('<testcase name="check:jsonb" classname="verify" file="verify"><failure message="fail rc=7" /></testcase>');
+      expect(readFileSync(join(receipts, "verify--all--primary.receipt"), "utf8")).toContain("exit=1");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps its default temp log directory when a check fails and names it", () => {
+    const { root, env } = makeFallbackHarness();
+    const { GBRAIN_VERIFY_LOG_DIR: _unused, ...defaults } = env;
+    try {
+      const r = spawnSync("bash", [join(root, "scripts", "run-verify-parallel.sh")], {
+        encoding: "utf8",
+        env: { ...defaults, STUB_FAIL_CHECK: "check:jsonb" },
+      });
+      expect(r.status).toBe(1);
+      const kept = /per-check logs kept in (\S+)/.exec(r.stderr)?.[1];
+      expect(kept).toBeDefined();
+      expect(readFileSync(join(kept!, "check_jsonb.log"), "utf8")).toContain("stub check failing: check:jsonb");
+      rmSync(kept!, { recursive: true, force: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a self-timed SOLO check starts only after every pool check has finished, and fails like any other", () => {
+    const { root, env } = makeFallbackHarness();
+    try {
+      const log = join(root, "order.log");
+      const dry = spawnSync("bash", [join(root, "scripts", "run-verify-parallel.sh"), "--dry-list"], { encoding: "utf8", env }).stdout.trim().split("\n");
+      expect(dry.at(-1)).toBe("check:guard-self-test");
+      expect(dry.filter((c) => c === "check:guard-self-test")).toHaveLength(1);
+      const r = spawnSync("bash", [join(root, "scripts", "run-verify-parallel.sh")], {
+        encoding: "utf8",
+        env: { ...env, STUB_LOG: log, STUB_SLOW_CHECK: "typecheck", GBRAIN_VERIFY_MAX_PARALLEL: "4" },
+      });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).toMatch(/running \d+ checks: \d+ in the pool, then 1 solo/);
+      const checks = new Set(dry);
+      const lines = readFileSync(log, "utf8").trim().split("\n").filter((l) => checks.has(l.replace(/^(start|end) /, "")));
+      const soloStart = lines.indexOf("start check:guard-self-test");
+      expect(soloStart).toBeGreaterThan(-1);
+      const poolEnds = lines.filter((l) => l.startsWith("end ") && l !== "end check:guard-self-test");
+      expect(poolEnds).toHaveLength(dry.length - 1);
+      expect(lines.slice(soloStart).filter((l) => l !== "end check:guard-self-test")).toEqual(["start check:guard-self-test"]);
+      expect(lines.indexOf("end typecheck")).toBeLessThan(soloStart);
+      const failing = spawnSync("bash", [join(root, "scripts", "run-verify-parallel.sh")], {
+        encoding: "utf8",
+        env: { ...env, STUB_FAIL_CHECK: "check:guard-self-test" },
+      });
+      expect(failing.status).toBe(1);
+      expect(failing.stderr).toContain("--- check:guard-self-test (rc=7)");
+      expect(readFileSync(join(root, "logs", "outcomes.tsv"), "utf8")).toMatch(/^check:guard-self-test\tfail\t7\t\S+\t\d+$/m);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("typecheck runs on every platform: only the macOS 26 workflow raises the per-check cap, Linux keeps 120 s (#6056)", () => {
+    const workflows = readdirSync(".github/workflows").filter((f) => /\.ya?ml$/.test(f));
+    const read = (f: string) => readFileSync(join(".github/workflows", f), "utf8");
+    expect(workflows.filter((f) => read(f).includes("GBRAIN_VERIFY_TIMEOUT"))).toEqual(["macos-validation.yml"]);
+    const mac = read("macos-validation.yml");
+    expect(mac).toMatch(/^\s+runs-on: macos-26$/m);
+    expect(mac).toMatch(/^\s+GBRAIN_VERIFY_TIMEOUT: '240'$/m);
+    for (const f of workflows) expect(read(f)).not.toContain("TYPECHECK_COVERED_BY");
+    expect(readFileSync(SCRIPT, "utf8")).not.toContain("TYPECHECK_COVERED_BY");
+    expect(readFileSync(SCRIPT, "utf8")).toContain('TIMEOUT="${GBRAIN_VERIFY_TIMEOUT:-120}"');
+    const testYml = read("test.yml");
+    const verifyJob = testYml.slice(testYml.indexOf("\n  verify:\n"), testYml.indexOf("\n  verify:\n") + 4000);
+    expect(verifyJob).toContain("- run: bun run verify");
+    expect(verifyJob).toMatch(/runs-on: ubicloud-standard-\d+-ubuntu/);
+    const dry = spawnSync("bash", [SCRIPT, "--dry-list"], { encoding: "utf8" }).stdout.split("\n");
+    expect(dry).toContain("typecheck");
+    const pkgScripts = (JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> }).scripts;
+    for (const [name, cmd] of Object.entries(pkgScripts)) expect(`${name}: ${cmd}`).not.toContain("GBRAIN_VERIFY_TIMEOUT");
+  });
+
   it("one check failing → exit 1, sentinel records the check's own rc (7), not 143", () => {
     const { root, env } = makeFallbackHarness();
     try {
@@ -325,4 +422,20 @@ exit 0
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("the watchdog never outlives its check: no orphaned sleep holds the caller's pipes", () => {
+    const timeoutSecs = "47";
+    const { root, env } = makeFallbackHarness(timeoutSecs);
+    const watchdogSleeps = () => spawnSync("pgrep", ["-f", `^sleep ${timeoutSecs}$`], { encoding: "utf8" }).stdout.trim().split("\n").filter(Boolean);
+    try {
+      const started = performance.now();
+      const r = spawnSync("bash", [join(root, "scripts", "run-verify-parallel.sh")], { encoding: "utf8", env });
+      expect(r.status).toBe(0);
+      expect(performance.now() - started).toBeLessThan(Number(timeoutSecs) * 1000 / 2);
+      if (Bun.which("pgrep")) expect(watchdogSleeps()).toEqual([]);
+    } finally {
+      for (const pid of watchdogSleeps()) try { process.kill(Number(pid)); } catch {}
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

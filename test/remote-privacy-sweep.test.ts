@@ -173,6 +173,7 @@ const PARAM_FACTORY: Record<string, Record<string, unknown>> = {
   get_backlinks: { slug: WORLD_PAGE_SLUG },
   traverse_graph: { slug: WORLD_PAGE_SLUG },
   get_versions: { slug: WORLD_FENCE_SLUG },
+  get_write_attribution: { slug: WORLD_FENCE_SLUG, versions: true },
   get_chunks: { slug: WORLD_FENCE_SLUG },
   resolve_slugs: { partial: 'world-page' },
   volunteer_context: { window: 'Recent discussion about WORLDSWEEP topics and pages.' },
@@ -191,6 +192,9 @@ const PARAM_FACTORY: Record<string, Record<string, unknown>> = {
   // put_page-into-fence-bearing-page restoration-echo class is explicitly
   // NOT covered here (write-side sweep TODO).
   put_page: { slug: 'notes/sweep-fresh-write', content: '# Fresh write\n\nNew content.\n' },
+  put_pages: { request_id: '6007a5e0-0000-4000-8000-000000000001', pages: [{ slug: 'notes/sweep-fresh-batch', content: '# Fresh batch\n\nNew content.\n' }] },
+  // A stale revision on the fence-bearing page: the refusal must not echo it.
+  edit_page: { slug: WORLD_FENCE_SLUG, expected_revision: '00000000-0000-4000-8000-000000000000', edits: [{ old_text: 'x', new_text: 'y' }] },
   remember: { fact: 'fresh sweep fact', provenance: 'sweep', entity: 'people/sweep-fresh-entity' },
   capture: { content: 'fresh sweep capture' },
   add_tag: { slug: WORLD_PAGE_SLUG, tag: 'sweep-tag' },
@@ -208,7 +212,7 @@ const PARAM_FACTORY: Record<string, Record<string, unknown>> = {
 // carries ctx.auth; the scalar shape — like the stdio transport — doesn't).
 // These operations enforce durable write authority inside the shared dispatcher.
 // Other scope checks remain transport-owned and outside this privacy harness.
-const COORDINATED_WRITES = new Set(['put_page', 'capture', 'delete_page', 'restore_page', 'revert_version',
+const COORDINATED_WRITES = new Set(['put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page',
   'remember', 'forget', 'add_tag', 'remove_tag', 'add_timeline_entry',
   'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve',
   'get_write_request', 'list_write_requests', 'cancel_write_request']);
@@ -260,6 +264,7 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   sources_list: 'ok',
   sources_status: 'ok',
   find_orphans: 'ok',
+  wanted_pages: 'ok',
   find_contradictions: 'ok',
   find_experts: 'ok',
   find_trajectory: 'ok',
@@ -294,6 +299,7 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   search_stats: 'ok',
   cache_stats: 'ok',
   get_usage: 'ok',
+  get_write_attribution: 'ok',
   get_job_stats: 'ok',
   list_jobs: 'ok', // base unused — per-shape override in EXPECTED_BY_SHAPE (above)
   quarantine_list: 'ok',
@@ -330,7 +336,11 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   // mutating ops (fresh-slug targets; envelope-echo checks only)
   remember: 'ok',
   forget: 'error',
+  // rate_answer with no answer_id is a validation error; a real answer id only
+  // ever names pages that answer returned to the same client.
+  rate_answer: 'error',
   put_page: 'ok',
+  put_pages: 'ok',
   delete_page: 'ok',
   restore_page: 'ok',
   capture: 'ok',
@@ -343,6 +353,7 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   list_write_requests: 'ok',
   cancel_write_request: 'error',
   revert_version: 'error',
+  edit_page: 'error',
   put_raw_data: 'error',
   log_ingest: 'error',
   takes_add: 'ok',
@@ -365,6 +376,8 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   loops_close: 'error',
   loops_mute: 'error',
   loops_unmute: 'error',
+  // agent contract v1 A6: the generic invocation omits the required `code` → validation error.
+  mute_notice: 'error',
   sources_remove: 'error',
   submit_job: 'error',
   get_job: 'error',

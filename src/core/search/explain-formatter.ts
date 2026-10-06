@@ -48,6 +48,12 @@ export function formatResultExplain(
   // (result wasn't routed through runPostFusionStages), fall back to
   // final score and label "no boosts applied" downstream.
   const base = result.base_score ?? result.score;
+  // Which retrieval arm instances found this row, at what rank, and their
+  // RRF contribution (page votes on the lead chunk, own votes otherwise).
+  if (result.rrf && result.rrf.arms.length > 0) {
+    const found = result.rrf.arms.map(v => `${v.arm} #${v.rank + 1} (+${fmt(v.contribution)})`).join(', ');
+    lines.push(`   found by: ${found}`);
+  }
   lines.push(`   base=${fmt(base)} (rrf+cosine)`);
   // v0.46.15: raw query↔chunk cosine (the calibrated semantic signal evidence
   // keys off). Absent on keyword-only / no-embedding paths.
@@ -59,7 +65,8 @@ export function formatResultExplain(
 
   if (result.backlink_boost !== undefined && result.backlink_boost !== 1.0) {
     anyBoost = true;
-    lines.push(`   + backlink ×${fmt(result.backlink_boost)}`);
+    const inbound = result.backlink_count !== undefined ? ` (${result.backlink_count} inbound)` : '';
+    lines.push(`   + backlink ×${fmt(result.backlink_boost)}${inbound}`);
   }
   if (result.salience_boost !== undefined && result.salience_boost !== 1.0) {
     anyBoost = true;
@@ -87,6 +94,10 @@ export function formatResultExplain(
     anyBoost = true;
     const prefix = result.graph_session_prefix ?? '?';
     lines.push(`   - session_demote ×${fmt(result.session_demote_factor)} (prefix=${prefix})`);
+  }
+  if (result.feedback_boost !== undefined && result.feedback_boost !== 1.0) {
+    anyBoost = true;
+    lines.push(`   + feedback ×${fmt(result.feedback_boost)} (use-attributed ratings)`);
   }
   if (result.reranker_delta !== undefined && result.reranker_delta !== 0) {
     anyBoost = true;
@@ -183,6 +194,63 @@ export function formatResultsExplain(
   const head = [formatAutocutSummary(meta?.autocut), formatDegradedSummary(meta?.degraded), formatDeliverySummary(meta?.delivery), formatDecideSummary(meta?.decide)]
     .filter((l): l is string => l !== null);
   return head.length > 0 ? `${head.join('\n')}\n\n${body}` : body;
+}
+
+/** A ranking stage's state in score_details: it ran, was skipped (with why), or never ran on this path. */
+export type StageState<T> = ({ state: 'applied' } & T) | { state: 'skipped' | 'not_run'; reason: string };
+
+/** Stable per-result score breakdown returned by `search`/`query` with `explain: true`. */
+export interface ScoreDetails {
+  /** The row's final score. */
+  final: number;
+  /** Arm-instance votes; `rank` is 1-based for display, `fusion_rank` the 0-based rank RRF used. */
+  arms: Array<{ arm: string; rank: number; fusion_rank: number; k: number; weight: number; contribution: number; vote: 'page' | 'chunk'; chunk_id?: number }>;
+  rrf: StageState<{ raw: number; normalized: number; compiled_truth_boost: number }>;
+  blend: StageState<{ rrf_weight: number; norm_rrf: number; cosine_weight: number; cosine: number }>;
+  /** Score entering the post-fusion boost stages. */
+  base_score: number | null;
+  /** Multiplicative factors applied after fusion, by stage (only stages that changed this row). */
+  boosts: Record<string, { factor: number } & Record<string, unknown>>;
+  rerank: StageState<{ score: number; delta: number | null; pinned: boolean }>;
+}
+
+/**
+ * Pure projection of the stamps every ranking stage leaves on a row into one
+ * stable object. Absent stamps become `not_run`/`skipped` states rather than
+ * invented values, so the breakdown never claims a stage it did not observe.
+ */
+export function buildScoreDetails(result: SearchResult): ScoreDetails {
+  const arms = (result.rrf?.arms ?? []).map(v => ({
+    arm: v.arm, rank: v.rank + 1, fusion_rank: v.rank, k: v.k, weight: v.weight,
+    contribution: v.contribution, vote: v.vote, ...(v.chunk_id !== undefined ? { chunk_id: v.chunk_id } : {}),
+  }));
+  const rrf: ScoreDetails['rrf'] = result.rrf
+    ? { state: 'applied', raw: result.rrf.raw, normalized: result.rrf.normalized, compiled_truth_boost: result.rrf.compiled_truth_boost }
+    : { state: 'not_run', reason: 'single_arm_path' };
+  const blend: ScoreDetails['blend'] = result.blend_norm_rrf !== undefined && typeof result.cosine === 'number'
+    ? { state: 'applied', rrf_weight: 0.7, norm_rrf: result.blend_norm_rrf, cosine_weight: 0.3, cosine: result.cosine }
+    : { state: 'not_run', reason: 'no_query_embedding' };
+  const boosts: ScoreDetails['boosts'] = {};
+  const add = (name: string, factor: number | undefined, detail: Record<string, unknown> = {}) => {
+    if (factor === undefined || factor === 1) return;
+    const clean = Object.fromEntries(Object.entries(detail).filter(([, v]) => v !== undefined));
+    boosts[name] = { factor, ...clean };
+  };
+  add('backlink', result.backlink_boost, { inbound: result.backlink_count });
+  add('salience', result.salience_boost);
+  add('recency', result.recency_boost);
+  add('chronicle', result.chronicle_boost);
+  add('title', result.title_match_boost);
+  add('adjacency', result.graph_adjacency_boost, { hits: result.graph_adjacency_hits });
+  add('cross_source', result.graph_cross_source_boost, { other_sources: result.graph_cross_source_hits });
+  add('session_demote', result.session_demote_factor, { prefix: result.graph_session_prefix });
+  add('alias_resolved', result.alias_resolved_boost);
+  add('supersede', result.supersede_penalty, { superseded_by: result.superseded_by });
+  add('exact_match', result.exact_match_boost);
+  const rerank: ScoreDetails['rerank'] = result.rerank_score !== undefined
+    ? { state: 'applied', score: result.rerank_score, delta: result.reranker_delta ?? null, pinned: result.relational_pinned === true }
+    : { state: 'not_run', reason: 'reranker_off_or_outside_head' };
+  return { final: result.score, arms, rrf, blend, base_score: result.base_score ?? null, boosts, rerank };
 }
 
 /**

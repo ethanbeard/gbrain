@@ -53,9 +53,11 @@ describe('scripts/e2e-backend-matrix.txt', () => {
       expect(text, file).toMatch(/GBRAIN_PGBOUNCER_E2E_URL=\S+\?prepare=false/);
       expect(text, file).toContain('GBRAIN_CI_REQUIRE_PGBOUNCER');
     }
-    // ci:local names a database behind its single pooler; run-e2e.sh pins prepare=false.
+    // ci:local names a database behind its single pooler in both E2E
+    // invocations (sharded and --no-shard); run-e2e.sh pins prepare=false.
     const local = readFileSync(join(REPO, 'scripts/ci-local.sh'), 'utf8');
-    expect(local.match(/GBRAIN_PGBOUNCER_E2E_DB=\S+/g)?.length).toBe(4);
+    expect(local.match(/GBRAIN_PGBOUNCER_E2E_DB=\S+/g)?.length).toBe(2);
+    expect(local.match(/bash scripts\/run-e2e\.sh/g)?.length).toBe(2);
     expect(local).toContain('GBRAIN_CI_REQUIRE_PGBOUNCER');
   });
 });

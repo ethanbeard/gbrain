@@ -33,11 +33,9 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { buildGatewayConfig } from '../src/core/ai/build-gateway-config.ts';
-import { configureGateway, getEmbeddingDimensions, getEmbeddingModel, isAvailable } from '../src/core/ai/gateway.ts';
+import { getEmbeddingDimensions, getEmbeddingModel, isAvailable } from '../src/core/ai/gateway.ts';
 import { rerankerReadinessForEngine } from '../src/core/ai/reranker-readiness-engine.ts';
 import { describeRerankerFix } from '../src/core/ai/reranker-readiness.ts';
-import { loadConfig, type GBrainConfig } from '../src/core/config.ts';
 import { isSearchMode, type SearchMode } from '../src/core/search/mode.ts';
 import type { LongMemEvalQuestion } from '../src/eval/longmemeval/adapter.ts';
 import {
@@ -51,6 +49,7 @@ import {
 } from '../src/eval/longmemeval/diagnostics.ts';
 import { withBenchmarkBrain } from '../src/eval/longmemeval/harness.ts';
 import { loadQuestionIds } from '../src/eval/longmemeval/run-config.ts';
+import { configureEvalGateway } from '../src/eval/shared/gateway-bootstrap.ts';
 
 const DEFAULT_EMBED_CACHE_PATH = join(homedir(), '.cache', 'gbrain-eval', 'longmemeval-embed.sqlite');
 
@@ -161,13 +160,7 @@ async function main(): Promise<void> {
     usage(2);
   }
 
-  // Gateway bootstrap — the cli.ts longmemeval path verbatim: ~/.gbrain/config.json
-  // when present, else env (OPENAI_API_KEY / GBRAIN_EMBEDDING_MODEL / _DIMENSIONS).
-  const config = loadConfig() ?? ({
-    embedding_model: process.env.GBRAIN_EMBEDDING_MODEL,
-    embedding_dimensions: process.env.GBRAIN_EMBEDDING_DIMENSIONS ? Number(process.env.GBRAIN_EMBEDDING_DIMENSIONS) : undefined,
-  } as GBrainConfig);
-  configureGateway(buildGatewayConfig(config));
+  configureEvalGateway();
   if (!isAvailable('embedding')) {
     process.stderr.write('Error: no embedding provider is configured (set OPENAI_API_KEY + GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS, or a ~/.gbrain/config.json).\n');
     process.exit(2);

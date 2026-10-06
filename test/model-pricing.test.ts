@@ -21,7 +21,7 @@ import {
   ANTHROPIC_CACHE_WRITE_5M_MULT,
 } from '../src/core/model-pricing.ts';
 import { ANTHROPIC_PRICING } from '../src/core/anthropic-pricing.ts';
-import { MODEL_PRICING } from '../src/core/takes-quality-eval/pricing.ts';
+import { getPricing as takesQualityPricing } from '../src/core/takes-quality-eval/pricing.ts';
 import { estimateAnthropicCost } from '../src/core/brain-score-recommendations.ts';
 
 describe('CANONICAL_PRICING — table integrity', () => {
@@ -50,8 +50,9 @@ describe('CANONICAL_PRICING — table integrity', () => {
     expect(CANONICAL_PRICING['anthropic:claude-opus-4-7']).toMatchObject({ input: 5.0, output: 25.0 });
   });
 
-  test('Sonnet 5 present at $3/$15 (standard rate, intro discount not modeled)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toMatchObject({ input: 3.0, output: 15.0 });
+  test('Sonnet 5 and 5.5 present at $2/$10 (launch price became the standard rate)', () => {
+    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toMatchObject({ input: 2.0, output: 10.0 });
+    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5-5']).toMatchObject({ input: 2.0, output: 10.0, cache_read: 0.2 });
   });
 
   test('Fable 5 present at $10/$50', () => {
@@ -146,14 +147,16 @@ describe('canonicalLookup — id normalization', () => {
   });
 
   test('OpenRouter id WITH a declared static entry → hit on its own rate, not the vendor alias', () => {
-    // deepseek/deepseek-v4-flash-0731 happens to match deepseek:deepseek-v4-flash
-    // to the cent, but this must resolve via its OWN canonical key, not by
-    // falling through to the bare vendor tail — that fallthrough is exactly
+    // deepseek/deepseek-v4-flash-0731 resolves via its OWN canonical key, not
+    // by falling through to the bare vendor tail — that fallthrough is exactly
     // what canonicalLookup's nested-id miss (case above) exists to prevent.
+    // Its rate is OpenRouter's catalogue rate (re-verified 2026-10-05), which
+    // differs from the vendor's deepseek:deepseek-v4-flash row.
     expect(canonicalLookup('openrouter:deepseek/deepseek-v4-flash-0731')).toEqual({
-      input: 0.14,
-      output: 0.28,
+      input: 0.0152,
+      output: 1.28,
     });
+    expect(canonicalLookup('openrouter:deepseek/deepseek-v4-flash-0731')).not.toEqual(canonicalLookup('deepseek:deepseek-v4-flash'));
     expect(canonicalLookup('openrouter:qwen/qwen3.7-flash')).toEqual({
       input: 0.03,
       output: 0.13,
@@ -187,12 +190,9 @@ describe('DRIFT GUARD — derived views stay equal to canonical (re-hardcode tri
     }
   });
 
-  test('takes-quality MODEL_PRICING equals canonical for every allowlisted key', () => {
-    for (const [key, p] of Object.entries(MODEL_PRICING)) {
-      const c = canonicalLookup(key);
-      expect(c).toBeDefined();
-      expect(p.input_per_1m).toBe(c!.input);
-      expect(p.output_per_1m).toBe(c!.output);
+  test('takes-quality pricing equals canonical for every canonical key', () => {
+    for (const [key, c] of Object.entries(CANONICAL_PRICING)) {
+      expect({ key, p: takesQualityPricing(key) }).toEqual({ key, p: { input_per_1m: c.input, output_per_1m: c.output } });
     }
   });
 
@@ -206,6 +206,25 @@ describe('DRIFT GUARD — derived views stay equal to canonical (re-hardcode tri
     expect(canonical).toBeDefined();
     expect(openai.touchpoints?.expansion?.models?.[0]).toBe('gpt-5.6-luna');
     expect(openai.touchpoints?.expansion?.cost_per_1m_tokens_usd).toBe(canonical.input);
+  });
+
+  test('A-N1: DeepSeek rows carry the vendor PEAK rates; legacy flash id stays in lockstep with deepseek-flash', () => {
+    expect(CANONICAL_PRICING['deepseek:deepseek-flash']).toEqual({ input: 0.30, output: 1.20 });
+    expect(CANONICAL_PRICING['deepseek:deepseek-v4-flash']).toEqual(CANONICAL_PRICING['deepseek:deepseek-flash']);
+    expect(CANONICAL_PRICING['deepseek:deepseek-v4-pro']).toEqual({ input: 1.32, output: 3.96 });
+  });
+
+  test('A-N1: every deepseek recipe chat/expansion model is priced and the touchpoint costs equal canonical deepseek-flash', async () => {
+    const { deepseek } = await import('../src/core/ai/recipes/deepseek.ts');
+    const flash = CANONICAL_PRICING['deepseek:deepseek-flash'];
+    expect(deepseek.touchpoints.chat?.models?.[0]).toBe('deepseek-flash');
+    expect(deepseek.touchpoints.expansion?.models?.[0]).toBe('deepseek-flash');
+    for (const m of [...(deepseek.touchpoints.chat?.models ?? []), ...(deepseek.touchpoints.expansion?.models ?? [])]) {
+      expect({ m, priced: canonicalLookup(`deepseek:${m}`) !== undefined }).toEqual({ m, priced: true });
+    }
+    expect(deepseek.touchpoints.chat?.cost_per_1m_input_usd).toBe(flash.input);
+    expect(deepseek.touchpoints.chat?.cost_per_1m_output_usd).toBe(flash.output);
+    expect(deepseek.touchpoints.expansion?.cost_per_1m_tokens_usd).toBe(flash.input);
   });
 
   test('cross-modal panel models are all priced from canonical', () => {
@@ -269,5 +288,14 @@ describe('canonicalLookup — case-insensitive fallback (#4123 / TODOS case-sens
       expect(prior === undefined || prior === key).toBe(true);
       folded.set(lower, key);
     }
+  });
+});
+
+describe('D3 peak-rate label', () => {
+  test('an estimate touching a deepseek row says it is a peak-rate upper bound; router rows and others do not', async () => {
+    const { peakRateNote } = await import('../src/core/budget/reservation-cost.ts');
+    expect(peakRateNote(['deepseek:deepseek-flash'])).toBe(' (DeepSeek at peak rates, an upper bound; off-peak bills half)');
+    expect(peakRateNote(['anthropic:claude-sonnet-5-5', 'deepseek:deepseek-v4-pro'])).not.toBe('');
+    expect(peakRateNote(['openrouter:deepseek/deepseek-v4-flash-0731', 'anthropic:claude-sonnet-5-5', undefined])).toBe('');
   });
 });

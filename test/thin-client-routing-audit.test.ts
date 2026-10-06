@@ -18,6 +18,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as mcpClient from '../src/core/mcp-client.ts';
+import * as cliForceExit from '../src/core/cli-force-exit.ts';
 import { runForget } from '../src/commands/recall.ts';
 import { runJobs } from '../src/commands/jobs.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -75,6 +76,21 @@ describe('thin-client routing audit — ROUTE additions call the remote op', () 
     expect(calls.map(c => c.tool)).toEqual(['forget']);
     expect(calls[0].args).toMatchObject({ id: '42' });
     expect(out).toContain('Forgot fact id=42');
+  });
+
+  test('gbrain forget --source on a thin client is refused with the same forget minus --source as the fix', async () => {
+    const requestId = '0190c6d2-1111-7000-8000-000000000042';
+    const docs: string[] = [];
+    const final = spyOn(cliForceExit, 'writeStdoutFinal').mockImplementation(async (doc: string) => { docs.push(doc); });
+    const priorExitCode = process.exitCode;
+    try {
+      await thinClient(() => runForget(async () => { throw new Error('local engine opened'); },
+        ['42', '--source', 'notes', '--request-id', requestId, '--json']));
+    } finally { final.mockRestore(); cliForceExit._resetCliExitVerdictForTests(); process.exitCode = priorExitCode ?? 0; }
+    expect(calls).toEqual([]);
+    const envelope = JSON.parse(docs.join(''));
+    expect(envelope).toMatchObject({ code: 'invalid_params', fix: { argv: ['gbrain', 'forget', '42', '--request-id', requestId], next: 'run' } });
+    expect(envelope.suggestion).toContain('Drop --source');
   });
 
   test('gbrain jobs list calls list_jobs with the parsed filters', async () => {

@@ -28,6 +28,7 @@ import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -95,7 +96,7 @@ for (const backend of testBackends()) {
     /** First sync, a database-only tag, then an upstream edit: the canonical form now differs from the file's bytes (an overlay). */
     async function overlaySync(m: { id: string; root: string }) {
       expect(await performManagedSync(engine, { sourceId: m.id, noPull: true })).toMatchObject({ status: 'first_sync', filesImported: 1 });
-      await engine.transaction(tx => withCoordinatedWrite(tx, [m.id], () => tx.addTag('todos', 'kept-in-brain', { sourceId: m.id })));
+      await engine.transaction(tx => withCoordinatedWrite(tx, [m.id], () => tx.addTag('todos', 'kept-in-brain', { sourceId: m.id }), TEST_WRITE_ATTRIBUTION));
       writeFileSync(join(m.root, 'TODOS.md'), `${TODOS}- keep the mirror pullable\n`);
       commit(m.root, 'upstream edit');
       expect(await performManagedSync(engine, { sourceId: m.id, noPull: true })).toMatchObject({ filesImported: 1 });
@@ -185,7 +186,7 @@ for (const backend of testBackends()) {
         content: '---\ntitle: Alice Example\ntype: person\n---\n# Alice Example\n' } });
       const [{ id }] = await engine.transaction(tx => withCoordinatedWrite(tx, [m.id], () => tx.executeRaw<{ id: number }>(
         `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, source) VALUES ($1, 'people/alice-example', 'Alice prefers mornings', 'preference', 'private', 'test')
-         RETURNING id::int AS id`, [m.id])));
+         RETURNING id::int AS id`, [m.id]), TEST_WRITE_ATTRIBUTION));
       const forgot = await submitForgetMutation(ctx(m.id), 'forget', { id: Number(id), request_id: randomUUID() }) as { request_id: string };
       let effects: Array<{ kind: string; state: string; outcome: Record<string, unknown> | null }> = [];
       for (let i = 0; i < 100; i++) {

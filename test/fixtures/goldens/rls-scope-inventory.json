@@ -25,12 +25,12 @@
       },
       "addLinksBatch#default": {
         "flagOffLanes": [
-          "pool"
+          "tx"
         ],
-        "flagOffOpensTransaction": false,
+        "flagOffOpensTransaction": true,
         "flagOn": "unscoped",
         "flagOnLanes": [
-          "pool"
+          "tx"
         ],
         "flagOnScopes": []
       },
@@ -1778,6 +1778,39 @@
         ],
         "flagOnScopes": []
       },
+      "listFactsKeyset#default": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "listFactsKeyset#keyset": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
+      "listFactsKeyset#strictTime": {
+        "flagOffLanes": [
+          "pool"
+        ],
+        "flagOffOpensTransaction": false,
+        "flagOn": "unscoped",
+        "flagOnLanes": [
+          "pool"
+        ],
+        "flagOnScopes": []
+      },
       "listFactsSince#allFilters": {
         "flagOffLanes": [
           "pool"
@@ -2483,7 +2516,8 @@
       },
       "replaceDerivedLinks#default": {
         "flagOffLanes": [
-          "tx"
+          "tx",
+          "tx>sp"
         ],
         "flagOffOpensTransaction": true,
         "flagOn": "scoped",
@@ -3402,6 +3436,7 @@
         "listEvalCaptureFailures": "none",
         "listFactsByEntity": "none",
         "listFactsBySession": "none",
+        "listFactsKeyset": "none",
         "listFactsSince": "none",
         "listFilesForPage": "none",
         "listLinkSources": "direct",
@@ -3421,6 +3456,7 @@
         "markPagesExtractedBatch": "none",
         "mergeOntologyFact": "none",
         "migrateFactsToCanonical": "none",
+        "onCheckout": "none",
         "purgeDeletedPages": "none",
         "putContradictionCacheEntry": "none",
         "putDreamVerdict": "none",
@@ -3430,6 +3466,7 @@
         "reconnect": "none",
         "refreshPageBody": "none",
         "registerBeforeDisconnect": "none",
+        "relationalChainHop": "none",
         "relationalFanout": "none",
         "removeLink": "none",
         "removeLinksByPagesAndSource": "none",

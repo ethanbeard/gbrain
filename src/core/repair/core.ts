@@ -22,8 +22,9 @@ import { isTerminal, principalKey } from '../persistence/model.ts';
 import { getWriteRequest } from '../persistence/journal.ts';
 import { initializeLocalPersistence, requestPrincipalForContext } from '../persistence/page-mutations.ts';
 import { lookupEmbeddingPrice, estimateCostFromChars } from '../embedding-pricing.ts';
+import { shellQuote } from '../agent-output.ts';
 
-export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'orphan-bindings', 'embedding-effects', 'google-file-modes', 'stale-atoms', 'extractor-facts'] as const;
+export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'captured-facts', 'loop-facts', 'orphan-children', 'failed-writes', 'frontmatter'] as const;
 export type RepairKind = typeof REPAIR_KINDS[number];
 
 export interface RepairScope { brain_id: string; source_ids: string[] }
@@ -47,12 +48,14 @@ export interface RepairPlan {
   preview_hash?: string;
   /** Preview-bound kinds: every previewed item with its class, all of which the hash covers. */
   listing?: RepairListing[];
+  /** Kind-specific preview detail (per-file diffs, manual fixes, next actions), rendered by the handler's `render`. */
+  details?: Record<string, unknown>;
 }
 
 export interface RepairListing { item: string; class: string; detail?: string }
 
-/** What the run was asked to do; preview-bound (explicit-only) kinds read `expect` and `includeAmbiguous`. */
-export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmbiguous?: boolean }
+/** What the run was asked to do; preview-bound (explicit-only) kinds read `expect`, `includeAmbiguous` and the `only`/`skip` path selection. */
+export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[] }
 
 export interface RepairHandler {
   kind: RepairKind;
@@ -68,10 +71,14 @@ export interface RepairHandler {
    * A kind with named per-item outcomes returns them instead of a boolean.
    */
   apply(ctx: OperationContext, item: RepairItem, opts?: { embed: boolean; runId?: string }): Promise<boolean | RepairItemOutcome>;
+  /** How many per-item outcomes the result lists (default 20). */
+  outcomeItemsLimit?: number;
+  /** Human lines for the plan's `details`; `diff` asks for every per-item diff, not one sample per class. */
+  render?(details: Record<string, unknown>, opts: { diff: boolean }): string[];
 }
 
 /** A named per-item outcome; `applied` counts it as applied, otherwise skipped. */
-export interface RepairItemOutcome { applied: boolean; outcome: string; reason?: string }
+export interface RepairItemOutcome { applied: boolean; outcome: string; reason?: string; detail?: Record<string, unknown> }
 
 export interface RepairResult {
   kind: RepairKind;
@@ -93,7 +100,9 @@ export interface RepairResult {
   listing?: RepairListing[];
   /** Per-outcome counts and the first items, for kinds that name outcomes. */
   outcomes?: Record<string, number>;
-  outcome_items?: Array<{ item: string; outcome: string; reason?: string }>;
+  outcome_items?: Array<{ item: string; outcome: string; reason?: string; detail?: Record<string, unknown> }>;
+  /** Kind-specific preview detail (see RepairPlan.details). */
+  details?: Record<string, unknown>;
 }
 
 const RECEIPT_BYTES = 16_384;
@@ -181,12 +190,12 @@ function writerHeld(error: unknown): error is OperationError {
  */
 export async function runRepair(ctx: OperationContext, handler: RepairHandler, scope: RepairScope,
   opts: { apply: boolean; limit?: number; embeddingModel?: string; sourceFlag?: string; embed?: boolean; applyArgs?: string[];
-    explicit?: boolean; expect?: string; includeAmbiguous?: boolean }): Promise<RepairResult> {
+    explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[] }): Promise<RepairResult> {
   const { repairSpec, explicitKindRequired } = await import('./registry.ts');
   if (repairSpec(handler.kind)?.explicit_only && opts.explicit !== true) throw explicitKindRequired(handler.kind);
   if (opts.apply) await initializeLocalPersistence(ctx);
   const { cursor: resumed, runId: storedRunId } = await readCursor(ctx.engine, handler.kind, scope, opts.apply ? opts.expect : undefined);
-  const plan = await handler.plan(ctx.engine, scope, resumed, { apply: opts.apply, expect: opts.expect, includeAmbiguous: opts.includeAmbiguous });
+  const plan = await handler.plan(ctx.engine, scope, resumed, { apply: opts.apply, expect: opts.expect, includeAmbiguous: opts.includeAmbiguous, only: opts.only, skip: opts.skip });
   const pending = opts.limit !== undefined ? plan.items.slice(0, opts.limit) : plan.items;
   const counters = await capacity(ctx);
   const admits = (handler.publication ?? 'coordinated') === 'coordinated' ? pending.length : 0;
@@ -198,10 +207,13 @@ export async function runRepair(ctx: OperationContext, handler: RepairHandler, s
     capacity: counters.map(({ scope: key, resource, used, limit, stop_at }) => ({ scope: key, resource, used, limit, stop_at })),
     resumed_from: resumed, applied: 0, skipped: 0, complete: false, ...(plan.warnings?.length ? { warnings: plan.warnings } : {}),
     apply_command: `gbrain repair ${handler.kind}${opts.sourceFlag ? ` --source ${opts.sourceFlag}` : ''}${(opts.applyArgs ?? []).map(arg => ` ${arg}`).join('')}`
-      + `${opts.includeAmbiguous ? ' --include-ambiguous' : ''} --apply${plan.preview_hash ? ` --expect ${plan.preview_hash}` : ''}`,
+      + `${[...(opts.only ?? []).flatMap(path => ['--only', path]), ...(opts.skip ?? []).flatMap(path => ['--skip', path])].map(arg => ` ${shellQuote([arg])}`).join('')}`
+      + `${opts.includeAmbiguous ? ' --include-ambiguous' : ''} --apply${plan.preview_hash ? ` --expect ${plan.preview_hash}` : ''}`
+      + `${repairSpec(handler.kind)?.consent === 'destructive' ? ' --yes' : ''}`,
   };
   if (!opts.apply) {
     if (plan.listing) result.listing = plan.listing;
+    if (plan.details) result.details = plan.details;
     result.complete = pending.length === plan.items.length;
     return result;
   }
@@ -222,8 +234,9 @@ export async function runRepair(ctx: OperationContext, handler: RepairHandler, s
       const applied = await handler.apply({ ...ctx, sourceId: item.source_id }, item, { embed: opts.embed === true, runId });
       if (typeof applied === 'object') {
         result.outcomes = { ...result.outcomes, [applied.outcome]: (result.outcomes?.[applied.outcome] ?? 0) + 1 };
-        if ((result.outcome_items ??= []).length < SAMPLE * 2) {
-          result.outcome_items.push({ item: `${item.source_id}:${item.slug}`, outcome: applied.outcome, ...(applied.reason ? { reason: applied.reason } : {}) });
+        if ((result.outcome_items ??= []).length < (handler.outcomeItemsLimit ?? SAMPLE * 2)) {
+          result.outcome_items.push({ item: `${item.source_id}:${item.slug}`, outcome: applied.outcome, ...(applied.reason ? { reason: applied.reason } : {}),
+            ...(applied.detail ? { detail: applied.detail } : {}) });
         }
       }
       if (typeof applied === 'object' ? applied.applied : applied) result.applied++;

@@ -53,7 +53,7 @@ import { OperationError } from './ops/contract.ts';
  */
 
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { createHash, randomBytes } from 'crypto';
@@ -493,6 +493,21 @@ export function readPushStatusForRoot(root: string): PushStatusEntry | null {
     /* fall through to the scan */
   }
   return readPushStatuses().find((e) => e.repoRoot === root) ?? null;
+}
+
+/**
+ * #5432: the push-status record that belongs to workspace `ws`, or null. A
+ * record matches by its repoRoot (symlinks resolved on both sides); a single
+ * legacy record with no repoRoot is attributed to `ws`. Another root's record
+ * is never reported as this workspace's push state.
+ */
+export function pushStatusForWorkspace(entries: readonly PushStatusEntry[], ws: string): PushStatusEntry | null {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- comparison only: normalizes the operator's own push-status repoRoot and workspace path to compare them; nothing is read or written at the resolved path
+  const real = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+  const target = real(ws);
+  const own = entries.find((e) => e.repoRoot !== undefined && real(e.repoRoot) === target);
+  if (own) return own;
+  return entries.length === 1 && entries[0]!.repoRoot === undefined ? entries[0]! : null;
 }
 
 /** One aggregation for every status surface (SessionStart note, doctor,

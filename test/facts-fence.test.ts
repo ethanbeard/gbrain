@@ -148,6 +148,19 @@ describe('parseFactsFence — strikethrough semantics (Codex R2-#3 contract)', (
     expect(r.facts[1].active).toBe(true);
   });
 
+  test('struck multiline rows stay inactive after a render/parse round trip', () => {
+    const rendered = renderFactsTable([
+      minimalFact(1, { claim: 'Old\n- a\n- b', active: false, supersededBy: 2, context: 'superseded by #2' }),
+      minimalFact(2, { claim: 'New claim' }),
+      minimalFact(3, { claim: 'Gone\nline', active: false, forgotten: true, context: 'forgotten: user asked' }),
+    ]);
+    const r = parseFactsFence(rendered);
+    expect(r.warnings).toEqual([]);
+    expect(r.facts[0]).toMatchObject({ claim: 'Old\n- a\n- b', active: false, supersededBy: 2 });
+    expect(r.facts[1].active).toBe(true);
+    expect(r.facts[2]).toMatchObject({ claim: 'Gone\nline', active: false, forgotten: true });
+  });
+
   test('strikethrough + "forgotten: <reason>" context → forgotten=true', () => {
     const body = wrapFenceBody(
       `| 1 | ~~Stale fact~~ | fact | 1.0 | private | low | 2018-01-01 | 2026-05-10 | inferred | forgotten: user asked to remove |`,
@@ -198,6 +211,14 @@ describe('parseFactsFence — strikethrough semantics (Codex R2-#3 contract)', (
 });
 
 describe('parseFactsFence — lenient hand-edits', () => {
+  test('decodes hand-written br variants inside cells', () => {
+    const body = wrapFenceBody('| 1 | first<br/>second | fact | 1.0 | world | medium | 2026-01-01 |  | src<BR />note |  |');
+    const { facts, warnings } = parseFactsFence(body);
+    expect(warnings).toEqual([]);
+    expect(facts[0].claim).toBe('first\nsecond');
+    expect(facts[0].source).toBe('src\nnote');
+  });
+
   test('skips separator row (just dashes)', () => {
     const body = wrapFenceBody(
       `| 1 | claim | fact | 1.0 | world | medium | 2026-01-01 |  | src |  |`,
@@ -300,6 +321,19 @@ describe('parseFactsFence — malformed rows surface warnings', () => {
 // ─────────────────────────────────────────────────────────────────
 
 describe('renderFactsTable', () => {
+  test('keeps multiline claim, source, and context in one physical row', () => {
+    const out = renderFactsTable([minimalFact(1, {
+      claim: 'first\nsecond',
+      source: 'src\r\nline',
+      context: 'context\rline',
+    })]);
+    const rows = out.split('\n').filter(line => line.startsWith('| 1 |'));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toContain('first<br>second');
+    expect(rows[0]).toContain('src<br>line');
+    expect(rows[0]).toContain('context<br>line');
+  });
+
   test('produces a canonical-shape fence with header + separator + rows', () => {
     const out = renderFactsTable([
       minimalFact(1, { claim: 'C1', source: 's1' }),
@@ -364,6 +398,14 @@ describe('renderFactsTable', () => {
 // ─────────────────────────────────────────────────────────────────
 
 describe('round-trip: render then parse returns equivalent rows', () => {
+  test('round-trips markdown lists, blank lines, and CRLF in claims', () => {
+    const claims = ['Key:\n- a\n- b', 'x\n\ny', 'one\r\ntwo'];
+    const rendered = renderFactsTable(claims.map((claim, i) => minimalFact(i + 1, { claim })));
+    const { facts, warnings } = parseFactsFence(rendered);
+    expect(warnings).toEqual([]);
+    expect(facts.map(f => f.claim)).toEqual(['Key:\n- a\n- b', 'x\n\ny', 'one\ntwo']);
+  });
+
   test('preserves escaped pipes, backslashes, empty cells, and adjacent ordinary rows', () => {
     const originals: ParsedFact[] = [
       minimalFact(1, {
@@ -472,6 +514,27 @@ describe('round-trip: render then parse returns equivalent rows', () => {
 // ─────────────────────────────────────────────────────────────────
 
 describe('upsertFactRow', () => {
+  test('a multiline fact leaves the fence writable for a second upsert', () => {
+    const first = upsertFactRow('# Entity\n', {
+      claim: 'Key:\n- a\n- b',
+      kind: 'fact',
+      confidence: 1.0,
+      visibility: 'world',
+      notability: 'medium',
+    });
+    expect(parseFactsFence(first.body).warnings).toEqual([]);
+    const second = upsertFactRow(first.body, {
+      claim: 'Second fact',
+      kind: 'fact',
+      confidence: 1.0,
+      visibility: 'world',
+      notability: 'medium',
+    });
+    const parsed = parseFactsFence(second.body);
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.facts.map(f => f.claim)).toEqual(['Key:\n- a\n- b', 'Second fact']);
+  });
+
   test('appends to empty body by creating ## Facts section + fence', () => {
     const body = '# Some Entity\n\nProse here.\n';
     const { body: out, rowNum } = upsertFactRow(body, {

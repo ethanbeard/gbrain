@@ -172,6 +172,8 @@ export async function runPhaseAutoThink(
         save: config.autoCommit,
         client: opts.client,
         model: modelId,
+        // The BudgetMeter above priced modelId; a chain hop would spend on a model it never checked.
+        allowFallback: false,
         // Fail-closed trust: the local dream cycle must say so explicitly, or
         // trajectory injection degrades to visibility='world' rows.
         remote: false,

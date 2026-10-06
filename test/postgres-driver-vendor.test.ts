@@ -33,6 +33,7 @@ describe('vendored Postgres driver packaging', () => {
       expect(index).toContain('async function reserve({ signal } = {})');
       expect(index).toContain('sql.discard = reservation.discard');
       expect(index).toContain('completed.cancelPromise');
+      expect(index).toContain('return poisoned(c)');
     }
   });
 });

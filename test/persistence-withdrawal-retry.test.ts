@@ -9,6 +9,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { submitForgetMutation } from '../src/core/persistence/memory-mutations.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { getWriteRequest } from '../src/core/persistence/journal.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -39,7 +40,7 @@ async function seed(engine: BrainEngine, slug: string) {
     const page = await tx.putPage(slug, { type: 'note', title: 'Example', compiled_truth: 'Canonical example', timeline: '', frontmatter: {} }, { sourceId });
     const fact = await tx.insertFact({ fact: `Withdraw ${slug}`, source: 'test', entity_slug: slug, visibility: 'world' }, { source_id: sourceId });
     return { page, fact };
-  }));
+  }, TEST_WRITE_ATTRIBUTION));
 }
 
 for (const boundary of ['admission-counter', 'completed-withdrawal'] as const) {
@@ -58,7 +59,7 @@ for (const boundary of ['admission-counter', 'completed-withdrawal'] as const) {
             if (key === 'transaction') return (fn: (tx: BrainEngine) => Promise<any>) => nested.transaction(child => fn(wrap(child)));
             if (key === 'executeRaw') return async (sql: string, args?: unknown[]) => {
               if (sql === 'SELECT incarnation,archived FROM sources WHERE id=$1 FOR UPDATE') { withdrawal = true; sourceTransactions++; }
-              if (!injected && boundary === 'admission-counter' && sql === 'SELECT * FROM persistence_counters WHERE key=$1 FOR UPDATE') {
+              if (!injected && boundary === 'admission-counter' && sql.startsWith('SELECT * FROM persistence_counters WHERE key')) {
                 injected = true;
                 throw Object.assign(new Error('confirmed counter statement abort'), { code: '55P03' });
               }

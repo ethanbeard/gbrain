@@ -279,6 +279,9 @@ export interface ProseAssessment {
 // and excluded from the denominator entirely (Codex #2 — a code-heavy doc
 // must not read as high-markup). The remaining strips count toward markup.
 const FENCED_CODE_RE = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
+// gbrain's own facts/takes fences (#5822): their table cells are the page's
+// structured facts, written by gbrain itself, so they are excluded like code.
+const GBRAIN_FENCE_RE = /<!--- gbrain:([a-z_-]+):begin -->[\s\S]*?<!--- gbrain:\1:end -->/g;
 const INLINE_CODE_RE = /`[^`\n]*`/g;
 const HTML_TAG_RE = /<\/?[a-z][^>]*>/gi;
 const MD_IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
@@ -291,7 +294,7 @@ const MD_EMPHASIS_RE = /[*_~]{1,3}/g;
 const TABLE_PIPE_RE = /\|/g;
 
 /**
- * Pure prose-vs-markup assessment. Strips code (excluded from the ratio),
+ * Pure prose-vs-markup assessment. Strips code and gbrain facts/takes fences (excluded from the ratio),
  * then measures how much of the REMAINING content is markup syntax vs real
  * sentences. Returns a ratio in [0, 1]; high = boilerplate/nav shape.
  *
@@ -300,8 +303,8 @@ const TABLE_PIPE_RE = /\|/g;
  * than catching the obvious nav-blob shape without nuking legit prose.
  */
 export function assessProse(body: string): ProseAssessment {
-  // Code excluded from the denominator (Codex #2): a code doc isn't junk.
-  const noCode = body.replace(FENCED_CODE_RE, ' ').replace(INLINE_CODE_RE, ' ');
+  // Code and gbrain-managed fences are excluded from the denominator (Codex #2): a code doc isn't junk.
+  const noCode = body.replace(GBRAIN_FENCE_RE, ' ').replace(FENCED_CODE_RE, ' ').replace(INLINE_CODE_RE, ' ');
   const total_chars = noCode.replace(/\s+/g, '').length;
   if (total_chars === 0) {
     return { prose_chars: 0, total_chars: 0, markup_ratio: 0 };

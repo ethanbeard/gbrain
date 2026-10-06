@@ -89,7 +89,9 @@ for (const kind of ['pglite', 'postgres'] as const) {
       };
     }
 
-    const call = (ctx: OperationContext, name: string, args: Record<string, unknown>) => operationsByName[name].handler(ctx, args);
+    // search/query rows are read for page_id, a diagnostic remote callers get only with fields: 'full'.
+    const call = (ctx: OperationContext, name: string, args: Record<string, unknown>) =>
+      operationsByName[name].handler(ctx, name === 'search' || name === 'query' ? { ...args, fields: 'full' } : args);
 
     async function legacy(slug: string, sourceId: string, body: string, text: string, timeline = ''): Promise<number> {
       const page = await engine.putPage(slug, {

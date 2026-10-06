@@ -11,7 +11,14 @@
  *
  *   gbrain config set orphans.exclude_prefixes "my-private-folder/,archive/"
  *   gbrain config set orphans.exclude_slugs "some-one-off-page"
+ *
+ * One policy, two renderers: `shouldExcludeFromOrphanReporting` (TypeScript,
+ * one slug at a time) and `orphanExclusionSql` (a SQL predicate for set-wise
+ * aggregates such as get_health). Both read the constants below;
+ * `test/orphan-policy-sql-parity.test.ts` keeps them equal on generated slugs.
  */
+
+import { joinFragments, sqlFragment, trustedSql, type SqlFragment } from './engine-sql/fragment.ts';
 
 // '/readme' — a README is a folder descriptor, not a knowledge node;
 // nothing is expected to wikilink to it.
@@ -56,11 +63,22 @@ const FIRST_SEGMENT_EXCLUSIONS = new Set([
 ]);
 
 const ROOT_DATE_SLUG = /^\d{4}-\d{2}-\d{2}(?:-.+)?$/;
+// SQL (ARE) twin of ROOT_DATE_SLUG: JS `\d` is ASCII-only and `.` stops at
+// line terminators, so both are spelled out explicitly.
+const ROOT_DATE_SLUG_SQL = '^[0123456789]{4}-[0123456789]{2}-[0123456789]{2}(-[^\\n\\r\\u2028\\u2029]+)?$';
+
+const DAILY_SEGMENT = '/daily/';
+const BRAIN_PREFIX = '_brain-';
+const AGENTS_PREFIX = 'agents/';
+const AGENT_DREAMING_SEGMENT = '/memory/dreaming/';
+const AGENT_WORKSPACE_FILES = ['agents', 'identity', 'soul', 'tools', 'user', 'heartbeat', 'dreams', 'dormant'];
+const AGENT_WORKSPACE_FILE = new RegExp(`^agents/[^/]+/(?:${AGENT_WORKSPACE_FILES.join('|')})$`);
+const AGENT_WORKSPACE_FILE_SQL = `^agents/[^/]+/(${AGENT_WORKSPACE_FILES.join('|')})$`;
 
 function isAgentWorkspaceConvention(slug: string): boolean {
-  if (!slug.startsWith('agents/')) return false;
-  if (slug.includes('/memory/dreaming/')) return true;
-  return /^agents\/[^/]+\/(?:agents|identity|soul|tools|user|heartbeat|dreams|dormant)$/.test(slug);
+  if (!slug.startsWith(AGENTS_PREFIX)) return false;
+  if (slug.includes(AGENT_DREAMING_SEGMENT)) return true;
+  return AGENT_WORKSPACE_FILE.test(slug);
 }
 
 /** Per-brain additions to the convention defaults (from config). */
@@ -120,7 +138,7 @@ export function shouldExcludeFromOrphanReporting(
   }
 
   if (slug.includes(RAW_SEGMENT)) return true;
-  if (slug.includes('/daily/')) return true;
+  if (slug.includes(DAILY_SEGMENT)) return true;
 
   for (const prefix of DENY_PREFIXES) {
     if (slug.startsWith(prefix)) return true;
@@ -131,7 +149,7 @@ export function shouldExcludeFromOrphanReporting(
 
   if (ROOT_DATE_SLUG.test(slug)) return true;
 
-  if (slug.startsWith('_brain-')) return true;
+  if (slug.startsWith(BRAIN_PREFIX)) return true;
 
   if (isAgentWorkspaceConvention(slug)) return true;
 
@@ -144,3 +162,43 @@ export function shouldExcludeFromOrphanReporting(
 
   return false;
 }
+
+const SQL_ALIAS = /^[a-z_][a-z0-9_]*$/;
+
+/**
+ * SQL renderer of `shouldExcludeFromOrphanReporting(slug, overrides, { type })`
+ * over the pages row aliased `alias`: a boolean expression that is TRUE when
+ * the row is excluded and never NULL. Every list (the convention constants and
+ * the per-brain overrides) binds as a text[] parameter; only the alias, checked
+ * against a plain-identifier pattern, is spliced. Quarantine is not part of
+ * the predicate: SQL callers filter it with the quarantine fragment.
+ */
+export function orphanExclusionSql(alias: string, overrides?: OrphanPolicyOverrides): SqlFragment {
+  if (!SQL_ALIAS.test(alias)) throw new Error(`orphanExclusionSql: alias must be a plain identifier, got ${JSON.stringify(alias)}`);
+  const slug = trustedSql(`${alias}.slug`);
+  const type = trustedSql(`${alias}.type`);
+  // One comparison per list entry (OR-chained, each value a parameter): a
+  // per-row unnest() subquery costs more than the whole remaining predicate.
+  const anyOf = (values: readonly string[], test: (value: string) => SqlFragment) =>
+    values.length === 0 ? sqlFragment`FALSE` : joinFragments(values.map(test), ' OR ');
+  const suffix = (v: string) => sqlFragment`right(${slug}, ${v.length}::int) = ${v}::text`;
+  const prefix = (v: string) => sqlFragment`starts_with(${slug}, ${v}::text)`;
+  return sqlFragment`COALESCE((
+    ${type} = ANY(${[...NON_LINKABLE_PAGE_TYPES]}::text[])
+    OR ${slug} = ANY(${[...PSEUDO_SLUGS]}::text[])
+    OR ${anyOf(AUTO_SUFFIX_PATTERNS, suffix)}
+    OR strpos(${slug}, ${RAW_SEGMENT}::text) > 0
+    OR strpos(${slug}, ${DAILY_SEGMENT}::text) > 0
+    OR ${anyOf(DENY_PREFIXES, prefix)}
+    OR split_part(${slug}, '/', 1) = ANY(${[...FIRST_SEGMENT_EXCLUSIONS]}::text[])
+    OR ${slug} ~ ${ROOT_DATE_SLUG_SQL}::text
+    OR starts_with(${slug}, ${BRAIN_PREFIX}::text)
+    OR (starts_with(${slug}, ${AGENTS_PREFIX}::text)
+        AND (strpos(${slug}, ${AGENT_DREAMING_SEGMENT}::text) > 0 OR ${slug} ~ ${AGENT_WORKSPACE_FILE_SQL}::text))
+    OR ${slug} = ANY(${overrides?.excludeSlugs ?? []}::text[])
+    OR ${anyOf(overrides?.excludePrefixes ?? [], prefix)}
+  ), false)`;
+}
+
+/** #5828: the brain_score timeline component's graded subset of the linkable scope. */
+export { gradeTimelinePages } from './timeline-grading.ts';

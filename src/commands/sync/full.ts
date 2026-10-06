@@ -42,6 +42,7 @@ import {
   massReconcileAllowed,
 } from '../../core/sync-reconcile.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
+import { heldRenameOrigins, holdRefusedImport, moveHeldRenames, noteScreenedImport, settleFullSyncHolds, wouldHoldFields, type LegacyHolds } from './holds.ts';
 import { sweepOrphanedRenameSentinels } from './rename-reconcile.ts';
 
 export async function performFullSync(
@@ -55,6 +56,7 @@ export async function performFullSync(
   roots: { gitContextRoot: string; syncScopeRoot: string; anchorPath: string; slugRootMode: SlugRootMode },
   headCommit: string,
   opts: SyncOpts,
+  holds: LegacyHolds | null = null,
 ): Promise<SyncResult> {
   const { gitContextRoot, syncScopeRoot, anchorPath, slugRootMode } = roots;
   const company = currentCompanyBrainSync(opts.sourceId);
@@ -72,7 +74,9 @@ export async function performFullSync(
   // default-markdown `isSyncable(rel)`, so `gbrain sync --strategy
   // code --dry-run` always reported zero files even when ~1500 code
   // files were waiting.
-  if (opts.dryRun) return fullSyncDryRun(syncScopeRoot, headCommit, opts);
+  // #5988: paths are relative to the slug base, the same keys holds and the ledger use.
+  const holdRoot = slugRoot ?? syncScopeRoot;
+  if (opts.dryRun) return fullSyncDryRun(engine, syncScopeRoot, headCommit, opts, { holds, holdRoot });
 
   // v0.22.13 (PR #490 A1 + Q5): full sync is always "large" by definition
   // (entire working tree). Auto-concurrency fires unconditionally for Postgres;
@@ -95,6 +99,7 @@ export async function performFullSync(
   const _fullImportT0 = Date.now();
   serr(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
   opts.onProgress?.({ phase: 'full_import' });
+  await moveHeldRenames(engine, holds, holdRoot);
   let result: import('../import.ts').RunImportResult;
   try {
     result = await runImport(engine, importArgs, {
@@ -109,6 +114,13 @@ export async function performFullSync(
       // issue #1939: performFullSync owns the failure ledger + bookmark via the
       // shared gate below; don't let runImport double-record or write its own.
       managedBookmark: true,
+      // #5988: a held rename destination whose old page changed is held, never imported as a new page.
+      heldPaths: new Set(holds?.heldPaths),
+      // #5988: content refusals are held, not failed (never gating the bookmark).
+      onFileResult: async (path, filePath, fileResult) => {
+        noteScreenedImport(holds, path, fileResult);
+        return await holdRefusedImport(engine, holds, path, filePath, fileResult) ? 'held' : undefined;
+      },
     });
     if (opts.signal?.aborted) throw new ImportAbortError('interrupted', 1, result);
   } catch (error) {
@@ -134,6 +146,11 @@ export async function performFullSync(
   // failures still climb their attempts.
   const fullSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
   const fullFailureSet = new Set(result.failures.map(f => f.path));
+  if (holds?.existing.size || holds?.retryPaths.size) {
+    const walked = new Set(collectSyncableFiles(syncScopeRoot, { strategy: opts.strategy ?? 'markdown', includeGitignored: opts.includeGitignored,
+      includeHidden: opts.includeHidden }).map(abs => relative(holdRoot, abs)));
+    await settleFullSyncHolds(engine, holds, { root: holdRoot, walked, failed: fullFailureSet });
+  }
   const fullSucceeded = loadSyncFailures()
     .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
     .map(e => e.path);
@@ -222,7 +239,8 @@ export async function performFullSync(
   };
 }
 
-function fullSyncDryRun(syncScopeRoot: string, headCommit: string, opts: SyncOpts): SyncResult {
+async function fullSyncDryRun(engine: BrainEngine, syncScopeRoot: string, headCommit: string, opts: SyncOpts,
+  hold: { holds: LegacyHolds | null; holdRoot: string }): Promise<SyncResult> {
   const dryRunMalformed: string[] = [];
   let allFiles = collectSyncableFiles(syncScopeRoot, {
     strategy: opts.strategy ?? 'markdown',
@@ -257,6 +275,7 @@ function fullSyncDryRun(syncScopeRoot: string, headCommit: string, opts: SyncOpt
     chunksCreated: 0,
     embedded: 0,
     pagesAffected: [],
+    ...(await wouldHoldFields(engine, hold.holds, hold.holdRoot, allFiles.map(abs => relative(hold.holdRoot, abs)))),
   };
 }
 
@@ -382,10 +401,13 @@ async function reconcileFullSyncDeletes(
       includeHidden: opts.includeHidden,
     })
       .map(abs => relative(slugRoot ?? syncScopeRoot, abs));
-    const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
+    // #5988 (E13): the old page of a held rename keeps its origin until the
+    // renamed file imports; its file being gone does not make it stale.
+    const heldOrigins = await heldRenameOrigins(engine, sid);
+    const rows = (await engine.executeRaw<{ slug: string; source_path: string | null }>(
       `SELECT slug, source_path FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
       [sid],
-    );
+    )).filter(row => !heldOrigins.has(row.source_path!));
     // #774: a scoped full sync is authoritative ONLY for its scope — pages
     // whose source_path lives outside the subpath (e.g. from an earlier
     // root-level sync of this source) are out of this walk's sight and must

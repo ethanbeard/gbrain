@@ -614,7 +614,7 @@ module path when it keeps exporting the name; "module-private" means the old mod
 
 | Old symbol | Kind | Still importable from | New location(s) |
 |---|---|---|---|
-| `applyPostgresForwardReferenceBootstrap` | split | `src/core/postgres-engine/forward-reference-bootstrap.ts:applyPostgresForwardReferenceBootstrap` | `src/core/engine-sql/bootstrap.ts:applyForwardReferenceBootstrap`<br>`src/core/engine-sql/bootstrap.ts:forwardReferenceGaps` |
+| `applyPostgresForwardReferenceBootstrap` | split | **not re-exported** | `src/core/engine-sql/bootstrap.ts:applyPostgresForwardReferenceBootstrap`<br>`src/core/engine-sql/bootstrap.ts:applyForwardReferenceBootstrap`<br>`src/core/engine-sql/bootstrap.ts:forwardReferenceGaps` |
 
 ### `src/core/postgres-engine/salience.ts`
 

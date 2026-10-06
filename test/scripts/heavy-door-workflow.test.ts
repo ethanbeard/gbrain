@@ -1,14 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { safeLoad } from 'js-yaml';
+import { load } from 'js-yaml';
 
 type Step = { name?: string; id?: string; if?: string; run?: string; env?: Record<string, string>; with?: Record<string, string> };
 type Job = { name: string; env: Record<string, string>; strategy?: { 'fail-fast': boolean; matrix: { lane: string } }; steps: Step[] };
 const root = join(import.meta.dir, '../..');
-const workflow = safeLoad(readFileSync(join(root, '.github/workflows/heavy-tests.yml'), 'utf8')) as {
+const workflow = load(readFileSync(join(root, '.github/workflows/heavy-tests.yml'), 'utf8')) as {
   on: { workflow_dispatch: { inputs: Record<string, { default: boolean }> } };
   jobs: Record<string, Job>;
 };
@@ -73,5 +73,68 @@ describe('heavy door supply chain and coverage gates', () => {
       expect(result.stderr).toContain('No paid turn ran');
       expect(result.stdout).not.toContain('paid=true');
     }
+  });
+
+  test('Docker bootstrap e2e has no existence guard that could turn a missing script green', () => {
+    const step = workflow.jobs.heavy.steps.find(s => s.name === 'Bootstrap offline Docker e2e')!;
+    expect(step.run!.trim()).toBe('bash tests/docker/bootstrap-e2e.sh');
+  });
+
+  test('the Claude plugin door reports even when the Codex door failed', () => {
+    const claude = workflow.jobs['plugin-doors'].steps.find(s => s.name?.startsWith('Claude plugin door'))!;
+    expect(claude.if).toBe('${{ !cancelled() }}');
+  });
+
+  test('Hermes with an empty ANTHROPIC_API_KEY is a visible, tracked skip on a scheduled run', () => {
+    const gate = hermes.steps.find(step => step.id === 'paidgate')!;
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-hermes-gate-test-'));
+    try {
+      const bin = join(home, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'hermes'), `#!/bin/sh\necho 'Hermes Agent v${hermes.env.HERMES_VERSION} (2026.8.3)'\n`, { mode: 0o755 });
+      const output = join(home, 'output');
+      const summary = join(home, 'summary');
+      const result = spawnSync('bash', ['-euo', 'pipefail', '-c', gate.run!], {
+        env: {
+          PATH: `${bin}:${process.env.PATH}`, ...hermes.env, ANTHROPIC_API_KEY: '',
+          GITHUB_EVENT_NAME: 'schedule', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary,
+        },
+        encoding: 'utf8',
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(readFileSync(output, 'utf8')).toContain('paid=false');
+      expect(result.stderr).toContain('Fix (owner-only): gh secret set ANTHROPIC_API_KEY');
+      expect(readFileSync(summary, 'utf8')).toContain('known-skipped');
+      expect(hermes.steps.find(step => step.name === 'Run hermes door tests')!.if).toBe("steps.paidgate.outputs.paid == 'true'");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('real-agent e2e without provider secrets warns that 0 live tests ran and names the fix', () => {
+    const job = workflow.jobs['real-agent-e2e'];
+    const gate = job.steps.find(step => step.id === 'keys')!;
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-real-agent-gate-test-'));
+    try {
+      const output = join(home, 'output');
+      const summary = join(home, 'summary');
+      const result = spawnSync('bash', ['-euo', 'pipefail', '-c', gate.run!], {
+        env: { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'set', OPENAI_API_KEY: '', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+        encoding: 'utf8',
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(readFileSync(output, 'utf8')).toContain('keyed=false');
+      expect(result.stderr).toContain('::warning::Real-agent door e2e executed 0 live claude/codex tests');
+      expect(result.stderr).toContain('gh secret set OPENAI_API_KEY');
+      expect(result.stderr).toContain('gh workflow run heavy-tests.yml');
+      expect(result.stderr).toContain('real-agent-e2e');
+      expect(readFileSync(summary, 'utf8')).toContain('0 live tests executed');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+    const run = job.steps.find(step => step.name === 'Run real-agent door tests')!;
+    expect(run.env?.GBRAIN_TEST_KEEP_PROVIDER_KEYS).toContain("'1'");
+    expect(run.env?.CODEX_API_KEY).toContain('secrets.OPENAI_API_KEY');
+    expect(run.run).toContain("'bootstrap real Claude Code door' 'bootstrap real-codex door'");
   });
 });

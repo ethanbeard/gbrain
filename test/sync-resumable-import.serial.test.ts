@@ -274,7 +274,10 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     );
     execSync('git add -A && git commit -m "good + bad"', { cwd: repoPath, stdio: 'pipe' });
 
+    // #5988: content refusals are held by default; sync.holds=fail keeps the fail-closed gate this test exercises.
+    await engine.setConfig('sync.holds', 'fail');
     const res = await performSync(engine, { repoPath, sourceId: sid, noPull: true, noEmbed: true });
+    await engine.setConfig('sync.holds', 'hold');
     expect(res.status).toBe('blocked_by_failures');
 
     // Codex #2: blocked path writes neither last_commit NOR last_sync_at.

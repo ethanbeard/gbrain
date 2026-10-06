@@ -638,6 +638,30 @@ describe('MCP registration verification [FIX7]', () => {
     expect(adds).toBe(1); // the failed remove halts the flow before any re-add
   }, 30_000);
 
+  const serveTail = (argv: string[]) => argv.slice(argv.indexOf('--') + 2);
+  const adds = (calls: string[][]) => calls.filter((c) => c[1] === 'mcp' && c[2] === 'add');
+
+  test('a fresh registration pins the registration surface (starter)', async () => {
+    const { runner, calls } = mcpHost({ initialReg: null });
+    expect((await runHooks(runner)).result).toBe(0);
+    expect(serveTail(adds(calls)[0])).toEqual(['serve', '--surface', 'starter']);
+  }, 30_000);
+
+  test('never narrow: a replaced entry keeps its pinned surface, a bare serve stays bare, --surface wins', async () => {
+    const pinned = mcpHost({ initialReg: FOREIGN });
+    expect((await runHooks(pinned.runner)).result).toBe(0);
+    expect(serveTail(adds(pinned.calls)[1])).toEqual(['serve', '--surface', 'full']);
+
+    const bare = mcpHost({ initialReg: `gbrain:\n  command: /somewhere/else/gbrain serve\n  env: GBRAIN_SOURCE=other-workspace` });
+    expect((await runHooks(bare.runner)).result).toBe(0);
+    expect(serveTail(adds(bare.calls)[1])).toEqual(['serve']);
+
+    const explicit = mcpHost({ initialReg: FOREIGN });
+    const r = await capture(() => runBootstrap(['hooks', '--workspace', ws, '--harness', 'claude-code', '--gbrain-bin', gbrainBin, '--surface', 'verbs'], { runner: explicit.runner }));
+    expect(r.result).toBe(0);
+    expect(adds(explicit.calls).map(serveTail)).toEqual([['serve', '--surface', 'verbs'], ['serve', '--surface', 'verbs']]);
+  }, 60_000);
+
   test('host without `mcp get` → inconclusive, kept with a note (never a false bless)', async () => {
     const { runner } = mcpHost({ initialReg: OURS, getSupported: false });
     const r = await runHooks(runner);

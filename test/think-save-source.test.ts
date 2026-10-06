@@ -3,12 +3,12 @@
  * its citations by bare slug, so on a multi-source brain the synthesis landed
  * in the wrong source and its evidence could point at a same-slug page in
  * another source. persistSynthesis now takes the think's scope from all three
- * callers (CLI think, the think op, auto-think).
+ * callers (CLI think, the think op, auto-think). Each caller's save scope is
+ * exercised in think-cli-source-flag.serial.test.ts (CLI, think op) and
+ * auto-think-phase.test.ts (auto-think).
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { readFileSync } from 'fs';
-import { resolve } from 'path';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { persistSynthesis, type ThinkResult } from '../src/core/think/index.ts';
@@ -80,13 +80,5 @@ describe('#5426 think --save persists into the think source', () => {
     const saved = await persistSynthesis(engine, synthesis('unscoped question'));
     const rows = await engine.executeRaw<{ source_id: string }>(`SELECT source_id FROM pages WHERE slug = $1`, [saved.slug]);
     expect(rows.map(r => r.source_id)).toEqual(['default']);
-  });
-
-  test('all three callers pass their scope', () => {
-    // test-reads-source-ok[structural]: the three callers need a live LLM synthesis to observe end to end; persistSynthesis itself is tested above.
-    const read = (p: string) => readFileSync(resolve(import.meta.dir, '..', p), 'utf-8');
-    expect(read('src/commands/think.ts')).toContain('persistSynthesis(engine, result, { sourceId, allowedSources })');
-    expect(read('src/core/ops/takes.ts')).toMatch(/persistSynthesis\(ctx\.engine, result, \{[\s\S]*?sourceId: ctx\.sourceId === ALL_SOURCES \? undefined : ctx\.sourceId/);
-    expect(read('src/core/cycle/auto-think.ts')).toContain('persistSynthesis(engine, result, opts.sourceId ? { sourceId: opts.sourceId } : {})');
   });
 });

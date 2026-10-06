@@ -67,13 +67,11 @@ import { hybridSearch } from '../src/core/search/hybrid.ts';
 import {
   __setEmbedTransportForTests,
   __setRerankTransportForTests,
-  configureGateway,
   embed,
   getEmbeddingDimensions,
   getEmbeddingModel,
 } from '../src/core/ai/gateway.ts';
-import { buildGatewayConfig } from '../src/core/ai/build-gateway-config.ts';
-import { loadConfig, type GBrainConfig } from '../src/core/config.ts';
+import { configureEvalGateway } from '../src/eval/shared/gateway-bootstrap.ts';
 import { rerankerReadinessForEngine } from '../src/core/ai/reranker-readiness-engine.ts';
 import { describeRerankerFix, type RerankerReadiness } from '../src/core/ai/reranker-readiness.ts';
 import { EmbeddingCache, installEmbedCache, type EmbedCacheStats, type InstalledEmbedCache } from '../src/eval/shared/embed-cache.ts';
@@ -573,17 +571,6 @@ export function buildOverlay(args: Pick<Args, 'autocut' | 'relationalPin' | 'sea
   };
 }
 
-/** Mirror of cli.ts's `eval longmemeval` bootstrap: config file when present, env otherwise. */
-function configureGatewayFromEnv(): void {
-  const config =
-    loadConfig() ??
-    ({
-      embedding_model: process.env.GBRAIN_EMBEDDING_MODEL,
-      embedding_dimensions: process.env.GBRAIN_EMBEDDING_DIMENSIONS ? Number(process.env.GBRAIN_EMBEDDING_DIMENSIONS) : undefined,
-    } as GBrainConfig);
-  configureGateway(buildGatewayConfig(config));
-}
-
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const log = (s: string): void => { process.stderr.write(`[r1] ${s}\n`); };
@@ -610,7 +597,7 @@ async function main(): Promise<void> {
       // The CI gate's stub: embed throws → hybrid falls open to keyword + title + alias.
       __setEmbedTransportForTests(() => { throw new Error('stub: no embed in R1 dry run'); });
     } else {
-      configureGatewayFromEnv();
+      configureEvalGateway();
       embedder = `${getEmbeddingModel()}@${getEmbeddingDimensions()}`;
       log(`embedder ${embedder}`);
       if (args.embedCache) {

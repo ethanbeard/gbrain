@@ -273,7 +273,7 @@ function Postgres(a, b) {
       if (!busy) {
         if (releasing) {
           c.reserved = null
-          onopen(c)
+          onopen(c, true)
         } else {
           move(c, reserved)
         }
@@ -496,7 +496,9 @@ function Postgres(a, b) {
     move(c, ended)
   }
 
-  function onopen(c) {
+  function onopen(c, released) {
+    if (c.status && c.status !== 73 && (released || options.max !== 1)) // not I
+      return poisoned(c)
     if (ending) {
       while (queries.length)
         queries.shift().reject(Errors.connection('CONNECTION_ENDED', options))
@@ -519,6 +521,16 @@ function Postgres(a, b) {
     ready
       ? move(c, busy)
       : move(c, full)
+  }
+
+  function poisoned(c) {
+    if (c.queue === ended)
+      return
+    move(c, ended)
+    try {
+      options.onpoisoned && options.onpoisoned(String.fromCharCode(c.status))
+    } catch (_) {}
+    c.terminate()
   }
 
   function onclose(c, e) {
@@ -604,6 +616,7 @@ function parseOptions(a, b) {
     onnotice        : o.onnotice,
     onnotify        : o.onnotify,
     onclose         : o.onclose,
+    onpoisoned      : o.onpoisoned,
     onparameter     : o.onparameter,
     socket          : o.socket,
     transform       : parseTransform(o.transform || { undefined: undefined }),

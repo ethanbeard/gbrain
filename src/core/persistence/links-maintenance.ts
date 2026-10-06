@@ -2,29 +2,41 @@ import type { BrainEngine } from '../engine.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../link-extraction.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { withCoordinatedWrite } from './context.ts';
+import { maintenanceAttribution } from './attribution.ts';
 import { unrecordedCanonicalTimeline } from './canonical-projections.ts';
+import { runMentionPass, type MentionPassResult } from '../mentions/pass.ts';
+import { formatMentionSummary, linkPhaseDeadline, mentionJsonFields, previewMentionPass } from '../mentions/stale.ts';
 
-export interface ManagedLinkExtraction { pages: number; created: number; removed: number; timeline: number; skipped: number; remaining: number; }
+export interface ManagedLinkExtraction { pages: number; created: number; removed: number; timeline: number; skipped: number; remaining: number;
+  /** The mention pass (absent when the caller ran links only, as sync does). */
+  mentions?: MentionPassResult; mention_due?: number; mention_last_pass_at?: string | null; }
 
 /** `gbrain extract --stale` on a managed brain, locally or inside the PGLite owner. */
 export async function runManagedStaleExtraction(engine: BrainEngine, opts: { sourceId?: string; dryRun?: boolean }): Promise<ManagedLinkExtraction> {
   if (!opts.dryRun) return extractManagedStaleLinks(engine, { sourceId: opts.sourceId });
   const remaining = await engine.countStalePagesForExtraction({ sourceId: opts.sourceId, versionTs: LINK_EXTRACTOR_VERSION_TS });
-  return { pages: 0, created: 0, removed: 0, timeline: 0, skipped: 0, remaining };
+  const m = await previewMentionPass(engine, opts.sourceId);
+  return { pages: 0, created: 0, removed: 0, timeline: 0, skipped: 0, remaining, mention_due: m.due, mention_last_pass_at: m.last_pass_at };
 }
 
 /** The `extract --stale` report for a managed brain, in the same text and JSON shapes as the unmanaged sweep. */
 export function formatManagedStaleExtraction(result: ManagedLinkExtraction, dryRun: boolean, json: boolean): string {
   if (json) {
-    return JSON.stringify(dryRun ? { action: 'extract_stale_dry_run', stale_pages: result.remaining } : {
+    return JSON.stringify(dryRun ? { action: 'extract_stale_dry_run', stale_pages: result.remaining, mention_due_pages: result.mention_due ?? 0,
+      mention_last_pass_at: result.mention_last_pass_at ?? null } : {
       action: 'extract_stale_done', links_created: result.created, links_removed: result.removed, timeline_created: result.timeline,
-      pages_processed: result.pages, stale_remaining: result.remaining, ...(result.skipped ? { skipped_changed: result.skipped } : {}),
+      pages_processed: result.pages, stale_remaining: result.remaining + (result.mentions?.remaining ?? 0),
+      ...(result.skipped ? { skipped_changed: result.skipped } : {}), ...(result.mentions ? mentionJsonFields(result.mentions) : {}),
     });
   }
-  if (dryRun) return `(dry run) ${result.remaining} page(s) need link/timeline extraction. Run without --dry-run to extract.`;
+  if (dryRun) {
+    return `(dry run) ${result.remaining} page(s) need link/timeline extraction; ${result.mention_due ?? 0} page(s) need a mention pass ` +
+      `(last pass: ${result.mention_last_pass_at ?? 'never'}). Run without --dry-run to extract.`;
+  }
+  const mentionLine = result.mentions ? formatMentionSummary(result.mentions) : null;
   return `Extract --stale: ${result.created} link(s) created, ${result.removed} removed, ${result.timeline} timeline entr(ies) from ${result.pages} page(s).` +
     (result.skipped ? ` Skipped ${result.skipped} page(s) edited during extraction or with unresolved attendance; they stay stale.` : '') +
-    (result.remaining ? ` ${result.remaining} page(s) remain stale.` : '');
+    (result.remaining ? ` ${result.remaining} page(s) remain stale.` : '') + (mentionLine ? `\n${mentionLine}` : '');
 }
 
 /**
@@ -35,6 +47,9 @@ export function formatManagedStaleExtraction(result: ManagedLinkExtraction, dryR
  * their link targets existed; then pages whose watermark is stale follow. Each
  * page's links and watermark commit together, bound to the revision that was
  * read; a page edited meanwhile, or with unresolved attendance, stays stale.
+ * Then, unless `mentions: false` (sync's inline extraction), the mention pass
+ * runs (mentions/pass.ts); a budgeted run gives link work half the budget
+ * while mention-due pages exist.
  * An unresolved-attendance page is marked attendance-blocked at the revision
  * read (doctor reports it apart from lag) and is still reconsidered every run;
  * publishing its links later clears the marker with the watermark.
@@ -45,12 +60,16 @@ export function formatManagedStaleExtraction(result: ManagedLinkExtraction, dryR
  * PGLite owner delegation all run it, in the process that owns the brain.
  */
 export async function extractManagedStaleLinks(engine: BrainEngine,
-  opts: { sourceId?: string; slugs?: readonly string[]; maxPages?: number; timeBudgetMs?: number; signal?: AbortSignal } = {}): Promise<ManagedLinkExtraction> {
+  opts: { sourceId?: string; slugs?: readonly string[]; maxPages?: number; timeBudgetMs?: number; signal?: AbortSignal; mentions?: boolean } = {}): Promise<ManagedLinkExtraction> {
   const result: ManagedLinkExtraction = { pages: 0, created: 0, removed: 0, timeline: 0, skipped: 0, remaining: 0 };
-  const deadline = opts.timeBudgetMs === undefined ? Infinity : Date.now() + opts.timeBudgetMs;
+  const startMs = Date.now();
+  const withMentions = opts.mentions !== false;
+  const deadline = withMentions ? await linkPhaseDeadline(engine, opts.sourceId, startMs, opts.timeBudgetMs)
+    : opts.timeBudgetMs === undefined ? Infinity : startMs + opts.timeBudgetMs;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
   const maxPages = opts.maxPages ?? Infinity;
   const done = new Set<string>();
+  const attribution = await maintenanceAttribution(engine);
   const derive = async (slug: string, sourceId: string, stamp?: string) => {
     opts.signal?.throwIfAborted();
     done.add(`${sourceId}\0${slug}`);
@@ -73,7 +92,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       const at = stamp ?? new Date().toISOString();
       await tx.markPagesExtractedBatch([{ slug, source_id: sourceId, extractedAt: at }], at);
       return { ...written, timeline: added };
-    }));
+    }, attribution));
     if (!outcome) { result.skipped++; return; }
     result.pages++;
     result.created += outcome.created;
@@ -96,5 +115,9 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
     }
   }
   result.remaining = await engine.countStalePagesForExtraction({ sourceId: opts.sourceId, versionTs });
+  if (withMentions) {
+    result.mentions = await runMentionPass(engine, { sourceId: opts.sourceId, signal: opts.signal,
+      ...(opts.timeBudgetMs === undefined ? {} : { deadline: startMs + opts.timeBudgetMs }) });
+  }
   return result;
 }

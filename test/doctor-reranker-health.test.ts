@@ -159,6 +159,9 @@ describe('reranker_health (v0.48.2 readiness-aware)', () => {
       expect(c.status).toBe('warn');
       expect(c.message).toContain('auth failure');
       expect(c.message).toContain('key present but rejected');
+      // #5432: audit-log history, not a live verdict.
+      expect(c.message).toContain('no live probe was run');
+      expect(c.details?.live_probe_performed).toBe(false);
     });
   });
 

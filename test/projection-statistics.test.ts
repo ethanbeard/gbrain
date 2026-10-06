@@ -133,3 +133,26 @@ describe('projection migration ledger verification', () => {
     await verifyProjectionStatistics(engine);
   }, 60_000);
 });
+
+describe('PGLite planner statistics after a bulk write', () => {
+  test('refresh analyzes every table so joins on source and links see real row counts', async () => {
+    const db = new PGlite();
+    try {
+      await db.exec(`CREATE TABLE pages(id integer PRIMARY KEY, source_id text NOT NULL, frontmatter jsonb,
+          text_projection_revision uuid, knowledge_revision uuid);
+        CREATE INDEX pages_source_idx ON pages(source_id);
+        CREATE TABLE links(from_page_id integer, to_page_id integer);
+        INSERT INTO pages SELECT i, 'vault', '{}'::jsonb, NULL, NULL FROM generate_series(1, 3000) i;
+        INSERT INTO links SELECT i, i + 1 FROM generate_series(1, 2000) i;`);
+      await db.exec(PROJECTION_STATISTICS_SQL.replace(/ANALYZE[^;]*;/, ''));
+      expect(await refreshProjectionStatistics(fixtureEngine(db))).toBe(true);
+      const stats = await db.query<{ tablename: string; attname: string }>(
+        `SELECT tablename, attname FROM pg_stats WHERE (tablename, attname) IN (('pages', 'source_id'), ('links', 'from_page_id'))`);
+      expect(stats.rows.length).toBe(2);
+      const plan = await db.query<{ 'QUERY PLAN': Array<{ Plan: { 'Plan Rows': number } }> }>(
+        `EXPLAIN (FORMAT JSON) SELECT * FROM pages WHERE source_id = ANY('{vault}'::text[])`);
+      expect(plan.rows[0]['QUERY PLAN'][0].Plan['Plan Rows']).toBe(3000);
+    } finally { await db.close(); }
+  }, 30_000);
+});
+

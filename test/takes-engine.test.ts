@@ -403,6 +403,8 @@ describe('take embedding writes', () => {
     const updated = await engine.updateTakeEmbeddings([{
       take_id: take!.id,
       embedding: new Float32Array(dims).fill(0.25),
+      claim: take!.claim,
+      model: 'openai:text-embedding-3-large',
     }]);
 
     expect(updated).toBe(1);

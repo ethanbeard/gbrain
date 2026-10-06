@@ -17,10 +17,13 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Dependency layer first for build caching. postinstall.ts must be present
-# before `bun install` (package.json wires it as the postinstall hook; it
-# exits 0 on every path by contract).
+# Dependency layer first for build caching. Lifecycle scripts stay on
+# (@electric-sql/pglite is a trustedDependency), so postinstall.ts must be
+# present before `bun install`; it loads every repo module dynamically and
+# exits 0 on every path, so it needs nothing else from src/. patches/ is
+# copied so a future `patchedDependencies` entry cannot break this layer.
 COPY package.json bun.lock bunfig.toml ./
+COPY patches/ patches/
 COPY scripts/postinstall.ts scripts/postinstall.ts
 RUN bun install --frozen-lockfile
 

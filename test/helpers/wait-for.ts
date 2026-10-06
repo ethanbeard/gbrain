@@ -7,7 +7,7 @@
  * The predicate is checked at least once even with timeoutMs <= 0.
  */
 export interface WaitForOpts {
-  /** Deadline. Default 5000ms. */
+  /** Deadline. Default 5000ms. Scaled by GBRAIN_TEST_WAIT_MULTIPLIER (see testWaitMs). */
   timeoutMs?: number;
   /** Poll interval. Default 10ms. */
   intervalMs?: number;
@@ -15,11 +15,47 @@ export interface WaitForOpts {
   label?: string;
 }
 
+/**
+ * GBRAIN_TEST_WAIT_MULTIPLIER (default 1) scales every test deadline for
+ * instrumented lanes: scripts/lib/test-env.sh sets 2 when COVERAGE_DIR is
+ * set, because coverage slows the code under test while the deadlines stay
+ * wall-clock. Accepted range 1..4; anything else fails the test loudly.
+ */
+export function testWaitMultiplier(): number {
+  const raw = process.env.GBRAIN_TEST_WAIT_MULTIPLIER;
+  if (raw === undefined || raw === '') return 1;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1 || value > 4) {
+    throw new Error(
+      `GBRAIN_TEST_WAIT_MULTIPLIER=${JSON.stringify(raw)} is not a number from 1 to 4.\n`
+      + 'Why: it scales test wait deadlines (test/helpers/wait-for.ts); a bad value would make every deadline meaningless.\n'
+      + 'Fix: unset GBRAIN_TEST_WAIT_MULTIPLIER, or set it to a value from 1 to 4 (coverage lanes use 2).\n'
+      + 'Docs: docs/TESTING.md#speed--environment-helpers-testhelpers',
+    );
+  }
+  return value;
+}
+
+/**
+ * Bun's per-test timeout in every runner is 60s; a scaled deadline stays at
+ * or below this ceiling (or its unscaled base, if larger) so a slow condition
+ * fails as a labeled waitFor error, never as an anonymous bun timeout.
+ */
+const SCALED_DEADLINE_CEILING_MS = 50_000;
+
+/** `ms` scaled by GBRAIN_TEST_WAIT_MULTIPLIER, capped below bun's per-test timeout. */
+export function testWaitMs(ms: number): number {
+  const multiplier = testWaitMultiplier();
+  if (multiplier === 1) return ms;
+  return Math.max(ms, Math.min(Math.round(ms * multiplier), SCALED_DEADLINE_CEILING_MS));
+}
+
 export async function waitFor(
   predicate: () => boolean | Promise<boolean>,
   opts: WaitForOpts = {},
 ): Promise<void> {
-  const timeoutMs = opts.timeoutMs ?? 5000;
+  const baseTimeoutMs = opts.timeoutMs ?? 5000;
+  const timeoutMs = testWaitMs(baseTimeoutMs);
   const intervalMs = opts.intervalMs ?? 10;
   const start = Date.now();
   for (;;) {
@@ -27,8 +63,9 @@ export async function waitFor(
     const elapsed = Date.now() - start;
     if (elapsed >= timeoutMs) {
       const label = opts.label ? `${opts.label}: ` : '';
+      const scaled = timeoutMs === baseTimeoutMs ? '' : ` scaled to ${timeoutMs}ms by GBRAIN_TEST_WAIT_MULTIPLIER`;
       throw new Error(
-        `waitFor: ${label}condition still false after ${elapsed}ms (timeout ${timeoutMs}ms)`,
+        `waitFor: ${label}condition still false after ${elapsed}ms (timeout ${baseTimeoutMs}ms${scaled})`,
       );
     }
     // Clamp the final sleep to the remaining deadline so a coarse interval

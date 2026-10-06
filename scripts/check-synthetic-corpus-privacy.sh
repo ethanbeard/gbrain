@@ -37,6 +37,7 @@ PLACEHOLDERS=(
 # Skip if directory doesn't exist yet (early-clone state).
 if [ ! -d "$CORPUS_DIR" ]; then
   echo "OK: $CORPUS_DIR does not exist yet (skipping privacy scan)"
+  echo "GBRAIN_CHECK_SKIPPED: $CORPUS_DIR absent"
   exit 0
 fi
 

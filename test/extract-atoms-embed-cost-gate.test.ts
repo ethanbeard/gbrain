@@ -75,34 +75,35 @@ describe('resolveExtractAtomsCostGate', () => {
   });
 
   // An operator who SET `cycle.extract_atoms.budget_usd` asked for a ceiling.
-  // Dropping the cap because the embed route is unpriced silently turns that
-  // ceiling off (Codex P1); the cap stays and the unpriced embed bills at $0.
-  test('an explicit operator budget keeps the cap on over an unpriced embed route, priced at $0', () => {
-    expect(resolveExtractAtomsCostGate(FREE_CHAT, UNPRICED_EMBED, undefined, { explicitBudget: true })).toEqual({
-      enforceCap: true,
-      zeroPricedEmbedModel: UNPRICED_EMBED,
-      pricingOverrides: { [UNPRICED_EMBED.toLowerCase()]: { input: 0, output: 0 } },
-    });
+  // This used to keep the cap and bill the unpriced embed route at $0 (Codex
+  // P1). Garry's explicit-cap rule (2026-10-02) supersedes that: a cap the user
+  // set refuses an unpriced route and tells the agent to look the price up and
+  // register it, rather than assume $0.
+  test('an explicit operator budget refuses an unpriced embed route with no_pricing guidance', () => {
+    const gate = resolveExtractAtomsCostGate(FREE_CHAT, UNPRICED_EMBED, undefined, { explicitBudget: true });
+    expect(gate).toMatchObject({ enforceCap: true, unpricedModel: UNPRICED_EMBED, unpricedKind: 'embed' });
+    expect(gate.refusal).toMatchObject({ code: 'no_pricing', model: UNPRICED_EMBED, kind: 'embed', units: ['usd_per_1m_tokens'] });
+    expect(gate.refusal!.register_command).toStartWith(`gbrain pricing set ${UNPRICED_EMBED} --rate`);
   });
 
-  test('the $0 embed row merges into existing operator overrides without clobbering them', () => {
+  test('an explicit budget never invents a $0 embed row; other overrides are left as they were', () => {
+    // Superseded by the explicit-cap rule: the gate used to merge a $0 row for
+    // the embed route into the operator's overrides. It now returns no
+    // overrides at all and refuses, so the operator map is never rewritten.
     const overrides = parsePricingOverrides(JSON.stringify({ 'litellm:gpt-4o': { input: 2.5, output: 10 } }))!;
     const gate = resolveExtractAtomsCostGate(FREE_CHAT, UNPRICED_EMBED, overrides, { explicitBudget: true });
-    expect(gate.enforceCap).toBe(true);
-    expect(gate.pricingOverrides).toEqual({
-      'litellm:gpt-4o': { input: 2.5, output: 10 },
-      [UNPRICED_EMBED.toLowerCase()]: { input: 0, output: 0 },
-    });
+    expect(gate.refusal?.model).toBe(UNPRICED_EMBED);
+    expect('pricingOverrides' in gate).toBe(false);
+    expect(overrides).toEqual({ 'litellm:gpt-4o': { input: 2.5, output: 10 } });
   });
 
-  test('an explicit budget never zero-prices an unpriced CHAT model — the cap still drops', () => {
-    // The chat model is the billable call the cap exists for; assuming $0 for
-    // it would enforce a fiction. Only the embed route gets the $0 treatment.
-    expect(resolveExtractAtomsCostGate('groq:llama-3.3-70b', UNPRICED_EMBED, undefined, { explicitBudget: true })).toEqual({
-      enforceCap: false,
-      unpricedModel: 'groq:llama-3.3-70b',
-      unpricedKind: 'chat',
-    });
+  test('an explicit budget refuses an unpriced CHAT model instead of dropping the cap', () => {
+    // Used to drop the cap and run uncapped. Superseded by Garry's explicit-cap
+    // rule (2026-10-02): a spending cap you set blocks an unpriced model and
+    // tells the agent to look up the price and register it.
+    const gate = resolveExtractAtomsCostGate('groq:llama-3.3-70b', UNPRICED_EMBED, undefined, { explicitBudget: true });
+    expect(gate).toMatchObject({ enforceCap: true, unpricedModel: 'groq:llama-3.3-70b', unpricedKind: 'chat' });
+    expect(gate.refusal).toMatchObject({ code: 'no_pricing', model: 'groq:llama-3.3-70b', provider: 'groq', kind: 'chat' });
   });
 
   test('without an explicit budget the unpriced embed still drops the (default) cap', () => {
@@ -170,7 +171,11 @@ describe('extract_atoms with a $0 chat model and an unpriced embedding model (PG
     expect(result.details?.transcripts_skipped_budget).toBe(0);
   }, 60000);
 
-  test('an explicit cycle.extract_atoms.budget_usd keeps the cap enforced over the unpriced embed (Codex P1)', async () => {
+  // Used to run with the embed route billed at $0 (Codex P1). Superseded by
+  // Garry's explicit-cap rule (2026-10-02): the run is refused, makes no model
+  // call, and reports the no_pricing guidance.
+  test('an explicit cycle.extract_atoms.budget_usd refuses the unpriced embed route: no model call, guidance in details', async () => {
+    let chatCalls = 0;
     await engine.setConfig('cycle.extract_atoms.budget_usd', '0.05');
     const stderr: string[] = [];
     const savedError = console.error;
@@ -180,21 +185,21 @@ describe('extract_atoms with a $0 chat model and an unpriced embedding model (PG
       result = await runPhaseExtractAtoms(engine, {
         _transcripts: [{ filePath: '/fake/meeting-c.txt', content: 'transcript content c', contentHash: 'c1b2c3d4e5f60718' }],
         _pages: [],
-        _chat: chat,
+        _chat: async (o) => { chatCalls++; return chat(o); },
       });
     } finally {
       console.error = savedError;
     }
-    expect(result.status).toBe('ok');
-    expect(result.details?.atoms_extracted).toBe(1);
-    expect(result.details?.budget_exhausted).toBe(false);
+    expect(result.status).toBe('warn');
+    expect(chatCalls).toBe(0);
+    expect(result.details?.atoms_extracted).toBe(0);
     expect(result.details?.budget_usd).toBe(0.05);
+    expect(result.details?.no_pricing).toMatchObject({ model: UNPRICED_EMBED, kind: 'embed' });
     const joined = stderr.join('\n');
     // The cap was NOT dropped — the operator asked for one.
     expect(joined).not.toContain('running without a cost gate');
-    // ...and the run says so, naming the embed model it bills at $0.
-    expect(joined).toContain(UNPRICED_EMBED);
-    expect(joined).toContain('$0');
+    // ...and the run names the embed model and the registration command.
+    expect(joined).toContain(`gbrain pricing set ${UNPRICED_EMBED} --rate`);
   }, 60000);
 
   test('with a $0 pricing override for the embed model the cap stays on and the run still extracts', async () => {

@@ -13,7 +13,9 @@ import type { CyclePhase, PhaseResult } from '../cycle.ts';
 import { LockStolenError } from '../db-lock.ts';
 import { BudgetExhausted } from '../budget/budget-tracker.ts';
 import { withChatCallMeter } from '../ai/chat-usage.ts';
+import { withAIAttribution } from '../ai/invocation-guard.ts';
 import { recordContainedPaidFailure } from './dream-breaker.ts';
+import { cliRenderContext, toAgentError, type RenderedAction } from '../agent-output.ts';
 
 /** Errors that must stop the whole job instead of failing one phase. */
 export function isUncontainedPhaseError(error: unknown, signal?: AbortSignal): boolean {
@@ -38,7 +40,7 @@ export async function timeContainedPhase<T extends PhaseResult>(containment: Pha
   const start = performance.now();
   const meter = { calls: 0 };
   try {
-    const result = await withChatCallMeter(meter, fn);
+    const result = await withAIAttribution({ phase: `cycle:${phase}` }, () => withChatCallMeter(meter, fn));
     return { result, duration_ms: Math.round(performance.now() - start) };
   } catch (error) {
     if (isUncontainedPhaseError(error, containment.signal)) throw error;
@@ -61,8 +63,15 @@ export async function timeContainedPhase<T extends PhaseResult>(containment: Pha
         summary: `${phase} failed: ${err.message.slice(0, 200)}`,
         details: { contained: true, paid_model_calls: meter.calls, paid_loop_recorded: paidLoopRecorded },
         error: { class: err.name || 'Error', code, message: err.message.slice(0, 200) },
+        ...phaseErrorSiblings(err, phase),
       },
       duration_ms: Math.round(performance.now() - start),
     };
   }
+}
+
+/** Agent contract v1: the nested legacy `error` keeps its shape and gains sibling `code` / `fix`. */
+function phaseErrorSiblings(err: Error, phase: string): { code: string; fix?: RenderedAction } {
+  const env = toAgentError(err, { transport: 'cli', command: `dream:${phase}`, render: cliRenderContext() });
+  return { code: env.code, ...(env.fix ? { fix: env.fix } : {}) };
 }

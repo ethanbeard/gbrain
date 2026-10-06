@@ -12,9 +12,11 @@
  * require a brain. The cli.ts no-DB bypass routes `replay` here directly;
  * run/trend/regress go through connectEngine in cli.ts.
  *
- * Codex review #4 fail-closed budget: `--budget-usd N` aborts before the
- * next call's projected cost would exceed the cap. Models without a
- * pricing entry produce an actionable error, not silent zero.
+ * Budget: `--budget-usd N` aborts before the next call's projected cost
+ * would exceed the cap. Every canonically priced (or `gbrain pricing set`)
+ * model is gateable; an unpriced model refuses under the cap with a
+ * `no_pricing` envelope whose fix registers the rate, and runs with a
+ * warning when no cap is set.
  *
  * Codex review #3 receipt naming: every run binds (corpus, prompt, models,
  * rubric) shas; rubric_version field segregates trend rows by rubric epoch.
@@ -29,6 +31,8 @@ import { writeReceipt } from '../core/takes-quality-eval/receipt-write.ts';
 import { loadReceiptFromDisk } from '../core/takes-quality-eval/replay.ts';
 import { compareReceipts } from '../core/takes-quality-eval/regress.ts';
 import { loadTrend, renderTrendTable, type TrendRow } from '../core/takes-quality-eval/trend.ts';
+import { OperationError } from '../core/ops/contract.ts';
+import { writeCliError } from '../cli/cli-error.ts';
 
 const HELP = `gbrain eval takes-quality — reproducible cross-modal quality eval
 
@@ -37,8 +41,9 @@ Subcommands:
       [--slug-prefix P] [--cycles N] [--models a,b,c] [--json]
     Sample N takes from the brain, score with 3 models in parallel,
     aggregate to PASS/FAIL/INCONCLUSIVE. Default: --limit 100, --cycles 3
-    (1 in non-TTY), --source db, --budget-usd null (no cap; pass 0 to
-    explicitly disable budget enforcement). Default models:
+    (1 in non-TTY), --source db, no --budget-usd cap. Under a cap, a model
+    gbrain has no price for refuses (no_pricing; register its rate with
+    gbrain pricing set); without one it runs uncounted. Default models:
       ${DEFAULT_MODEL_PANEL.join(', ')}
     Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
 
@@ -169,6 +174,7 @@ export async function runEvalTakesQuality(engine: BrainEngine, args: string[]): 
     try {
       result = await runEval(engine, { limit, cycles, models, budgetUsd, slugPrefix, source });
     } catch (e) {
+      if (e instanceof OperationError) process.exit(writeCliError(e, 'eval', { json }));
       process.stderr.write(`run failed: ${e instanceof Error ? e.message : String(e)}\n`);
       process.exit(1);
     }

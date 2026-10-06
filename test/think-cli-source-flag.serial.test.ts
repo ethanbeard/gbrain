@@ -14,7 +14,7 @@
  */
 import { describe, test, expect, beforeEach, mock } from 'bun:test';
 
-const captured: { opts: Array<Record<string, unknown>> } = { opts: [] };
+const captured: { opts: Array<Record<string, unknown>>; persist: Array<Record<string, unknown>> } = { opts: [], persist: [] };
 
 const stubResult = {
   answer: 'Stub answer.',
@@ -32,7 +32,10 @@ mock.module('../src/core/think/index.ts', () => ({
     captured.opts.push(opts);
     return JSON.parse(JSON.stringify(stubResult));
   },
-  persistSynthesis: async () => ({ slug: 'synthesis/stub', evidenceInserted: 0, warnings: [] }),
+  persistSynthesis: async (_engine: unknown, _result: unknown, opts: Record<string, unknown> = {}) => {
+    captured.persist.push(opts);
+    return { slug: 'synthesis/stub', evidenceInserted: 0, warnings: [] };
+  },
   stripGapsSection: (s: string) => s,
 }));
 
@@ -105,7 +108,7 @@ async function runCli(args: string[]): Promise<{ code: number; out: string[]; er
   }
 }
 
-beforeEach(() => { captured.opts.length = 0; });
+beforeEach(() => { captured.opts.length = 0; captured.persist.length = 0; });
 
 describe('#4508 think --source CLI surface', () => {
   test('--source is parsed out of the question and threaded into runThink', async () => {
@@ -188,5 +191,35 @@ describe('#4508 think --source CLI surface', () => {
     } finally {
       ambient.mode = 'default';
     }
+  });
+});
+
+describe('think --save writes to the resolved source', () => {
+  test('an explicit --source saves into that source only', async () => {
+    const r = await runCli(['plain', 'question', '--source', 'workspace', '--save']);
+    expect(r.code).toBe(0);
+    expect(captured.persist).toEqual([{ sourceId: 'workspace', allowedSources: undefined }]);
+  });
+
+  test('the ambient default saves into the default source, bound to its federated set', async () => {
+    const r = await runCli(['plain', 'question', '--save']);
+    expect(r.code).toBe(0);
+    expect(captured.persist).toEqual([{ sourceId: 'default', allowedSources: ['default', 'team-wiki'] }]);
+  });
+
+  test('--source __all__ is a read scope, so the save carries no source', async () => {
+    const r = await runCli(['plain', 'question', '--source', '__all__', '--save']);
+    expect(r.code).toBe(0);
+    expect(captured.persist).toEqual([{ sourceId: undefined, allowedSources: undefined }]);
+  });
+
+  test('the local think operation saves into the caller source and never into the __all__ sentinel', async () => {
+    const { operationsByName } = await import('../src/core/operations.ts');
+    const engine = { kind: 'pglite', executeRaw: async () => [], getConfig: async () => null } as never;
+    const ctx = (sourceId: string) => ({ engine, remote: false, sourceId, config: { engine: 'pglite' },
+      logger: { info() {}, warn() {}, error() {} } }) as never;
+    await operationsByName.think.handler(ctx('workspace'), { question: 'plain question', save: true });
+    await operationsByName.think.handler(ctx('__all__'), { question: 'plain question', save: true });
+    expect(captured.persist).toEqual([{ sourceId: 'workspace' }, { sourceId: undefined }]);
   });
 });

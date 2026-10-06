@@ -1,4 +1,5 @@
 import postgres from '#postgres'
+import { traceSqlOptions } from './sql-trace.ts';
 import { GBrainError, type EngineConfig } from './types.ts';
 import { SCHEMA_SQL } from './schema-embedded.generated.ts';
 import { applyPostgresForwardReferenceBootstrap } from './engine-sql/bootstrap.ts';
@@ -265,7 +266,7 @@ export function getConnection(): ReturnType<typeof postgres> {
  *
  * Back-compat: callers that ignore the return value are unaffected.
  */
-export async function connect(config: EngineConfig): Promise<boolean> {
+export async function connect(config: EngineConfig, hooks: { onpoisoned?: (status: string) => void } = {}): Promise<boolean> {
   if (sql) {
     // Warn if a different URL is passed — the old connection is still in use
     if (config.database_url && connectedUrl && config.database_url !== connectedUrl) {
@@ -301,6 +302,7 @@ export async function connect(config: EngineConfig): Promise<boolean> {
       // during migrations + initSchema, and breaks stdout-parsing callers like
       // `gbrain jobs submit --json | ...`). Opt back in with GBRAIN_PG_NOTICES=1.
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+      onpoisoned: hooks.onpoisoned,
     };
     if (Object.keys(timeouts).length > 0) {
       opts.connection = timeouts;
@@ -313,7 +315,7 @@ export async function connect(config: EngineConfig): Promise<boolean> {
         );
       }
     }
-    sql = postgres(url, opts);
+    sql = postgres(url, traceSqlOptions(opts, 'module'));
 
     // Test connection
     await sql`SELECT 1`;
@@ -328,7 +330,7 @@ export async function connect(config: EngineConfig): Promise<boolean> {
     throw new GBrainError(
       'Cannot connect to database',
       msg,
-      'Check your connection URL in ~/.gbrain/config.json',
+      'Check the database URL; `gbrain engine status --probe` names where it comes from (environment variable or the config file under GBRAIN_HOME)',
     );
   }
 }

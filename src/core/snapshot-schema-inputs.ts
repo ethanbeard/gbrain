@@ -43,10 +43,14 @@ export const SNAPSHOT_DYNAMIC_IMPORTS_NOT_HASHED: Readonly<Record<string, string
   'operations.ts': 'verbs.ts request-time verb handlers',
   'persistence/memory-mutations.ts': 'verbs.ts request-time verb handlers',
   'persistence/verb-errors.ts': 'verbs.ts request-time verb handlers',
+  'feedback/record.ts': 'verbs.ts request-time answer recording',
   'verbs/entity-card.ts': 'verbs.ts request-time verb handlers',
+  'mentions/coverage.ts': 'verbs.ts request-time verb handlers (entity coverage notice)',
   'think/index.ts': 'verbs.ts request-time verb handlers',
   'embedding.ts': 'verbs.ts request-time verb handlers',
   'model-pricing.ts': 'verbs.ts request-time verb handlers',
+  'interop-notices.ts': 'verbs.ts request-time verb handlers (agent contract notices)',
+  'remember-batch.ts': 'verbs.ts request-time verb handlers (remember items[])',
 };
 
 const STATIC_SPECIFIER =

@@ -12,7 +12,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { randomBytes } from 'crypto';
-import { patternSince, redactFindings, scanText } from '../src/core/secret-scan.ts';
+import { correctedEntropy, patternSince, redactFindings, scanText, shannonEntropy } from '../src/core/secret-scan.ts';
 
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 /** Random alphanumeric string that always carries a digit (entropy rule input). */
@@ -23,6 +23,19 @@ function rand(n: number): string {
   return s.slice(0, n - 1) + String(bytes[0]! % 10);
 }
 const hex = (n: number) => randomBytes(Math.ceil(n / 2)).toString('hex').slice(0, n);
+/** Deterministic twin of rand(): the same shape from a seeded generator, so a case never flakes. */
+function seededRand(n: number, seed: number): string {
+  let a = seed >>> 0;
+  const next = () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  let s = '';
+  for (let i = 0; i < n - 1; i++) s += ALNUM[Math.floor(next() * ALNUM.length)];
+  return s + String(Math.floor(next() * 10));
+}
 const PLACEHOLDER_NONCE = 'GSTACK_EXAMPLE_NONCE';
 const SCHEME_SEP = ':' + '//';
 /** `scheme://user:password@host/path`, assembled from parts. */
@@ -177,9 +190,35 @@ describe('A5 high_entropy_assignment: punctuated values', () => {
   const T = REDACTED('high_entropy_assignment');
 
   test('unquoted values with password punctuation are claimed whole', () => {
-    for (const v of [`!${rand(14)}`, `${rand(10)}!#%${rand(10)}`, `${rand(8)}$*@^~${rand(8)}`, `${rand(8)}.?<>${rand(8)}`]) {
+    // The first case is the value that flaked about 1 run in 10: 15 characters
+    // whose raw Shannon entropy (3.457 bits/char) sat under the 3.5 floor.
+    const repro = ['!dcG4', 'Gmw1q', 'GRbR3'].join('');
+    for (const v of [repro, `!${seededRand(14, 1)}`, `${seededRand(10, 2)}!#%${seededRand(10, 3)}`, `${seededRand(8, 4)}$*@^~${seededRand(8, 5)}`, `${seededRand(8, 6)}.?<>${seededRand(8, 7)}`]) {
       expect(he(`password=${v}`).text).toBe(`password=${T}`);
       expect(he(`DB_PASSWORD: ${v}`).text).toBe(`DB_PASSWORD: ${T}`);
+    }
+  });
+
+  test('the entropy floor is judged bias-corrected, so short random secrets are claimed', () => {
+    const repro = ['!dcG4', 'Gmw1q', 'GRbR3'].join('');
+    expect(shannonEntropy(repro)).toBeLessThan(3.5);
+    expect(correctedEntropy(repro)).toBeGreaterThanOrEqual(3.5);
+    // 300 seeded values at each length the 12-char floor exists for. The raw
+    // floor missed 68% at 12 characters and 9% at 15; the corrected one stays
+    // under 2% at every length.
+    for (const n of [12, 13, 14, 15, 16]) {
+      let missed = 0;
+      for (let seed = 0; seed < 300; seed++) {
+        const v = seededRand(n, 1000 * n + seed);
+        if (he(`password=${v}`).text !== `password=${T}`) missed++;
+      }
+      expect(missed / 300).toBeLessThan(0.02);
+    }
+  });
+
+  test('all-digit values never clear the gate: counters, timestamps and ids stay', () => {
+    for (const v of ['1234567890123', '17909637569851', '9081726354091827']) {
+      expect(he(`token_count=${v}`).text).toBe(`token_count=${v}`);
     }
   });
 

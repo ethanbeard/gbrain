@@ -67,14 +67,18 @@ function sliceToTokens(text: string, maxTokens: number): string {
 }
 
 /**
- * Per-result token cost: title + chunk_text. Slug is metadata and
+ * Per-result token cost: title + chunk_text + chain evidence edges (which
+ * do enter the assistant context). Slug is metadata and
  * doesn't enter the assistant context, so we don't count it. If a
  * caller wants a different cost model (e.g. including timeline detail
  * or compiled_truth length), they can pre-shape the chunk_text before
  * calling enforceTokenBudget.
  */
 export function resultTokens(r: SearchResult): number {
-  return estimateTokens(r.title) + estimateTokens(r.chunk_text);
+  const graph = r.relational
+    ? r.relational.edges.reduce((n, e) => n + estimateTokens(`${e.stored_from} ${e.link_type} ${e.stored_to} ${e.context ?? ''}`), 0)
+    : 0;
+  return estimateTokens(r.title) + estimateTokens(r.chunk_text) + graph;
 }
 
 export interface TokenBudgetMeta {

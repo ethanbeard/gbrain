@@ -28,6 +28,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../operations.ts';
 import { loadActivePackBestEffort } from './best-effort.ts';
 import { ALLOWED_SUBTYPE_FIELDS, type AllowedSubtypeField } from './manifest-v1.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /** Sentinel: `from_type: '*unknown*'` matches every page whose type isn't
  *  declared in the pack's page_types AND isn't the target of any prior
@@ -248,7 +249,7 @@ async function applyRetypeRule(
       SELECT COUNT(*)::text AS updated FROM upd
     `;
     try {
-      const rows = await engine.executeRaw<{ updated: string }>(sqlText, allParams);
+      const rows = await maintenanceTransaction(engine, tx => tx.executeRaw<{ updated: string }>(sqlText, allParams));
       const batchCount = parseInt(rows[0]?.updated ?? '0', 10) || 0;
       if (batchCount === 0) break;
       totalApplied += batchCount;

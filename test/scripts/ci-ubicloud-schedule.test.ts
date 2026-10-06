@@ -1,7 +1,8 @@
 // ci-ubicloud-schedule.test.ts — the Ubicloud fan-out's work queue:
 // weighting (trusted tables first, lane p75 fallback), heaviest-first
-// same-lane batching with a draining batch target, marker-log parsing, and
-// the explicit-file seams the ci:local wrappers expose for it.
+// same-lane batching with a draining batch target, marker-log parsing, burst
+// fleet sizing from `ubi-runner.sh usage`, and the explicit-file seams the
+// ci:local wrappers expose for it.
 
 import { describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
@@ -10,7 +11,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   buildItems,
+  burstVms,
   parseItemLog,
+  parseUsageTotal,
   readWeightTable,
   sortQueue,
   takeBatch,
@@ -100,6 +103,34 @@ describe("parseItemLog", () => {
       { lane: "unit", file: "test/a.test.ts", rc: 0, ms: 120, output: "a output" },
       { lane: "unit", file: "test/b.test.ts", rc: 1, ms: 45, output: "b failed" },
     ]);
+  });
+});
+
+describe("burst fleet sizing", () => {
+  const fleet = { vmVcpus: 16, defaultVms: 4, maxVms: 8, ceilingVcpus: 448, workVms: 100 };
+
+  it("reads the project total from the usage report", () => {
+    const report = "OWNER           VMS  VCPUS\ngbra40            4     64\ngbra49            1     16\ntotal             5     80\n";
+    expect(parseUsageTotal(report)).toBe(80);
+    expect(parseUsageTotal("ubi-runner: request failed")).toBeNull();
+  });
+
+  it("bursts to the maximum when the quota is free", () => {
+    expect(burstVms({ ...fleet, usedVcpus: 80 }).vms).toBe(8);
+    expect(burstVms({ ...fleet, usedVcpus: 0 }).reason).toContain("burst maximum 8");
+  });
+
+  it("never pushes the project past the ceiling, and falls back to the default when busy", () => {
+    expect(burstVms({ ...fleet, usedVcpus: 320 }).vms).toBe(8);
+    expect(burstVms({ ...fleet, usedVcpus: 352 }).vms).toBe(6);
+    expect(burstVms({ ...fleet, usedVcpus: 400 }).vms).toBe(4);
+    expect(burstVms({ ...fleet, usedVcpus: 500 }).reason).toContain("quota busy, default 4");
+  });
+
+  it("uses the default when usage cannot be read, and never more VMs than the work fills", () => {
+    expect(burstVms({ ...fleet, usedVcpus: null }).vms).toBe(4);
+    expect(burstVms({ ...fleet, usedVcpus: 0, workVms: 1 })).toMatchObject({ vms: 1 });
+    expect(burstVms({ ...fleet, usedVcpus: null, workVms: 2 }).vms).toBe(2);
   });
 });
 

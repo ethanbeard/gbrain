@@ -382,6 +382,9 @@ describe('github-source materialize', () => {
         );
         expect(res.status).toBe('partial');
         expect(res.failedFiles).toBeGreaterThan(0);
+        // #5012: the partial names its real cause, never the git path's timeout default.
+        expect(res.reason).toBe('connector_item_failures');
+        expect(res.filesImported).toBe(res.added + res.modified);
         expect(readFileSync(join(dir, 'gh', REPO, '3.md'), 'utf-8')).toBe(oldPage);
         const state = JSON.parse(readFileSync(join(dir, '.github-source.json'), 'utf-8')) as { last_sweep_at: string };
         expect(state.last_sweep_at).toBe('2026-08-02T00:00:00Z');

@@ -5,13 +5,17 @@
  */
 import type { BrainEngine } from '../../core/engine.ts';
 import type { Check } from '../doctor.ts';
+import type { MisroutedResult } from '../../core/multi-source-drift.ts';
+import { redactConnectionInfo } from '../../core/audit/redact-connection-info.ts';
+import { loadActivePackForLocalEngine } from '../../core/schema-pack/best-effort.ts';
+import { sanitizeTypeForDisplay, storedTypeMissesPack } from '../../core/schema-pack/type-usage.ts';
 
 // =================================================================
 // v0.39 T7 + T9 — schema-pack doctor checks
 // =================================================================
 // Three checks per v0.38 CEO plan that never shipped at v0.38 time:
 //   schema_pack_active       — does the active pack resolve cleanly?
-//   schema_pack_consistency  — what % of pages match the active pack?
+//   schema_pack_consistency  — do stored page types match the active pack?
 //   schema_pack_source_drift — do per-source packs disagree?
 // All three are warn-only; never fail-block.
 
@@ -44,60 +48,110 @@ export async function checkSchemaPackActive(engine: BrainEngine): Promise<Check>
   }
 }
 
-export async function checkSchemaPackConsistency(engine: BrainEngine): Promise<Check> {
+const SCHEMA_PACK_DOCS = 'docs/architecture/schema-packs.md#undeclared-page-types';
+
+/**
+ * #5432: a check that could not read its input says "not verified" (warn),
+ * never ok. The redacted reason rides in `details.reason` for `--json`.
+ */
+function notVerified(err: unknown, fix: string, docs = SCHEMA_PACK_DOCS): Omit<Check, 'name'> {
+  const reason = redactConnectionInfo(err instanceof Error ? err.message : String(err)).slice(0, 200);
+  return {
+    status: 'warn',
+    message: `Not verified: the check could not run (${reason}). Fix the cause, then re-run \`${fix}\`.`,
+    details: { code: 'not_verified', verified: false, reason, fix, docs },
+  };
+}
+
+interface SourceConformance {
+  source_id: string;
+  total: number;
+  untyped: number;
+  undeclared: number;
+  undeclared_types: Array<{ type: string; count: number }>;
+  pack: string | null;
+}
+
+/**
+ * #5879: pages match the active pack only when their stored type is a
+ * declared page type or an alias of one (`storedTypeMissesPack`, the same
+ * classification as `schema lint --with-db`). Each source is graded against
+ * its own resolved pack. Any undeclared type warns; untyped pages warn at
+ * >= 10% of a source.
+ */
+export async function checkSchemaPackConsistency(
+  engine: BrainEngine,
+  opts: { sourceIds?: string[] } = {},
+): Promise<Check> {
+  const scoped = opts.sourceIds !== undefined;
+  let rows: Array<{ src: string; type: string | null; n: string }>;
   try {
-    const rows = await engine.executeRaw<{ src: string; total: string | number; untyped: string | number }>(
-      `SELECT
-         source_id AS src,
-         COUNT(*)::text AS total,
-         COUNT(*) FILTER (WHERE type IS NULL OR type = '')::text AS untyped
-       FROM pages
-       WHERE deleted_at IS NULL
-       GROUP BY source_id
-       ORDER BY source_id`,
+    rows = await engine.executeRaw(
+      `SELECT COALESCE(source_id, 'default') AS src, type, COUNT(*)::text AS n
+         FROM pages
+        WHERE deleted_at IS NULL${scoped ? ' AND source_id = ANY($1::text[])' : ''}
+        GROUP BY source_id, type
+        ORDER BY source_id`,
+      scoped ? [opts.sourceIds] : [],
     );
-    if (rows.length === 0) {
-      return { name: 'schema_pack_consistency', status: 'ok', message: 'No pages in any source — schema consistency N/A.' };
-    }
-    let worstPct = 0;
-    let worstSrc = '';
-    let worstUntyped = 0;
-    let worstTotal = 0;
-    for (const r of rows) {
-      const total = Number(r.total);
-      const untyped = Number(r.untyped);
-      if (total === 0) continue;
-      const pct = untyped / total;
-      if (pct > worstPct) {
-        worstPct = pct;
-        worstSrc = r.src;
-        worstUntyped = untyped;
-        worstTotal = total;
-      }
-    }
-    if (worstPct === 0) {
-      return { name: 'schema_pack_consistency', status: 'ok', message: 'All pages match the active schema pack across every source.' };
-    }
-    const pctStr = (worstPct * 100).toFixed(1);
-    if (worstPct >= 0.1) {
-      return {
-        name: 'schema_pack_consistency',
-        status: 'warn',
-        message: `Source \`${worstSrc}\`: ${worstUntyped} of ${worstTotal} pages (${pctStr}%) have no type matching the active pack. Run \`gbrain schema detect --source ${worstSrc}\` to propose a pack matching your content shape.`,
-      };
-    }
-    return {
-      name: 'schema_pack_consistency',
-      status: 'ok',
-      message: `${pctStr}% untyped at worst (source \`${worstSrc}\`) — under the 10% warn threshold.`,
-    };
   } catch (e) {
-    return {
-      name: 'schema_pack_consistency',
-      status: 'ok',
-      message: `Skipped: ${(e as Error).message}`,
-    };
+    return { name: 'schema_pack_consistency', ...notVerified(e, 'gbrain schema review-orphans') };
   }
+  if (rows.length === 0) {
+    return { name: 'schema_pack_consistency', status: 'ok', message: 'No pages in any source — schema consistency N/A.' };
+  }
+  const bySource = new Map<string, Array<{ type: string | null; n: number }>>();
+  for (const r of rows) {
+    const list = bySource.get(r.src) ?? [];
+    list.push({ type: r.type, n: Number(r.n) });
+    bySource.set(r.src, list);
+  }
+  const graded: SourceConformance[] = [];
+  const unresolved: string[] = [];
+  for (const [src, types] of bySource) {
+    const pack = await loadActivePackForLocalEngine(engine, { sourceId: src });
+    if (!pack) { unresolved.push(src); continue; }
+    const undeclaredTypes = types
+      .filter((t): t is { type: string; n: number } => !!t.type && storedTypeMissesPack(t.type, pack.manifest))
+      .map((t) => ({ type: t.type, count: t.n }))
+      .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+    graded.push({
+      source_id: src,
+      total: types.reduce((sum, t) => sum + t.n, 0),
+      untyped: types.filter((t) => !t.type).reduce((sum, t) => sum + t.n, 0),
+      undeclared: undeclaredTypes.reduce((sum, t) => sum + t.count, 0),
+      undeclared_types: undeclaredTypes,
+      pack: pack.manifest.name,
+    });
+  }
+  const details: Record<string, unknown> = { per_source: graded, unresolved_sources: unresolved, docs: SCHEMA_PACK_DOCS };
+  const problems: string[] = [];
+  for (const g of graded.filter((x) => x.undeclared > 0)) {
+    const sample = g.undeclared_types.slice(0, 5).map((t) => `'${sanitizeTypeForDisplay(t.type)}' (${t.count})`).join(', ');
+    problems.push(`Source \`${g.source_id}\`: ${g.undeclared} page(s) use ${g.undeclared_types.length} type(s) pack \`${g.pack}\` neither declares nor aliases: ${sample}. List them with \`gbrain schema review-orphans --source ${g.source_id}\`, then declare the type (\`gbrain schema add-type <type>\`, which takes its primitive and prefix) or retype the pages to a declared type.`);
+  }
+  const worst = graded.reduce<SourceConformance | null>((w, g) =>
+    g.total > 0 && (!w || g.untyped / g.total > w.untyped / w.total) ? g : w, null);
+  const worstPct = worst ? worst.untyped / worst.total : 0;
+  if (worst && worstPct >= 0.1) {
+    problems.push(`Source \`${worst.source_id}\`: ${worst.untyped} of ${worst.total} pages (${(worstPct * 100).toFixed(1)}%) have no type matching the active pack. Run \`gbrain schema detect --source ${worst.source_id}\` to propose a pack matching your content shape.`);
+  }
+  if (unresolved.length > 0) {
+    problems.push(`Not verified for ${unresolved.length} source(s) (${unresolved.join(', ')}): the active pack did not resolve. Run \`gbrain schema active\` to debug.`);
+  }
+  if (problems.length > 0) {
+    const code = graded.some((x) => x.undeclared > 0) ? 'page_type_undeclared' : unresolved.length > 0 ? 'not_verified' : 'pages_untyped';
+    return { name: 'schema_pack_consistency', status: 'warn', message: problems.join(' '), details: { ...details, code } };
+  }
+  if (!worst || worst.untyped === 0) {
+    return { name: 'schema_pack_consistency', status: 'ok', message: 'All pages match the active schema pack across every source.', details };
+  }
+  return {
+    name: 'schema_pack_consistency',
+    status: 'ok',
+    message: `${(worstPct * 100).toFixed(1)}% untyped at worst (source \`${worst.source_id}\`) — under the 10% warn threshold.`,
+    details,
+  };
 }
 
 export async function checkSchemaPackSourceDrift(engine: BrainEngine): Promise<Check> {
@@ -120,11 +174,7 @@ export async function checkSchemaPackSourceDrift(engine: BrainEngine): Promise<C
       message: `Per-source pack divergence detected: ${distinctPacks.size} distinct packs across ${rows.length} sources. Run \`gbrain sources list\` then \`gbrain schema active --source <id>\` per source to audit.`,
     };
   } catch (e) {
-    return {
-      name: 'schema_pack_source_drift',
-      status: 'ok',
-      message: `Skipped: ${(e as Error).message}`,
-    };
+    return { name: 'schema_pack_source_drift', ...notVerified(e, 'gbrain doctor') };
   }
 }
 
@@ -171,4 +221,85 @@ export function multiSourceDriftGitRootSkipNote(skippedIds: string[]): string {
     ` ${skippedIds.length} source(s) not checked (git-root-pinned, prefix-aware ` +
     `matching not yet implemented — #4712): ${skippedIds.join(', ')}.`
   );
+}
+
+const DRIFT_DOCS = 'docs/guides/troubleshooting.md#not-verified-doctor-checks';
+
+/**
+ * #5432: one multi_source_drift verdict for the local and remote doctor. A
+ * truncated walk or an unreadable source root/subdirectory is "not
+ * verified" (warn), never "no drift"; the walk bounds and unreadable sources
+ * ride in details.
+ */
+export function multiSourceDriftCheck(
+  result: MisroutedResult,
+  candidateSources: number,
+  host: 'local' | 'remote',
+): Check {
+  const details = {
+    walk_truncated: result.walk_truncated,
+    unreadable_sources: result.unreadable_sources,
+    git_root_skipped: result.git_root_skipped,
+    limit: result.limit,
+    timeout_ms: result.timeout_ms,
+    docs: DRIFT_DOCS,
+  };
+  const skipNote = result.git_root_skipped.length > 0 ? multiSourceDriftGitRootSkipNote(result.git_root_skipped) : '';
+  const unreadable = result.unreadable_sources;
+  const unreadableNote = unreadable.length > 0
+    ? ` Not verified for ${unreadable.length} source(s) whose local_path could not be read: ` +
+      unreadable.map((u) => `${u.source_id} (${u.reason === 'root_unreadable' ? 'root unreadable' : `${u.dirs} unreadable dir(s)`})`).join(', ') +
+      `. Fix the path or permissions (\`gbrain sources status\`), then re-run \`gbrain doctor\`.`
+    : '';
+  if (result.walk_truncated) {
+    return {
+      name: 'multi_source_drift',
+      status: 'warn',
+      message:
+        `Multi-source drift not verified — the FS walk hit its bound (${result.limit} files / ${result.timeout_ms} ms)` +
+        (host === 'remote' ? ' on the brain server' : '') +
+        `. Re-run with a larger bound: \`GBRAIN_DRIFT_LIMIT=<files> GBRAIN_DRIFT_TIMEOUT_MS=<ms> gbrain doctor\`.` +
+        unreadableNote,
+      details: { ...details, code: 'not_verified', verified: false },
+    };
+  }
+  if (result.count > 0) {
+    const sampleStr = result.sample.map((s) => `${s.slug} (intended=${s.intended_source})`).join(', ');
+    const advice = host === 'local'
+      ? multiSourceDriftAdvice(result.count, sampleStr)
+      : `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
+        `(e.g., ${sampleStr}). Likely pre-v0.30.3 misroutes OR an incomplete initial sync. ` +
+        `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.`;
+    return { name: 'multi_source_drift', status: 'warn', message: advice + skipNote + unreadableNote, details: { ...details, code: 'drift_detected' } };
+  }
+  if (unreadable.length > 0) {
+    return {
+      name: 'multi_source_drift',
+      status: 'warn',
+      message: `No cross-source slug drift among readable sources.${unreadableNote}${skipNote}`,
+      details: { ...details, code: 'not_verified', verified: false },
+    };
+  }
+  // #4712: if EVERY candidate source was skipped as git-root-pinned, no walk
+  // ran — 'ok' would misreport "verified clean" when nothing was checked.
+  const allSkipped = result.git_root_skipped.length > 0 && result.git_root_skipped.length >= candidateSources;
+  if (allSkipped) {
+    return {
+      name: 'multi_source_drift',
+      status: 'warn',
+      message: `Multi-source drift check performed no verification${skipNote}`,
+      details: { ...details, code: 'not_verified', verified: false },
+    };
+  }
+  return {
+    name: 'multi_source_drift',
+    status: 'ok',
+    message: skipNote ? `No cross-source slug drift detected among checked sources.${skipNote}` : 'No cross-source slug drift detected.',
+    details,
+  };
+}
+
+/** #5432: the drift check itself failed (e.g. the sources query); report it instead of dropping the check. */
+export function multiSourceDriftNotVerified(err: unknown): Check {
+  return { name: 'multi_source_drift', ...notVerified(err, 'gbrain doctor', DRIFT_DOCS) };
 }

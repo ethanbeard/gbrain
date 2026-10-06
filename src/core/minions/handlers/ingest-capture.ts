@@ -34,6 +34,7 @@ import type { BrainEngine } from '../../engine.ts';
 import type { IngestionEvent } from '../../ingestion/types.ts';
 import { validateIngestionEvent } from '../../ingestion/types.ts';
 import { importFromContent } from '../../import-file.ts';
+import { maintenanceTransaction } from '../../persistence/attribution.ts';
 
 export interface IngestCaptureResult {
   slug: string;
@@ -201,7 +202,7 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
     // same-slug page in another source is untouched. Idempotent: a missing or
     // already-deleted page reports 'skipped'.
     if (isTombstone) {
-      const deleted = await engine.softDeletePage(slug, { sourceId: sourceId ?? 'default' });
+      const deleted = await maintenanceTransaction(engine, tx => tx.softDeletePage(slug, { sourceId: sourceId ?? 'default' }));
       if (sourceFallback) {
         console.error(
           `[WARN] ingest_capture: requested source '${sourceFallback.requested}' unavailable ` +

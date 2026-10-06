@@ -4,22 +4,28 @@
  * Protects: on a managed brain the backfill publishes each entity page's
  * facts fence through the coordinator and adopts the legacy fact rows in
  * place (managed_maintenance_adopt_fact_fence), for file-backed and
- * database-only pages alike.
+ * database-only pages alike, and verify reads a page holding a duplicate
+ * active fence row as in sync whether the publication or extract_facts
+ * indexed it last (#5814).
  * Fails when: the phase writes fence files into the managed worktree or
  * runs a raw `UPDATE facts` (the managed writer guard refuses it and the
  * orchestrator chain wedges), when adoption inserts duplicate rows instead
  * of keeping the legacy ids and vectors, or when it expires a
- * conversation-extractor row on the same page.
+ * conversation-extractor row on the same page, or when verify counts every
+ * fence row against the index although extract_facts indexes a duplicate once.
  * Seams: none; `managedBrain` and the migration's exported `__testing` phases.
  */
 import { expect, test } from 'bun:test';
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { __testing } from '../src/commands/migrations/v0_32_2.ts';
 import type { OrchestratorOpts } from '../src/commands/migrations/types.ts';
+import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence } from '../src/core/facts-fence.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
+import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { maintenancePreflight, submitFactFenceAdoption } from '../src/core/persistence/prepared-maintenance.ts';
 import { managedBrain } from './helpers/managed-brain.ts';
 import { LEGACY_DB_ONLY_SLUG, LEGACY_FILE_SLUG, seedLegacyManagedContent, type LegacySeed } from './helpers/managed-legacy-fixture.ts';
@@ -163,5 +169,26 @@ for (const backend of testBackends()) {
       await engine.executeRaw(`INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence)
         VALUES ('archived-example', 'people/erin-example', 'Erin example left Acme example', 'fact', 'world', 'medium', now(), 'mcp:put_page', 0.8)`);
     } });
+  }, 120_000);
+
+  test(`${backend}: a duplicate active fence row reads in sync whichever writer indexed the page last (#5814)`, async () => {
+    await managedBrain(async ({ ctx, engine }) => {
+      const slug = 'people/dana-example';
+      const row = (rowNum: number, claim: string) => ({ rowNum, claim, kind: 'fact' as const, confidence: 1, visibility: 'private' as const,
+        notability: 'medium' as const, validFrom: '2026-01-01', source: 'manual', active: true });
+      const body = replaceOrInsertFactsFence('# Dana Example\n', renderFactsTable([row(1, 'Lives in Paris'), row(2, 'Lives in Paris'), row(3, 'Works at Acme example')]));
+      const receipt = await submitPageMutation(ctx, { operation: 'put_page', params: { slug, request_id: randomUUID(),
+        content: `---\ntype: person\ntitle: Dana Example\n---\n\n${body}` } }) as { state: string };
+      expect(receipt.state).toBe('committed');
+      const indexed = async () => (await engine.executeRaw<{ row_num: number }>(
+        'SELECT row_num FROM facts WHERE source_markdown_slug = $1 AND row_num IS NOT NULL ORDER BY row_num', [slug])).map(r => Number(r.row_num));
+
+      // The publication projects every fence row; extract_facts indexes the duplicate once.
+      expect(await indexed()).toEqual([1, 2, 3]);
+      expect(await __testing.phaseCVerify(engine, OPTS)).toMatchObject({ status: 'complete', detail: 'pages_checked=1' });
+      await runExtractFacts(engine, { sourceId: 'default' });
+      expect(await indexed()).toEqual([1, 3]);
+      expect(await __testing.phaseCVerify(engine, OPTS)).toMatchObject({ status: 'complete', detail: 'pages_checked=1' });
+    }, { databaseUrl });
   }, 120_000);
 }

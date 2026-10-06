@@ -26,6 +26,7 @@ import { serr } from '../../core/console-prefix.ts';
 import { buildPartialResult } from '../../core/sync-lock.ts';
 import type { createProgress } from '../../core/progress.ts';
 import type { SyncOpts, SyncResult } from '../sync.ts';
+import type { LegacyHolds } from './holds.ts';
 import { resolveSyncCheckpointSeconds, resolveSyncMaxCheckpointFailures, resolveSyncYieldEvery } from './checkpoint.ts';
 
 export type SyncActivePack = { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
@@ -70,6 +71,8 @@ export interface SyncPlan {
   readonly syncOpts: { strategy: SyncOpts['strategy']; includeHidden: SyncOpts['includeHidden'] };
   /** Manifest path -> the mode's canonical page path (slug/source_path base). */
   readonly modePath: (p: string) => string;
+  /** #5988: the run's content holds (null for company-brain sources); its re-screen paths join the import drain. */
+  readonly holds: LegacyHolds | null;
 }
 
 export interface SyncRun {

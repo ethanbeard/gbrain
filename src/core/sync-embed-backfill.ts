@@ -6,6 +6,7 @@
  */
 import type { BrainEngine } from './engine.ts';
 import { syncFailureJsonFields, type ManagedSyncFailure } from './persistence/sync-failures.ts';
+import { syncHoldJsonFields } from './persistence/sync-holds.ts';
 import { submitEmbedBackfill } from './embed-backfill-submit.ts';
 import { resolveWorkerBackedSyncEmbedMode } from './embedding.ts';
 import {
@@ -221,6 +222,7 @@ export function buildSingleSyncJsonEnvelope(
     source_id: sourceId,
     sync_status: result.status,
     ...syncFailureJsonFields(result),
+    ...syncHoldJsonFields(result),
     ...(result.reason ? { reason: result.reason } : {}),
     added: result.added,
     modified: result.modified,

@@ -25,7 +25,7 @@ No private brain content is used in any reported result. The NDJSON run records 
 
 ## 3. Sample selection
 
-- **Random seed:** `42` throughout. Set via `--seed N` on `gbrain eval run-all`; recorded in every per-run record.
+- **Random seed:** `42` throughout. LongMemEval's dev slice and splits are sampled with seed 42 (`evals/longmemeval/`); `gbrain eval run-all --seed N` records the seed in every per-run record.
 - **No per-question curation.** Splits are taken whole; no question is filtered for reporting.
 - **No mode-specific tuning.** The same dataset + same seed feeds every mode. The mode bundle is the only independent variable. A mode Δ therefore measures the joint effect of every knob the bundles differ on — today that's `tokenBudget`, `expansion`, `relationalRetrieval` (the typed-edge fourth recall arm, ON for balanced/tokenmax, OFF for conservative), and `searchLimit`; the canonical diff is `MODE_BUNDLES` in `src/core/search/mode.ts`.
 - **Cache comparability across upgrades.** Semantic result-cache reads and writes are temporarily disabled in every mode, regardless of configuration. Every query uses fresh retrieval. The retained storage machinery still keys rows on `KNOBS_HASH_VERSION` and the active knobs + embedding column/provider; historical runs with result caching enabled are not directly comparable to current runs for latency or provider spend.
@@ -34,28 +34,35 @@ No private brain content is used in any reported result. The NDJSON run records 
 
 ## 4. Run procedure
 
-The command is the doc. Anyone can reproduce.
+Each suite runs through its own command, once per mode. `gbrain eval run-all`
+runs only the suites wired into it (BrainBench, which is search-mode
+independent and runs once per sweep); naming `longmemeval` or `replay` in its
+`--suites` exits 1 with `eval_suite_unwired` and these per-suite commands as
+the fix.
 
 ```bash
 # Setup: in your gbrain working tree, with OPENAI_API_KEY + ANTHROPIC_API_KEY exported.
 git rev-parse HEAD  # record the commit for the methodology footer
 
-# Sweep all 3 modes × 2 retrieval-focused suites with seed 42.
-gbrain eval run-all \
-  --modes conservative,balanced,tokenmax \
-  --suites longmemeval,replay \
-  --seed 42 \
-  --limit 500 \
-  --budget-usd-retrieval 5 \
-  --budget-usd-answer 20 \
-  --output docs/eval/results/<version>/
+# LongMemEval, all 3 modes; --record appends each run to the ledger.
+for mode in conservative balanced tokenmax; do
+  gbrain eval longmemeval <dataset.jsonl> --mode "$mode" --limit 500 --record
+done
+
+# Replay captured production queries against each mode (needs a brain with captured queries).
+for mode in conservative balanced tokenmax; do
+  gbrain eval replay --mode "$mode"
+done
+
+# BrainBench (hermetic, mode-independent), recorded once per sweep.
+gbrain eval run-all --seed 42
 
 # Render the comparison.
 gbrain eval compare --md > docs/eval/results/<version>/README.md
 gbrain eval compare --json > docs/eval/results/<version>/comparison.json
 ```
 
-The orchestrator writes per-run records to `<repo>/.gbrain-evals/eval-results.jsonl`. Every record carries: `run_id`, `ran_at`, `suite`, `mode`, `commit`, `seed`, `limit`, `params`, `status`, `duration_ms`. When a release publishes eval numbers, the `--output` dumps under `docs/eval/results/<version>/` carry the raw question-level outputs so a reviewer can re-score with their own metric implementation. **No dumps are committed in the repo right now** — reproduce by running the commands above; determinism (§3) means your re-run matches the reported orderings.
+`gbrain eval longmemeval --record` and `gbrain eval run-all` write per-run records to `<repo>/.gbrain-evals/eval-results.jsonl`. Every record carries: `run_id`, `ran_at`, `suite`, `mode`, `commit`, `seed`, `limit`, `params`, `status`, `duration_ms`. `gbrain eval run-all` exits 1 when a suite's record says `failed`; the record is kept. When a release publishes eval numbers, the dumps under `docs/eval/results/<version>/` carry the raw question-level outputs so a reviewer can re-score with their own metric implementation. **No dumps are committed in the repo right now** — reproduce by running the commands above; determinism (§3) means your re-run matches the reported orderings.
 
 ## 5. Threats to validity
 
@@ -305,7 +312,7 @@ no improvement.
 - The 88% cache hit rate is the high end of what's achievable. Half that is closer to a default agent without cache-aware prompt layout.
 - The "Δ vs tokenmax" math assumes the OTHER cost components (system, tools, history, reasoning) stay constant. In practice, conservative's smaller per-turn payload also leaves more room in the context window for history → which can change agent behavior in either direction.
 
-This anchor + the per-query math both live in this doc on purpose. The per-query framing is what an isolated benchmark would measure (and what `gbrain eval run-all` will produce). The realistic-scale anchor is what an operator actually pays. Both are honest; neither is the whole truth.
+This anchor + the per-query math both live in this doc on purpose. The per-query framing is what an isolated benchmark would measure (and what the per-mode `gbrain eval longmemeval` runs produce). The realistic-scale anchor is what an operator actually pays. Both are honest; neither is the whole truth.
 
 ## Reproducibility footer
 

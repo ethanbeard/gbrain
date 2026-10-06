@@ -1,4 +1,5 @@
 import { ALLOWED_SCOPES } from './scope.ts';
+import { NO_SOURCES } from './source-id.ts';
 
 /**
  * Derive a legacy bearer token's source scope from its stored
@@ -6,8 +7,11 @@ import { ALLOWED_SCOPES } from './scope.ts';
  *
  * ARRAY = federated read grant, exposed through `allowedSources` with the
  * first granted source as the scalar write floor. STRING = scalar source.
- * Missing, empty, or garbage values fail closed to the historical `default`
- * floor and NEVER widen to all sources.
+ * An array with no usable source id is the explicit no-source grant
+ * (`auth rescope-token --sources none`): the `NO_SOURCES` sentinel with an
+ * empty `allowedSources`, which reads, writes and publication all refuse.
+ * Missing or non-array garbage values keep the historical `default` floor.
+ * Nothing here ever widens to all sources.
  */
 export function parseLegacyTokenScope(rawSource: unknown): { sourceId: string; allowedSources?: string[] } {
   if (Array.isArray(rawSource)) {
@@ -15,7 +19,7 @@ export function parseLegacyTokenScope(rawSource: unknown): { sourceId: string; a
     if (allowedSources.length > 0) {
       return { sourceId: allowedSources[0], allowedSources };
     }
-    return { sourceId: 'default' };
+    return { sourceId: NO_SOURCES, allowedSources: [] };
   }
   if (typeof rawSource === 'string' && rawSource.length > 0) {
     return { sourceId: rawSource };

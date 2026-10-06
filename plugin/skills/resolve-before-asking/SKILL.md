@@ -23,6 +23,7 @@ writes_to:
   - people/
   - companies/
 upstream: resolve-before-asking@fc834ee
+when_to_use: "Use when the user asks: \"resolve before asking\", \"before asking the user\", \"unidentified contact\", \"unknown relationship\", \"should I ask who\"."
 ---
 
 # Resolve Before Asking — Exhaust the Brain Before Bothering the User
@@ -255,6 +256,14 @@ acme-example team. Nothing names their role directly.
 ```
 
 After emitting the gate, stop the turn (see ask-user).
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Every lookup comes back empty with a degraded notice: keyword-only search can miss the entity. Say so in the confirmable question instead of asking "who is X?" cold.
+- `get_page` returns `page_not_found` for a guessed slug: try title and alias search before concluding the entity is unknown.
+- Filling a page returns `revision_conflict`: re-read and merge.
 
 ## Anti-Patterns
 

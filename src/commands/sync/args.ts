@@ -9,12 +9,23 @@ import { parseDurationSeconds, parseWorkers } from '../../core/sync-concurrency.
 import { resolveNoEmbed } from '../../core/sync-git.ts';
 import type { SyncOpts } from '../sync.ts';
 import { parseMissingPathMode } from './missing-path.ts';
+import { intFlagValue } from '../../cli/flag-values.ts';
+import { usageError } from '../../cli/cli-error.ts';
 import type { MissingPathMode } from './missing-path.ts';
 
 export function printSyncHelp(): void {
   console.log(`Usage: gbrain sync [options]
 
 Sync the brain repo's text content into the engine, then embed.
+
+A file whose content refuses deterministically (frontmatter gbrain cannot
+read without guessing, a conflicting frontmatter slug, over-size, or a
+content_sanity reject) is held: the rest of the source imports, the
+checkpoint advances, and each hold prints its code, line, key and next
+command. Inspect holds with 'gbrain sources status <id>'; preview the fix
+with 'gbrain repair frontmatter --source <id>'. A source a file blocked
+before this release recovers on its next sync ('--no-pull' on a managed
+brain). 'gbrain config set sync.holds fail' restores fail-closed blocking.
 
 Options:
   --no-embed           Skip the embed step. Use this when the embed
@@ -60,15 +71,34 @@ Options:
                        Caution: imports untracked files as-is — unignored
                        scratch files and secrets included; review 'git status'
                        before enabling, especially as persisted config.
-  --dry-run            Show what would be synced without writing.
-  --skip-failed        Acknowledge previously-recorded sync failures so
-                       the bookmark can advance past unparseable files.
+  --dry-run            Show what would be synced without writing; lists
+                       every file the content screen would hold (would_hold)
+                       and screen errors separately (screen_skipped).
+  --skip-failed        Legacy sync only: acknowledge previously-recorded
+                       sync failures so the bookmark can advance. Held files
+                       never need it; managed sync refuses it.
   --retry-failed       Re-attempt previously-failed files; clear on success.
+                       Not needed for held files, which re-screen on the next
+                       sync when they change (or with 'gbrain sources
+                       retry-held <id>').
   --reset-checkpoint   Connector source only: re-walk its window once from an empty
                        checkpoint; unchanged pages are not admitted again.
   --watch              Re-sync continuously on an interval.
   --interval N         Watch-mode interval in seconds (default 60).
-  --no-pull            Skip 'git pull' before the sync (useful for tests).
+  --no-pull            Skip 'git pull' before the sync. Required on managed
+                       brains: 'gbrain sources refresh <id>' moves the
+                       checkout, and sync catches the index up to it.
+  --no-bulk            Managed Postgres sync: publish one page per transaction
+                       instead of bulk groups (each page keeps its own write
+                       request either way). Persist with
+                       'gbrain config set sync.bulk false' or
+                       GBRAIN_SYNC_BULK=0; tune with sync.bulk_size and
+                       sync.bulk_max_txn_ms.
+  --lanes N            Managed Postgres sync: publish up to N bulk groups at
+                       once (1-8, default 6, capped by the connection pool).
+                       Pages still commit in file order. Persist with
+                       'gbrain config set sync.lanes N' or GBRAIN_SYNC_LANES.
+  --no-lanes           Same as --lanes 1: one bulk group at a time.
   --no-delegate        On a PGLite brain with a live 'gbrain serve', sync
                        normally delegates the run to the serve process over
                        its IPC socket (the lock owner does the work; embeds
@@ -106,23 +136,60 @@ Options:
                        parses cleanly.
                        Exit codes: 0 = all sources ok or skipped,
                        1 = any error, 2 = cost-prompt-not-confirmed.
+                       Managed syncs add outcome (synced | resumable |
+                       blocked), drain and next {command, safe_to_loop,
+                       eta_seconds, why}.
+  --timeout <dur>      Stop the sync after <dur> (per source with --all).
+                       A managed sync drains its whole backlog in one run
+                       until it is done, blocked, or this budget ends;
+                       progress never extends it. A stopped managed drain
+                       is 'resumable' (exit 0): rerun the same command.
+                       See docs/guides/live-sync.md (catching up a large
+                       backlog on managed Postgres).
   --yes                Accept any interactive prompts (CI / non-TTY).
 
 See also:
   gbrain embed --stale    Re-embed all stale chunks (post --no-embed).
   gbrain doctor           Diagnose dim mismatches and other sync issues.
+  gbrain sources status <id>              Held files with their next command.
+  gbrain repair frontmatter --source <id> Preview the fix for held files.
+  docs/guides/repair.md#held-files        Walkthrough.
 `);
 }
 
 /** Flags read before the `--break-lock` branch. */
+/** setTimeout treats delays above 2^31-1 ms as ~1 ms; --interval stays within that bound. */
+const MAX_WATCH_INTERVAL_SECONDS = Math.floor(2_147_483_647 / 1000);
+
+/**
+ * #5988: there is no `sync --retry-held`. Held files re-screen on the next
+ * sync by themselves; `sources retry-held` schedules a re-screen without
+ * running anything, so the refusal names it instead of acting as an alias.
+ */
+function retryHeldRefusal(args: string[]) {
+  const source = args.find((a, i) => args[i - 1] === '--source');
+  return usageError('gbrain sync has no --retry-held flag; held files are re-screened on the next sync, and sources retry-held schedules a re-screen for a source.',
+    `Run gbrain sources retry-held ${source ?? '<source-id>'}, then sync that source again without --retry-held.`, {
+      fix: { argv: ['gbrain', 'sources', 'retry-held', source ?? '<source-id>'], consent: [], actor: 'agent', requires_exclusive: false,
+        ...(source ? {} : { inputs: [{ name: 'source-id', how: 'gbrain sources status lists each source with its held files' }] }),
+        why: 'Most held files re-screen on the next sync by themselves (changed, deleted, or readable by a newer gbrain); retry-held schedules a re-screen of every held file of the source on its next sync and runs nothing now.',
+        verify: { argv: ['gbrain', 'sources', 'status', ...(source ? [source] : []), '--json'] } } });
+}
+
 export function parseSyncFlags(args: string[]) {
+  if (args.includes('--retry-held')) throw retryHeldRefusal(args);
   const repoPath = args.find((a, i) => args[i - 1] === '--repo') || undefined;
   const watch = args.includes('--watch');
-  const intervalStr = args.find((a, i) => args[i - 1] === '--interval');
-  const interval = intervalStr ? parseInt(intervalStr, 10) : 60;
+  // #5931 (D4): timers coerce delays above 2^31-1 ms (and NaN/0) to ~1 ms, so a bad
+  // --interval used to spin the watch loop; it is a usage error (exit 2) instead.
+  const intervalAt = args.indexOf('--interval');
+  const interval = intervalAt === -1 ? 60 : intFlagValue(args[intervalAt + 1], '--interval', { min: 1, max: MAX_WATCH_INTERVAL_SECONDS, example: 60 });
   const dryRun = args.includes('--dry-run');
   const full = args.includes('--full');
   const noPull = args.includes('--no-pull');
+  const noBulk = args.includes('--no-bulk');
+  const lanesAt = args.indexOf('--lanes');
+  const lanes = args.includes('--no-lanes') ? 1 : lanesAt === -1 ? undefined : intFlagValue(args[lanesAt + 1], '--lanes', { min: 1, max: 8, example: 4 });
   let noEmbed = resolveNoEmbed(args, loadConfig());
   const noExtract = args.includes('--no-extract'); // v0.42.7 #1696
   const skipFailed = args.includes('--skip-failed');
@@ -181,7 +248,7 @@ export function parseSyncFlags(args: string[]) {
     console.error(`--max-age cannot be combined with --force-break-lock (force skips all guards).`);
     process.exit(1);
   }
-  return { repoPath, watch, interval, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack, explicitProcessing, includeGitignored, workingTree, syncAll, missingPathMode, jsonOut, yesFlag, breakLock, forceBreakLock, maxAgeSeconds };
+  return { repoPath, watch, interval, dryRun, full, noPull, noBulk, lanes, noEmbed, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack, explicitProcessing, includeGitignored, workingTree, syncAll, missingPathMode, jsonOut, yesFlag, breakLock, forceBreakLock, maxAgeSeconds };
 }
 
 export type SyncFlags = ReturnType<typeof parseSyncFlags>;

@@ -24,6 +24,7 @@
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult } from '../types.ts';
 import { currentTextProjectionFilter } from './safe-chunks.ts';
+import { readEdgeResolution } from '../chunkers/symbol-resolver.ts';
 
 const MAX_WALK_DEPTH = 2;
 const NEIGHBOR_CAP_PER_HOP = 50;
@@ -129,14 +130,25 @@ export async function expandAnchors(
         continue;
       }
 
-      // Two kinds of neighbors to visit:
+      // Three kinds of neighbors to visit:
       //   1. Resolved edges with to_chunk_id: direct chunk follow.
-      //   2. Unresolved edges (code_edges_symbol): resolve by
+      //   2. Symbol edges the within-file resolver already answered:
+      //      follow the resolved chunk_id / ambiguous candidates directly
+      //      (same page as the caller). The name lookup below would pull
+      //      in EVERY file defining the symbol, the aliasing the resolver
+      //      exists to prevent.
+      //   3. Genuinely unresolved edges: resolve by
       //      symbol_name_qualified = to_symbol_qualified, then follow.
       const directChunkIds: number[] = [];
       const unresolvedTargets: string[] = [];
       for (const e of edges) {
-        if (e.to_chunk_id != null) directChunkIds.push(e.to_chunk_id);
+        if (e.to_chunk_id != null) {
+          directChunkIds.push(e.to_chunk_id);
+          continue;
+        }
+        const res = readEdgeResolution(e.edge_metadata);
+        if (res.kind === 'resolved') directChunkIds.push(res.chunk_id);
+        else if (res.kind === 'ambiguous') directChunkIds.push(...res.candidate_chunk_ids);
         else if (e.to_symbol_qualified) unresolvedTargets.push(e.to_symbol_qualified);
       }
       // Resolve unresolved edges by looking up chunks whose

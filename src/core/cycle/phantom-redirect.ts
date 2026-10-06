@@ -58,6 +58,7 @@ import { logPhantomEvent, type PhantomOutcome } from '../facts/phantom-audit.ts'
 import { MOVE_WITHDRAWAL_SUBJECT_SQL } from '../facts/withdrawal-schema.ts';
 import { resolvePageWriteTarget } from '../write-through.ts';
 import { recordRenameAlias } from '../page-state/rename-alias.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 
 /** Tagged-union outcome of a single phantom-redirect attempt. */
@@ -302,7 +303,7 @@ async function migratePhantomFacts(
   canonicalSlug: string,
   rowMap: ReadonlyMap<number, number>,
 ): Promise<number> {
-  return engine.transaction(tx => movePhantomFacts(tx, sourceId, phantomSlug, canonicalSlug, rowMap));
+  return maintenanceTransaction(engine, tx => movePhantomFacts(tx, sourceId, phantomSlug, canonicalSlug, rowMap));
 }
 
 /** The body of migratePhantomFacts inside the caller's transaction. */
@@ -492,7 +493,7 @@ export async function tryRedirectPhantom(
   }
 
   // Codex #1: phantom-specific resolver bypasses exact-self-match.
-  const canonical = await resolvePhantomCanonical(engine, sourceId, page.slug);
+  const canonical = await resolvePhantomCanonical(engine, sourceId, page.slug, { type: page.type });
   if (!canonical) {
     logPhantomEvent({
       phantom_slug: page.slug,
@@ -578,13 +579,13 @@ export async function tryRedirectPhantom(
     frontmatter: reparsed.frontmatter,
     tags: canonicalTags,
   });
-  await engine.refreshPageBody(
+  await maintenanceTransaction(engine, tx => tx.refreshPageBody(
     canonical,
     sourceId,
     reparsed.compiled_truth,
     reparsed.timeline,
     newContentHash,
-  );
+  ));
 
   // Withdrawals are scoped to the entity; the phantom was the canonical
   // entity. Moved first, so the withdrawal trigger honors them as the
@@ -599,7 +600,7 @@ export async function tryRedirectPhantom(
   // Round 19/20: soft-delete + unlink. Order matters — softDelete first
   // so a concurrent sync that observes the phantom .md gone treats it as
   // a normal deletion (not a regression).
-  await engine.softDeletePage(page.slug, { sourceId });
+  await maintenanceTransaction(engine, tx => tx.softDeletePage(page.slug, { sourceId }));
   const phantomPath = path.join(brainDir, `${page.slug}.md`);
   if (fs.existsSync(phantomPath)) {
     try {

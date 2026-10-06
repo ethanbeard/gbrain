@@ -37,6 +37,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /**
  * Round identifier. Matches the progressive-batch primitive's Stage
@@ -208,7 +209,7 @@ export async function writeReceipt(
   const frontmatter = buildReceiptFrontmatter(input);
   const compiled_truth = buildReceiptBody(input);
 
-  const page = await engine.putPage(
+  const page = await maintenanceTransaction(engine, tx => tx.putPage(
     slug,
     {
       type: 'extract_receipt',
@@ -217,7 +218,7 @@ export async function writeReceipt(
       frontmatter,
     },
     { sourceId: input.source_id },
-  );
+  ));
 
   // #4009: receipts are audit artifacts — deliberately never run through
   // the contextual-retrieval ladder. Born with a NULL

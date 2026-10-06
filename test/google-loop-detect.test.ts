@@ -13,7 +13,9 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  asksQuestion,
   detectThreadLoop,
+  isAcknowledgementOnly,
   INBOUND_GRACE_HOURS,
   OUTBOUND_GRACE_HOURS,
   type ThreadLoopVerdict,
@@ -539,6 +541,82 @@ describe('detectThreadLoop precision corpus', () => {
       NOW,
     );
     expect(verdict.open[0].evidence[0].quote?.length).toBe(200);
+  });
+});
+
+// gbrain-evals N7 (2026-10-02 receipt, repros n7-2, n7-6, n7-7).
+describe('N7 open-loops wave regressions', () => {
+  test('N7-7: a question mark inside a link is not an ask', () => {
+    expect(asksQuestion('FYI, the doc: https://docs.example.com/view?id=42')).toBe(false);
+    expect(asksQuestion('See www.example.com/a?b=c for details.')).toBe(false);
+    expect(asksQuestion('Can you check https://docs.example.com/view?id=42 ?')).toBe(true);
+    const v = detectThreadLoop(
+      thread([msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'FYI, the doc: https://docs.example.com/view?id=42' })]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+  });
+
+  test('N7-2: "Thanks!" to a question neither closes nor restarts the reply-owed loop', () => {
+    const ask = msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' });
+    const v = detectThreadLoop(
+      thread([ask, msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' })]),
+      MY,
+      NOW,
+    );
+    expect(v.close).not.toContain('unanswered_inbound');
+    expect(v.open).toHaveLength(1);
+    expect(v.open[0].loopType).toBe('unanswered_inbound');
+    expect(v.open[0].openedMs).toBe(ask.internalDateMs);
+  });
+
+  test('N7-2: an acknowledgement of a message that asked nothing is still a reply', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Here is the deck.' }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks!' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('N7-2: a substantive reply still closes', () => {
+    const v = detectThreadLoop(
+      thread([
+        msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 40, body: 'Can you send the deck?' }),
+        msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 30, sent: true, body: 'Thanks! Attached is the deck.' }),
+      ]),
+      MY,
+      NOW,
+    );
+    expect(v.open).toEqual([]);
+    expect(v.close).toEqual(['unanswered_inbound']);
+  });
+
+  test('acknowledgement detection is narrow', () => {
+    for (const t of ['Thanks!', 'thank you', 'Got it, thanks.', 'Thanks, Bob!', 'ok']) expect(isAcknowledgementOnly(t)).toBe(true);
+    for (const t of ['Yes', 'No, not this week.', 'Thanks! Attached.', 'Thanks, sending it tomorrow.', 'Will do.', '']) expect(isAcknowledgementOnly(t)).toBe(false);
+  });
+
+  test('N7-6: the loop opens at the oldest message that carries the obligation', () => {
+    const first = msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 720, body: 'Can you review this?' });
+    const v = detectThreadLoop(
+      thread([first, msg({ from: 'bob@example.com', to: ['me@example.com'], ageHours: 30, body: 'Bumping this.' })]),
+      MY,
+      NOW,
+    );
+    expect(v.open[0].openedMs).toBe(first.internalDateMs);
+    const ask = msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 200, sent: true, body: 'Can you review?' });
+    const out = detectThreadLoop(
+      thread([ask, msg({ from: 'me@example.com', to: ['bob@example.com'], ageHours: 100, sent: true, body: 'Any news?' })]),
+      MY,
+      NOW,
+    );
+    expect(out.open[0].openedMs).toBe(ask.internalDateMs);
   });
 });
 

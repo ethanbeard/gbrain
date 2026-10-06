@@ -56,6 +56,7 @@ fail=0
 if [ ! -d "$TDIR" ]; then
   echo "SKIP: templates/bootstrap/ absent — nothing to check yet"
   echo "check-bootstrap-templates: ok (skipped)"
+  echo "GBRAIN_CHECK_SKIPPED: templates/bootstrap/ absent"
   exit 0
 fi
 

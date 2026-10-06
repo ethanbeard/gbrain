@@ -89,6 +89,8 @@ export const BATCH_AUDIT_SITES = [
   'extract.by_mention',
   // #3674: --rebuild reconciling delete-then-insert of the mention scan's rows.
   'extract.by_mention.rebuild',
+  // Entity mention index: the stale sweep's reconciling mention pass.
+  'extract.mentions',
   // v0.42.7 (#1696): extract --stale incremental sweep.
   'extract.stale',
   // #3961: atom-provenance edges banked after the completion-receipt flip.

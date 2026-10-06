@@ -14,18 +14,22 @@ import { localHostId, registerLocalWriter } from '../../src/core/persistence/ide
 import { claimNextWrite, compactWriteReceipts } from '../../src/core/persistence/journal.ts';
 import { publishMutation } from '../../src/core/persistence/coordinator.ts';
 import { withCoordinatedWrite } from '../../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './write-attribution.ts';
 import { declarePersistenceProtocol } from '../../src/core/persistence/protocol.ts';
 import { prepareManagedFactsMutation } from '../../src/core/persistence/facts-prepare.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { runPersistenceEffects } from '../../src/core/persistence/effects.ts';
 import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { withEnv } from './with-env.ts';
+import { testWaitMs } from './wait-for.ts';
+import { __setMaintenanceWriteWaitForTests } from '../../src/core/persistence/maintenance-wait.ts';
 
 export const factCompactionCases = ['explicit_failed', 'derived_failed', 'explicit_partial', 'derived_partial', 'explicit_success', 'derived_success'] as const;
 type Case = typeof factCompactionCases[number];
 
 export async function exerciseFactCompaction(engine: BrainEngine, scenario: Case): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-fact-compaction-'));
+  const restoreWait = __setMaintenanceWriteWaitForTests(testWaitMs(250));
   try {
     await withEnv({ GBRAIN_HOME: home }, async () => {
       const sourceId = `compact-${randomUUID()}`;
@@ -84,7 +88,7 @@ export async function exerciseFactCompaction(engine: BrainEngine, scenario: Case
         const shouldConflict = i < 2 && (scenario.endsWith('_failed') || scenario.endsWith('_partial') && i === 1);
         if (shouldConflict) await engine.transaction(async tx => {
           await declarePersistenceProtocol(tx);
-          await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('UPDATE pages SET knowledge_revision=gen_random_uuid() WHERE source_id=$1 AND slug=$2', [sourceId, row.slug]));
+          await withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('UPDATE pages SET knowledge_revision=gen_random_uuid() WHERE source_id=$1 AND slug=$2', [sourceId, row.slug]), TEST_WRITE_ATTRIBUTION);
         });
         const done = await publishMutation(engine, row, prepared, localHostId());
         expect(done.state).toBe(shouldConflict || i === 2 && !scenario.endsWith('_success') ? 'conflict' : 'committed');
@@ -122,6 +126,7 @@ export async function exerciseFactCompaction(engine: BrainEngine, scenario: Case
       expect(await engine.executeRaw("SELECT id,state,outcome,error_code FROM persistence_requests WHERE source_id=$1 AND operation='extract_facts' ORDER BY sequence", [sourceId])).toEqual(terminal);
     });
   } finally {
+    restoreWait();
     await disposePersistenceConsumer(engine);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
     __setChatTransportForTests(null); __setEmbedTransportForTests(null); resetGateway();

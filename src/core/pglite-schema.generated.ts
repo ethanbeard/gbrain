@@ -129,6 +129,7 @@ CREATE TRIGGER bump_page_generation_clock_trg
 CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_pages_slug_basename ON pages (source_id, (regexp_replace(slug, '^.*/', '')));
 CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
 CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
   ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
@@ -185,6 +186,7 @@ CREATE TABLE IF NOT EXISTS links (
   origin_field   TEXT,
   resolution_type TEXT   CHECK (resolution_type IS NULL OR resolution_type IN ('qualified', 'unqualified')),
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  assertion_tense TEXT   CONSTRAINT links_assertion_tense_check CHECK (assertion_tense IS NULL OR assertion_tense IN ('present', 'past')),
   CONSTRAINT links_from_to_type_source_origin_unique
     UNIQUE NULLS NOT DISTINCT (from_page_id, to_page_id, link_type, link_source, origin_page_id)
 );
@@ -196,6 +198,24 @@ CREATE INDEX IF NOT EXISTS idx_links_origin ON links(origin_page_id);
 CREATE OR REPLACE VIEW page_links AS
   SELECT id, from_page_id, to_page_id FROM links;
 
+
+CREATE TABLE IF NOT EXISTS wanted_links (
+  id               BIGSERIAL PRIMARY KEY,
+  origin_page_id   INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  source_id        TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  producer         TEXT NOT NULL CHECK (producer IN ('body','frontmatter')),
+  ref_kind         TEXT NOT NULL CHECK (ref_kind IN ('slug','name')),
+  target_source_id TEXT NOT NULL,
+  target_ref       TEXT NOT NULL,
+  link_type        TEXT NOT NULL DEFAULT '',
+  context          TEXT NOT NULL DEFAULT '',
+  checked_at       TIMESTAMPTZ NOT NULL,
+  first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT wanted_links_reference_unique
+    UNIQUE (origin_page_id, producer, ref_kind, target_source_id, target_ref)
+);
+CREATE INDEX IF NOT EXISTS wanted_links_target_idx ON wanted_links (target_source_id, target_ref);
+CREATE INDEX IF NOT EXISTS wanted_links_source_idx ON wanted_links (source_id);
 
 CREATE TABLE IF NOT EXISTS tags (
   id      SERIAL PRIMARY KEY,
@@ -324,7 +344,9 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   grant_profile           TEXT NULL,
   grant_revision          INTEGER NOT NULL DEFAULT 0,
   grant_repair_reasons    TEXT[] NOT NULL DEFAULT '{}',
-  created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source_grant            TEXT NULL CHECK (source_grant IN ('none')),
+  takes_holders           TEXT[] NULL
 );
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
   ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
@@ -393,6 +415,8 @@ CREATE TABLE IF NOT EXISTS op_checkpoints (
 );
 CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
   ON op_checkpoints (updated_at);
+CREATE INDEX IF NOT EXISTS op_checkpoints_sync_hold_page_idx
+  ON op_checkpoints ((completed_keys->0->>'page_id')) WHERE op = 'sync-hold';
 
 CREATE TABLE IF NOT EXISTS op_checkpoint_paths (
   op          TEXT NOT NULL,
@@ -421,6 +445,55 @@ CREATE INDEX IF NOT EXISTS context_volunteer_events_src_time_idx
 CREATE INDEX IF NOT EXISTS context_volunteer_events_src_slug_idx
   ON context_volunteer_events (source_id, slug);
 
+CREATE TABLE IF NOT EXISTS retrieval_events (
+  id          TEXT PRIMARY KEY,
+  client_id   TEXT NOT NULL DEFAULT 'local',
+  op          TEXT NOT NULL CHECK (op IN ('query','search','think','synthesize','recall')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS retrieval_events_time_idx ON retrieval_events (created_at);
+CREATE TABLE IF NOT EXISTS retrieval_event_pages (
+  event_id      TEXT NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+  source_id     TEXT NOT NULL,
+  slug          TEXT NOT NULL,
+  content_hash  TEXT,
+  rank          INTEGER NOT NULL,
+  cited         BOOLEAN NOT NULL DEFAULT false,
+  PRIMARY KEY (event_id, source_id, slug)
+);
+CREATE TABLE IF NOT EXISTS retrieval_event_links (
+  event_id   TEXT NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+  source_id  TEXT NOT NULL,
+  edge_key   TEXT NOT NULL,
+  to_slug    TEXT NOT NULL,
+  PRIMARY KEY (event_id, source_id, edge_key, to_slug)
+);
+CREATE TABLE IF NOT EXISTS retrieval_feedback (
+  event_id       TEXT NOT NULL REFERENCES retrieval_events(id) ON DELETE CASCADE,
+  signal         TEXT NOT NULL CHECK (signal IN ('explicit','cited')),
+  element_kind   TEXT NOT NULL CHECK (element_kind IN ('page','link')),
+  source_id      TEXT NOT NULL,
+  element_key    TEXT NOT NULL,
+  client_id      TEXT NOT NULL DEFAULT 'local',
+  rating         SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  weight_before  REAL NOT NULL,
+  weight_after   REAL NOT NULL,
+  applied_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (event_id, signal, element_kind, source_id, element_key)
+);
+CREATE INDEX IF NOT EXISTS retrieval_feedback_client_time_idx
+  ON retrieval_feedback (client_id, applied_at DESC);
+CREATE TABLE IF NOT EXISTS retrieval_weights (
+  source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  element_kind  TEXT NOT NULL CHECK (element_kind IN ('page','link')),
+  element_key   TEXT NOT NULL,
+  weight        REAL NOT NULL DEFAULT 0.5 CHECK (weight >= 0 AND weight <= 1),
+  content_hash  TEXT,
+  updates       INTEGER NOT NULL DEFAULT 0,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, element_kind, element_key)
+);
+
 CREATE TABLE IF NOT EXISTS session_context_state (
   source_id           TEXT NOT NULL,
   client_id           TEXT NOT NULL DEFAULT 'local',
@@ -430,6 +503,9 @@ CREATE TABLE IF NOT EXISTS session_context_state (
   checkpoint_manifest JSONB NOT NULL DEFAULT '[]'::jsonb,
   last_wake_at        TIMESTAMPTZ,
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  facts_cursor_at     TIMESTAMPTZ,
+  facts_cursor_id     BIGINT,
+  degraded_wakes      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (source_id, client_id, session_id)
 );
 CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
@@ -983,6 +1059,9 @@ BEGIN
     IF NEW.submission_authority IS NULL OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation + 1 THEN
       RAISE EXCEPTION 'Minion queue protocol 1 required: old workers cannot claim upgraded queue jobs';
     END IF;
+    IF NEW.spend_authorization IS NOT NULL AND NEW.spend_claim_token IS DISTINCT FROM NEW.claim_generation THEN
+      RAISE EXCEPTION 'Minion spend protocol 1 required: only upgraded workers can claim spend-authorized jobs; restart workers on the upgraded binary';
+    END IF;
   ELSIF NEW.claim_generation IS DISTINCT FROM OLD.claim_generation THEN
     RAISE EXCEPTION 'Minion queue claim generation may advance only with a claim';
   END IF;
@@ -994,9 +1073,31 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
   FOR EACH ROW EXECUTE FUNCTION enforce_minion_queue_protocol();
 
 -- Canonical page state (migration 150).
-ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID NOT NULL DEFAULT gen_random_uuid();
+DO \$do\$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attisdropped) THEN
+      ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND atthasdef) THEN
+      ALTER TABLE sources ALTER COLUMN incarnation SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attnotnull) THEN
+      UPDATE sources SET incarnation = gen_random_uuid() WHERE incarnation IS NULL;
+      ALTER TABLE sources ALTER COLUMN incarnation SET NOT NULL;
+    END IF;
+  END \$do\$;
 CREATE UNIQUE INDEX IF NOT EXISTS sources_incarnation_key ON sources(incarnation);
-ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID NOT NULL DEFAULT gen_random_uuid();
+DO \$do\$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attisdropped) THEN
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND atthasdef) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attnotnull)
+       AND NOT EXISTS (SELECT 1 FROM pages) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET NOT NULL;
+    END IF;
+  END \$do\$;
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS text_projection_revision UUID;
 ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS knowledge_revision UUID;
 ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS timeline TEXT;
@@ -1009,8 +1110,13 @@ CREATE TABLE IF NOT EXISTS page_write_guards (
     slug TEXT NOT NULL,
     PRIMARY KEY (source_incarnation, slug)
   );
-CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
     BEGIN
+      IF OLD.knowledge_revision IS NULL THEN
+        NEW.knowledge_revision := COALESCE(NEW.knowledge_revision, gen_random_uuid());
+        NEW.text_projection_revision := NULL;
+        RETURN NEW;
+      END IF;
       IF (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.compiled_truth,
           NEW.timeline, NEW.frontmatter, NEW.deleted_at)
          IS DISTINCT FROM
@@ -1033,7 +1139,7 @@ CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUA
 DROP TRIGGER IF EXISTS pages_knowledge_revision ON pages;
 CREATE TRIGGER pages_knowledge_revision BEFORE UPDATE ON pages
     FOR EACH ROW EXECUTE FUNCTION gbrain_advance_page_revision();
-CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
     BEGIN
       IF TG_OP = 'UPDATE' AND (NEW.page_id, NEW.tag) IS NOT DISTINCT FROM (OLD.page_id, OLD.tag) THEN
         RETURN NULL;
@@ -1062,6 +1168,40 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
   ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+CREATE TABLE IF NOT EXISTS chronicle_page_state (
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL,
+  extractor_version INTEGER NOT NULL,
+  slug TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending','skipped','extracted','failed')),
+  reason TEXT,
+  trigger TEXT NOT NULL CHECK (trigger IN ('auto','backfill')),
+  principal_kind TEXT,
+  principal_id TEXT,
+  request_id UUID,
+  no_extract BOOLEAN NOT NULL DEFAULT false,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at TIMESTAMPTZ,
+  cost_usd NUMERIC,
+  unpriced BOOLEAN NOT NULL DEFAULT false,
+  event_slugs TEXT[] NOT NULL DEFAULT '{}',
+  event_hashes TEXT[] NOT NULL DEFAULT '{}',
+  decided_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, page_id, content_hash, extractor_version)
+);
+CREATE INDEX IF NOT EXISTS chronicle_page_state_work_idx
+  ON chronicle_page_state (source_id, state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS chronicle_page_state_page_idx ON chronicle_page_state (page_id);
+CREATE TABLE IF NOT EXISTS chronicle_judge_reservations (
+  id BIGSERIAL PRIMARY KEY,
+  reserved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source_id TEXT NOT NULL,
+  page_id INTEGER NOT NULL,
+  content_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chronicle_judge_reservations_at_idx ON chronicle_judge_reservations (reserved_at);
 CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
   source_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
@@ -1174,7 +1314,7 @@ CREATE TABLE IF NOT EXISTS persistence_effects (
     UNIQUE(request_id,kind)
   );
 
-CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
 DECLARE target_source text; old_source text; row_data jsonb; old_data jsonb; allowed jsonb;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM persistence_brain WHERE singleton=1 AND enabled) THEN
@@ -1193,37 +1333,46 @@ BEGIN
         IS NOT DISTINCT FROM (OLD.last_commit,OLD.last_sync_at,OLD.newest_content_at) THEN RETURN NEW; END IF;
       allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
       IF NOT (allowed ? NEW.id) THEN
-        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source checkpoints require canonical owner publication';
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source checkpoints require canonical owner publication',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:checkpoint',
+          DETAIL=jsonb_build_object('op',TG_OP,'relationship','checkpoint_outside_owner','target_source',NEW.id,'old_source',OLD.id,'allowed',allowed)::text;
       END IF;
       RETURN NEW;
     END IF;
     IF COALESCE(current_setting('gbrain.topology_change',true),'') <> 'on' THEN
-      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source topology must be drained and changed through writer administration';
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source topology must be drained and changed through writer administration',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:topology',
+        DETAIL=jsonb_build_object('op',TG_OP,'relationship','topology_outside_administration','target_source',row_data->>'id','old_source',old_data->>'id')::text;
     END IF;
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME IN ('facts','takes') AND TG_OP='UPDATE' THEN
-    IF TG_TABLE_NAME='facts' THEN
-      row_data := row_data - ARRAY['embedding_model','embedded_text_hash'];
-      old_data := old_data - ARRAY['embedding_model','embedded_text_hash'];
-    END IF;
-    -- Embedding completion and retrieval telemetry are physical projections.
+    row_data := row_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    old_data := old_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    -- Embedding completion, retrieval telemetry and write attribution
+    -- (attribution-schema.ts; a journal backfill fills it) are physical projections.
     IF (row_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at'])
       = (old_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at']) THEN RETURN NEW; END IF;
   END IF;
-  IF row_data ? 'source_id' THEN target_source := row_data->>'source_id';
-  ELSE SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer; END IF;
-  IF TG_OP='UPDATE' THEN
-    IF old_data ? 'source_id' THEN old_source := old_data->>'source_id';
-    ELSE SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer; END IF;
+  IF TG_TABLE_NAME NOT IN ('tags','timeline_entries','takes') THEN
+    target_source := row_data->>'source_id'; old_source := old_data->>'source_id';
+  END IF;
+  IF target_source IS NULL THEN SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer; END IF;
+  IF TG_OP='UPDATE' AND old_source IS NULL THEN
+    SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer;
   END IF;
   -- Cascaded projection removal after the already-guarded parent deletion.
   IF target_source IS NULL AND TG_OP='DELETE' THEN RETURN OLD; END IF;
   allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
   IF target_source IS NULL OR NOT (allowed ? target_source) OR (old_source IS NOT NULL AND NOT (allowed ? old_source)) THEN
-    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: canonical writer must use the persistence coordinator';
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: canonical writer must use the persistence coordinator',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:allowlist',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship',CASE WHEN target_source IS NULL THEN 'missing_source'
+        WHEN NOT (allowed ? target_source) THEN 'different_source' ELSE 'old_source_outside' END,
+        'target_source',target_source,'old_source',old_source,'allowed',allowed)::text;
   END IF;
   IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END \$fn\$;
+
 DO \$body\$
 DECLARE target text;
 BEGIN
@@ -1247,7 +1396,7 @@ CREATE TABLE IF NOT EXISTS page_projection_jobs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY(source_incarnation,slug)
   );
-CREATE OR REPLACE FUNCTION gbrain_queue_page_projection() RETURNS trigger LANGUAGE plpgsql AS \$fn\$
+CREATE OR REPLACE FUNCTION gbrain_queue_page_projection() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$fn\$
     DECLARE incarnation UUID;
     BEGIN
       IF TG_OP='DELETE' THEN
@@ -1295,6 +1444,27 @@ CREATE TABLE IF NOT EXISTS persistence_topology_changes (
 );
 ALTER TABLE persistence_topology_changes ADD COLUMN IF NOT EXISTS intent_bytes bigint NOT NULL DEFAULT 0 CHECK(intent_bytes>=0);
 CREATE INDEX IF NOT EXISTS persistence_topology_recovering ON persistence_topology_changes(created_at) WHERE state='recovering';
+
+CREATE TABLE IF NOT EXISTS persistence_worktree_refreshes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  worktree_id uuid NOT NULL REFERENCES persistence_worktrees(id),
+  source_ids text[] NOT NULL,
+  principal_id uuid NOT NULL,
+  owner_epoch bigint NOT NULL,
+  topology_generation bigint NOT NULL,
+  state text NOT NULL CHECK (state IN ('draining','fenced','merged','syncing','completed','aborted','recovery_required')),
+  old_head text NOT NULL,
+  target_head text NOT NULL,
+  upstream_ref text NOT NULL,
+  preserved_uncommitted text[] NOT NULL DEFAULT '{}',
+  outcome jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS persistence_worktree_refreshes_active
+  ON persistence_worktree_refreshes(worktree_id)
+  WHERE state IN ('draining','fenced','merged','syncing','recovery_required');
 
 CREATE TABLE IF NOT EXISTS source_ingestion_receipts (
   id uuid PRIMARY KEY,
@@ -1425,13 +1595,13 @@ CREATE TABLE IF NOT EXISTS persistence_writer_protocols (
     registered_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY(worktree_id,host_id)
   );
-CREATE OR REPLACE FUNCTION gbrain_require_persistence_protocol(required integer) RETURNS void LANGUAGE plpgsql AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_require_persistence_protocol(required integer) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
   BEGIN
     IF required >= 2 AND COALESCE(current_setting('gbrain.persistence_protocol',true),'') <> '2' THEN
       RAISE EXCEPTION 'writer_upgrade_required: this mutation requires persistence protocol 2' USING ERRCODE='42501';
     END IF;
   END \$\$;
-CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGUAGE plpgsql AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
   DECLARE target text; version integer; floor integer; active boolean; record jsonb;
   BEGIN
     IF TG_OP='DELETE' THEN target:=OLD.target_kind; version:=OLD.protocol_version;
@@ -1471,7 +1641,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_request_protocol() RETURNS trigger LANGU
 DROP TRIGGER IF EXISTS gbrain_request_protocol ON persistence_requests;
 CREATE TRIGGER gbrain_request_protocol BEFORE INSERT OR UPDATE OR DELETE ON persistence_requests
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_request_protocol();
-CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUAGE plpgsql AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
   DECLARE floor integer;
   BEGIN
     SELECT writer_protocol_floor INTO floor FROM persistence_brain WHERE singleton=1 FOR SHARE;
@@ -1482,7 +1652,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_effect_protocol() RETURNS trigger LANGUA
 DROP TRIGGER IF EXISTS gbrain_effect_protocol ON persistence_effects;
 CREATE TRIGGER gbrain_effect_protocol BEFORE INSERT OR UPDATE OR DELETE ON persistence_effects
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_effect_protocol();
-CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LANGUAGE plpgsql AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
   BEGIN
     IF NEW.writer_protocol_floor<OLD.writer_protocol_floor THEN
       RAISE EXCEPTION 'writer_upgrade_required: the protocol floor cannot be lowered' USING ERRCODE='42501';
@@ -1505,7 +1675,7 @@ CREATE OR REPLACE FUNCTION gbrain_guard_protocol_activation() RETURNS trigger LA
 DROP TRIGGER IF EXISTS gbrain_protocol_activation ON persistence_brain;
 CREATE TRIGGER gbrain_protocol_activation BEFORE UPDATE ON persistence_brain
     FOR EACH ROW EXECUTE FUNCTION gbrain_guard_protocol_activation();
-CREATE OR REPLACE FUNCTION gbrain_guard_skill_publication() RETURNS trigger LANGUAGE plpgsql AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_guard_skill_publication() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
   DECLARE permitted jsonb;
   BEGIN
     PERFORM gbrain_require_persistence_protocol(2);
@@ -1531,7 +1701,7 @@ CREATE TRIGGER gbrain_skill_publication BEFORE INSERT OR UPDATE OR DELETE ON sha
 DROP TRIGGER IF EXISTS gbrain_skill_publication ON shared_skill_revisions;
 CREATE TRIGGER gbrain_skill_publication BEFORE INSERT OR UPDATE OR DELETE ON shared_skill_revisions
       FOR EACH ROW EXECUTE FUNCTION gbrain_guard_skill_publication();
-CREATE OR REPLACE FUNCTION gbrain_lease_shared_skill_delivery() RETURNS trigger LANGUAGE plpgsql AS \$\$
+CREATE OR REPLACE FUNCTION gbrain_lease_shared_skill_delivery() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS \$\$
   DECLARE item text; found_revision shared_skill_revisions%ROWTYPE; brain text;
   BEGIN
     SELECT brain_id::text INTO brain FROM persistence_brain WHERE singleton=1;
@@ -1713,6 +1883,49 @@ DO \$rls\$ BEGIN
   END IF;
 END \$rls\$;
 
+CREATE TABLE IF NOT EXISTS decide_review_queue (
+  kind            TEXT NOT NULL,
+  source_id       TEXT NOT NULL,
+  a_ref           TEXT NOT NULL,
+  b_ref           TEXT NOT NULL DEFAULT '*',
+  evidence        TEXT,
+  reason          TEXT NOT NULL DEFAULT 'queued',
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (kind, source_id, a_ref, b_ref)
+);
+CREATE TABLE IF NOT EXISTS decide_review_proposals (
+  id               BIGSERIAL PRIMARY KEY,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  kind             TEXT NOT NULL,
+  source_id        TEXT NOT NULL,
+  sweep_id         TEXT NOT NULL,
+  a_ref            TEXT NOT NULL,
+  b_ref            TEXT NOT NULL,
+  subject          TEXT NOT NULL DEFAULT '*',
+  visibility       TEXT,
+  p_action         REAL NOT NULL,
+  threshold        REAL,
+  model_resolved   TEXT,
+  question_version TEXT,
+  status           TEXT NOT NULL DEFAULT 'pending',
+  decided_at       TIMESTAMPTZ,
+  receipt          TEXT,
+  UNIQUE (kind, source_id, a_ref, b_ref, subject)
+);
+CREATE INDEX IF NOT EXISTS decide_review_proposals_status_idx ON decide_review_proposals (status, created_at);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE decide_review_queue ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE decide_review_proposals ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+
 -- gbrain facts relink attempts and journal (#5836).
 CREATE TABLE IF NOT EXISTS fact_relink_attempts (
   source_id       TEXT NOT NULL,
@@ -1732,6 +1945,109 @@ DO \$rls\$ BEGIN
     ALTER TABLE fact_relink_attempts ENABLE ROW LEVEL SECURITY;
   END IF;
 END \$rls\$;
+
+-- Temporal typed edges: dated evidence, derived relationship state, proposals.
+CREATE TABLE IF NOT EXISTS link_transitions (
+  id              BIGSERIAL PRIMARY KEY,
+  source_id       TEXT NOT NULL,
+  from_page_id    INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  to_page_id      INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  link_type       TEXT NOT NULL,
+  kind            TEXT NOT NULL CHECK (kind IN ('start','end')),
+  occurred_on     DATE NOT NULL,
+  date_precision  TEXT NOT NULL DEFAULT 'day' CHECK (date_precision IN ('day','month','year')),
+  producer        TEXT NOT NULL CHECK (producer IN ('timeline','explicit','frontmatter','manual','inline','dream')),
+  origin_page_id  INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+  line_hash       TEXT NOT NULL DEFAULT '',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS link_transitions_identity_idx
+  ON link_transitions (origin_page_id, from_page_id, to_page_id, link_type, kind, occurred_on, producer) NULLS NOT DISTINCT;
+CREATE INDEX IF NOT EXISTS link_transitions_relationship_idx ON link_transitions (from_page_id, to_page_id, link_type);
+CREATE INDEX IF NOT EXISTS link_transitions_origin_idx ON link_transitions (origin_page_id);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE link_transitions ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+CREATE TABLE IF NOT EXISTS link_relationships (
+  from_page_id    INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  to_page_id      INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  link_type       TEXT NOT NULL,
+  scope           TEXT NOT NULL CHECK (scope IN ('all','world')),
+  source_id       TEXT NOT NULL,
+  semantics       TEXT NOT NULL CHECK (semantics IN ('state','event')),
+  valid_ranges    DATEMULTIRANGE NOT NULL,
+  status_now      TEXT NOT NULL CHECK (status_now IN ('live','ended','ended_unknown_date','not_started','disputed','event')),
+  first_start     DATE,
+  last_start      DATE,
+  last_end        DATE,
+  undated_present INTEGER NOT NULL DEFAULT 0,
+  undated_past    INTEGER NOT NULL DEFAULT 0,
+  disputed        BOOLEAN NOT NULL DEFAULT false,
+  recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  retired_at      TIMESTAMPTZ,
+  evidence_hash   TEXT NOT NULL,
+  refreshed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (from_page_id, to_page_id, link_type, scope)
+);
+CREATE INDEX IF NOT EXISTS link_relationships_to_idx ON link_relationships (to_page_id, link_type, scope);
+CREATE INDEX IF NOT EXISTS link_relationships_source_idx ON link_relationships (source_id, status_now);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE link_relationships ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+CREATE TABLE IF NOT EXISTS link_edge_proposals (
+  id                 BIGSERIAL PRIMARY KEY,
+  source_id          TEXT NOT NULL,
+  from_page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  a_to_page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  b_to_page_id       INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  link_type          TEXT NOT NULL,
+  evidence_hash      TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK (status IN ('proposed','applied','rejected','undone','stale','reverted_by_user','undated_unresolved','ambiguous_same_date','compatible','error')),
+  ending_to_page_id  INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+  close_date         DATE,
+  born_closed        BOOLEAN NOT NULL DEFAULT false,
+  model              TEXT,
+  confidence         REAL,
+  cost_usd           REAL,
+  generated_line     TEXT,
+  detail             TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (from_page_id, a_to_page_id, b_to_page_id, link_type, evidence_hash)
+);
+CREATE INDEX IF NOT EXISTS link_edge_proposals_status_idx ON link_edge_proposals (source_id, status, created_at);
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE link_edge_proposals ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+CREATE SEQUENCE IF NOT EXISTS graph_generation_seq;
+
+-- Always-loaded core memory: remote-edit notices.
+CREATE TABLE IF NOT EXISTS core_edit_notices (
+  id              BIGSERIAL PRIMARY KEY,
+  source_id       TEXT NOT NULL,
+  slug            TEXT NOT NULL,
+  page_id         BIGINT,
+  revision        TEXT,
+  base_revision   TEXT,
+  base_text       TEXT,
+  actor           TEXT NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  acked_at        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS core_edit_notices_pending_idx ON core_edit_notices (source_id, slug, id) WHERE acked_at IS NULL;
+DO \$rls\$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) THEN
+    ALTER TABLE core_edit_notices ENABLE ROW LEVEL SECURITY;
+  END IF;
+END \$rls\$;
+
+
 
 `;
 

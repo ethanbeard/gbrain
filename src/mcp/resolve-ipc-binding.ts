@@ -18,6 +18,7 @@
  *
  * Best-effort by contract: failure to bind never blocks the serve.
  */
+import { readPressureGate } from '../core/context/pressure.ts';
 import type { Server } from 'node:net';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig } from '../core/config.ts';
@@ -26,6 +27,7 @@ import {
   startResolveIpcServer,
   ensureIpcSecretForConfig,
   type IpcHandlers,
+  type IpcServerOpts,
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 import { lexicalArmsEnabled } from '../core/context/reflex.ts';
@@ -86,12 +88,16 @@ export async function bindResolveIpcForServe(
   engine: BrainEngine,
   defaultSource: string,
   persistenceProvider?: PersistenceIpcProvider,
+  opts: { rememberCallable?: boolean | (() => boolean) } = {},
 ): Promise<ResolveIpcBinding> {
   let persistence: PersistenceIpcBinding | null = null;
   try {
     const cfg = loadConfig();
-    const resolveSocket = resolveSocketPathForConfig(cfg);
-    if (!resolveSocket) return NULL_BINDING;
+    // #5042: this serve's own source-keyed socket, plus the legacy URL-only
+    // socket when it is free (older hooks and hooks naming no source).
+    const resolveSocket = resolveSocketPathForConfig(cfg, 'resolve', defaultSource);
+    const legacySocket = resolveSocketPathForConfig(cfg);
+    if (!resolveSocket || !legacySocket) return NULL_BINDING;
 
     // The owner socket follows the brain the engine opened, which may be a mount (#5237).
     const owner = residentPersistenceConfig(cfg);
@@ -159,90 +165,95 @@ export async function bindResolveIpcForServe(
       }
     }
 
-    const server = await startResolveIpcServer(
-      resolveSocket,
-      {
-        // [CX2-10] Bound-source posture for BOTH kinds: the IPC layer
-        // rejects any resolve/turn_context request naming a source other
-        // than boundSourceId ('source_mismatch'), so the only sourceId that
-        // reaches this handler is the bound one or absent — and the handler
-        // resolves against the server's OWN registered source regardless.
-        resolve: (req) =>
-          resolveEntitiesToPointers(
-            engine,
-            defaultSource,
-            req.candidates ?? [],
-            {
-              priorContextText: req.priorContextText,
-              maxPointers: req.maxPointers,
-              suppression: req.suppression,
-              // v0.46.15 kill switch: either side may disable — a client
-              // `false` wins, else the server's own file-config gate.
-              // Config is re-read PER REQUEST (adversarial F3): `gbrain
-              // serve` is long-running, and the switch's whole value is
-              // reverting a false-fire regression on the NEXT TURN with a
-              // config edit — a startup snapshot would freeze it until a
-              // serve restart. loadConfig is a file read (~1ms) inside the
-              // 400ms IPC budget.
-              lexicalArms: req.lexicalArms === false ? false : lexicalArmsEnabled(loadConfig()),
-            },
-          ),
-        // IPC v2 [ENG-3]: per-turn context assembly for the hook command.
-        // [CX2-10] Always assembles against the server's OWN registered
-        // source — cross-source requests are rejected in the IPC layer via
-        // boundSourceId below, and the handler never honors a caller source.
-        turn_context: (req) =>
-          assembleTurnContext(engine, {
-            sourceId: defaultSource,
-            window: req.window ?? [],
+    const handlers: IpcHandlers = {
+      // [CX2-10] Bound-source posture for BOTH kinds: the IPC layer
+      // rejects any resolve/turn_context request naming a source other
+      // than boundSourceId ('source_mismatch'), so the only sourceId that
+      // reaches this handler is the bound one or absent — and the handler
+      // resolves against the server's OWN registered source regardless.
+      resolve: (req) =>
+        resolveEntitiesToPointers(
+          engine,
+          defaultSource,
+          req.candidates ?? [],
+          {
             priorContextText: req.priorContextText,
-            sessionId: req.sessionId,
-            maxBytes: req.maxBytes,
-            // Per-request config read — same next-turn-revert rationale as
-            // the resolve handler above (adversarial F3).
-            lexicalArms: lexicalArmsEnabled(loadConfig()),
-          }),
-        // v0.45.7 ambient recall: boundary context pack. Extracted to
-        // context-pack-handler.ts (directly testable against a real engine);
-        // the runtime owns entity merge, banking, the since-cursor, and the
-        // complete-pack-only monotonic cursor advance.
-        context_pack: makeContextPackIpcHandler(engine, defaultSource),
-        ...syncHandlers,
-        ...sweepHandlers,
+            maxPointers: req.maxPointers,
+            suppression: req.suppression,
+            // v0.46.15 kill switch: either side may disable — a client
+            // `false` wins, else the server's own file-config gate.
+            // Config is re-read PER REQUEST (adversarial F3): `gbrain
+            // serve` is long-running, and the switch's whole value is
+            // reverting a false-fire regression on the NEXT TURN with a
+            // config edit — a startup snapshot would freeze it until a
+            // serve restart. loadConfig is a file read (~1ms) inside the
+            // 400ms IPC budget.
+            lexicalArms: req.lexicalArms === false ? false : lexicalArmsEnabled(loadConfig()),
+          },
+        ),
+      // IPC v2 [ENG-3]: per-turn context assembly for the hook command.
+      // [CX2-10] Always assembles against the server's OWN registered
+      // source — cross-source requests are rejected in the IPC layer via
+      // boundSourceId below, and the handler never honors a caller source.
+      turn_context: async (req) => ({
+        ...await assembleTurnContext(engine, {
+          sourceId: defaultSource,
+          window: req.window ?? [],
+          priorContextText: req.priorContextText,
+          sessionId: req.sessionId,
+          maxBytes: req.maxBytes,
+          // Per-request config read — same next-turn-revert rationale as
+          // the resolve handler above (adversarial F3).
+          lexicalArms: lexicalArmsEnabled(loadConfig()),
+        }),
+        // Context-pressure gate for the harness hook (pressure.ts); a surface without remember never warns.
+        pressure: await readPressureGate(engine, typeof opts.rememberCallable === 'function' ? opts.rememberCallable() : opts.rememberCallable ?? true),
+      }),
+      // v0.45.7 ambient recall: boundary context pack. Extracted to
+      // context-pack-handler.ts (directly testable against a real engine);
+      // the runtime owns entity merge, banking, the since-cursor, and the
+      // complete-pack-only monotonic cursor advance.
+      context_pack: makeContextPackIpcHandler(engine, defaultSource),
+      ...syncHandlers,
+      ...sweepHandlers,
+    };
+    const serverOpts: IpcServerOpts = {
+      // The IPC resolve path IS the ambient reflex channel. Logging happens
+      // at DELIVERY (post-write), not inside the resolver — a block the
+      // client's 250ms budget abandoned was never injected, and counting it
+      // would corrupt the volunteered-vs-used precision stats (red-team).
+      // Volunteer-stage PROBE resolves (wide ungated pool) are skipped for
+      // the same reason: the pool is not injected pointers. NOTE (ship
+      // security review): on the PGLite/IPC rung the gated survivors are
+      // NOT re-logged anywhere (the client has no engine handle) — openclaw
+      // volunteer events cover the direct-Postgres rung only, see
+      // reflex.ts. The probe claim is a WIRE FIELD, so it is honored only
+      // when the request is volunteer-SHAPED (slug-only suppression + the
+      // wide volunteer pool cap): a normal pointer resolve stamping
+      // probe:'volunteer' to evade delivery telemetry still logs.
+      onDelivered: (block, req) => {
+        if (isVolunteerProbeShaped(req)) return;
+        logDeliveredReflexPointers(engine, block.pointers);
       },
-      {
-        // The IPC resolve path IS the ambient reflex channel. Logging happens
-        // at DELIVERY (post-write), not inside the resolver — a block the
-        // client's 250ms budget abandoned was never injected, and counting it
-        // would corrupt the volunteered-vs-used precision stats (red-team).
-        // Volunteer-stage PROBE resolves (wide ungated pool) are skipped for
-        // the same reason: the pool is not injected pointers. NOTE (ship
-        // security review): on the PGLite/IPC rung the gated survivors are
-        // NOT re-logged anywhere (the client has no engine handle) — openclaw
-        // volunteer events cover the direct-Postgres rung only, see
-        // reflex.ts. The probe claim is a WIRE FIELD, so it is honored only
-        // when the request is volunteer-SHAPED (slug-only suppression + the
-        // wide volunteer pool cap): a normal pointer resolve stamping
-        // probe:'volunteer' to evade delivery telemetry still logs.
-        onDelivered: (block, req) => {
-          if (isVolunteerProbeShaped(req)) return;
-          logDeliveredReflexPointers(engine, block.pointers);
-        },
-        // The hook lane's feedback loop (#2095 closed over turn_context):
-        // the delivered block's post-trim volunteered pages + pointers land
-        // in context_volunteer_events under the request's channel. Body
-        // lives in volunteer-events.ts (logTurnContextDeliveryFireAndForget)
-        // so the shipped wiring is unit-testable.
-        onTurnContextDelivered: (result, req) =>
-          logTurnContextDeliveryFireAndForget(engine, result, req),
-        boundSourceId: defaultSource,
-        secret: ipcSecret,
-      },
-    );
+      // The hook lane's feedback loop (#2095 closed over turn_context):
+      // the delivered block's post-trim volunteered pages + pointers land
+      // in context_volunteer_events under the request's channel. Body
+      // lives in volunteer-events.ts (logTurnContextDeliveryFireAndForget)
+      // so the shipped wiring is unit-testable.
+      onTurnContextDelivered: (result, req) =>
+        logTurnContextDeliveryFireAndForget(engine, result, req),
+      boundSourceId: defaultSource,
+      secret: ipcSecret,
+    };
+    const server = await startResolveIpcServer(resolveSocket, handlers, serverOpts);
+    const legacyServer = legacySocket === resolveSocket ? null : await startResolveIpcServer(legacySocket, handlers, serverOpts);
 
     // startResolveIpcServer returns null when the socket is already owned
     // by a live listener (another serve) — that serve is the IPC provider.
-    if (!server && !persistence) return NULL_BINDING;
+    if (!server && !persistence) {
+      try { legacyServer?.close(); } catch { /* noop */ }
+      return NULL_BINDING;
+    }
 
     let closed = false;
     return {
@@ -255,6 +266,7 @@ export async function bindResolveIpcForServe(
         // server.close() unlinks the pathname THIS listener bound; never
         // blind-unlink the path — it may belong to a newer live serve (#4896).
         try { server?.close(); } catch { /* noop */ }
+        try { legacyServer?.close(); } catch { /* noop */ }
         persistence?.close();
       },
     };

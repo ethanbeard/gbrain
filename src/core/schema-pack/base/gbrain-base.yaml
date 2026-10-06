@@ -12,8 +12,8 @@
 #
 # Determinism: codegen output is sorted lex-stable per primitive and per
 # field. Re-running `bun scripts/generate-gbrain-base.ts` must produce
-# byte-identical output. CI-pinned via
-# test/regressions/gbrain-base-codegen-determinism.test.ts.
+# byte-identical output; `bun scripts/generate-gbrain-base.ts --check`
+# reports drift.
 #
 # Aliases: empty by default. v0.38 ships gbrain-base with NO alias graph
 # edges so existing search behavior is unchanged. Users opt into alias
@@ -336,18 +336,22 @@ link_types:
   - name: founded
     inference:
       regex: \b(founded|founder of|co-?founded|started)\b
+      ner_only: true
 
   - name: invested_in
     inference:
       regex: \b(invested in|backed|seeded|funded|wrote a check)\b
+      ner_only: true
 
   - name: advises
     inference:
       regex: \b(advises|advisor|advising|advisor to)\b
+      ner_only: true
 
   - name: works_at
     inference:
       regex: \b(works? at|employed by|works? for|joined|hired by|ceo of|cto of|cmo of)\b
+      ner_only: true
 
   - name: yc_partner
 

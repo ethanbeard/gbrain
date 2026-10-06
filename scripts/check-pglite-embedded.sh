@@ -42,6 +42,10 @@ cp -R "$REPO_ROOT/native" "$BUILD_DIR/native"
 # from an engine-only import. Keep the compiled graph's file imports available.
 cp -R "$REPO_ROOT/templates" "$BUILD_DIR/templates"
 cp -R "$REPO_ROOT/skills" "$BUILD_DIR/skills"
+# The nightly probes embed their fixtures (src/core/cycle/nightly-probe-fixtures.ts).
+mkdir -p "$BUILD_DIR/test/fixtures/conversation-formats"
+cp "$REPO_ROOT/test/fixtures/longmemeval-nightly.jsonl" "$BUILD_DIR/test/fixtures/"
+cp "$REPO_ROOT/test/fixtures/conversation-formats/all.jsonl" "$REPO_ROOT/test/fixtures/conversation-formats/adversarial.jsonl" "$BUILD_DIR/test/fixtures/conversation-formats/"
 cp "$REPO_ROOT/package.json" "$BUILD_DIR/package.json"
 cp "$REPO_ROOT/LICENSE" "$BUILD_DIR/LICENSE"
 cp "$REPO_ROOT/scripts/pglite-embedded-smoketest.ts" "$BUILD_DIR/scripts/pglite-embedded-smoketest.ts"
@@ -55,6 +59,7 @@ if ! (cd "$BUILD_DIR" && bun build --compile --no-compile-autoload-bunfig --outf
   # e2e — so local dev without compile support isn't blocked. CI has compile.
   if grep -qiE 'not (found|available)|permission denied|Could not download|ETIMEDOUT|network' "$BUILD_DIR/compile.log"; then
     echo "[check-pglite-embedded] SKIP: bun build --compile unavailable in this sandbox." >&2
+    echo "GBRAIN_CHECK_SKIPPED: bun build --compile unavailable"
     sed -n '1,20p' "$BUILD_DIR/compile.log" >&2 || true
     exit 0
   fi

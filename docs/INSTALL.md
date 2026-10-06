@@ -52,10 +52,12 @@ GBRAIN_NO_AUTOPILOT_INSTALL=1 GBRAIN_NO_REEMBED=1 gbrain upgrade --no-autopilot-
 The autopilot opt-out reaches package postinstall hooks and migration
 orchestrators, and skips existing service-unit rewrites. Other migrations still
 run. `GBRAIN_NO_REEMBED=1` independently skips potentially paid reindexing.
-For a clone linked with Bun, use `git pull --ff-only`, then
-`GBRAIN_NO_AUTOPILOT_INSTALL=1 bun install`,
-`gbrain apply-migrations --yes --no-autopilot-install`, and
-`GBRAIN_NO_REEMBED=1 gbrain post-upgrade --no-autopilot-install`.
+The same command upgrades a clone linked with Bun: it fetches, checks the new
+release's Bun floor, fast-forwards to the checked commit and runs
+`bun install`. Avoid a bare `git pull`, which skips that check. When the new
+release needs a newer Bun, `gbrain upgrade` refuses and changes nothing (exit
+78): run `bun upgrade`, then the upgrade again
+([Bun floor](guides/upgrades-auto-update.md#bun-floor)).
 Verify a known keyword result, saved fact and process reopen after upgrading.
 See the [agent upgrade steps](../INSTALL_FOR_AGENTS.md#upgrade).
 
@@ -79,9 +81,11 @@ gbrain init --prefer-postgres    # env URL → Supabase token discovery → loca
 To switch later:
 
 ```bash
-gbrain migrate --to supabase     # PGLite → Postgres
-gbrain migrate --to pglite       # Postgres → PGLite (rare)
+gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --json   # PGLite → Postgres: prints the plan, exits 3
+gbrain migrate --to pglite                                        # Postgres → PGLite (rare; brains without write history)
 ```
+
+The move to Postgres carries the brain's full history and runs after the user approves the plan (`--yes --expect <plan_hash>`). Walkthrough: [Move a PGLite brain to Postgres](guides/move-to-postgres.md).
 
 If Postgres access ever breaks at runtime, `gbrain engine status --probe` diagnoses it and `gbrain db-repair` fixes it — see the "Engine detection and access repair" section of [`docs/ENGINES.md`](ENGINES.md).
 
@@ -109,7 +113,7 @@ chat providers need an explicit `models.*` pin. With neither key, they stay off
 calmly and memory comes from agent-authored `## Facts` fences and the
 `remember` verb.
 
-For the autopilot daemon specifically, keys and process-level env (`NODE_EXTRA_CA_CERTS`, proxy vars, custom base URLs) belong in `~/.gbrain/env` — a 0600 file created by `gbrain autopilot --install` and sourced by the daemon wrapper (interactive shell rc files never reach daemon shells; the path honors `GBRAIN_HOME`). Re-run `gbrain autopilot --install` after editing it so the daemon reloads.
+For the autopilot daemon specifically, keys and process-level env (`NODE_EXTRA_CA_CERTS`, proxy vars, custom base URLs) belong in `~/.gbrain/env` — a 0600 file created by `gbrain autopilot --install` and sourced by the daemon wrapper (interactive shell rc files never reach daemon shells; the path honors `GBRAIN_HOME`). Re-run `gbrain autopilot --install` after editing it so the daemon reloads. To keep a key off disk, use your secret manager there: the file is sourced by bash at every daemon start, so a line like `VOYAGE_API_KEY="$(doppler secrets get VOYAGE_API_KEY --plain)"` (or `op read`, `security find-generic-password -w`, `pass show`) fetches the value at start-up and never writes it (#5196). The command must work non-interactively in the daemon's environment.
 
 To change an existing brain's embedding provider, follow the explicit-consent playbook at [`skills/migrations/v0.46.3.0.md`](../skills/migrations/v0.46.3.0.md), with the full reference in [`docs/guides/embedding-migration.md`](guides/embedding-migration.md). Preview the work and cost before approving a migration; do not repoint existing vectors at a different model.
 
@@ -124,8 +128,8 @@ gbrain autopilot --install        # background daemon for nightly enrichment
 **Wire this same local brain into your coding agent** — zero server, zero token:
 
 ```bash
-claude mcp add gbrain -- gbrain serve --surface verbs    # Claude Code
-codex  mcp add gbrain -- gbrain serve --surface verbs    # Codex
+claude mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs    # Claude Code
+codex  mcp add gbrain -- "$(command -v gbrain)" serve --surface verbs    # Codex
 ```
 
 The agent spawns `gbrain serve` as a stdio subprocess against your local brain. `--surface verbs` gives the agent the seven-verb memory protocol (`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` — [MEMORY_VERBS v1](protocol/MEMORY_VERBS_v1.md)) instead of the full tool catalog; `--surface starter` adds the daily-driver set on top of the verbs (~27 ops total); drop the flag (default `full`) for every operation. Full walkthrough (both this local path and connecting to a remote brain), plus the brain-first protocol to paste into `CLAUDE.md` / `AGENTS.md`: **[Give your coding agent a memory](tutorials/connect-coding-agent.md)**.
@@ -179,6 +183,8 @@ Connect to someone else's brain without running a local engine:
 
 ```bash
 gbrain init --mcp-only            # configures remote MCP, skips local DB
+# requires: --issuer-url --mcp-url --oauth-client-id --oauth-client-secret
+# (or GBRAIN_REMOTE_ISSUER_URL / GBRAIN_REMOTE_MCP_URL / ... env vars)
 ```
 
 Useful for: team mounts, brain-as-a-service deployments, dev machines without disk space. Most local commands refuse with a paste-ready hint. See [`docs/architecture/topologies.md`](architecture/topologies.md).

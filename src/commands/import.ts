@@ -1,10 +1,13 @@
+import { writeJsonDocument } from '../core/cli-force-exit.ts';
+import { opError } from '../core/ops/contract.ts';
 import { hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal } from '../core/minions/source-filesystem.ts';
 import { readdirSync, lstatSync, existsSync, mkdirSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
-import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
+import { OperationError } from '../core/ops/contract.ts';
+import { importFile, importImageFile, isImageFilePath, type ImportResult } from '../core/import-file.ts';
 import { gitFirstCommitDates } from '../core/git-first-commit.ts';
 import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile } from '../core/company-brain/profile.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
@@ -33,10 +36,12 @@ import {
 import { realpathOrResolve } from '../core/path-confine.ts';
 import { slog } from '../core/console-prefix.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
+import { importAnalyzeEveryPages, maybeRefreshPlannerStats, PLANNER_STATS_REPAIR_COMMAND } from '../core/planner-stats.ts';
 import { importManagedFile } from '../core/persistence/import-mutations.ts';
 import { acceptedPendingReceipt } from '../core/persistence/accepted-pending.ts';
 import { estimateCostFromChars, lookupEmbeddingPrice } from '../core/embedding-pricing.ts';
 import { getEmbeddingModel } from '../core/ai/gateway.ts';
+import { managedRootMarkerFor } from '../core/persistence/root-registry.ts';
 
 /** Return a refusal when an import target lies outside every admitted root. */
 export function configuredRootImportError(dir: string, configuredRoots: string[]): string | null {
@@ -136,12 +141,41 @@ export class ImportAbortError extends Error {
   readonly partialResult?: RunImportResult;
   /** True: the user-facing message was already printed at the throw site. */
   readonly alreadyReported = true;
-  constructor(reason: string, exitCode = 1, partialResult?: RunImportResult) {
-    super(`import aborted: ${reason}`);
+  /** `cause` keeps the underlying error (and its stack) for in-process callers. */
+  constructor(reason: string, exitCode = 1, partialResult?: RunImportResult, cause?: unknown) {
+    super(`import aborted: ${reason}`, cause === undefined ? undefined : { cause });
     this.name = 'ImportAbortError';
     this.exitCode = exitCode;
     this.partialResult = partialResult;
   }
+}
+
+// The CLI dispatch (src/cli/commands/import.ts) exits on any ImportAbortError
+// without printing, so each refusal below prints its reason and the next
+// command to stderr before the caller throws the returned abort.
+
+/** A managed import of a symlinked input root: name the path, its target and the command that works. */
+function symlinkedRootAbort(dirArg: string, dir: string): ImportAbortError {
+  console.error(`Managed import refuses a symlinked input root: ${dirArg} resolves to ${dir}.`);
+  console.error(`Fix: gbrain import ${dir}`);
+  return new ImportAbortError('managed import refuses a symlinked input root');
+}
+
+/** A refused source filesystem lock admission: print its code, message and fix, and keep it as the cause. */
+function lockAdmissionAbort(dirArg: string, dir: string, error: unknown): ImportAbortError {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`Cannot import ${dirArg}: source filesystem lock admission failed.`);
+  if (error instanceof OperationError) {
+    console.error(`Error [${error.code}]: ${message}`);
+    if (error.suggestion) console.error(`Fix: ${error.suggestion}`);
+    const marker = error.code === 'writer_coordinator_required' ? managedRootMarkerFor(dir)?.marker : undefined;
+    if (marker) console.error(`Marker: ${marker}`);
+  } else {
+    console.error(`Error: ${message}`);
+    console.error('Fix: gbrain doctor --json');
+  }
+  const reason = error instanceof OperationError ? `${error.code}: ${message}` : message;
+  return new ImportAbortError(`source filesystem lock admission failed (${reason})`, 1, undefined, error);
 }
 
 /**
@@ -184,6 +218,30 @@ export interface RunImportResult {
   resealed?: { pages: number; pending_chunks: number; embedding_usd: number | null };
 }
 
+/**
+ * D2 + A1: under `--json` a keyless brain's import refusal is the one document.
+ * The step the agent can take now is the same import with --no-embed (pages
+ * stay keyword-searchable; vectors come later), routed explicitly to the brain
+ * and source this run resolved; turning embeddings on asks the user.
+ */
+async function keylessImportRefusal(engine: BrainEngine, args: string[], e: unknown) {
+  const { brainRoutingArgs } = await import('../core/brain-resolver.ts');
+  const { resolveSourceWithTier } = await import('../core/source-resolver.ts');
+  const named = args.some(a => a === '--source' || a === '--source-id' || a.startsWith('--source=') || a.startsWith('--source-id='));
+  const target = named ? undefined : await resolveSourceWithTier(engine, null).then(r => r.source_id, () => undefined);
+  return opError('embedding_disabled', String(e instanceof Error ? e.message.split('\n')[0] : e),
+    'Embeddings are off by choice on this brain, so import needs --no-embed; turning embeddings on needs the user\'s consent (gbrain doctor --only embeddings --json shows the command).', {
+      reason: 'disabled_by_choice',
+      why: 'This brain was set up keyword-only. Importing with --no-embed keeps every page keyword-searchable; `gbrain embed --stale` adds vectors once embeddings are enabled.',
+      fix: {
+        argv: ['gbrain', 'import', ...args.filter(a => a !== '--json' && a !== '--no-embed'), '--no-embed', '--json',
+          ...(target ? ['--source', target] : []), ...brainRoutingArgs()],
+        consent: [], actor: 'agent', requires_exclusive: true,
+        why: 'Imports the same files without computing vectors, which needs no provider key.',
+      },
+    });
+}
+
 export async function runImport(
   engine: BrainEngine,
   args: string[],
@@ -193,6 +251,10 @@ export async function runImport(
     strategy?: SyncStrategy;
     sourceId?: string;
     managedBookmark?: boolean;
+    /** #5988: paths the caller already held this run; they are skipped without importing (not failures). */
+    heldPaths?: ReadonlySet<string>;
+    /** #5988: each file's outcome (a throw arrives as `{ status: 'error', error }`); `'held'` = the caller held it, not a failure. */
+    onFileResult?: (path: string, filePath: string, result: Pick<ImportResult, 'status' | 'error' | 'refusal' | 'frontmatter_recovery'>) => Promise<'held' | undefined>;
     /**
      * #753/#774: glob patterns to exclude from the import (same semantics as
      * `isSyncable`'s `exclude` — matched against the dir-relative path).
@@ -258,8 +320,8 @@ export async function runImport(
     try {
       assertEmbeddingEnabled(loadConfig());
     } catch (e) {
-      console.error(`\n${e instanceof Error ? e.message : e}`);
-      console.error('Tip: run `gbrain import <dir> --no-embed` to import without embedding now.');
+      if (jsonOutput) throw await keylessImportRefusal(engine, args, e);
+      console.error(`\n${e instanceof Error ? e.message : e}\nTip: run \`gbrain import <dir> --no-embed\` to import without embedding now.`);
       throw new ImportAbortError('embedding disabled (deferred-setup sentinel)');
     }
 
@@ -272,7 +334,7 @@ export async function runImport(
     } catch (e) {
       if (e instanceof EmbeddingCredentialError) {
         if (jsonOutput) {
-          console.log(JSON.stringify({ status: 'embedding_credentials_missing', diagnosis: e.diagnosis }));
+          await writeJsonDocument(JSON.stringify({ status: 'embedding_credentials_missing', diagnosis: e.diagnosis }));
         } else {
           console.error('');
           console.error(e.userMessage);
@@ -440,7 +502,7 @@ export async function runImport(
 
   const [persistence] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
   const managedImport = persistence?.enabled === true;
-  if (managedImport && dir !== resolve(dirArg)) throw new ImportAbortError('managed import refuses a symlinked input root');
+  if (managedImport && dir !== resolve(dirArg)) throw symlinkedRootAbort(dirArg, dir);
   const singleFile = managedImport && lstatSync(dir).isFile();
   const importRoot = singleFile ? dirname(dir) : dir;
 
@@ -455,7 +517,7 @@ export async function runImport(
       // Root discovery is part of admission. Preserve the CLI/library's typed
       // preflight error contract without changing errors from an import in flight.
       if (entered || signal?.aborted) throw error;
-      throw new ImportAbortError('source filesystem lock admission failed');
+      throw lockAdmissionAbort(dirArg, dir, error);
     }
   }
 
@@ -634,6 +696,10 @@ export async function runImport(
   const firstCommits = !singleFile && await engine.getConfig('sync.git_first_commit_dates').catch(() => null) === 'true'
     ? gitFirstCommitDates(dir) : null;
 
+  // F4b: PGLite has no autovacuum; refresh stale planner statistics every N files so the import
+  // never plans against the empty tables it started with (O-CEO-17).
+  const analyzeEvery = await importAnalyzeEveryPages(engine);
+
   async function processFile(eng: BrainEngine, filePath: string) {
     if (signal?.aborted) return;
     const relativePath = singleFile ? basename(filePath) : relative(dir, filePath);
@@ -642,6 +708,7 @@ export async function runImport(
     // relative (matching the incremental path's git-diff paths). The
     // checkpoint (`completed`) stays dir-relative.
     const importRelPath = opts.slugRoot ? relative(opts.slugRoot, filePath) : relative(importRoot, filePath);
+    if (opts.heldPaths?.has(importRelPath)) { skipped++; completed.add(relativePath); processed++; tickProgress(); return; }
     // v0.31.2 (D5): per-file slow-path log. Fires only when a single
     // file takes >5s. The user's hang surfaces as one file taking
     // forever — without this, the agent can't see which file.
@@ -663,7 +730,10 @@ export async function runImport(
       if (_fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
       }
-      if (result.status === 'imported') {
+      if (await opts.onFileResult?.(importRelPath, filePath, result) === 'held') {
+        skipped++;
+        completed.add(relativePath);
+      } else if (result.status === 'imported') {
         imported++;
         chunksCreated += result.chunks;
         importedSlugs.push(result.slug);
@@ -704,7 +774,8 @@ export async function runImport(
         return;
       }
       // #5600: an accepted managed import still publishing is not a failure; the next run resumes its request.
-      if (acceptedPendingReceipt(e)) { skipped++; console.error(`  Pending: ${relativePath} was accepted and is still publishing; rerun to confirm it.`); } else {
+      if (acceptedPendingReceipt(e)) { skipped++; console.error(`  Pending: ${relativePath} was accepted and is still publishing; rerun to confirm it.`); }
+      else if (await opts.onFileResult?.(importRelPath, filePath, { status: 'error', error: e instanceof Error ? e.message : String(e) }) === 'held') { skipped++; completed.add(relativePath); } else {
         const msg = e instanceof Error ? e.message : String(e);
         const { count, sample } = recordImportFailure(errorCounts, errorSamples, msg);
         if (count <= 5) {
@@ -719,6 +790,10 @@ export async function runImport(
     }
     processed++;
     tickProgress();
+    if (analyzeEvery > 0 && processed % analyzeEvery === 0) {
+      await maybeRefreshPlannerStats(engine, 'import', { throttle: false }).catch((e: unknown) =>
+        console.error(`  Warning: planner statistics refresh failed (${e instanceof Error ? e.message : String(e)}); the import continues. Afterwards run: ${PLANNER_STATS_REPAIR_COMMAND}`));
+    }
     if (company) {
       await engine.executeRaw("INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('company-brain-content',$1,$2::text::jsonb) ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()",
         [company.receiptId, JSON.stringify([...completed])]);
@@ -1107,7 +1182,7 @@ export async function runImport(
     // written only for git-repo dirs (see the gitHead gate below), so a caller
     // importing a scratch directory has no other channel. Emit the per-file
     // list so state can be gated per file.
-    console.log(JSON.stringify({
+    await writeJsonDocument(JSON.stringify({
       status: errors > 0 ? 'partial' : 'success', duration_s: parseFloat(totalTime),
       imported, skipped, errors, chunks: chunksCreated,
       ...(resealSummary ? { resealed: resealSummary } : {}),
@@ -1233,6 +1308,16 @@ function isCollectibleForWalker(
   }
 }
 
+/** Whether the git work tree around `dir` ignores `dir` itself (`git check-ignore` exits 0). */
+function gitIgnoresDir(dir: string): boolean {
+  try {
+    execFileSync('git', ['-C', dir, 'check-ignore', '-q', '.'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Git-aware fast path for `collectSyncableFiles`. Returns the strategy-filtered
  * list of syncable files when `dir` is inside a git work tree (paths absolute,
@@ -1263,6 +1348,9 @@ function gitListSyncableFiles(
   } catch {
     return null; // not a git work tree, or git not on PATH → FS-walk fallback
   }
+  // A directory the enclosing repository ignores (a scratch or cache folder inside a checkout) lists
+  // nothing here, so an explicit import of it would succeed with zero files. Walk it directly instead.
+  if (stdout === '' && gitIgnoresDir(dir)) return null;
   const files: string[] = [];
   for (const rel of stdout.split('\0')) {
     if (!rel) continue;

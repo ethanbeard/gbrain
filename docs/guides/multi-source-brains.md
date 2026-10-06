@@ -131,7 +131,7 @@ still go to the bound source only.
 | `<id> is not federated` | The named source is not federated. | `gbrain sources federate <id>`, or start the connection without the binding. |
 | `<id> opted out of federation` | The named source was unfederated. | `gbrain sources federate <id>` if it should be readable from other sources. |
 | `<bound> opted out of federation …, so it reads no other source` | The bound source itself is isolated (`federated=false`), so it never reads another source. | `gbrain sources federate <bound>`, or start the connection without the binding. |
-| `Your token is not granted <id>` | An HTTP token or OAuth client whose grant does not include the source. | `gbrain auth rescope-client <client_id> --federated-read <ids>` for an OAuth client. |
+| `Your token is not granted <id>` | An HTTP token or OAuth client whose grant does not include the source. | `gbrain auth rescope-client <client_id> --federated-read <ids>` for an OAuth client; `gbrain auth rescope-token <name> --sources <ids>` for a legacy bearer token. |
 
 `search_by_image`, `open_loops` and the code-intel tools keep their stricter
 rule: an explicit `source_id` must be inside the connection's own source or
@@ -166,8 +166,7 @@ source is archived. Private pages stay hidden from remote agents exactly as in
 
 Graph output carries source ids: each `gbrain graph` node has `source_id`, and
 each edge returned to agents has `from_source_id` / `to_source_id`. The same slug
-in two sources is two nodes or two edges, so a walk may return more edges than
-before.
+in two sources is two nodes or two edges.
 
 When a local unqualified read finds nothing but the page has links in a source
 outside the read (a non-federated source), the CLI prints the per-source counts
@@ -223,12 +222,13 @@ gbrain sources federate <id>
 gbrain sources unfederate <id>
 gbrain sources mirror-readonly <id>
 gbrain sources mirror-writable <id>
+gbrain sources refresh <id> [--dry-run] [--resume|--abandon]   Managed brains: fast-forward the checkout and sync.
 ```
 
 ### Read-only mirror sources
 
 A source whose Git remote is the source of truth (a code or docs repository
-you keep current with `git pull --ff-only`) can be marked a read-only mirror:
+you keep current from upstream) can be marked a read-only mirror:
 
 ```bash
 gbrain sources mirror-readonly <id>
@@ -245,6 +245,27 @@ maintenance write) is stored database-only too; its receipt says
 write on, except for pages created while the source was a mirror: those have
 no file in the checkout and stay database-only. Git effects of a mirror's
 writes (for example a `forget`) complete as skipped. The flag is off by default.
+
+A managed brain never pulls inside a cycle. Advance a managed checkout with
+one command on its owner host:
+
+```bash
+gbrain sources refresh <id>
+```
+
+It refuses new writes to every source that shares the checkout until queued
+ones finish, fast-forwards it with `git merge --ff-only`, then syncs each of
+those sources without pulling. Sources bound to one checkout (for example
+`notes/` and `docs/` of the same repository) are refreshed together, because a
+merge rewrites files of all of them. `--dry-run` previews the incoming commit;
+refusals are listed under
+[worktree refresh refusals](write-refusals.md#worktree-refresh-refusals). A
+brain that is not managed keeps pulling inside `gbrain sync --source <id>`.
+
+The autopilot cycle syncs the checkout as it is and reports
+`upstream_refresh: "skipped_managed"`; `gbrain doctor` (`sync_freshness`) says
+"upstream unknown" when the checkout was not fetched in the last 24 hours. See
+[`managed_pull_skipped`](write-refusals.md#managed_pull_skipped).
 
 ## The git requirement for --path sources
 
@@ -309,7 +330,7 @@ stored file paths, called its **slug-root mode**:
 
 The mode is decided once, by the first real sync or the first coordinated page
 write (such as `put_page`) that records a new file path, and pinned in the
-source's configuration. A few older write paths, such as saved brainstorm
+source's configuration. A few write paths, such as saved brainstorm
 ideas, follow an existing pin but do not set one. Every later sync,
 write and reader obeys the pin, so an existing brain never has its slugs
 renamed. `gbrain sync --dry-run` works out the mode without pinning it. A
@@ -328,11 +349,10 @@ can refuse that file with a slug/origin mismatch; there, add new pages as
 files in the checkout and sync them. Pages that already have a stored path
 keep writing to that file.
 
-**Older stored paths.** Before v0.60.5.0, write-through recorded
-Git-root-style paths (`notes/people/alice-example.md`) for pages in
-`source-root` sources, which made the next sync fail. Sync now accepts that
-older form when the rest of the path names the same page, and rewrites it on
-the next import. No command is needed.
+**Older stored paths.** Releases before v0.60.5.0 recorded Git-root-style
+paths (`notes/people/alice-example.md`) for pages in `source-root` sources.
+Sync accepts that form when the rest of the path names the same page, and
+rewrites it on the next import. No command is needed.
 
 **`ambiguous_source_path`.** If both readings of an old stored path exist as
 files, for example `~/vault/notes/people/alice-example.md` and

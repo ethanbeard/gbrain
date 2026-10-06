@@ -37,6 +37,7 @@ import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, RemoteMcpError, unpackToolResult } from '../core/mcp-client.ts';
 import { readCursor, writeCursor } from '../core/recall-cursor-state.ts';
 import { resolveSourceId, resolveSourceIdEngineFree, SourceTargetError } from '../core/source-resolver.ts';
+import { usageError } from '../cli/cli-error.ts';
 
 // Same kebab-case shape gate the source-resolver applies. v0.32: applied
 // locally on thin-client where the canonical resolver's assertSourceExists
@@ -125,7 +126,20 @@ function parseFlags(args: string[]): ParsedFlags {
     if (a === '--source') { out.source = args[++i] ?? 'default'; out.sourceExplicit = true; continue; }
     if (a === '--source-id') { out.source = args[++i] ?? ''; out.sourceExplicit = true; continue; }
     if (a.startsWith('--source-id=')) { out.source = a.slice('--source-id='.length); out.sourceExplicit = true; continue; }
-    if (a === '--limit') { out.limit = parseInt(args[++i] ?? '50', 10) || 50; continue; }
+    if (a === '--limit') {
+      const raw = args[++i] ?? '';
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) < 1) {
+        const message = `--limit must be a positive safe integer (got "${raw}").`;
+        // Agent contract v1: invalid_params (exit 2 through renderCliError, the envelope under --json).
+        const valueGiven = i < args.length && !raw.startsWith('--');
+        const argv = ['gbrain', 'recall', ...args.slice(0, i), '50', ...args.slice(valueGiven ? i + 1 : i)];
+        throw usageError(message, 'Pass a positive integer, e.g. --limit 50.', {
+          why: '--limit caps how many facts recall returns, so it must be a whole number of at least 1.',
+          fix: { argv, consent: [], actor: 'agent', why: 'The same recall with a valid --limit.', requires_exclusive: false },
+        });
+      }
+      out.limit = Number(raw); continue;
+    }
     if (a === '--query') { out.query = args[++i] ?? null; continue; }
     if (a === '--budget-tokens') { rawBudget = args[++i]; continue; }
     if (a === '--budget-policy') {
@@ -163,8 +177,10 @@ function parseFlags(args: string[]): ParsedFlags {
   return out;
 }
 
-export function hasRecallBudgetPolicy(args: string[]): boolean {
-  return parseFlags(args).budgetPolicy !== null;
+/** Only `--query`/`--budget-tokens` without --budget-policy runs the recall op in-process; every other form has a thin-client path. */
+export function recallNeedsLocalEngine(args: string[]): boolean {
+  const flags = parseFlags(args);
+  return flags.budgetPolicy === null && (flags.query !== null || flags.budgetTokens !== null);
 }
 
 function parseSinceParam(raw: string): Date | null {
@@ -830,16 +846,18 @@ export async function runForget(engine: BrainEngine | (() => Promise<BrainEngine
     ? args[sourceIndex].slice('--source='.length) : args[sourceIndex + 1];
   const { parseWriteRequestId } = await import('../core/persistence/preconditions.ts');
   const { randomUUID } = await import('node:crypto');
-  const { OperationError, operations } = await import('../core/operations.ts');
+  const { opError, operations } = await import('../core/operations.ts');
   const { reportPersistenceCliError } = await import('./persistence-delegate.ts');
   const json = args.includes('--json');
   let requestId: string;
   try {
     if (requestIndex >= 0 && (!requestValue || requestValue.startsWith('--'))) {
-      throw new OperationError('invalid_params', '--request-id requires a UUID.');
+      throw opError('invalid_params', '--request-id requires a UUID.',
+        `Give --request-id the UUID an earlier attempt of this forget printed, or omit it and gbrain forget ${id} generates one.`);
     }
     if (sourceIndex >= 0 && (!sourceValue || sourceValue.startsWith('--'))) {
-      throw new OperationError('invalid_params', '--source requires a source ID.');
+      throw opError('invalid_params', '--source requires a source ID.', `Give --source the id of the source that holds fact ${id}, e.g. --source default, or omit it to use the default source.`,
+        { fix: { argv: ['gbrain', 'sources', 'list', '--json'], consent: [], actor: 'agent', why: 'Lists the source ids, read-only.', requires_exclusive: false } });
     }
     requestId = parseWriteRequestId(requestValue) ?? randomUUID();
   } catch (error) {
@@ -855,7 +873,10 @@ export async function runForget(engine: BrainEngine | (() => Promise<BrainEngine
   const cfg = loadConfig();
   if (isThinClient(cfg)) {
     try {
-      if (sourceValue) throw new OperationError('invalid_params', '--source cannot override the remote memory writer grant.');
+      if (sourceValue) throw opError('invalid_params', '--source cannot override the remote memory writer grant.',
+        'Drop --source: on a remote brain the connection\'s memory writer grant decides the source.',
+        { fix: { argv: ['gbrain', 'forget', String(id), ...(reason !== undefined ? ['--reason', reason] : []), '--request-id', requestId], consent: [], actor: 'agent',
+          requires_exclusive: false, why: `The same forget of fact ${id} without --source, under the same request id.` } });
       const raw = await callRemoteTool(cfg!, 'forget', params, { timeoutMs: 30_000 });
       const result = unpackToolResult<{ id: string; expired: boolean }>(raw);
       if (json) console.log(JSON.stringify(result, null, 2));
@@ -878,7 +899,7 @@ export async function runForget(engine: BrainEngine | (() => Promise<BrainEngine
     const delegated = await maybeDelegateLocalOperation('forget', params, cfg, {
       brain: cli.brain, source, timeoutMs: cli.timeoutMs ?? undefined,
     });
-    let result: { id: string; expired: boolean };
+    let result: { id: string; expired: boolean; similar_active?: { candidates?: Array<{ fact_id: string; similarity: number }>; next?: string } };
     if (delegated.handled) result = delegated.result as typeof result;
     else {
       const connected = typeof engine === 'function' ? await engine() : engine;
@@ -888,7 +909,17 @@ export async function runForget(engine: BrainEngine | (() => Promise<BrainEngine
         dryRun: false, sourceId, logger: { info: console.log, warn: console.warn, error: console.error } }, params) as typeof result;
     }
     if (json) console.log(JSON.stringify(result, null, 2));
-    else process.stdout.write(result.expired ? `Forgot fact id=${id}\n` : `Fact id=${id} was already withdrawn\n`);
+    else {
+      process.stdout.write(result.expired ? `Forgot fact id=${id}\n` : `Fact id=${id} was already withdrawn\n`);
+      const similar = result.similar_active;
+      if (similar?.candidates?.length) {
+        process.stdout.write(`Close matches still active: ${similar.candidates.map(c => `#${c.fact_id} (${c.similarity})`).join(', ')}\n`);
+      }
+      if (similar?.next) {
+        const { agentBlock } = await import('../core/agent-markers.ts');
+        process.stderr.write(agentBlock({ next: similar.next }));
+      }
+    }
   } catch (error) {
     if (await reportPersistenceCliError(error, json)) return;
     throw error;

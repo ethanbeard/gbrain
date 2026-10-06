@@ -3,10 +3,10 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { E2E_EXCLUSIONS, prepareMatrix, validateRow } from '../../scripts/e2e-matrix.ts';
+import { BACKEND_MATRIX_OWNED, E2E_EXCLUSIONS, MAX_E2E_WORKERS, prepareMatrix, validateRow } from '../../scripts/e2e-matrix.ts';
 
 const repo = join(import.meta.dir, '../..');
-const paths = ['a', 'b', 'c', 'd', 'e'].map(n => `test/e2e/${n}.test.ts`);
+const paths = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'].map(n => `test/e2e/${n}.test.ts`);
 const weights = new Map(paths.map((f, i) => [f, 100 - i * 10]));
 function fixture(fn: (root: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'gbrain-e2e-matrix-'));
@@ -23,9 +23,10 @@ function worker(root: string, row: unknown) {
   });
 }
 describe('frozen E2E matrix', () => {
-  test('partitions the exact selection once, with deterministic weights and at most four workers', () => {
+  test('partitions the exact selection once, with deterministic weights and at most eight workers', () => {
     const matrix = prepareMatrix(paths, weights);
-    expect(matrix.include).toHaveLength(4);
+    expect(MAX_E2E_WORKERS).toBe(8);
+    expect(matrix.include).toHaveLength(8);
     expect(matrix.include.flatMap(r => r.files).sort()).toEqual(paths);
     expect(prepareMatrix(paths, weights)).toEqual(matrix);
     expect(prepareMatrix(paths.slice(0, 2), weights).include).toHaveLength(2);
@@ -47,13 +48,27 @@ describe('frozen E2E matrix', () => {
       'excluded: test/e2e/reconcile-crash-unactivated.test.ts (owned by persistence-validation.yml)',
     ]);
   });
+  test('drops every backend-matrix file and names the Tier 1 backend matrix as its owner', () => {
+    const rows = readFileSync(join(repo, 'scripts/e2e-backend-matrix.txt'), 'utf8').split('\n')
+      .filter(row => row && !row.startsWith('#') && !row.startsWith('!')).map(row => row.split('\t')[0]);
+    const e2eRows = rows.filter(row => row.startsWith('test/e2e/'));
+    expect(e2eRows.length).toBeGreaterThan(30);
+    expect([...BACKEND_MATRIX_OWNED].sort()).toEqual([...e2eRows].sort());
+    const notices: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((line: string) => { notices.push(line); });
+    try {
+      expect(prepareMatrix([...e2eRows, paths[0]], weights).include).toEqual([{ shard: 1, files: [paths[0]], empty: false }]);
+    } finally { spy.mockRestore(); }
+    expect(notices).toContain('excluded: test/e2e/executor-binding-matrix.test.ts (owned by the Tier 1 backend matrix, scripts/e2e-backend-matrix.txt)');
+    expect(notices).toHaveLength(e2eRows.length);
+  });
   test('refuses invalid selections and duplicate paths', () => {
     for (const files of [[paths[0], paths[0]], ['../outside.test.ts'], ['test/e2e/../escape.test.ts'], ['test/e2e/$(touch marker).test.ts']]) expect(() => prepareMatrix(files, weights)).toThrow();
   });
   test('empty sentinel launches no runner; missing/malformed input fails instead of selecting all', () => fixture(root => {
     writeFileSync(join(root, 'scripts/run-e2e.sh'), 'exit 99\n');
     expect(worker(root, { shard: 1, files: [], empty: true }).status).toBe(0);
-    for (const row of [null, {}, { shard: 1, files: [], empty: false }, { shard: 2, files: [], empty: true }, { shard: 5, files: [paths[0]], empty: false }]) expect(worker(root, row).status).not.toBe(0);
+    for (const row of [null, {}, { shard: 1, files: [], empty: false }, { shard: 2, files: [], empty: true }, { shard: 9, files: [paths[0]], empty: false }]) expect(worker(root, row).status).not.toBe(0);
   }));
   test('worker executes the complete frozen argv and clears inherited SHARD', () => fixture(root => {
     writeFileSync(join(root, 'scripts/run-e2e.sh'), 'test -z "${SHARD:-}" || exit 81\nprintf "FILE:%s\\n" "$@"\n');

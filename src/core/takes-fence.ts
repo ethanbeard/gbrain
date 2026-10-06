@@ -538,9 +538,15 @@ export function supersedeRow(
   const oldClaim = takes[idx].claim;
   const newRowNum = takes.length > 0 ? Math.max(...takes.map(t => t.rowNum)) + 1 : 1;
 
-  // Mark old row inactive; append new row.
+  // The pointer lives on the OLD row (the canonical projection reads it there),
+  // after the row's own provenance. A stale self-reference written by older
+  // versions onto a then-new row is dropped so it cannot shadow the real pointer.
+  const priorSource = takes[idx].source?.trim() ?? '';
+  const originalSource = /^superseded by #\d+$/i.test(priorSource) ? '' : priorSource;
   const updatedTakes: ParsedTake[] = takes.map((t, i) =>
-    i === idx ? { ...t, active: false } : t,
+    i === idx
+      ? { ...t, active: false, source: originalSource ? `${originalSource}; superseded by #${newRowNum}` : `superseded by #${newRowNum}` }
+      : t,
   );
   updatedTakes.push({
     rowNum: newRowNum,
@@ -550,7 +556,7 @@ export function supersedeRow(
     weight: replacement.weight,
     sinceDate: replacement.sinceDate,
     untilDate: replacement.untilDate,
-    source: replacement.source ?? `superseded by #${newRowNum}`,
+    source: replacement.source ?? '',
     active: true,
   });
   void oldClaim; // Reserved for future "show what changed" diff helper.

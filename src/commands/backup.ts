@@ -15,6 +15,7 @@
  * back to the cached verdict + age (cache-derived exit code), never a crash;
  */
 
+import { OperationError, opError } from '../core/ops/contract.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { getBackupStatus } from '../core/backup/coverage.ts';
@@ -23,10 +24,25 @@ import {
   backupCheckDisabled,
   backupNagGate,
   isBackupStatusStale,
+  isVerifiedRecoverable,
   loadBackupStatus,
   currentBackupEvidence,
+  type BackupAssetVerdict,
   type BackupStatus,
 } from '../core/backup/status-file.ts';
+
+const BACKUP_USAGE: Record<string, { usage: string; example: string }> = {
+  create: { usage: 'gbrain backup create --output /absolute/private/path/archive.gbrain-backup [--json]',
+    example: 'gbrain backup create --output /srv/private/brain-2026-10-03.gbrain-backup' },
+  restore: { usage: 'gbrain backup restore ARCHIVE --into /absolute/new-root [--mode new-brain|recovery] [--confirm-quiesced] [--confirm-backup-compatible] [--confirm-authority-reviewed] [--json]',
+    example: 'gbrain backup restore /srv/private/brain-2026-10-03.gbrain-backup --into /srv/gbrain-restored' },
+};
+
+/** A3/D4: a malformed `backup create|restore` invocation is a caller mistake (exit 2) with the usage and an example. */
+function backupUsageError(sub: string, message: string): OperationError {
+  const u = BACKUP_USAGE[sub] ?? BACKUP_USAGE.create!;
+  return opError('invalid_params', message, `Usage: ${u.usage}. Example: ${u.example}`);
+}
 
 export interface BackupCliResult {
   exitCode: 0 | 1 | 2;
@@ -68,20 +84,36 @@ function recoveryStatement(s: BackupStatus): string {
   return `${repoPart}; ${riskPart}. ${s.recovery_scope ?? 'Git is not a full database backup.'}`;
 }
 
+/**
+ * #5505: coverage leaves dirty trees and unverified remotes without fix_argv
+ * (no single mechanical fix at compute time); the CLI still names the command
+ * that clears each one. A deduped root lists several source ids; any of them
+ * pushes the shared repository.
+ */
+function suggestedFix(a: BackupAssetVerdict): string[] | null {
+  if (a.fix_argv && a.fix_argv.length > 0) return a.fix_argv;
+  if (a.state === 'dirty') {
+    return a.kind === 'bootstrap_workspace' ? ['gbrain', 'sources', 'push', '--path', a.id] : ['gbrain', 'sources', 'push', a.id.split(', ')[0]];
+  }
+  if (a.state === 'ok' && !isVerifiedRecoverable(a)) return ['gbrain', 'backup', 'check'];
+  return null;
+}
+
 function renderHuman(s: BackupStatus, out: (line: string) => void): void {
   const age = backupCacheAge(s);
   out(`backup coverage — ${s.overall === 'warn' ? 'WARN' : 'ok'} (checked ${age}, by ${s.computed_by})`);
   for (const a of s.assets) {
-    const mark = a.state === 'ok' && a.verification?.state === 'verified' ? '✓' : a.state === 'no_remote' ? '✗' : a.state === 'info' ? '·' : '⚠';
+    const mark = isVerifiedRecoverable(a) ? '✓' : a.state === 'no_remote' ? '✗' : a.state === 'info' ? '·' : '⚠';
     out(`  ${mark} [${a.kind}] ${a.id} — ${a.state}${a.verification ? `; remote evidence: ${a.verification.state}` : ''}${a.detail ? `: ${a.detail}` : ''}`);
-    if (a.fix_argv && a.fix_argv.length > 0) out(`      fix: ${a.fix_argv.join(' ')}`);
+    const fix = suggestedFix(a);
+    if (fix) out(`      fix: ${fix.join(' ')}`);
   }
   out(recoveryStatement(s));
   if (s.degraded) {
     out('note: the brain database was unreadable during this check — verdict is partial (not cached)');
   }
   if (s.overall === 'warn') {
-    out('Fix the ✗ rows above, then run: gbrain backup check');
+    out('Fix the ✗ and ⚠ rows above, then run: gbrain backup check');
   }
 }
 
@@ -110,20 +142,20 @@ export async function runBackupCli(
         const arg = args[i];
         if (arg === '--json') continue;
         if (arg === '--output' || arg === '--into' || arg === '--mode') {
-          if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(`Missing value for ${arg}`);
+          if (!args[i + 1] || args[i + 1].startsWith('--')) throw backupUsageError(sub, `Missing value for ${arg}.`);
           values[arg] = args[++i];
         } else if (['--confirm-quiesced', '--confirm-backup-compatible', '--confirm-authority-reviewed'].includes(arg)) confirmations.add(arg);
-        else if (arg.startsWith('-')) throw new Error(`Unknown backup option: ${arg}`);
+        else if (arg.startsWith('-')) throw backupUsageError(sub, `Unknown backup option: ${arg}.`);
         else positional.push(arg);
       }
       const { createPgliteBackup, restorePgliteBackup } = await import('../core/backup/snapshot.ts');
       if (sub === 'create') {
-        if (!values['--output'] || values['--into'] || values['--mode'] || confirmations.size || positional.length) throw new Error('Usage: gbrain backup create --output /absolute/private/path/archive.gbrain-backup');
+        if (!values['--output'] || values['--into'] || values['--mode'] || confirmations.size || positional.length) throw backupUsageError(sub, 'gbrain backup create takes exactly --output <absolute archive path>.');
         const result = await createPgliteBackup({ output: values['--output'] });
         if (json) console.log(JSON.stringify({ ok: true, ...result }));
         else console.log(`Backup created: ${result.archive}\nSensitive full database state; protect any off-VM copy.\nExcluded assets: ${(result.manifest.omitted as string[]).join('; ')}`);
       } else {
-        if (!values['--into'] || values['--output'] || positional.length !== 1) throw new Error('Usage: gbrain backup restore ARCHIVE --into /absolute/new-root');
+        if (!values['--into'] || values['--output'] || positional.length !== 1) throw backupUsageError(sub, 'gbrain backup restore takes one ARCHIVE and --into <absolute new root>.');
         if (values['--mode'] !== undefined && !['new-brain', 'recovery'].includes(values['--mode'])) throw new Error('Restore --mode must be new-brain or recovery.');
         const result = await restorePgliteBackup({ archive: positional[0], into: values['--into'], mode: values['--mode'] === 'recovery' ? 'recovery' : 'new_brain',
           confirmQuiesced: confirmations.has('--confirm-quiesced'), confirmBackupCompatible: confirmations.has('--confirm-backup-compatible'),
@@ -133,6 +165,11 @@ export async function runBackupCli(
       }
       return { exitCode: 0 };
     } catch (error) {
+      if (error instanceof OperationError && error.code === 'invalid_params') {
+        const { writeCliError } = await import('../cli/cli-error.ts');
+        writeCliError(error, 'backup', { json, legacy: { ok: false, reason: 'invalid_params', message: error.message } });
+        return { exitCode: 2 };
+      }
       const detail = error as Error & { code?: string; retryable?: boolean };
       if (json) console.log(JSON.stringify({ ok: false, reason: detail.code ?? 'backup_failed', message: detail.message, ...(detail.retryable ? { retryable: true } : {}) }));
       else console.error(detail.message);

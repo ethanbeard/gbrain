@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
-import { waitFor, waitForValue } from './wait-for.ts';
+import { testWaitMs, waitFor, waitForValue } from './wait-for.ts';
+import { withEnv } from './with-env.ts';
 
 describe('waitFor', () => {
   test('immediate-true fast path: single check, no interval sleep', async () => {
@@ -97,5 +98,38 @@ describe('waitForValue', () => {
     await expect(
       waitForValue(() => undefined, { timeoutMs: 40, intervalMs: 5, label: 'never-value' }),
     ).rejects.toThrow('never-value');
+  });
+});
+
+describe('GBRAIN_TEST_WAIT_MULTIPLIER', () => {
+  test('unset leaves deadlines unchanged', async () => {
+    await withEnv({ GBRAIN_TEST_WAIT_MULTIPLIER: undefined }, () => {
+      expect(testWaitMs(5000)).toBe(5000);
+    });
+  });
+
+  test('scales deadlines and names the scaling in the timeout error', async () => {
+    await withEnv({ GBRAIN_TEST_WAIT_MULTIPLIER: '2' }, async () => {
+      expect(testWaitMs(5000)).toBe(10_000);
+      const started = Date.now();
+      const error = await waitFor(() => false, { timeoutMs: 40, intervalMs: 5, label: 'scaled' }).then(() => new Error('resolved'), (e: unknown) => e as Error);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(80);
+      expect(error.message).toContain('timeout 40ms scaled to 80ms by GBRAIN_TEST_WAIT_MULTIPLIER');
+    });
+  });
+
+  test('a scaled deadline stays below bun\'s 60s per-test timeout; a larger base is kept', async () => {
+    await withEnv({ GBRAIN_TEST_WAIT_MULTIPLIER: '4' }, () => {
+      expect(testWaitMs(20_000)).toBe(50_000);
+      expect(testWaitMs(120_000)).toBe(120_000);
+    });
+  });
+
+  test('an out-of-range value fails with the fix command', async () => {
+    for (const value of ['0.5', '9', 'fast']) {
+      await withEnv({ GBRAIN_TEST_WAIT_MULTIPLIER: value }, () => {
+        expect(() => testWaitMs(10)).toThrow(/Why: .*\nFix: unset GBRAIN_TEST_WAIT_MULTIPLIER/s);
+      });
+    }
   });
 });

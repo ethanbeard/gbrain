@@ -619,10 +619,11 @@ describe('writeFactsToFence — row_num survives a fence-less rewrite', () => {
     // fence writes impossible (pre-v51 brains, transient DB errors).
     const brokenEngine = Object.create(engine) as typeof engine;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (brokenEngine as any).executeRaw = async (sqlText: string, params: unknown[]) => {
+    // A transaction engine derived from brokenEngine keeps its own connection: delegate with `this`.
+    (brokenEngine as any).executeRaw = async function (this: typeof engine, sqlText: string, params: unknown[]) {
       if (sqlText.includes('MAX(row_num)')) throw new Error('simulated lookup failure');
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (engine as any).executeRaw(sqlText, params);
+      return (engine as any).executeRaw.call(this, sqlText, params);
     };
 
     const result = await writeFactsToFence(
@@ -810,10 +811,11 @@ describe('writeFactsToFence — durability latch recovery', () => {
         let gated = false;
         const gatedEngine = Object.create(engine) as typeof engine;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (gatedEngine as any).insertFacts = async (rows: unknown, opts: unknown) => {
+        // The insert runs on a transaction engine derived from gatedEngine: delegate with `this`.
+        (gatedEngine as any).insertFacts = async function (this: typeof engine, rows: unknown, opts: unknown) {
           if (!gated) { gated = true; await gate; }
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          return (engine as any).insertFacts(rows, opts);
+          return (engine as any).insertFacts.call(this, rows, opts);
         };
 
         const a = writeFactsToFence(

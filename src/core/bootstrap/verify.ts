@@ -30,6 +30,7 @@
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
+import { maintenanceAttribution } from '../persistence/attribution.ts';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -221,7 +222,10 @@ async function removeProbes(engine: BrainEngine, ws: string, sourceId: string): 
     // must survive verify's cleanup [G13].
     const sql = `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug IN ($2, $3)`;
     const params = [sourceId, VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG];
-    if (managed) await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params)));
+    if (managed) {
+      const attribution = await maintenanceAttribution(engine);
+      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(sql, params), attribution));
+    }
     else await engine.executeRaw(sql, params);
   } catch {
     /* facts table may not exist on a pre-migration brain — doctor_green names that */
@@ -517,6 +521,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
         ok: true,
         detail:
           `facts default visibility: world (set by bootstrap verify — was unset). ` +
+          `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
           `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} private\` if less-trusted surfaces will read this brain.`,
       };
     }
@@ -525,6 +530,7 @@ async function ensureDefaultVisibilityPosture(engine: BrainEngine): Promise<Veri
       ok: true,
       detail:
         `facts default visibility: ${existing.trim()} (explicit operator value — untouched). ` +
+        `Governs extraction-path writes only — \`remember\` always defaults to world regardless; pass \`visibility\` per call to keep a remembered fact private. ` +
         `Flip with \`gbrain config set ${FACTS_DEFAULT_VISIBILITY_KEY} <world|private>\`.`,
     };
   } catch (e) {

@@ -3,7 +3,7 @@
  *
  * In this dev checkout (nested node_modules) tier 1 must win with
  * source 'embedded'. The hoisted / broken lanes are covered end-to-end by
- * test/pglite-hoisted-install.serial.test.ts (they need a synthetic layout a
+ * test/pglite-hoisted-install.test.ts (they need a synthetic layout a
  * unit test can't fake in-process — Bun resolves the anchor's specifiers
  * relative to the REAL module path).
  *

@@ -126,7 +126,7 @@ gbrain serve --http --port 3001 --bind 0.0.0.0 # bind explicitly for remote acce
                                                 # (default bind is 127.0.0.1)
 gbrain auth register-client neuromancer \
   --grant-types client_credentials \
-  --scopes read,write,admin                    # admin needed for ping/doctor
+  --scopes read,write,admin                    # admin needed for remote doctor
 
 # source-scoped client (write to one source, federate reads across
 # multiple sources). Omit both flags for an unscoped super-client.
@@ -141,8 +141,8 @@ The `register-client` command prints a `client_id` and `client_secret`.
 Note both. **Scope must include `admin`** for `run_doctor` (used by
 `gbrain remote doctor`) and generic background jobs. `submit_job` accepts
 only `sync`, `import`, `lint`, and `lint-fix` with the authenticated source's
-registered root. `gbrain remote ping` no longer submits an autopilot cycle;
-run maintenance on the brain host. See the
+registered root, so the host refuses the `autopilot-cycle` job that
+`gbrain remote ping` submits; run maintenance on the brain host. See the
 [authorization upgrade guide](../guides/authorization-upgrade.md#generic-remote-background-jobs).
 
 **Step 2 — On the thin client (neuromancer):**
@@ -182,7 +182,6 @@ Example for Claude Desktop's `~/.config/claude/claude_desktop_config.json`:
 
 ```bash
 gbrain doctor             # runs thin-client checks (no local DB needed)
-gbrain remote ping        # triggers an autopilot cycle on the host (Tier B)
 gbrain remote doctor      # asks the host to run its own doctor (Tier B)
 ```
 
@@ -502,7 +501,8 @@ Quiesce every writer on every host that uses this database before activating:
 3. Stop `gbrain jobs work` workers and supervisors that are not autopilot's.
 4. Disable cron entries, Git hooks and harness hooks that run `gbrain sync`,
    `embed`, `extract`, `dream` or `import`.
-5. Upgrade every remaining host to this release, even ones you only read from.
+5. Upgrade every remaining host to the gbrain version you activate with (v0.60.11.0
+   or newer), even ones you only read from.
 
 Then run the sequence, re-reading status between every step, because
 `admin_state` rotates after every change and a stale value refuses with
@@ -518,8 +518,10 @@ gbrain sources writer activate --brain host --confirm-quiesced \
   --admin-intent writer_activate --expected-state <fresh admin_state> --json
 ```
 
-After activation, managed sync requires `--no-pull` (Git pull/rebase needs an
-explicit drained maintenance window) and refuses `--skip-failed` and
+After activation, managed sync requires `--no-pull` (new upstream commits come in
+through `gbrain sources refresh <source>`, the drained worktree-wide fast-forward,
+which runs inside a resident PGLite owner such as `gbrain serve` when one holds the brain;
+see [worktree refresh refusals](../guides/write-refusals.md#worktree-refresh-refusals)) and refuses `--skip-failed` and
 `--include-gitignored`; after fixing a failed item run
 `gbrain sync --no-pull --retry-failed` with the same source and options. Resume
 autopilot with `gbrain autopilot resume` and re-enable the hooks you stopped.
@@ -574,14 +576,14 @@ dry run first."*
    It takes no `<source>`: deactivation is brain-wide.
 5. Verify on every host: `gbrain sources writer status` reports `mode: classic`
    and this host's `local_markers`: `cleared`, or `pending` with each path that
-   still needs attention. Older binaries honor local markers without this
-   cleanup, so run a command from this release (for example
+   still needs attention. Binaries older than v0.60.20.0 honor local markers
+   without this cleanup, so run a v0.60.20.0 or newer command (for example
    `gbrain sources writer status`) once on every other host before an older
    binary writes there. That first command removes the markers and registry
    records of the retired epoch; a marker from an unknown or newer epoch (for
    example after restoring an older backup) is kept and reported.
 
-`min_writer_version` stays deferred: while the brain is managed, the database
+`min_writer_version` is not implemented: while the brain is managed, the database
 writer guard is the enforcement, and after deactivation that guard is inert.
 
 ### Writer admin lock
@@ -596,7 +598,7 @@ neither lock nor unlock, and generic `gbrain config set`/`unset` (including
 `--pattern`) refuse the reserved key `persistence.writer_admin_lock`. Dry runs
 of the four operations refuse too. The lock guards against routine or accidental
 agent administration; it is not a security boundary against a caller with the
-same shell. Binaries older than this release do not consult it.
+same shell. Binaries older than v0.60.11.0 do not consult it.
 `gbrain sources writer status` shows `admin_lock` (whether it is set, when, and
 by which host) and the selected brain.
 
@@ -692,8 +694,8 @@ the canonical page, which moves the phantom's rows by id, then
 the `managed_facts_entity` intent. Each checks its local writer authority (and,
 for file publication, the canonical owner) before model calls. Receipt pages
 for these runs stay unmanaged-only. `unsupported_maintenance` in writer status
-and activation preview is now empty. Do not infer that every dream or job
-writer is restored from the named lanes above.
+and activation preview is empty, but that does not mean dream or job writers
+outside the lanes named above publish on a managed brain.
 
 Google and GitHub API sources route through managed connector checkpoints,
 not a Git cursor. A deliberately unbound API source uses reviewed
@@ -716,7 +718,7 @@ another explicit retry after inspecting and repairing its cause; cancelled
 receipts are not retry-approved. No connector API data is fetched before the
 source/owner and active-work preflight, although deriving exact matching input
 can require a normal API fetch before retry approval.
-For PGLite, `dream` and `jobs --follow` still need exclusive engine access:
+For PGLite, `dream` and `jobs --follow` need exclusive engine access:
 stop the resident owner and any supervisor using their normal shutdown path,
 wait for writes to drain, run the inline command, then restart the owner. The
 disk-brain CLI regression verifies refusal with a live owner, malformed-output

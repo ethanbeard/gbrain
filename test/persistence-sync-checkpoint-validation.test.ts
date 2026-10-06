@@ -11,6 +11,7 @@ import { claimWorktree, getWorktreeBinding } from '../src/core/persistence/owner
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { INCOMPLETE_SYNC_RECEIPT_SQL, checkpointRetryCommand, findIncompleteSyncReceipt, formatCheckpointTimeoutHint, readRequestIndexStates } from '../src/core/persistence/checkpoint-validation.ts';
 import { persistenceOperations } from '../src/core/ops/persistence.ts';
 import { printManagedSyncDiagnostic } from '../src/commands/sync-diagnostics.ts';
@@ -137,7 +138,7 @@ test('#5762 a validation statement timeout fails the checkpoint terminally with 
   expect(lines.join('')).toContain('Docs: docs/guides/write-refusals.md#checkpoint-validation-timeout');
 
   // Nothing is left queued ahead of other writes to the source.
-  await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw("UPDATE pages SET title='edited' WHERE source_id=$1 AND slug='a'", [f.id])));
+  await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.executeRaw("UPDATE pages SET title='edited' WHERE source_id=$1 AND slug='a'", [f.id]), TEST_WRITE_ATTRIBUTION));
   expect(await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND state IN ('queued','running','recovering')", [f.id])).toEqual([]);
 
   // The receipt rebuilds the same hint from its durable code after a restart.

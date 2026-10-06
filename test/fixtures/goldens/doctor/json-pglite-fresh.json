@@ -8,12 +8,15 @@
     ],
     "exit_code": 0,
     "report": {
-      "brain_checks_score": 85,
+      "brain_checks_score": 100,
+      "capped_by": [
+        "embeddings_disabled"
+      ],
       "category_scores": {
-        "brain": 85,
+        "brain": 100,
         "meta": 100,
-        "ops": 95,
-        "skill": 90
+        "ops": 100,
+        "skill": 95
       },
       "checks": [
         {
@@ -32,9 +35,22 @@
             "path": "pglite — serve IPC socket not present",
             "policy_skill_installed": false
           },
+          "fix": {
+            "actor": "user",
+            "consent": [
+              "persistent_install"
+            ],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/protocol/MEMORY_VERBS_v1.md#install-the-4-command-quickstart",
+            "next": "report",
+            "requires_exclusive": false,
+            "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
+            "why": "Register `<absolute path to gbrain> serve --surface starter` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+          },
           "message": "pglite — serve IPC socket not present; enabled but NO resolve path exists right now: the IPC socket is only bound by a running `gbrain serve` (stdio or --http) — until one is up, hooks/reflex degrade to no_serve on this brain (host capability may still supply pointers; policy skill carries otherwise) — policy skill not installed; run `gbrain integrations install retrieval-reflex --target <host-repo>`",
           "name": "retrieval_reflex_health",
-          "status": "warn"
+          "readiness_state": "not_applicable",
+          "severity": "info",
+          "status": "ok"
         },
         {
           "category": "skill",
@@ -141,6 +157,7 @@
               "webhook-transforms"
             ]
           },
+          "fix_unavailable_reason": "unstructured",
           "message": "64 new built-in skill(s) available that this workspace hasn't installed: academic-verify, archive-crawler, article-enrichment, ask-user, blog-ingest, book-mirror, brain-ingest-gate, brain-link-discipline, … +56 more. Add them with `gbrain skillpack sync`.",
           "name": "skill_currency",
           "status": "warn"
@@ -171,10 +188,12 @@
             ],
             "backstop_visibility": "private",
             "counters_note": "local, append-only, loss-tolerant observability over the last 7d — never a source of truth",
+            "cross_lane_duplicates_7d": 0,
             "instruction_visibility": "world",
             "mode": "off",
             "mode_valid": true,
-            "nudge_shown": true,
+            "near_duplicates_shadow_7d": 0,
+            "nudge_shown": false,
             "transient_ttl": "3d",
             "ttl_valid": true,
             "visibility_note": "world = readable by agents authorized on THIS brain, not the public internet"
@@ -200,6 +219,47 @@
           },
           "message": "No dream key died 3+ times in 24h",
           "name": "dream_paid_loop",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "details": {
+            "pending_fresh_install": [
+              "0.11.0",
+              "0.14.0",
+              "0.22.4",
+              "0.28.0",
+              "0.53.0"
+            ]
+          },
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "apply-migrations",
+              "--yes",
+              "--no-autopilot-install"
+            ],
+            "command": "gbrain apply-migrations --yes --no-autopilot-install",
+            "consent": [],
+            "next": "run",
+            "requires_exclusive": true,
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "minions_migration",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Runs the setup migrations gbrain init left pending (preferences, host-work notes, shared-skill checkpoints) on the brain host, without installing background services."
+          },
+          "message": "5 setup migration(s) not run yet on this new brain (pending_fresh_install: 0.11.0, 0.14.0, 0.22.4, 0.28.0, 0.53.0). Expected after gbrain init, not a failed upgrade.",
+          "name": "minions_migration",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -309,6 +369,42 @@
         },
         {
           "category": "ops",
+          "details": {
+            "reason": "no_harness_detected"
+          },
+          "fix": {
+            "actor": "user",
+            "consent": [
+              "persistent_install"
+            ],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/protocol/MEMORY_VERBS_v1.md#install-the-4-command-quickstart",
+            "next": "report",
+            "requires_exclusive": false,
+            "user_message": "Which agent app should get gbrain memory? The install guide has a one-line command for each.",
+            "why": "Register `<absolute path to gbrain> serve --surface starter` as a stdio MCP server in your agent host; the install section lists the exact command per harness (Claude Code, Codex, Grok Build, opencode, OpenClaw)."
+          },
+          "message": "No agent harness was detected. Wire one when the user picks an agent app.",
+          "name": "harness_wiring",
+          "readiness_state": "missing",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "details": {
+            "consent_refused": 0,
+            "derived_cap_exhausted": 0,
+            "events": 0,
+            "internal_errors": 0,
+            "json_document_missing": 0,
+            "window_days": 7
+          },
+          "message": "No agent dead ends in the last 7 days (0 non-success event(s) logged).",
+          "name": "agent_contract",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
           "message": "Connected, 0 pages",
           "name": "connection",
           "status": "ok"
@@ -362,6 +458,39 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "refreshes": []
+          },
+          "message": "No worktree refresh is stuck.",
+          "name": "worktree_refresh_stuck",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "extra_columns": [],
+            "page_child_source_columns": [],
+            "runbook": "docs/guides/write-refusals.md#managed-guard-page-children"
+          },
+          "message": "Guarded tables carry only the columns gbrain creates.",
+          "name": "managed_guard_schema_drift",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "guard_refusals": 0,
+            "runbook": "docs/guides/write-refusals.md#managed-guard-page-children",
+            "trigger_refusals": 0,
+            "unclassified_p0001": 0,
+            "window_days": 7
+          },
+          "message": "No write was refused by a database guard in the last 7 days.",
+          "name": "publication_refusals",
+          "status": "ok"
+        },
+        {
           "category": "meta",
           "message": "links_link_source_check has the v114 kebab-case gate",
           "name": "links_link_source_check",
@@ -381,13 +510,13 @@
         },
         {
           "category": "meta",
-          "message": "Version 189 (latest: 189)",
+          "message": "Version <latest> (latest: <latest>)",
           "name": "schema_version",
           "status": "ok"
         },
         {
           "category": "meta",
-          "message": "810 column(s) verified against live schema",
+          "message": "980 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -399,15 +528,101 @@
         },
         {
           "category": "brain",
-          "message": "100% coverage, 0 missing",
+          "fix": {
+            "actor": "user",
+            "argv": [
+              "gbrain",
+              "init",
+              "--force",
+              "--embedding-model",
+              "voyage:voyage-4",
+              "--embedding-dimensions",
+              "1024",
+              "--path",
+              "<home>/.gbrain/brain.pglite"
+            ],
+            "command": "gbrain init --force --embedding-model voyage:voyage-4 --embedding-dimensions 1024 --path <home>/.gbrain/brain.pglite",
+            "consent": [
+              "credentials",
+              "paid"
+            ],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/search-modes.md",
+            "inputs": [
+              {
+                "how": "Ask the user for an API key for Voyage AI; store it with `gbrain config set voyage_api_key <key>` (every gbrain process reads it), or export VOYAGE_API_KEY in the environment of every gbrain process. Then run the command.",
+                "name": "VOYAGE_API_KEY"
+              }
+            ],
+            "next": "tell_user_to_run",
+            "requires_exclusive": true,
+            "user_message": "Semantic search needs an embedding API key. Voyage AI works with this brain; if you add a key (VOYAGE_API_KEY), I can turn it on. Embedding costs a little per page; your notes and facts stay as they are.",
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "embeddings",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Embeddings are off, so search is keyword-only, and no configured embedding key fits this brain. Once the key is set this turns on voyage:voyage-4 (1024d) for the PGLite brain at <home>/.gbrain/brain.pglite. Pages, facts and keyword search are kept; existing chunks and facts are queued for vectors, which `gbrain embed --stale` (or the next maintenance cycle) fills."
+          },
+          "message": "Not applicable: embeddings are disabled on this brain (keyword search keeps working).",
           "name": "embeddings",
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
           "status": "ok"
         },
         {
           "category": "brain",
-          "message": "Embedding provider probe failed: This brain has no explicit embedding model. Its stored vectors must not be interpreted using a new default. Run gbrain migrate embeddings --status and preview an explicit migration with --dry-run.",
+          "fix": {
+            "actor": "user",
+            "argv": [
+              "gbrain",
+              "init",
+              "--force",
+              "--embedding-model",
+              "voyage:voyage-4",
+              "--embedding-dimensions",
+              "1024",
+              "--path",
+              "<home>/.gbrain/brain.pglite"
+            ],
+            "command": "gbrain init --force --embedding-model voyage:voyage-4 --embedding-dimensions 1024 --path <home>/.gbrain/brain.pglite",
+            "consent": [
+              "credentials",
+              "paid"
+            ],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/search-modes.md",
+            "inputs": [
+              {
+                "how": "Ask the user for an API key for Voyage AI; store it with `gbrain config set voyage_api_key <key>` (every gbrain process reads it), or export VOYAGE_API_KEY in the environment of every gbrain process. Then run the command.",
+                "name": "VOYAGE_API_KEY"
+              }
+            ],
+            "next": "tell_user_to_run",
+            "requires_exclusive": true,
+            "user_message": "Semantic search needs an embedding API key. Voyage AI works with this brain; if you add a key (VOYAGE_API_KEY), I can turn it on. Embedding costs a little per page; your notes and facts stay as they are.",
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "embeddings",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Embeddings are off, so search is keyword-only, and no configured embedding key fits this brain. Once the key is set this turns on voyage:voyage-4 (1024d) for the PGLite brain at <home>/.gbrain/brain.pglite. Pages, facts and keyword search are kept; existing chunks and facts are queued for vectors, which `gbrain embed --stale` (or the next maintenance cycle) fills."
+          },
+          "message": "Not probed: embeddings are disabled on this brain by choice (keyword search keeps working).",
           "name": "embedding_provider",
-          "status": "warn"
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
+          "status": "ok"
         },
         {
           "category": "brain",
@@ -425,6 +640,18 @@
           "category": "brain",
           "message": "no embedding migration in flight",
           "name": "embedding_migration_state",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "message": "No chat_fallback_chain is set: every chat call uses only its own model.",
+          "name": "chat_fallback_chain",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "message": "Nothing to disclose: this brain is a fresh install at v<version>, after every disclosed behavior change, so the one-time behavior-change notice does not apply.",
+          "name": "behavior_changes",
           "status": "ok"
         },
         {
@@ -606,6 +833,30 @@
         {
           "category": "brain",
           "details": {
+            "docs": "docs/guides/repair.md#held-files",
+            "escalate_count": 50,
+            "held": 0,
+            "source_ids": [],
+            "sources": []
+          },
+          "message": "No Git source files are held.",
+          "name": "git_held_files",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/repair.md#held-files",
+            "hooks": []
+          },
+          "message": "No outdated gbrain frontmatter pre-commit hook is installed.",
+          "name": "frontmatter_hook",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "bindings": [],
             "count": 0,
             "docs": "docs/guides/repair.md#orphan-bindings",
@@ -722,6 +973,37 @@
         },
         {
           "category": "brain",
+          "details": {
+            "ambiguous": 0,
+            "docs": "docs/guides/repair.md#explicit-only-repair-kinds",
+            "evidenced": 0,
+            "excluded": 0,
+            "repair": "captured-facts",
+            "unclassifiable": 0
+          },
+          "message": "No active fact from a gbrain self-capture or paste candidate remains. This counts facts in the database; the self_capture check counts corpus files.",
+          "name": "captured_facts_active",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/repair.md#explicit-only-repair-kinds",
+            "drifted": 0,
+            "repair": "loop-facts"
+          },
+          "message": "Every closed commitment loop has its fact retired.",
+          "name": "loop_facts_drift",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "message": "Relative dates resolve against each source's observation date in fact extraction, dream synthesis, extract_atoms and propose_takes (the default). life chronicle events keep their current prompt unless extraction.date_grounding is set to true. Facts extracted before this was on keep their original wording; re-extract a source only with the user's consent (gbrain extract-conversation-facts --source-id <id> --dry-run previews it).",
+          "name": "extraction_date_grounding",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
           "message": "Sampled 0 pages; no bare-tweet phrases or external links.",
           "name": "integrity",
           "status": "ok"
@@ -828,6 +1110,20 @@
           "status": "ok"
         },
         {
+          "category": "brain",
+          "details": {
+            "docs": "docs/guides/repair.md#frontmatter",
+            "partial": false,
+            "repairable": 0,
+            "source_ids": [],
+            "sources": [],
+            "unscanned": []
+          },
+          "message": "No file has frontmatter gbrain repair frontmatter would fix.",
+          "name": "frontmatter_repairable",
+          "status": "ok"
+        },
+        {
           "category": "meta",
           "message": "No capture failures in the last 24h",
           "name": "eval_capture",
@@ -859,7 +1155,13 @@
         },
         {
           "category": "ops",
-          "message": "Skipped (PGLite — no multi-process worker surface)",
+          "details": {
+            "by_queue": {},
+            "depth": 0,
+            "engine": "pglite",
+            "worker_alive": true
+          },
+          "message": "PGLite: no jobs waiting for a worker.",
           "name": "queue_health",
           "status": "ok"
         },
@@ -877,12 +1179,23 @@
         },
         {
           "category": "ops",
+          "message": "Brain-wide maintenance jobs are finishing within their deadline.",
+          "name": "global_maintenance_timeouts",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
           "details": {
             "active_ids": [],
             "authorizable": {},
             "authorizable_total": 0,
             "docs": "docs/guides/repair.md#legacy-job-authority",
             "live": 0,
+            "queued_spend": {
+              "by_basis": {},
+              "long_waiting": 0,
+              "long_waiting_ids": []
+            },
             "terminal_keyed": {},
             "terminal_keyed_total": 0,
             "unsupported": 0,
@@ -890,6 +1203,41 @@
           },
           "message": "No queued job predates submission authority.",
           "name": "legacy_job_authority",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "convertible_count": 0,
+            "docs": "docs/mcp/ADMIN.md#legacy-token-grants",
+            "legacy_shape_count": 0,
+            "malformed": [],
+            "mirror_window_ends": "2026-11-04"
+          },
+          "message": "Every active legacy token uses the unified grant columns. The permissions mirror for older gbrain binaries is kept until 2026-11-04.",
+          "name": "legacy_token_grant_shape",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "docs": "docs/mcp/ADMIN.md#legacy-token-grants",
+            "drift": [],
+            "mirror_window_ends": "2026-11-04"
+          },
+          "message": "No legacy token grant has drifted from its permissions mirror.",
+          "name": "legacy_token_grant_drift",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "docs": "docs/mcp/ADMIN.md#tokens-without-scopes",
+            "null_scope_count": 0,
+            "tokens": []
+          },
+          "message": "Every active legacy token has explicit scopes.",
+          "name": "legacy_token_null_scope",
           "status": "ok"
         },
         {
@@ -945,9 +1293,47 @@
               "unpushed": 0
             }
           },
-          "message": "0 knowledge asset(s) have no git remote: . Current recovery is not verified for all repositories. Run `gbrain backup status` for fix commands (`gbrain bootstrap repo` / `git remote add origin <url>` / `gbrain sources harden <id>`).",
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "export",
+              "--source",
+              "default",
+              "--dir",
+              "<BACKUP_DIR>/default",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain export --source default --dir '<BACKUP_DIR>/default' --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/operations/backup-check.md",
+            "inputs": [
+              {
+                "how": "Ask the user where backups should live (a directory outside the brain, ideally synced or on another disk).",
+                "name": "BACKUP_DIR"
+              }
+            ],
+            "next": "run",
+            "requires_exclusive": false,
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "backup_coverage",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Writes a Markdown copy of 'default' (pages and facts) to a directory outside the brain so it survives losing the database."
+          },
+          "message": "Not urgent yet: the brain holds 0 page(s)+fact(s) and is under 7 days old (backup coaching starts at 25 items or 7 days). 1 knowledge asset(s) lack verified recovery: default (not_a_git_repo). A source repo with a pushed git remote restores its Markdown files only, never DB-only pages, facts, config or credentials. Run `gbrain backup status` for each asset's fix command.",
           "name": "backup_coverage",
-          "status": "warn"
+          "readiness_state": "degraded",
+          "severity": "info",
+          "status": "ok"
         },
         {
           "category": "ops",
@@ -963,9 +1349,11 @@
         },
         {
           "category": "brain",
-          "message": "Source 'default' has never completed a full cycle. Run `gbrain dream --source <id>` to cycle a source, or start `gbrain autopilot`.",
+          "message": "No full cycle yet for 'default': it holds no pages or only pages from the last 24h, so there is nothing to consolidate yet.",
           "name": "cycle_freshness",
-          "status": "warn"
+          "readiness_state": "not_applicable",
+          "severity": "info",
+          "status": "ok"
         },
         {
           "category": "brain",
@@ -981,7 +1369,7 @@
         },
         {
           "category": "brain",
-          "message": "Every DB page is file-backed or under a declared/default db_only path (derive-phase defaults: life/events/ atoms/ concepts/ extracts/ dream-cycle-summaries/)",
+          "message": "Every DB page is file-backed or under a declared/default db_only path (derive-phase defaults: life/events/ atoms/ concepts/ extracts/ dream-cycle-summaries/).",
           "name": "undeclared_db_only_pages",
           "status": "ok"
         },
@@ -1023,6 +1411,312 @@
           },
           "message": "No active facts yet; nothing to link.",
           "name": "unlinked_facts",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "contradiction_mode": "propose (default)",
+            "lagging": 0,
+            "proposals": {
+              "applied": 0,
+              "proposed": 0,
+              "undated": 0
+            },
+            "read_policy": "on",
+            "relationships": {},
+            "stale_assertions": []
+          },
+          "message": "relationships: none yet; read policy on; contradiction mode propose (default)",
+          "name": "edge_validity",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "auto_calls_24h": 0,
+            "chat_available": false,
+            "daily_limit": 200,
+            "docs": "docs/guides/life-chronicle.md",
+            "enabled": true,
+            "job_budget_usd": 0.25,
+            "last_7d": {
+              "extracted": 0,
+              "failed": 0,
+              "failedReasons": {},
+              "reasons": {},
+              "skipped": 0
+            },
+            "ledger_available": true,
+            "pending": 0,
+            "principals_24h": [],
+            "readiness": "missing",
+            "run_now": [
+              "gbrain",
+              "dream",
+              "--phase",
+              "chronicle"
+            ],
+            "severity": "info",
+            "source": "default",
+            "spend_7d": {
+              "incompleteRecords": 0,
+              "knownUsd": 0,
+              "unpricedCalls": 0
+            }
+          },
+          "message": "auto_chronicle is on (default). Last 24 h: 0 of 200 automatic extraction calls. Last 7 days: 0 extracted, 0 failed, 0 skipped; $0.00 known spend. 0 page(s) pending. No chat provider is configured, so nothing will be extracted until one is.",
+          "name": "auto_chronicle",
+          "readiness_state": "missing",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "message": "chronicle.* settings are valid.",
+          "name": "chronicle_config_invalid",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "ask_user": true,
+            "code": "auto_chronicle_default_on",
+            "decisions": [
+              {
+                "argv": [
+                  "gbrain",
+                  "config",
+                  "set",
+                  "auto_chronicle",
+                  "true"
+                ],
+                "fix": {
+                  "actor": "agent",
+                  "argv": [
+                    "gbrain",
+                    "config",
+                    "set",
+                    "auto_chronicle",
+                    "true"
+                  ],
+                  "consent": [
+                    "paid",
+                    "egress"
+                  ],
+                  "requires_exclusive": false,
+                  "user_message": "Automatic event extraction is on: each new or changed meeting, conversation or calendar page gets one paid chat call. Keep it on, or turn it off?",
+                  "verify": {
+                    "argv": [
+                      "gbrain",
+                      "doctor",
+                      "--only",
+                      "auto_chronicle_default_on",
+                      "--json"
+                    ]
+                  },
+                  "why": "Keeping automatic extraction records that the user accepted one paid chat call per eligible page; page text goes to the chat provider."
+                },
+                "id": "keep",
+                "label": "Keep automatic extraction on"
+              },
+              {
+                "argv": [
+                  "gbrain",
+                  "config",
+                  "set",
+                  "auto_chronicle",
+                  "false"
+                ],
+                "fix": {
+                  "actor": "agent",
+                  "argv": [
+                    "gbrain",
+                    "config",
+                    "set",
+                    "auto_chronicle",
+                    "false"
+                  ],
+                  "consent": [],
+                  "requires_exclusive": false,
+                  "verify": {
+                    "argv": [
+                      "gbrain",
+                      "doctor",
+                      "--only",
+                      "auto_chronicle_default_on",
+                      "--json"
+                    ]
+                  },
+                  "why": "Turns automatic extraction off; history stays available on request with chronicle-backfill."
+                },
+                "id": "opt_out",
+                "label": "Turn automatic extraction off"
+              }
+            ],
+            "default": "keep",
+            "docs": "docs/guides/life-chronicle.md",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "config",
+                "set",
+                "auto_chronicle",
+                "true"
+              ],
+              "consent": [
+                "paid",
+                "egress"
+              ],
+              "requires_exclusive": false,
+              "user_message": "Automatic event extraction is on: each new or changed meeting, conversation or calendar page gets one paid chat call. Keep it on, or turn it off?",
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "auto_chronicle_default_on",
+                  "--json"
+                ]
+              },
+              "why": "Keeping automatic extraction records that the user accepted one paid chat call per eligible page; page text goes to the chat provider."
+            },
+            "severity": "info"
+          },
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "config",
+              "set",
+              "auto_chronicle",
+              "true",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain config set auto_chronicle true --brain host",
+            "consent": [
+              "paid",
+              "egress"
+            ],
+            "next": "ask_user",
+            "requires_exclusive": false,
+            "user_message": "Automatic event extraction is on: each new or changed meeting, conversation or calendar page gets one paid chat call. Keep it on, or turn it off?",
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "auto_chronicle_default_on",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Keeping automatic extraction records that the user accepted one paid chat call per eligible page; page text goes to the chat provider."
+          },
+          "message": "Automatic event extraction is on by default and the user has not confirmed it yet. Each eligible new or changed meeting, conversation or calendar page gets one paid chat call (cap $0.25 per page; at most 200 calls per day, so at most $50.00 per day for a priced model; an unpriced model has no cap), and page text goes to the configured chat provider. Relay this to the user, then run `gbrain config set auto_chronicle true` to keep it or `gbrain config set auto_chronicle false` to opt out.",
+          "name": "auto_chronicle_default_on",
+          "readiness_state": "ok",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "backlog": {
+              "active": 0,
+              "delayed": 0,
+              "waiting": 0
+            },
+            "budget_usd": 1,
+            "daily_budget_usd": 5,
+            "daily_spent_usd": 0,
+            "docs": "docs/guides/facts-drain.md",
+            "enabled": true,
+            "health": "idle",
+            "last_run": null,
+            "max_jobs": 50
+          },
+          "message": "No facts-absorb jobs are queued (no run recorded yet).",
+          "name": "facts_drain",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "applicable": false
+          },
+          "message": "Not applicable: embeddings are disabled on this brain (keyword search keeps working).",
+          "name": "fact_take_vectors",
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "auto_analyze": true,
+            "checked": [
+              "pages",
+              "links",
+              "facts",
+              "takes",
+              "content_chunks",
+              "timeline_entries"
+            ],
+            "engine": "pglite",
+            "fix": "gbrain repair planner-stats --apply",
+            "stale": []
+          },
+          "message": "Planner statistics are fresh on 6 hot tables.",
+          "name": "planner_stats_stale",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "details": {
+            "answers_recorded": 0,
+            "docs": "docs/guides/retrieval-feedback.md",
+            "enabled": false,
+            "implicit": false,
+            "influence": 0.1,
+            "last_rating_at": null,
+            "learn": true,
+            "ratings_cited": 0,
+            "ratings_explicit": 0,
+            "top_client_share_7d": null,
+            "weights": 0,
+            "weights_off_neutral": 0
+          },
+          "message": "Retrieval feedback is off; rankings do not learn from ratings. Turn it on with: gbrain config set feedback.enabled true",
+          "name": "retrieval_feedback_health",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "details": {
+            "column": "not_null",
+            "failed": [],
+            "pending": 0
+          },
+          "message": "Every page has its revision; the page revision backfill is complete.",
+          "name": "revision_backfill",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "bad_config": [],
+            "chars_limit": 4000,
+            "chars_used": 0,
+            "compiled": [],
+            "docs": "docs/guides/core-memory.md",
+            "enabled": false,
+            "pages": 0
+          },
+          "message": "Core memory is off (opt-in). If the user wants a profile loaded in every session: gbrain config set memory.core.enabled true, then gbrain core init.",
+          "name": "core_memory",
           "status": "ok"
         },
         {
@@ -1157,21 +1851,24 @@
           "category": "meta",
           "details": {
             "counts": {
-              "global": 9,
+              "global": 12,
               "mixed": 2,
               "source": 12
             },
             "phase_scope_map": {
               "backlinks": "source",
               "calibration_profile": "global",
+              "chronicle": "global",
               "consolidate": "source",
               "conversation_facts_backfill": "source",
               "drift": "global",
+              "edge_contradictions": "global",
               "embed": "global",
               "enrich_thin": "source",
               "extract": "source",
               "extract_atoms": "source",
               "extract_facts": "source",
+              "facts_drain": "global",
               "grade_takes": "global",
               "lint": "source",
               "orphans": "global",
@@ -1187,14 +1884,57 @@
               "synthesize_concepts": "global"
             }
           },
-          "message": "Phase taxonomy: 12 source-scoped, 9 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, drift, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
+          "message": "Phase taxonomy: 12 source-scoped, 12 brain-global, 2 mixed. Source-safe: [lint, backlinks, sync, extract, extract_facts, extract_atoms, recompute_emotional_weight, consolidate, propose_takes, conversation_facts_backfill, enrich_thin, schema-suggest]. Brain-global: [resolve_symbol_edges, synthesize_concepts, grade_takes, calibration_profile, edge_contradictions, drift, chronicle, facts_drain, skillopt, embed, orphans, purge]. Mixed: [synthesize, patterns].",
           "name": "cycle_phase_scope",
           "status": "ok"
         },
         {
           "category": "brain",
-          "message": "No stale chunks",
+          "fix": {
+            "actor": "user",
+            "argv": [
+              "gbrain",
+              "init",
+              "--force",
+              "--embedding-model",
+              "voyage:voyage-4",
+              "--embedding-dimensions",
+              "1024",
+              "--path",
+              "<home>/.gbrain/brain.pglite"
+            ],
+            "command": "gbrain init --force --embedding-model voyage:voyage-4 --embedding-dimensions 1024 --path <home>/.gbrain/brain.pglite",
+            "consent": [
+              "credentials",
+              "paid"
+            ],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/search-modes.md",
+            "inputs": [
+              {
+                "how": "Ask the user for an API key for Voyage AI; store it with `gbrain config set voyage_api_key <key>` (every gbrain process reads it), or export VOYAGE_API_KEY in the environment of every gbrain process. Then run the command.",
+                "name": "VOYAGE_API_KEY"
+              }
+            ],
+            "next": "tell_user_to_run",
+            "requires_exclusive": true,
+            "user_message": "Semantic search needs an embedding API key. Voyage AI works with this brain; if you add a key (VOYAGE_API_KEY), I can turn it on. Embedding costs a little per page; your notes and facts stay as they are.",
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "embeddings",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Embeddings are off, so search is keyword-only, and no configured embedding key fits this brain. Once the key is set this turns on voyage:voyage-4 (1024d) for the PGLite brain at <home>/.gbrain/brain.pglite. Pages, facts and keyword search are kept; existing chunks and facts are queued for vectors, which `gbrain embed --stale` (or the next maintenance cycle) fills."
+          },
+          "message": "Not applicable: embeddings are disabled on this brain by choice, so chunks have no vectors by design (keyword search keeps working).",
           "name": "embed_staleness",
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -1211,19 +1951,52 @@
         },
         {
           "category": "brain",
+          "fix": {
+            "actor": "agent",
+            "argv": [
+              "gbrain",
+              "config",
+              "set",
+              "takes.bootstrap_enabled",
+              "true",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain config set takes.bootstrap_enabled true --brain host",
+            "consent": [
+              "paid"
+            ],
+            "next": "ask_user",
+            "requires_exclusive": false,
+            "user_message": "gbrain can extract typed claims (\"takes\") from your pages so it can track calibration over time. It uses a paid chat model (roughly $5 once). Turn it on?",
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "takes_count",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Takes (typed claims) are opt-in. Enabling the bootstrap lets maintenance extract them from existing pages with a chat model (about $5 on a typical brain), which feeds calibration."
+          },
           "message": "0 takes (takes.bootstrap_enabled is false; opt in to enable)",
           "name": "takes_count",
-          "status": "warn"
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
+          "status": "ok"
         },
         {
           "category": "meta",
-          "message": "Active pack gbrain-base-v2@1.2.0+1a2aee67 is current (no successor declared)",
+          "message": "Active pack gbrain-base-v2@1.3.0+a50a67b9 is current (no successor declared)",
           "name": "pack_upgrade_available",
           "status": "ok"
         },
         {
           "category": "meta",
-          "message": "0 distinct typed values (pack declares 19)",
+          "message": "0 distinct typed values (pack declares 20)",
           "name": "type_proliferation",
           "status": "ok"
         },
@@ -1236,43 +2009,13 @@
       ],
       "db_url_source": null,
       "engine": "pglite",
-      "health_score": 70,
+      "health_score": 95,
       "schema_version": 2,
       "status": "warnings",
       "top_issues": [
         {
-          "fix": "0 knowledge asset(s) have no git remote: . Current recovery is not verified for all repositories. Run `gbrain backup status` for fix commands (`gbrain bootstrap repo` / `git remote add origin <url>` / `gbrain sources harden <id>`).",
-          "name": "backup_coverage",
-          "status": "warn",
-          "tier": "symptom"
-        },
-        {
-          "fix": "Source 'default' has never completed a full cycle. Run `gbrain dream --source <id>` to cycle a source, or start `gbrain autopilot`.",
-          "name": "cycle_freshness",
-          "status": "warn",
-          "tier": "symptom"
-        },
-        {
-          "fix": "Embedding provider probe failed: This brain has no explicit embedding model. Its stored vectors must not be interpreted using a new default. Run gbrain migrate embeddings --status and preview an explicit migration with --dry-run.",
-          "name": "embedding_provider",
-          "status": "warn",
-          "tier": "symptom"
-        },
-        {
-          "fix": "pglite — serve IPC socket not present; enabled but NO resolve path exists right now: the IPC socket is only bound by a running `gbrain serve` (stdio or --http) — until one is up, hooks/reflex degrade to no_serve on this brain (host capability may still supply pointers; policy skill carries otherwise) — policy skill not installed; run `gbrain integrations install retrieval-reflex --target <host-repo>`",
-          "name": "retrieval_reflex_health",
-          "status": "warn",
-          "tier": "symptom"
-        },
-        {
           "fix": "64 new built-in skill(s) available that this workspace hasn't installed: academic-verify, archive-crawler, article-enrichment, ask-user, blog-ingest, book-mirror, brain-ingest-gate, brain-link-discipline, … +56 more. Add them with `gbrain skillpack sync`.",
           "name": "skill_currency",
-          "status": "warn",
-          "tier": "symptom"
-        },
-        {
-          "fix": "0 takes (takes.bootstrap_enabled is false; opt in to enable)",
-          "name": "takes_count",
           "status": "warn",
           "tier": "symptom"
         }

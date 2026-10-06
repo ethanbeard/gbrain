@@ -207,9 +207,9 @@ function AgentDrawer({ agent, sources, sourcesReady, onClose, onChanged, onResco
       <h3 className="section-title">API key</h3><p>Use this key as a bearer token in a client that supports static authentication. Its value is available only in the original private handoff.</p>
       {agent.status === 'active' && <div style={{ marginTop: 20 }}>
         {!confirmApiKeyRevoke ? <button type="button" className="btn btn-secondary" onClick={() => setConfirmApiKeyRevoke(true)}>Revoke API key</button> : <>
-          <p>Revoke all active API keys named {name}? Keys with the same name will stop working. Memory remains.</p>
+          <p>Revoke the API key {name} ({clientId})? Only this key stops working. Memory remains.</p>
           <button type="button" className="btn btn-secondary" disabled={busy} onClick={() => setConfirmApiKeyRevoke(false)}>Cancel</button>{' '}
-          <button type="button" className="btn btn-danger" disabled={busy} onClick={() => { setBusy(true); void api.revokeApiKey(name).then(onChanged).catch(cause => setError(cause instanceof Error ? cause.message : 'Revoke failed. Refresh the client list before retrying.')).finally(() => setBusy(false)); }}>Confirm revoke</button>
+          <button type="button" className="btn btn-danger" disabled={busy} onClick={() => { setBusy(true); void api.revokeApiKey(clientId).then(onChanged).catch(cause => setError(cause instanceof Error ? cause.message : 'Revoke failed. Refresh the client list before retrying.')).finally(() => setBusy(false)); }}>Confirm revoke</button>
         </>}
         {error && <p role="alert">{error}</p>}
       </div>}
@@ -217,18 +217,32 @@ function AgentDrawer({ agent, sources, sourcesReady, onClose, onChanged, onResco
   </Dialog>;
 }
 
+const API_KEY_SCOPES = [
+  { id: 'read', label: 'Read', help: 'Search and read memory.' },
+  { id: 'write', label: 'Write', help: 'Add and edit memory.' },
+  { id: 'admin', label: 'Admin', help: 'Brain administration operations. Grant only to fully trusted clients.' },
+] as const;
+
 function ApiKeyCreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: (result: { name: string; token: string }) => void }) {
   const [name, setName] = useState(''); const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const [scopes, setScopes] = useState<string[]>(['read', 'write']);
   const submit = async (event: FormEvent) => {
     event.preventDefault(); if (!name.trim()) { setError('Enter a key name.'); return; }
+    if (scopes.length === 0) { setError('Choose at least one access level.'); return; }
     setBusy(true); setError('');
-    try { const result = await api.createApiKey(name.trim()); onCreated({ name: result.name, token: result.token }); }
+    try { const result = await api.createApiKey(name.trim(), scopes); onCreated({ name: result.name, token: result.token }); }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Key creation failed. Inspect the clients list before retrying.'); }
     finally { setBusy(false); }
   };
   return <Dialog title="Create API key" titleId="create-api-key-title" onClose={onClose} busy={busy}><form onSubmit={submit}>
-    <p className="grant-help">API keys created here allow full read, write, and admin brain operations. Choose an OAuth client for scoped access. This key cannot log into the owner dashboard.</p>
-    <label htmlFor="api-key-name">Key name</label><input id="api-key-name" data-autofocus value={name} disabled={busy} onChange={event => setName(event.target.value)} />
+    <p className="grant-help">API keys default to read and write. Admin is granted only when you check it. Choose an OAuth client for per-source or per-operation access. This key cannot log into the owner dashboard.</p>
+    <label htmlFor="api-key-name">Key name</label><input id="api-key-name" data-autofocus value={name} maxLength={128} disabled={busy} onChange={event => setName(event.target.value)} />
+    <fieldset style={{ marginTop: 16 }}><legend>Access levels</legend>
+      {API_KEY_SCOPES.map(scope => <label key={scope.id} style={{ display: 'block' }}>
+        <input type="checkbox" checked={scopes.includes(scope.id)} disabled={busy} onChange={event => setScopes(current => event.target.checked ? [...current, scope.id] : current.filter(s => s !== scope.id))} />{' '}
+        {scope.label} <span className="grant-help">{scope.help}</span>
+      </label>)}
+    </fieldset>
     {error && <p role="alert">{error}</p>}<div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 20 }}>
       <button type="button" className="btn btn-secondary" disabled={busy} onClick={onClose}>Cancel</button><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create key'}</button>
     </div></form></Dialog>;

@@ -14,7 +14,8 @@
  *     'tools/call:<name>' — the prefix is stripped and the row counts as <name>.
  *   - 'surface_change' audit rows (ENG-8, src/core/surface-audit.ts) are
  *     bookkeeping, not usage — dropped.
- *   - Only successful calls count ('success' / 'success_with_warnings').
+ *   - Only successful calls count ('success' / 'success_with_warnings' /
+ *     'accepted_pending', an admitted write still in flight, #5249).
  *     Denied and errored rows are not usage: a client repeatedly bouncing off
  *     a gated op must not "use" its way into starter-set derivation or an
  *     advisor fit finding (that would let denial traffic curate the catalog).
@@ -129,7 +130,7 @@ export async function readClientOpUsage(
        FROM mcp_request_log
       WHERE created_at > now() - ($1::int * interval '1 day')
         AND token_name IS NOT NULL
-        AND status IN ('success', 'success_with_warnings')
+        AND status IN ('success', 'success_with_warnings', 'accepted_pending')
       GROUP BY token_name, operation`,
     [days],
   );

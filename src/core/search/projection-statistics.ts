@@ -1,4 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
+import { beginFullAnalyze, plannerAutoAnalyzeEnabled } from '../planner-stats.ts';
 
 export const PROJECTION_STATISTICS_NAME = 'pages_text_projection_current_stats';
 
@@ -49,12 +50,21 @@ export async function refreshProjectionStatistics(engine: BrainEngine): Promise<
       console.warn('[search] Projection planner statistics were not refreshed: database-owner maintenance is required. Run ANALYZE pages(text_projection_revision, knowledge_revision) as the table owner.');
       return false;
     }
+    // F4b: `planner.auto_analyze=false` keeps PGLite on the narrow refresh the projection statistics need.
+    const full = engine.kind === 'pglite' && await plannerAutoAnalyzeEnabled(engine);
     await engine.transaction(async tx => {
       if (engine.kind === 'postgres') {
         await tx.executeRaw("SET LOCAL statement_timeout = '30s'");
         await tx.executeRaw("SET LOCAL lock_timeout = '2s'");
       }
-      await tx.executeRaw('ANALYZE pages(text_projection_revision, knowledge_revision)');
+      // PGLite has no autovacuum, so nothing else ever collects planner statistics there. Without them the
+      // planner sees empty tables and runs search's graph joins as pages-by-pages nested loops (about 50 s
+      // per search on a freshly imported 4,000-page brain; 6 ms after ANALYZE). Postgres keeps the narrow
+      // refresh and leaves the rest to autovacuum.
+      // F4b: the full ANALYZE covers every hot table, so it publishes their planner-stats watermarks too.
+      const publishWatermarks = full ? await beginFullAnalyze(tx) : async () => {};
+      await tx.executeRaw(full ? 'ANALYZE' : 'ANALYZE pages(text_projection_revision, knowledge_revision)');
+      await publishWatermarks();
       await verifyProjectionStatistics(tx);
     });
     return true;

@@ -68,11 +68,11 @@ export const api = {
   updateClientGrant: (clientId: string, body: Record<string, unknown>) => apiFetch('/admin/api/rescope-client', { method: 'POST', body: JSON.stringify({ ...body, clientId }) }),
   requests: (page = 1, qs = '') => apiFetch(`/admin/api/requests?page=${page}${qs}`),
   apiKeys: () => apiFetch('/admin/api/api-keys'),
-  createApiKey(keyName: string) {
-    return apiFetch('/admin/api/api-keys', { method: 'POST', body: JSON.stringify({ name: keyName }) });
+  createApiKey(keyName: string, scopes: string[]) {
+    return apiFetch('/admin/api/api-keys', { method: 'POST', body: JSON.stringify({ name: keyName, scopes }) });
   },
-  revokeApiKey(keyName: string) {
-    return apiFetch('/admin/api/api-keys/revoke', { method: 'POST', body: JSON.stringify({ name: keyName }) });
+  revokeApiKey(id: string) {
+    return apiFetch('/admin/api/api-keys/revoke', { method: 'POST', body: JSON.stringify({ id }) });
   },
   updateClientTtl: (clientId: string, tokenTtl: number | null) => apiFetch('/admin/api/update-client-ttl', { method: 'POST', body: JSON.stringify({ clientId, tokenTtl }) }),
   rescopeClient: (clientId: string, sourceId: string, federatedRead: string[]) =>

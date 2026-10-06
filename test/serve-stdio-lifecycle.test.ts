@@ -645,6 +645,109 @@ describe('boot-readiness deadline (#3273)', () => {
     expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
   });
 
+  // #5205: the deadline line used to blame provider endpoints even when the
+  // boot was starved by a pool below what a resident serve needs.
+  test('names the stuck boot phase and a pool below the resident floor', async () => {
+    const h = makeHarness();
+    Object.assign(h.engine, { getPoolDiagnostics: () => ({ tracked: { raw: 0, direct: 0, reserved: 1, tx: 1 }, poolMax: 2, poisonedDiscards: 0 }) });
+    h.opts.startMcpServer = (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('persistence_consumer');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('code=serve_boot_timeout phase=persistence_consumer pool=2/2 tracked checkouts (below the resident floor of 6)');
+    expect(line).toContain('fix: export GBRAIN_POOL_SIZE=6');
+    expect(line).toContain('docs: docs/ENGINES.md#serve-boot-timeout');
+    expect(line).not.toContain('provider endpoints');
+  });
+
+  test('a stall with pool headroom points at the phase, not the pool', async () => {
+    const h = makeHarness();
+    Object.assign(h.engine, { getPoolDiagnostics: () => ({ tracked: { raw: 0, direct: 0, reserved: 0, tx: 0 }, poolMax: 10, poisonedDiscards: 0 }) });
+    h.opts.startMcpServer = (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('startup_sweep');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('phase=startup_sweep pool=0/10 tracked checkouts;');
+    expect(line).toContain('cause: boot stalled in startup_sweep');
+    expect(line).toContain('GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS');
+  });
+
+  // Large-brain ceiling (F4d): a 52k-document brain took ~80 s to boot,
+  // past the 60 s deadline, and serve exited mid-session. The deadline now
+  // measures time without boot progress; a boot that keeps advancing is
+  // never killed, however long it takes in total.
+  test('a slow boot that keeps advancing phases outlives several windows', async () => {
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      for (const phase of ['source_preflight', 'writeback_config', 'mcp_connect', 'source_scope', 'persistence_consumer', 'resolve_ipc_bind', 'startup_sweep']) {
+        startOpts?.onBootPhase?.(phase);
+        await new Promise(r => setTimeout(r, 25));
+      }
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    await new Promise(r => setTimeout(r, 100));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  test('forward-progress notes inside one long phase keep the boot alive', async () => {
+    const { noteForwardProgress } = await import('../src/core/forward-progress.ts');
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('persistence_consumer');
+      for (let i = 0; i < 12; i++) { noteForwardProgress(); await new Promise(r => setTimeout(r, 20)); }
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    await new Promise(r => setTimeout(r, 100));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  // The 52k-document serve kept answering tool calls while its boot waited on
+  // the engine behind them; completed requests are progress too.
+  test('a boot phase waiting behind answered tool calls is not killed', async () => {
+    const { trackStdioRpc } = await import('../src/mcp/server.ts');
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('mcp_connect');
+      startOpts?.onBootPhase?.('persistence_consumer');
+      for (let i = 0; i < 12; i++) await trackStdioRpc(() => new Promise(r => setTimeout(r, 20)));
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    await new Promise(r => setTimeout(r, 100));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  test('a boot that stops advancing still exits one window after its last progress, naming the phase', async () => {
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('source_scope');
+      await new Promise(r => setTimeout(r, 30));
+      startOpts?.onBootPhase?.('persistence_consumer');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 50;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('no boot progress for 50ms');
+    expect(line).toContain('code=serve_boot_timeout phase=persistence_consumer');
+  });
+
   test('bootTimeoutMs = 0 disables the deadline', async () => {
     const h = makeHarness();
     let resolveBoot!: () => void;

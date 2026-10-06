@@ -7,8 +7,11 @@
  * agent (Claude Code / Codex / OpenClaw) keys off to run the gbrain-upgrade skill.
  *
  * Carrier command: `config get self_upgrade.mode` — runs the startup hook, needs
- * no DB and no network, exits fast. The cache is pre-written fresh so the hook
- * emits from cache and never spawns the detached network refresh (hermetic).
+ * no DB and no network, exits fast. Every case that reaches the cache check
+ * pre-writes a fresh cache, so the hook emits from cache and never spawns the
+ * detached `check-update --refresh-cache` network refresh (hermetic). A case
+ * without a cache leaks that refresh into the runner's HOME (scripts/run-e2e.sh
+ * then cannot remove the file's home).
  *
  * The child is spawned with NODE_ENV unset (the production code gates the hook
  * off under NODE_ENV=test to keep the unit suite from spawning refreshers).
@@ -101,6 +104,7 @@ describe('self-upgrade marker on a real invocation', () => {
   });
 
   test('JUST_UPGRADED breadcrumb → one-time confirmation on stderr, then cleared', () => {
+    writeCache(`UP_TO_DATE ${VERSION}`);
     const breadcrumb = join(gbrainDir, 'just-upgraded-from');
     writeFileSync(breadcrumb, '0.42.0\n');
     const { stderr } = runGbrain('notify');

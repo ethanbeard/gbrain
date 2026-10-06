@@ -276,7 +276,7 @@ export async function runPhasePatterns(
     };
     const submitOpts: Partial<MinionJobInput> = {
       ...(maintenance ? { idempotency_key: `dream:patterns:${digest({ source: maintenance.writer.sourceIncarnation,
-        authority: maintenance.writer, reflections, model: config.model, output: config.outputSlugPrefix })}` } : {}),
+        authority: maintenance.writer, reflections: withoutSeats(reflections), model: config.model, output: config.outputSlugPrefix })}` } : {}),
       max_stalled: 3,
       timeout_ms: budgets.timeoutMs,
       queue: childQueueName,
@@ -361,13 +361,13 @@ export async function runPhasePatterns(
     throwIfAborted(opts.signal, '[dream] patterns output');
     const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], cycleSourceId);
 
-    await stampPatternOutputs(engine, maintenance, writtenRefs.filter(ref => ref.slug.startsWith(`${config.outputSlugPrefix}/`)), cycleDate, opts.signal);
+    const quoteVerify = await stampPatternOutputs(engine, maintenance, writtenRefs, reflections, config, cycleSourceId, cycleDate, opts.signal);
     const reverseWriteCount = maintenance ? await verifyMaintenanceOutputs(engine, maintenance, writtenRefs)
       : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
 
     const details = {
       reflections_considered: reflections.length,
-      patterns_written: writtenRefs.length,
+      patterns_written: writtenRefs.length, ...(quoteVerify ? { quote_verify: quoteVerify } : {}),
       reverse_write_count: reverseWriteCount,
       child_outcome: outcome,
       job_id: job.id,
@@ -532,11 +532,25 @@ async function loadPatternsConfig(engine: BrainEngine): Promise<PatternsConfig> 
  *  `dream.synthesize.last_completion_ts`; `dream.` is already a known prefix. */
 const LAST_EVIDENCE_KEY = 'dream.patterns.last_evidence_ts';
 
-interface ReflectionRef {
+export interface ReflectionRef {
   slug: string;
   title: string;
   excerpt: string;
   updatedAt: Date;
+  /** #4618: the seat the reflection was synthesized from, when stamped. */
+  seat: string | null;
+}
+
+/** The submission key's reflection identity, unchanged by #4618's seat field
+ * (a seat must never re-key, and so re-pay, a retained patterns child). */
+function withoutSeats(reflections: ReflectionRef[]): Array<Omit<ReflectionRef, 'seat'>> {
+  return reflections.map(({ slug, title, excerpt, updatedAt }) => ({ slug, title, excerpt, updatedAt }));
+}
+
+/** #4618: a pattern credits a seat only when every input reflection shares one. */
+function sharedSeat(reflections: ReflectionRef[]): string | undefined {
+  const seats = new Set(reflections.map(r => r.seat));
+  return seats.size === 1 ? (reflections[0]?.seat ?? undefined) : undefined;
 }
 
 async function gatherReflections(
@@ -549,9 +563,9 @@ async function gatherReflections(
   // Reflections live under the configured source slug prefix (bound as a
   // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix).
   const rows = await engine.executeRaw<{
-    slug: string; title: string | null; compiled_truth: string | null; updated_at: string | Date;
+    slug: string; title: string | null; compiled_truth: string | null; updated_at: string | Date; seat: string | null;
   }>(
-    `SELECT slug, title, compiled_truth, updated_at
+    `SELECT slug, title, compiled_truth, updated_at, frontmatter->>'seat' AS seat
        FROM pages
       WHERE slug LIKE $2
         AND source_id = $3 AND deleted_at IS NULL AND COALESCE(frontmatter->>'visibility','') <> 'private'
@@ -571,6 +585,7 @@ async function gatherReflections(
     // into the minion job's JSONB payload. Use the shared safe truncator so a
     // reflection containing emoji cannot abort the entire patterns phase.
     excerpt: truncateUtf8(r.compiled_truth ?? '', 600),
+    seat: r.seat ?? null,
   }));
 }
 
@@ -615,14 +630,83 @@ When done, briefly list the pattern slugs you wrote/updated in your final messag
  * #5733: pages under the patterns output prefix are dream output and carry the
  * dream_generated identity stamp every dream_generated consumer reads, through
  * the managed maintenance write on a managed brain, before the reverse-write.
+ * #5884: a pattern is derived from reflection pages, not raw material, so it is
+ * stamped raw-trace exempt (doctor raw_provenance) on every run that writes it.
  */
-async function stampPatternOutputs(engine: BrainEngine, maintenance: MaintenanceAuthority | null,
-  refs: Array<{ slug: string; source_id: string }>, cycleDate: string, signal?: AbortSignal): Promise<void> {
-  if (!maintenance) return stampDreamProvenance(engine, refs, cycleDate, signal);
+/**
+ * Quote-ground the pattern outputs (and pages a crashed run left unverified), then stamp provenance on the
+ * outputs. Returns the grounding counts, or null when dream.quote_verify is off.
+ */
+async function stampPatternOutputs(engine: BrainEngine, maintenance: MaintenanceAuthority | null, written: Array<{ slug: string; source_id: string }>,
+  reflections: ReflectionRef[], config: { outputSlugPrefix: string; sourceSlugPrefix: string }, sourceId: string, cycleDate: string, signal?: AbortSignal) {
+  const stats = await groundPatternPages(engine, maintenance, written, reflections, config.outputSlugPrefix, sourceId, cycleDate, signal);
+  await stampProvenance(engine, maintenance, written.filter(ref => ref.slug.startsWith(`${config.outputSlugPrefix}/`)), cycleDate, config.sourceSlugPrefix, sharedSeat(reflections), signal);
+  return stats;
+}
+
+async function stampProvenance(engine: BrainEngine, maintenance: MaintenanceAuthority | null,
+  refs: Array<{ slug: string; source_id: string }>, cycleDate: string, sourceSlugPrefix: string, seat: string | undefined, signal?: AbortSignal): Promise<void> {
+  const reason = `derived from reflections under ${sourceSlugPrefix}/; raw traces live on the cited reflection pages`;
+  // A pattern earns a seat only while its reflections share one, so a pattern without one drops a seat an earlier run stamped.
+  if (!maintenance) return stampDreamProvenance(engine, refs.map(ref => ({ ...ref, raw_trace_exempt_reason: reason, seat: seat ?? null })), cycleDate, signal);
   for (const ref of refs) {
     throwIfAborted(signal, '[dream] patterns provenance');
-    await stampMaintenancePage(engine, maintenance, ref.slug, cycleDate);
+    await stampMaintenancePage(engine, maintenance, ref.slug, cycleDate, undefined, reason, seat ?? null);
   }
+}
+
+// ── Quote grounding ──────────────────────────────────────────────────
+
+/**
+ * Ground every quoted span on the pattern pages against the full reflection
+ * pages the run read (quotes and speaker attribution only: a pattern counts
+ * its evidence). A failing claim unit leaves the body for frontmatter
+ * `unverified_claims`; `quote_verified_at` marks a checked page, so a page a
+ * crashed run left behind is verified by the next run. Kill switch:
+ * dream.quote_verify (default on). Returns null when disabled.
+ */
+export async function groundPatternPages(engine: BrainEngine, maintenance: MaintenanceAuthority | null, refs: Array<{ slug: string; source_id: string }>,
+  reflections: ReflectionRef[], outputSlugPrefix: string, sourceId: string, cycleDate: string, signal?: AbortSignal):
+  Promise<{ pages: number; quarantined: number; repaired: number } | null> {
+  const { dreamQuoteVerifyEnabled, groundSource, verifyBody } = await import('./synthesize-verify.ts');
+  if (!await dreamQuoteVerifyEnabled(engine)) return null;
+  const leftover = await engine.executeRaw<{ slug: string }>(
+    `SELECT slug FROM pages WHERE source_id = $1 AND slug LIKE $2 AND deleted_at IS NULL
+       AND frontmatter->>'dream_generated' = 'true' AND frontmatter->>'quote_verified_at' IS NULL`, [sourceId, `${outputSlugPrefix}/%`]);
+  const slugs = [...new Set([...refs.map(r => r.slug).filter(slug => slug.startsWith(`${outputSlugPrefix}/`)), ...leftover.map(r => r.slug)])];
+  if (slugs.length === 0) return { pages: 0, quarantined: 0, repaired: 0 };
+  const sourcePages = await engine.executeRaw<{ slug: string; compiled_truth: string; timeline: string }>(
+    'SELECT slug, compiled_truth, timeline FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL',
+    [sourceId, reflections.map(r => r.slug)]);
+  const sources = sourcePages.map(p => groundSource(p.slug, `${p.compiled_truth}\n\n${p.timeline ?? ''}`, { tolerant: true }));
+  const stats = { pages: 0, quarantined: 0, repaired: 0 };
+  const { serializePageToMarkdown } = await import('../markdown.ts');
+  for (const slug of slugs) {
+    throwIfAborted(signal, '[dream] patterns quote verify');
+    const snapshot = await engine.readPageSnapshot(slug, { sourceId });
+    if (!snapshot) continue;
+    const ct = verifyBody(snapshot.page.compiled_truth, sources, { checks: 'quotes' });
+    const tl = verifyBody(snapshot.page.timeline ?? '', sources, { checks: 'quotes' });
+    const quarantined = [...ct.quarantined, ...tl.quarantined];
+    stats.pages++;
+    stats.quarantined += quarantined.length;
+    stats.repaired += ct.normalized + ct.near + tl.normalized + tl.near;
+    const prior = Array.isArray(snapshot.page.frontmatter.unverified_claims) ? snapshot.page.frontmatter.unverified_claims as unknown[] : [];
+    const page = { ...snapshot.page,
+      compiled_truth: ct.body.trim() ? ct.body : (await import('./synthesize-verify.ts')).ALL_CLAIMS_QUARANTINED_BODY,
+      timeline: tl.body,
+      frontmatter: { ...snapshot.page.frontmatter, quote_verified_at: cycleDate,
+        ...(quarantined.length ? { unverified_claims: [...prior, ...quarantined.map(c => ({ ...c, sources: sources.map(x => x.path), detected_at: cycleDate }))].slice(-100) } : {}) } };
+    const content = serializePageToMarkdown(page, snapshot.tags);
+    if (maintenance) {
+      const { publishMaintenancePage } = await import('../persistence/prepared-maintenance.ts');
+      await publishMaintenancePage(engine, maintenance, slug, content, { expectedRevision: snapshot.revision });
+    } else {
+      const [{ importFromContent }, { isAvailable }] = await Promise.all([import('../import-file.ts'), import('../ai/gateway.ts')]);
+      await importFromContent(engine, slug, content, { noEmbed: !isAvailable('embedding'), sourceId });
+    }
+  }
+  return stats;
 }
 
 // ── Provenance via put_page tool execution rows ─────────────────────

@@ -52,6 +52,12 @@ async function runQueueHealth(ctx: DoctorContext): Promise<Check[]> {
         .slice(0, 3)
         .map(t => `${t.entity_slug}:${t.count}`)
         .join(', ') || '—';
+      // #5831: atom pages are no longer a fact source; name what earlier extraction left behind.
+      // Fenced rows name their page in source_markdown_slug; DB-only rows lead their context with it.
+      const [atoms] = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM facts
+          WHERE expired_at IS NULL AND (source_markdown_slug LIKE 'atoms/%' OR context LIKE 'atoms/%')`);
+      const atomFacts = Number(atoms?.n ?? 0);
       checks.push({
         name: 'facts_health',
         status,
@@ -59,7 +65,8 @@ async function runQueueHealth(ctx: DoctorContext): Promise<Check[]> {
           `facts_health(default): ${health.total_active} active, ` +
           `${health.total_today} today, ${health.total_week} this week, ` +
           `${health.total_consolidated} consolidated, ` +
-          `top entities ${top}`,
+          `top entities ${top}` +
+          (atomFacts > 0 ? `; ${atomFacts} active fact(s) came from atom pages, which are no longer extracted (they stay searchable; ones without an entity are not counted as pending consolidation)` : ''),
       });
     } else {
       checks.push({

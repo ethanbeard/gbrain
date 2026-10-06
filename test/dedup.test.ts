@@ -126,6 +126,19 @@ describe('compiled truth guarantee', () => {
     expect(hasCompiledTruth).toBe(true);
   });
 
+  test('adds the highest-scoring compiled_truth chunk; first seen wins a tie', () => {
+    const timeline = (id: number, score: number) => makeResult({
+      slug: 'a', chunk_id: id, score, chunk_source: 'timeline', chunk_text: `timeline entry number ${id}`,
+    });
+    const truth = (id: number, score: number) => makeResult({
+      slug: 'a', chunk_id: id, score, chunk_source: 'compiled_truth', chunk_text: `compiled truth variant ${id}`,
+    });
+    const best = dedupResults([timeline(1, 0.9), timeline(2, 0.8), timeline(3, 0.7), truth(4, 0.2), truth(5, 0.4), truth(6, 0.3)]);
+    expect(best.map(r => r.chunk_id)).toEqual([1, 2, 5]);
+    const tie = dedupResults([timeline(1, 0.9), timeline(2, 0.8), timeline(3, 0.7), truth(7, 0.3), truth(8, 0.3)]);
+    expect(tie.map(r => r.chunk_id)).toEqual([1, 2, 7]);
+  });
+
   test('does not swap when page already has compiled_truth', () => {
     const results = [
       makeResult({ slug: 'a', chunk_id: 1, score: 0.9, chunk_source: 'compiled_truth', chunk_text: 'compiled assessment' }),

@@ -2,12 +2,11 @@
  * #5183: `embed --stale` wedged (no progress, no error, 0% CPU) when
  * GBRAIN_EMBED_CONCURRENCY (default 20) exceeded the Postgres client pool:
  * every worker holds a connection, so extra workers waited on the pool
- * forever. Embed concurrency is now clamped to the pool on Postgres.
+ * forever. Embed concurrency is now clamped to the pool on Postgres. Both
+ * embed loops' worker counts are exercised in embed.serial.test.ts.
  */
 
 import { describe, test, expect, spyOn } from 'bun:test';
-import { readFileSync } from 'fs';
-import { resolve } from 'path';
 
 import { _resetEmbedConcurrencyClampWarningForTest, resolveEmbedConcurrency } from '../src/commands/embed.ts';
 
@@ -43,12 +42,5 @@ describe('#5183 embed concurrency never exceeds the Postgres pool', () => {
     expect(resolveEmbedConcurrency('pglite', undefined, {}, 2)).toBe(20);
     expect(resolveEmbedConcurrency('postgres', 4, {}, 12)).toBe(4);
     expect(resolveEmbedConcurrency('postgres', undefined, { GBRAIN_EMBED_CONCURRENCY: 'junk' }, 50)).toBe(20);
-  });
-
-  test('both embed loops use the clamped value', () => {
-    // test-reads-source-ok[structural]: both embed loops must take the clamped value; the loops need a live Postgres pool to observe.
-    const src = readFileSync(resolve(import.meta.dir, '..', 'src', 'commands', 'embed.ts'), 'utf-8');
-    expect(src.match(/const CONCURRENCY = resolveEmbedConcurrency\(engine\.kind, staleOpts\?\.paceMaxConcurrency\);/g)).toHaveLength(2);
-    expect(src).not.toMatch(/parseInt\(process\.env\.GBRAIN_EMBED_CONCURRENCY/);
   });
 });

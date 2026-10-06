@@ -13,11 +13,15 @@ import type { BrainEngine } from '../../core/engine.ts';
 import { LATEST_VERSION } from '../../core/migrate.ts';
 import { loadConfig } from '../../core/config.ts';
 import { loadCompletedMigrations } from '../../core/preferences.ts';
+import { indexCompletedEntries, isFreshInstallStamp, migrationLedgerSummary, trailingPartialCount } from '../../core/migration-ledger.ts';
+import { VERSION } from '../../version.ts';
+import { pendingFreshInstallCheck } from './checks/pending-fresh-install.ts';
 import { compareVersions } from '../migrations/index.ts';
 import { resolveHoursEnv } from '../../core/env-number.ts';
 import { schemaVersionHealth } from '../../core/schema-version-health.ts';
 import { checkProjectionReadiness } from './checks/projection-readiness.ts';
 import { remoteUnlinkedFactsCheck } from './checks/unlinked-facts.ts';
+import { checkChatFallbackChain } from './checks/chat-fallback.ts';
 import { resolveExcludePrivatePages } from '../../core/search/private-visibility.ts';
 import {
   type Check,
@@ -38,7 +42,6 @@ import {
   checkSyncConsolidation,
   checkPoolBudget,
   checkLinksExtractionLag,
-  checkChatFallbackChainInert,
   checkSearchMode,
   checkEvalDrift,
   checkRerankerHealth,
@@ -53,14 +56,17 @@ import {
   checkLinkResolutionOpportunity,
   checkFederationHealth,
   checkSelfUpgradeHealth,
-  multiSourceDriftGitRootSkipNote,
   computeExtractAtomsBacklogCheck,
 } from '../doctor.ts';
 import {
   checkSchemaPackActive,
   checkSchemaPackConsistency,
   checkSchemaPackSourceDrift,
+  multiSourceDriftCheck,
+  multiSourceDriftNotVerified,
 } from './schema-pack-checks.ts';
+import { brainScorePlanFix, checkError } from './check-fix.ts';
+import type { RenderContext } from '../../core/agent-output.ts';
 
 // Same alias the local doctor keeps for its own freshness checks; the alias
 // is a private one-liner in doctor.ts's check-fn library, so this module
@@ -69,7 +75,7 @@ const _resolveSyncFreshnessHours = resolveHoursEnv;
 
 export async function doctorReportRemote(
   engine: BrainEngine,
-  opts: { sourceIds?: string[]; remote?: boolean } = {},
+  opts: { sourceIds?: string[]; remote?: boolean; render?: RenderContext } = {},
 ): Promise<DoctorReport> {
   const checks: Check[] = [];
 
@@ -109,7 +115,7 @@ export async function doctorReportRemote(
       checks.push(await checkPgliteScratchProbe({ realInitFailed: true, storeDamageEvidence, realStorePath }));
     }
     // Without a connection, every other check is meaningless — short-circuit.
-    return computeDoctorReport(checks);
+    return computeDoctorReport(checks, { render: opts.render });
   }
 
   // 2. Schema version. Uses engine.getConfig('version') — the same engine-
@@ -122,7 +128,7 @@ export async function doctorReportRemote(
       ...schemaVersionHealth(version, LATEST_VERSION, { remote: true }),
     });
   } catch {
-    checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
+    checks.push(checkError('schema_version', 'check schema version'));
   }
 
   // 2b. #2038: idx_timeline_dedup shape. A renumbered-during-merge migration
@@ -151,7 +157,7 @@ export async function doctorReportRemote(
       });
     }
   } catch {
-    checks.push({ name: 'timeline_dedup_index', status: 'warn', message: 'Could not check idx_timeline_dedup shape' });
+    checks.push(checkError('timeline_dedup_index', 'check idx_timeline_dedup shape'));
   }
 
   // 2c. #550: pages(source_id, slug) upsert arbiter — same drift class as 2b.
@@ -202,13 +208,10 @@ export async function doctorReportRemote(
       name: 'brain_score',
       status: score >= 70 ? 'ok' : score >= 50 ? 'warn' : 'fail',
       message: `Brain score ${score}/100`,
+      ...(score >= 70 ? {} : { fix: brainScorePlanFix() }),
     });
   } catch (e) {
-    checks.push({
-      name: 'brain_score',
-      status: 'warn',
-      message: `Could not compute: ${e instanceof Error ? e.message : String(e)}`,
-    });
+    checks.push(checkError('brain_score', 'compute', e));
   }
 
   // 3b. Migration wedge hint (v0.31.8 — D14 + D19). The brain server's
@@ -217,26 +220,34 @@ export async function doctorReportRemote(
   // --yes. Same shape as the local doctor at line ~336.
   try {
     const completed = loadCompletedMigrations();
-    const byVersion = new Map<string, { complete: boolean; partial: boolean }>();
+    const byVersion = new Map<string, { complete: boolean; partial: boolean; ran: boolean }>();
     for (const entry of completed) {
-      const seen = byVersion.get(entry.version) ?? { complete: false, partial: false };
+      const seen = byVersion.get(entry.version) ?? { complete: false, partial: false, ran: false };
       if (entry.status === 'complete') seen.complete = true;
+      if (entry.status === 'complete' && !isFreshInstallStamp(entry)) seen.ran = true;
       if (entry.status === 'partial') seen.partial = true;
       byVersion.set(entry.version, seen);
     }
-    const completedVersions = Array.from(byVersion.entries()).filter(([, s]) => s.complete).map(([v]) => v);
+    // Fresh-install stamps are not forward progress (same rule as the local doctor).
+    const completedVersions = Array.from(byVersion.entries()).filter(([, s]) => s.ran).map(([v]) => v);
+    // A trailing retry marker makes the version pending (same rule as the local doctor and get_health).
+    const history = indexCompletedEntries(completed);
     const stuck = Array.from(byVersion.entries())
       .filter(([v, s]) => {
         if (!s.partial || s.complete) return false;
+        if (history.get(v)?.at(-1)?.status === 'retry') return false;
         const supersededBy = completedVersions.find(cv => compareVersions(cv, v) >= 0);
         return supersededBy === undefined;
       })
       .map(([v]) => v);
     const wedged: string[] = [];
     for (const v of stuck) {
-      const partialCount = completed.filter(e => e.version === v && e.status === 'partial').length;
+      const partialCount = trailingPartialCount(history.get(v) ?? []);
       if (partialCount >= 3) wedged.push(v);
     }
+    const newestRun = completedVersions.reduce<string | null>((a, v) => (a === null || compareVersions(v, a) > 0 ? v : a), null);
+    const pending = completed.length === 0 ? [] : migrationLedgerSummary(VERSION).pending.filter(v =>
+      (newestRun !== null && compareVersions(v, newestRun) < 0) || history.get(v)?.at(-1)?.status === 'retry');
     if (wedged.length > 0) {
       const cmd = wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ');
       checks.push({
@@ -250,6 +261,16 @@ export async function doctorReportRemote(
         status: 'fail',
         message: `MINIONS HALF-INSTALLED on brain host: ${stuck.join(', ')}. Run on the host: gbrain apply-migrations --yes`,
       });
+    } else if (pending.length > 0) {
+      checks.push({
+        name: 'minions_migration',
+        status: 'warn',
+        message: `${pending.length} host migration(s) not run yet on brain host: ${pending.join(', ')}. Run on the host: gbrain apply-migrations --yes`,
+        details: { pending },
+      });
+    } else {
+      const setup = pendingFreshInstallCheck();
+      if (setup) checks.push(setup);
     }
   } catch {
     // Best-effort. A broken JSONL on the brain server should not stop the
@@ -287,48 +308,11 @@ export async function doctorReportRemote(
         engine,
         nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
       );
-      if (result.walk_truncated) {
-        checks.push({
-          name: 'multi_source_drift',
-          status: 'warn',
-          message: 'Multi-source drift check skipped — FS walk hit limit/timeout on the brain server.',
-        });
-      } else if (result.count > 0) {
-        const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
-        const skipNote = result.git_root_skipped.length > 0
-          ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
-          : '';
-        checks.push({
-          name: 'multi_source_drift',
-          status: 'warn',
-          message:
-            `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
-            `(e.g., ${sampleStr}). Likely pre-v0.30.3 misroutes OR an incomplete initial sync. ` +
-            `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.` +
-            skipNote,
-        });
-      } else {
-        // #4712: see the local doctor's twin check — 'ok' would misreport
-        // "verified clean" if every candidate source was skipped and no
-        // walk actually ran.
-        const allSkipped =
-          result.git_root_skipped.length > 0 &&
-          result.git_root_skipped.length >= nonDefaultWithPath.length;
-        checks.push({
-          name: 'multi_source_drift',
-          status: allSkipped ? 'warn' : 'ok',
-          message: allSkipped
-            ? `Multi-source drift check performed no verification` +
-              multiSourceDriftGitRootSkipNote(result.git_root_skipped)
-            : result.git_root_skipped.length > 0
-              ? `No cross-source slug drift detected among checked sources.` +
-                multiSourceDriftGitRootSkipNote(result.git_root_skipped)
-              : 'No cross-source slug drift detected.',
-        });
-      }
+      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'remote'));
     }
-  } catch {
-    // Best-effort, like the rest of doctorReportRemote.
+  } catch (e) {
+    // Best-effort, but the check reports that it verified nothing (#5432).
+    checks.push(multiSourceDriftNotVerified(e));
   }
 
   // 5. Queue health (Postgres-only). PGLite has no minion_jobs in the same
@@ -403,12 +387,10 @@ export async function doctorReportRemote(
   //   schema_pack_consistency   — % of pages typed against active pack
   //   schema_pack_source_drift  — per-source pack divergence
   checks.push(await checkSchemaPackActive(engine));
-  checks.push(await checkSchemaPackConsistency(engine));
+  checks.push(await checkSchemaPackConsistency(engine, { sourceIds: opts.sourceIds }));
   checks.push(await checkSchemaPackSourceDrift(engine));
 
   // 7. v0.32.3 search-lite mode + per-key drift surface.
-  const inertFallbackChain = await checkChatFallbackChainInert(engine);
-  if (inertFallbackChain) checks.push(inertFallbackChain);
   checks.push(await checkSearchMode(engine));
 
   // 8. v0.32.3 eval_drift: retrieval-affecting files changed since last
@@ -421,6 +403,7 @@ export async function doctorReportRemote(
   // search.reranker.enabled FIRST so absence-of-failures means different
   // things when reranker is on vs off.
   checks.push(await checkRerankerHealth(engine));
+  checks.push(await checkChatFallbackChain(engine, { remote: opts.remote !== false }));
 
   // 9a. v0.40.4 graph_signals_coverage: when graph_signals is enabled
   // (via mode bundle default or explicit config override), surface
@@ -481,5 +464,5 @@ export async function doctorReportRemote(
   const { remoteWaveHandoff } = await import('./wave-checks.ts');
   checks.push(...await remoteWaveHandoff(engine, opts.sourceIds));
 
-  return computeDoctorReport(checks);
+  return computeDoctorReport(checks, { render: opts.render });
 }

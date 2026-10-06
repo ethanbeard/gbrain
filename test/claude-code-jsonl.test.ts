@@ -267,9 +267,8 @@ describe('confineTranscriptPath [S3#8]', () => {
     expect(confineTranscriptPath(link, { root })).toEqual({ ok: false, reason: 'symlink' });
   });
 
-  test('rejects: missing file / non-string / byte cap', () => {
+  test('rejects: non-string / byte cap', () => {
     const root = tdir();
-    expect(confineTranscriptPath(join(root, 'nope.jsonl'), { root })).toEqual({ ok: false, reason: 'unreadable' });
     expect(confineTranscriptPath(undefined, { root })).toEqual({ ok: false, reason: 'missing_path' });
     expect(confineTranscriptPath(42 as unknown as string, { root })).toEqual({ ok: false, reason: 'missing_path' });
     const big = join(root, 'big.jsonl');
@@ -328,6 +327,29 @@ describe('confineTranscriptPath [S3#8]', () => {
     // The newest line (the padding) is what the tail holds; the read stayed
     // bounded instead of pulling 50MiB into the hook lane.
     expect(parsed.bytesRead).toBeLessThanOrEqual(64 * 1024);
+  });
+
+  // #5465: Claude Code writes transcripts asynchronously, so the path can be
+  // absent on turn 1 of a fresh session. A CONFINED absent leaf validates ok
+  // with absent:true (nothing to read — the same trust as no path at all),
+  // which lets the user-prompt hook build its prompt-only context block
+  // instead of aborting the event. Every escape class stays rejected.
+  test('an absent leaf inside the tree validates absent; escapes still reject', () => {
+    const root = tdir();
+    const proj = join(root, 'proj-slug');
+    mkdirSync(proj, { recursive: true });
+    const absent = join(proj, '18c0ffee-1234-4321-9999-abcdefabcdef.jsonl');
+    expect(confineTranscriptPath(absent, { root })).toEqual({ ok: true, path: absent, size: 0, absent: true });
+    // Absent OUTSIDE the tree: still an escape, not a missing file.
+    const outside = tdir();
+    expect(confineTranscriptPath(join(outside, 'nope.jsonl'), { root })).toEqual({ ok: false, reason: 'outside_projects_dir' });
+    // Absent parent (containment unprovable): fail closed, as before.
+    expect(confineTranscriptPath(join(root, 'no-such-dir', 'nope.jsonl'), { root })).toEqual({ ok: false, reason: 'unreadable' });
+    // A symlinked parent that escapes the tree is still seen (the parent
+    // resolves outside → not contained).
+    const escape = join(root, 'escape');
+    symlinkSync(outside, escape);
+    expect(confineTranscriptPath(join(escape, 'nope.jsonl'), { root })).toEqual({ ok: false, reason: 'outside_projects_dir' });
   });
 
   test('rejects: directory named like a transcript', () => {

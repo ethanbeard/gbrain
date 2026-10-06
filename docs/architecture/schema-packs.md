@@ -60,6 +60,8 @@ gbrain schema use <pack> # activate a pack (writes ~/.gbrain/config.json)
 which takes precedence over the file setting written by `gbrain schema use`.
 Use `gbrain config unset schema_pack` to remove that database override, then
 `gbrain schema active` to confirm the resolved pack and its selection tier.
+`gbrain config get schema_pack` and `gbrain config show` report the same
+resolved pack and name its tier.
 
 Authoring + discovery verbs:
 
@@ -95,6 +97,34 @@ silently; silence the ingest warnings with
 `gbrain config set schema.type_warnings false` (the `--with-db` lint rules
 are unaffected).
 
+## Undeclared page types
+
+A page type is **undeclared** when the active pack neither declares it as a
+page type nor lists it as an alias. gbrain stores such a type as written and
+reports it everywhere it measures conformance, all with the same
+classification as `schema lint --with-db`'s `stored_type_undeclared`:
+
+- `put_page` (MCP, `gbrain put`, `gbrain call put_page`) commits the page and
+  returns `type_warning` with `code: page_type_undeclared`, the cause, the fix
+  and this anchor. It warns rather than rejects; `capture` still rejects an
+  undeclared explicit type, and dream subagent writes still normalize it to
+  `note` with `legacy_type`.
+- `gbrain lint <dir>` flags it as `type-undeclared` on the `type:` line.
+- `gbrain schema review-orphans` / MCP `schema_review_orphans` list untyped
+  AND undeclared-type pages (`reason`, `undeclared_types`, a true
+  `orphan_count`); `schema_stats` reports `undeclared_pages` and counts them
+  against `coverage`.
+- doctor `schema_pack_consistency` (the MCP `run_doctor` report) warns on any
+  undeclared type, per source against that source's pack.
+
+Fix one by declaring it (`gbrain schema add-type <type> --primitive <p>
+--prefix <dir/>`) or by rewriting the pages with a declared type. On a managed
+brain the `unify-types` job cannot apply yet, so rewrite the page with
+`put_page` (read it with `get_page include_content:true`, change `type:`, put it
+back). gbrain's own outputs use declared types: `gbrain report` and the dream
+drift report write `type: note` with a `report_type`, and the meeting
+transcript sidecar is `type: source` under `sources/meetings/`.
+
 ## Resolution chain (7 tiers)
 
 When the engine decides "which pack is active for this query?", it walks
@@ -110,15 +140,13 @@ this chain top-down. First match wins.
 | 6 | `~/.gbrain/config.json` `schema_pack` field | What `gbrain schema use` (and `gbrain init`, which sets `gbrain-base-v2`) writes. |
 | 7 | Default: `gbrain-base` | Always present. |
 
-Tier 7 stays `gbrain-base`, not `gbrain-base-v2`. A brain with no pack
-configured anywhere was created before `gbrain init` started writing
-`schema_pack`, and its pages carry the legacy 24-type taxonomy. Pointing the
-fallback at v2 would change type inference, alias closure and enrichment for
-those brains without running v2's `migration_from` retype rules, which
-`gbrain schema upgrade` applies as a reviewed step. The relationship
-behaviors that used to differ between the two (backwards frontmatter
-relations and attendance typed from any meeting link) are fixed in the
-extractor instead, so both packs store the same edges; see
+Tier 7 is `gbrain-base`, not `gbrain-base-v2`. Only a brain whose
+`gbrain init` never wrote `schema_pack` reaches tier 7, and its pages carry the
+legacy 24-type taxonomy. Pointing the fallback at v2 would change type
+inference, alias closure and enrichment for those brains without running v2's
+`migration_from` retype rules, which `gbrain schema upgrade` applies as a
+reviewed step. Relation direction and meeting attendance are decided in the
+extractor, so both packs store the same edges; see
 [Relation direction](#relation-direction).
 
 ## Relation direction
@@ -138,8 +166,18 @@ the in-code meeting prior. Meeting links then follow canonical attendance:
 only an explicit attendee list makes a person an attendee, stored person ->
 meeting (see [attendance evidence](../guides/attendance-evidence.md)). A pack
 that gives `attended` a phrase `regex` decides attendance itself and keeps its
-outgoing semantics. Brains extracted before this rule re-derive with
-`gbrain extract links --source db --include-frontmatter`.
+outgoing semantics. A brain whose links were extracted before v0.60.30.0
+re-derives them with `gbrain extract links --source db --include-frontmatter`.
+
+A link type's `inference.regex` runs before the in-code link matchers, so a
+pack regex decides the verb for a markdown link when it matches. A rule marked
+`ner_only: true` runs only for NER body mentions (`gbrain extract ner`). The
+bundled `gbrain-base` and `gbrain-base-v2` packs mark their `founded`,
+`works_at`, `invested_in` and `advises` sketch regexes this way, so a bare
+"started" or "joined" near a markdown link does not label it `founded` or
+`works_at`; the tuned in-code matchers decide those links. A brain whose links
+were extracted before v0.60.36.0 re-derives them with
+`gbrain extract links --source db`.
 
 ## How the agent uses the active pack
 
@@ -234,6 +272,7 @@ This section is the single home for the merge rules (other docs link here).
 `borrow_from` targets) into the `resolved.manifest` every consumer reads.
 The rules:
 
+- **`link_types[].temporal`** (`state` | `event`, optional) declares whether a relation can end or happened on a date; graph reads then treat it as a temporal typed edge ([temporal edges](../guides/temporal-edges.md)).
 - **Six fields inherit, child-wins:** `page_types`, `link_types`,
   `frontmatter_links`, `enrichable_types`, `filing_rules`, and `takes_kinds`.
   A child value with the same key (type name, link name, etc.) overrides the

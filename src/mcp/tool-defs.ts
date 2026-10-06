@@ -11,9 +11,9 @@ export interface McpToolDef {
     additionalProperties?: false;
   };
   /**
-   * MCP ToolAnnotations (SDK 1.29+), emitted ONLY when the op defines them —
-   * existing tools keep byte-identical definitions (the byte-equality
-   * regression test depends on absent keys staying absent).
+   * MCP ToolAnnotations (SDK 1.29+): the op's own curated annotations, else
+   * the conservative derivation in toolAnnotations(). Absent when neither
+   * applies, so an op of unknown effect stays unannotated.
    */
   annotations?: {
     title?: string;
@@ -24,7 +24,8 @@ export interface McpToolDef {
 }
 
 /**
- * Convert a single ParamDef to a JSON Schema fragment. Recursive on `items`.
+ * Convert a single ParamDef to a JSON Schema fragment. Recursive on `items`
+ * and object `properties` (closed, with member `required`).
  *
  * Single source of truth for ParamDef→JSON Schema mapping. Consumed by:
  * - buildToolDefs (stdio MCP server.ts via tool-defs.ts)
@@ -47,6 +48,11 @@ export function paramDefToSchema(p: ParamDef): Record<string, unknown> {
     ...(p.enum ? { enum: p.enum } : {}),
     ...(p.default !== undefined ? { default: p.default } : {}),
     ...(p.items ? { items: paramDefToSchema(p.items) } : {}),
+    ...(p.properties ? {
+      properties: Object.fromEntries(Object.entries(p.properties).map(([k, v]) => [k, paramDefToSchema(v)])),
+      required: Object.entries(p.properties).filter(([, v]) => v.required).map(([k]) => k),
+      additionalProperties: false,
+    } : {}),
   };
 }
 
@@ -72,6 +78,23 @@ function strictPassthroughProperties(op: Operation): Record<string, unknown> {
 }
 
 /**
+ * #5037 / agent contract A2: annotation-driven hosts need to tell reads from
+ * writes. An op's curated `annotations` win as written. Otherwise derive only
+ * what the op's required metadata states (every op declares `mutating` and
+ * `idempotent`; test/ops-mutation-tags.test.ts): `readOnlyHint: true` iff
+ * `mutating === false`; `readOnlyHint: false` iff `mutating === true`, plus
+ * `idempotentHint: true` when the write is also `idempotent`.
+ * `destructiveHint` and `openWorldHint` keep the MCP defaults (no metadata
+ * separates additive from destructive writes yet).
+ */
+export function toolAnnotations(op: Operation): McpToolDef['annotations'] | undefined {
+  if (op.annotations) return op.annotations;
+  if (op.mutating === false) return { readOnlyHint: true };
+  if (op.mutating === true) return op.idempotent === true ? { readOnlyHint: false, idempotentHint: true } : { readOnlyHint: false };
+  return undefined;
+}
+
+/**
  * Build MCP tool definitions from operations.
  *
  * Default emission (no opts / strictParams false) is BYTE-IDENTICAL to the
@@ -83,22 +106,25 @@ function strictPassthroughProperties(op: Operation): Record<string, unknown> {
  */
 export function buildToolDefs(ops: Operation[], opts?: { strictParams?: boolean }): McpToolDef[] {
   const strict = opts?.strictParams === true;
-  return ops.map(op => ({
-    name: op.name,
-    description: op.description,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        ...Object.fromEntries(
-          Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
-        ),
-        ...(strict ? strictPassthroughProperties(op) : {}),
+  return ops.map(op => {
+    const annotations = toolAnnotations(op);
+    return {
+      name: op.name,
+      description: op.description,
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          ...Object.fromEntries(
+            Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
+          ),
+          ...(strict ? strictPassthroughProperties(op) : {}),
+        },
+        required: Object.entries(op.params)
+          .filter(([, v]) => v.required)
+          .map(([k]) => k),
+        ...(strict ? { additionalProperties: false as const } : {}),
       },
-      required: Object.entries(op.params)
-        .filter(([, v]) => v.required)
-        .map(([k]) => k),
-      ...(strict ? { additionalProperties: false as const } : {}),
-    },
-    ...(op.annotations ? { annotations: op.annotations } : {}),
-  }));
+      ...(annotations ? { annotations } : {}),
+    };
+  });
 }

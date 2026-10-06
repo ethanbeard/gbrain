@@ -27,19 +27,45 @@ function reject(): never {
     'Use put_skill with the catalog expected_revision and complete approved file bundle; an existing pack requires host-authorized adoptSharedSkillpack adoption. Imported skill text remains knowledge data, not published instructions.');
 }
 
+const packsInTransaction = new WeakMap<object, Promise<PackRoot[]>>();
+/** Engines (the connection owner, not a transaction view of it) whose schema has shared_skill_packs; migrations never drop it. */
+const packTablePresent = new WeakSet<object>();
+function connectionOwner(engine: object): object {
+  let owner = engine;
+  while (Object.hasOwn(owner, '_pageTransaction') && (owner as { _pageTransaction?: boolean })._pageTransaction === true) owner = Object.getPrototypeOf(owner);
+  return owner;
+}
+/** The shared skillpack roots; #5984: read once per transaction engine. */
+function sharedPacks(engine: SqlEngine): Promise<PackRoot[]> {
+  const read = async () => {
+    const owner = connectionOwner(engine);
+    if (!packTablePresent.has(owner)) {
+      const [schema] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present");
+      if (!schema?.present) return [];
+      packTablePresent.add(owner);
+    }
+    return engine.executeRaw<PackRoot>(`SELECT p.source_id,p.source_incarnation,s.local_path AS source_root,
+      h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p
+      JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation
+      LEFT JOIN persistence_source_bindings b ON b.source_id=p.source_id AND b.source_incarnation=p.source_incarnation
+      LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid`, [localHostId()]);
+  };
+  if ((engine as { _pageTransaction?: boolean })._pageTransaction !== true) return read();
+  let cached = packsInTransaction.get(engine);
+  if (!cached) { cached = read(); packsInTransaction.set(engine, cached); }
+  return cached;
+}
+
+/** A transaction that changes shared_skill_packs re-reads them for its later knowledge writes. */
+export function forgetSharedPacks(engine: SqlEngine): void { packsInTransaction.delete(engine); }
+
 export async function assertKnowledgePublicationAllowed(
   engine: SqlEngine,
   row: KnowledgePublicationTarget,
   preparedFile?: KnowledgePublicationFile,
 ): Promise<void> {
   if (row.target_kind === 'skill_bundle') return;
-  const [schema] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present");
-  if (!schema?.present) return;
-  const packs = await engine.executeRaw<PackRoot>(`SELECT p.source_id,p.source_incarnation,s.local_path AS source_root,
-    h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p
-    JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation
-    LEFT JOIN persistence_source_bindings b ON b.source_id=p.source_id AND b.source_incarnation=p.source_incarnation
-    LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid`, [localHostId()]);
+  const packs = await sharedPacks(engine);
   if (!packs.length) return;
   const ownPack = packs.find(pack => pack.source_id === row.source_id && pack.source_incarnation === row.source_incarnation);
   if (ownPack && reserved(row.slug)) reject();

@@ -15,7 +15,8 @@
  * Serial: mock.module wraps the real dispatcher to record its arguments.
  */
 
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import type { Server } from 'node:http';
 import express from 'express';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -25,12 +26,13 @@ import { filterOpsForSurface } from '../src/mcp/surface.ts';
 import * as realDispatch from '../src/mcp/dispatch.ts';
 
 type DispatchArgs = Parameters<typeof realDispatch.dispatchToolCall>;
-const calls: Array<{ name: string; opts: NonNullable<DispatchArgs[3]> }> = [];
+const calls: Array<{ name: string; opts: NonNullable<DispatchArgs[3]>; stderrBefore: string[] }> = [];
+const stderrLines: string[] = [];
 const passthrough = { ...realDispatch };
 mock.module('../src/mcp/dispatch.ts', () => ({
   ...passthrough,
   dispatchToolCall: async (...args: DispatchArgs) => {
-    calls.push({ name: args[1], opts: args[3] ?? {} });
+    calls.push({ name: args[1], opts: args[3] ?? {}, stderrBefore: [...stderrLines] });
     return passthrough.dispatchToolCall(...args);
   },
 }));
@@ -51,7 +53,7 @@ afterAll(async () => {
   mock.restore();
 });
 
-async function start(surface?: 'starter'): Promise<{ base: string; token: string; clientId: string }> {
+async function start(surface?: 'starter', label: string = surface ?? 'full'): Promise<{ base: string; token: string; clientId: string }> {
   const app = express();
   const server: Server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   servers.push(server);
@@ -63,7 +65,7 @@ async function start(surface?: 'starter'): Promise<{ base: string; token: string
   const cookie = login.headers.get('set-cookie')!.split(';')[0];
   const reg = await fetch(`${base}/admin/api/register-client`, {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: `dispatch-context-${surface ?? 'full'}`, scopes: 'read write', grantTypes: ['client_credentials'] }),
+    body: JSON.stringify({ name: `dispatch-context-${label}`, scopes: 'read write', grantTypes: ['client_credentials'] }),
   });
   const { clientId, clientSecret } = await reg.json() as { clientId: string; clientSecret: string };
   const minted = await fetch(`${base}/token`, {
@@ -85,7 +87,7 @@ async function rpc(base: string, token: string, method: string, params?: unknown
   return JSON.parse(dataLine ? dataLine.slice('data:'.length) : text).result;
 }
 
-const FULL_SURFACE_KEYS = ['auth', 'logger', 'metaHook', 'remote', 'sourceId', 'surface', 'surfaceCeiling', 'takesHoldersAllowList', 'transport'];
+const FULL_SURFACE_KEYS = ['auth', 'logger', 'metaHook', 'noticeLedger', 'remote', 'resultRows', 'sourceId', 'surface', 'surfaceCeiling', 'takesHoldersAllowList', 'transport'];
 
 describe('POST /mcp dispatch context', () => {
   test('full surface: remote http dispatch with the verified auth and token source scope', async () => {
@@ -96,6 +98,8 @@ describe('POST /mcp dispatch context', () => {
     const { opts } = calls[0];
     expect(Object.keys(opts).sort()).toEqual(FULL_SURFACE_KEYS);
     expect(opts.remote).toBe(true);
+    // C1: a client without the thin-client header gets the host default, lean rows.
+    expect(opts.resultRows).toBe('lean');
     expect(opts.transport).toBe('http');
     expect(opts.takesHoldersAllowList).toEqual(['world']);
     expect(opts.sourceId).toBe('default');
@@ -105,6 +109,25 @@ describe('POST /mcp dispatch context', () => {
     expect(opts.auth?.clientId).toBe(clientId);
     expect(opts.auth?.scopes).toEqual(expect.arrayContaining(['read', 'write']));
     for (const level of ['info', 'warn', 'error'] as const) expect(typeof opts.logger?.[level]).toBe('function');
+  });
+
+  // #4817: a request that never returns must still leave its op name and an
+  // argument digest behind, so the line is written before dispatch starts.
+  test('logs the op name and an argument digest before dispatch, never the arguments', async () => {
+    const { base, token } = await start(undefined, 'dispatch-log');
+    const args = { query: 'synthetic private phrase', limit: 3 };
+    const spy = spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      stderrLines.push(String(chunk)); return true;
+    }) as typeof process.stderr.write);
+    try {
+      calls.length = 0;
+      await rpc(base, token, 'tools/call', { name: 'search', arguments: args });
+    } finally { spy.mockRestore(); }
+    const digest = createHash('sha256').update(JSON.stringify(args)).digest('hex').slice(0, 16);
+    const line = `[gbrain-serve] dispatch op=search args_sha256=${digest}\n`;
+    expect(calls[0].name).toBe('search');
+    expect(calls[0].stderrBefore).toContain(line);
+    expect(stderrLines.join('')).not.toContain('synthetic private phrase');
   });
 
   test('starter ceiling: allowedOps is the surface-filtered remote catalog and the surface is threaded', async () => {

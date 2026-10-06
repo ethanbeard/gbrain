@@ -25,6 +25,7 @@ import {
 } from '../src/core/cycle/extract-atoms.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { ChatResult, ChatOpts } from '../src/core/ai/gateway.ts';
+import { normalizeAIError } from '../src/core/ai/errors.ts';
 
 let engine: PGLiteEngine;
 
@@ -80,6 +81,28 @@ async function stateRow(
 }
 
 describe('transcript failure counting (v146)', () => {
+  test('a provider content block tombstones the transcript at the deterministic bound', async () => {
+    const blocked = normalizeAIError(Object.assign(new Error('Invalid JSON response'), {
+      name: 'AI_APICallError', statusCode: 200,
+      responseBody: JSON.stringify({ promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } }),
+    }), 'chat(google:x)');
+    const opts = {
+      sourceId: 'default', _pages: [], _transcripts: [transcript(FILE, HASH_A)],
+      _chat: async (_o: ChatOpts): Promise<ChatResult> => { throw blocked; },
+    };
+    for (let n = 1; n <= MAX_DETERMINISTIC_FAILURES; n++) {
+      const result = await runPhaseExtractAtoms(engine, opts);
+      expect((await stateRow(FILE, HASH_A))?.fail_count).toBe(n);
+      expect(result.details.tombstoned_transcripts).toEqual(n === MAX_DETERMINISTIC_FAILURES ? [FILE] : []);
+    }
+    let calls = 0;
+    const after = await runPhaseExtractAtoms(engine, {
+      ...opts, _chat: async (_o: ChatOpts): Promise<ChatResult> => { calls++; throw blocked; },
+    });
+    expect(calls).toBe(0);
+    expect(after.details.duplicates_skipped).toBe(1);
+  });
+
   test('malformed output is a COUNTED failure for a transcript, not a silent retry-forever', async () => {
     const result = await runPhaseExtractAtoms(engine, {
       sourceId: 'default',

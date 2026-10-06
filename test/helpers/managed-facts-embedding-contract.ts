@@ -16,6 +16,8 @@ import { prepareManagedFactsMutation } from '../../src/core/persistence/facts-pr
 import { serializePageToMarkdown } from '../../src/core/markdown.ts';
 import { upsertFactRow } from '../../src/core/facts-fence.ts';
 import { withEnv } from './with-env.ts';
+import { testWaitMs } from './wait-for.ts';
+import { __setMaintenanceWriteWaitForTests } from '../../src/core/persistence/maintenance-wait.ts';
 
 const hostModel = 'openai:text-embedding-3-large';
 const selectedModel = 'openai:text-embedding-3-small';
@@ -27,6 +29,7 @@ type Case = typeof managedEmbeddingCases[number];
 
 export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Case): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-fact-model-'));
+  let restoreWait = () => {};
   try {
     await withEnv({ GBRAIN_HOME: home }, async () => {
       await disposePersistenceConsumer(engine);
@@ -62,6 +65,7 @@ export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Ca
       const embeddings: string[] = [];
       let allEmbeddings = 0;
       const deferred = ['changed_before_publication', 'changed_before_replay', 'disabled_before_replay', 'file_disabled_before_replay', 'unchanged_replay', 'unsigned_replay'].includes(scenario);
+      if (deferred) restoreWait = __setMaintenanceWriteWaitForTests(testWaitMs(250));
       __setChatTransportForTests(async () => {
         generations++;
         if (scenario === 'changed_before_embedding') await engine.setConfig('embedding_model', hostModel);
@@ -144,6 +148,7 @@ export async function exerciseManagedEmbedding(engine: BrainEngine, scenario: Ca
       expect(getEmbeddingModel()).toBe(hostModel);
     });
   } finally {
+    restoreWait();
     await disposePersistenceConsumer(engine);
     await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
     __setChatTransportForTests(null); __setEmbedTransportForTests(null); resetGateway();

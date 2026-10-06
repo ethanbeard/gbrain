@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
-import { resolveEntitySlug } from '../src/core/entities/resolve.ts';
+import { resolveEntitySlug, resolveEntitySlugWithSource } from '../src/core/entities/resolve.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 let engine: PGLiteEngine;
@@ -39,6 +39,13 @@ beforeAll(async () => {
     // infra/ is a mixed namespace of analysis/runbook docs — must NOT be
     // prefix-expanded.
     { slug: 'infra/vault-runbook', title: 'Vault Runbook', type: 'note' },
+    // N9-5: two companies share the prefix; one is titled exactly the name.
+    { slug: 'companies/acme-0', title: 'Acme', type: 'company' },
+    { slug: 'companies/acme-labs-50', title: 'Acme Labs', type: 'company' },
+    // Two exact titles in one directory stay ambiguous.
+    { slug: 'companies/delta-1', title: 'Delta', type: 'company' },
+    { slug: 'companies/delta-2', title: 'Delta', type: 'company' },
+    { slug: 'companies/delta-labs-3', title: 'Delta Labs', type: 'company' },
   ];
   for (const p of pages) {
     await engine.putPage(p.slug, {
@@ -67,6 +74,15 @@ describe('resolveEntitySlug — hosts/ and projects/ prefix expansion', () => {
     // people/kiwi-example and hosts/kiwi both match — expansion must
     // refuse to pick one and fall through to the deterministic slugify.
     expect(await resolveEntitySlug(engine, 'default', 'kiwi')).toBe('kiwi');
+  });
+
+  it('N9-5: a same-directory collision resolves to the page titled exactly the bare name', async () => {
+    expect(await resolveEntitySlug(engine, 'default', 'Acme')).toBe('companies/acme-0');
+    expect(await resolveEntitySlugWithSource(engine, 'default', 'Acme')).toEqual({ slug: 'companies/acme-0', source: 'prefix_expansion' });
+  });
+
+  it('N9-5: two exact titles in one directory stay ambiguous', async () => {
+    expect(await resolveEntitySlug(engine, 'default', 'Delta')).toBe('delta');
   });
 
   it('infra/ pages are not prefix-expanded', async () => {

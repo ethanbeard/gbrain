@@ -91,7 +91,8 @@ describe('computeGoogleOauthCheck', () => {
       const r = await computeGoogleOauthCheck();
       expect(r.status).toBe('ok');
       expect(r.message).toContain('1 Google account(s) connected');
-      expect(r.message).toContain('refresh healthy');
+      expect(r.message).toContain('not probed online');
+      expect(r.message).not.toContain('refresh healthy');
     });
   });
 
@@ -129,7 +130,8 @@ describe('computeGoogleOauthCheck', () => {
     await withEnv({ GBRAIN_HOME: home }, async () => {
       const r = await computeGoogleOauthCheck();
       expect(r.status).toBe('ok');
-      expect(r.message).toContain('refresh healthy');
+      expect(r.message).toContain('not probed online');
+      expect(r.message).not.toContain('refresh healthy');
     });
   });
 

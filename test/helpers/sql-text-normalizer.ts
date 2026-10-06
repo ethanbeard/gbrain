@@ -37,11 +37,6 @@ export function collapseWhitespace(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
-/** The comparison key later lanes use: occurrence-renumbered, whitespace-collapsed text. */
-export function normalizeSqlText(text: string): string {
-  return collapseWhitespace(renumberPlaceholders(text).text);
-}
-
 export interface NormalizedStatement {
   lane: string;
   sql: string;

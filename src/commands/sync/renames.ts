@@ -9,6 +9,7 @@ import { softDeleteSyncPages } from '../../core/company-brain/profile.ts';
 import { serr } from '../../core/console-prefix.ts';
 import { DELETE_BATCH_SIZE } from '../../core/engine-constants.ts';
 import { importFile, isImageFilePath as isImageImportPath, importImageFile } from '../../core/import-file.ts';
+import { maintenanceTransaction } from '../../core/persistence/attribution.ts';
 import {
   resolveSlugsForRemovedPaths,
   refusedRemovedPathMessage,
@@ -26,10 +27,11 @@ import {
 import type { SyncResult } from '../sync.ts';
 import { trackedSlugIndex, activeSlugsBySourcePath } from './rename-reconcile.ts';
 import type { TrackedSlugIndex } from './rename-reconcile.ts';
+import { clearLegacyHold, holdRefusedImport, holdRenameDestination, noteScreenedImport } from './holds.ts';
 import { partial, noteTypeWarning, markCompleted } from './sync-run.ts';
 import type { SyncPlan, SyncRun, SyncProgress } from './sync-run.ts';
 
-type RenamePlan = Pick<SyncPlan, 'opts' | 'filtered' | 'manifest' | 'lastCommit' | 'pin' | 'gitContextRoot' | 'modePath' | 'syncImportRoot' | 'syncActivePack'>;
+type RenamePlan = Pick<SyncPlan, 'opts' | 'filtered' | 'manifest' | 'lastCommit' | 'pin' | 'gitContextRoot' | 'modePath' | 'syncImportRoot' | 'syncActivePack' | 'holds'>;
 
 type RenameContext = {
   renameOpts: { sourceId: string } | undefined;
@@ -201,7 +203,7 @@ async function applyRename(
   to: string,
 ): Promise<SyncResult | undefined> {
   const { engine, failedFiles, succeededPaths, pagesAffected, deletedSlugs } = run;
-  const { opts, gitContextRoot, syncImportRoot, syncActivePack } = plan;
+  const { opts, gitContextRoot, syncImportRoot, syncActivePack, holds } = plan;
   const { renameOpts, fromSlugByPath, noEmbed } = ctx;
   // v0.41.13.0 (T2 / D-V4-2): per-iteration abort check. Renames call
   // importFile() at line 1173-style sites which can be slow on big files;
@@ -227,6 +229,15 @@ async function applyRename(
     : await resolveRemovedPathSlug(engine, from, DEFAULT_SOURCE_ID, serr);
   // The new path doesn't yet have a row, so resolve from path only.
   const newSlug = resolveSlugForPath(to);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `to` is a git-diff rename path; the joined path is read only after the same isPathSafe(filePath, gitContextRoot) realpath containment check the import below applies
+  const filePath = join(syncImportRoot, to);
+  // #5988 (E13): a destination the import would refuse is screened before the
+  // old page's slug or origin moves; it is held and the old page stays whole.
+  if (isPathSafe(filePath, gitContextRoot) && await holdRenameDestination(engine, holds, { from, to, filePath, oldSlug, activePack: syncActivePack })) {
+    await markCompleted(run, to);
+    progress.tick(1, newSlug);
+    return undefined;
+  }
   // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
   // doesn't throw, and a thrown collision used to be swallowed by an
   // empty catch — both fell through to importFile, which created/updated
@@ -235,7 +246,7 @@ async function applyRename(
   let renameApplied = false;
   if (oldSlug !== undefined) {
     try {
-      renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
+      renameApplied = (await maintenanceTransaction(engine, tx => tx.updateSlug(oldSlug, newSlug, renameOpts))) > 0;
     } catch {
       // Destination slug occupied or invalid — treat as add; the
       // reconcile below removes the stale old row once the destination
@@ -280,8 +291,6 @@ async function applyRename(
   // source) was remapped scope-relative; the join base moves with it.
   // NAV-1 TOCTOU: refuse a destination that realpath-resolves outside the
   // repo (committed symlink pointing out).
-  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- `to` is a git-diff rename path from the synced repo (repo content can be hostile), but the joined path is used ONLY inside the isPathSafe(filePath, gitContextRoot) realpath containment check on the next line — a path escaping the repo root (dot-dot or committed symlink) is refused before any read
-  const filePath = join(syncImportRoot, to);
   let importResult: Awaited<ReturnType<typeof importFile>> | undefined;
   // #2683 residual: a failed destination import (status 'error' OR a
   // throw) must not checkpoint `to` — the resume filter would skip the
@@ -296,7 +305,9 @@ async function applyRename(
         : await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
       importResult = result;
       noteTypeWarning(run, result.type_warning);
-      if (result.status === 'imported') run.chunksCreated += result.chunks;
+      noteScreenedImport(holds, to, result);
+      if (await holdRefusedImport(engine, holds, to, filePath, result)) importResult = undefined;
+      else if (result.status === 'imported') run.chunksCreated += result.chunks;
       else if (result.status === 'skipped' && result.skip_reason === 'malformed_path') {
         // Informational skip — a bracket/control-char filename can never
         // import; counting it as a failure would gate the bookmark forever.
@@ -317,9 +328,13 @@ async function applyRename(
         failedFiles.push({ path: to, error: String((result as { error?: string }).error ?? 'import error') });
       }
     } catch (e: unknown) {
-      importErrored = true;
-      failedFiles.push({ path: to, error: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!await holdRefusedImport(engine, holds, to, filePath, { status: 'error', error: msg })) {
+        importErrored = true;
+        failedFiles.push({ path: to, error: msg });
+      }
     }
+    if (!importErrored && importResult) await clearLegacyHold(engine, holds, to);
   }
   const reconcileFailed = await reconcileRenameFallback(run, plan, ctx, from, to, newSlug, renameApplied, importResult);
   // Converged (cheap rename, clean reconcile, or nothing to reconcile):

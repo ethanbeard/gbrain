@@ -16,8 +16,12 @@ import { withEnv } from './helpers/with-env.ts';
 
 const directory = mkdtempSync(join(tmpdir(), 'gbrain-physical-root-'));
 let engine: PGLiteEngine;
-beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 120_000);
-afterAll(async () => { await engine.disconnect(); rmSync(directory, { recursive: true, force: true }); });
+let otherBrain: PGLiteEngine;
+beforeAll(async () => {
+  engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
+  otherBrain = new PGLiteEngine(); await otherBrain.connect({}); await otherBrain.initSchema();
+}, 120_000);
+afterAll(async () => { await engine.disconnect(); await otherBrain.disconnect(); rmSync(directory, { recursive: true, force: true }); });
 async function fixture() {
   const base = join(directory, randomUUID()); mkdirSync(base);
   const root = join(base, 'canonical'); mkdirSync(root); writeFileSync(join(root, 'page.md'), 'Canonical example');
@@ -89,6 +93,20 @@ test('an overlapping ancestor claim is refused across homes and retains the orig
     await expect(claimWorktree(engine, f.sources[1], f.root, f.hosts[1])).rejects.toMatchObject({ code: 'recovery_required' });
   });
   expect(await getWorktreeBinding(engine, f.sources[1], f.hosts[1])).toBeNull();
+  const lock = await acquireWorktree(binding); expect(lock).not.toBeNull(); await lock?.release();
+});
+
+test('another brain\'s reservation under the checkout\'s .git refuses the outer claim', async () => {
+  const f = await fixture();
+  const nested = join(f.root, '.git', 'child'); mkdirSync(nested, { recursive: true });
+  const source = `physical-${randomUUID()}`;
+  await otherBrain.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [source, nested]);
+  const binding = await withEnv({ GBRAIN_HOME: f.homes[1] }, () => claimWorktree(otherBrain, source, nested, f.hosts[1]));
+  expect(readPhysicalRootReservation(nested)?.worktreeId).toBe(binding.worktree_id);
+  await withEnv({ GBRAIN_HOME: f.homes[0] }, async () => {
+    await expect(claimWorktree(engine, f.sources[0], f.root, f.hosts[0])).rejects.toMatchObject({ code: 'recovery_required' });
+  });
+  expect(await getWorktreeBinding(engine, f.sources[0], f.hosts[0])).toBeNull();
   const lock = await acquireWorktree(binding); expect(lock).not.toBeNull(); await lock?.release();
 });
 
@@ -167,3 +185,27 @@ test.skipIf(!process.env.DATABASE_URL)('two real PostgreSQL processes with disti
     expect(await pg.engine.executeRaw('SELECT source_id FROM persistence_source_bindings')).toHaveLength(1);
   } finally { release?.(); for (const child of children) if (child.exitCode === null) child.kill(); await holding; await Promise.allSettled(children.map(child => child.exited)); await pg.close(); }
 }, 120_000);
+
+test('the overlap scan tolerates directories a concurrent git gc removes mid-walk', async () => {
+  const root = join(directory, randomUUID()); const objects = join(root, '.git', 'objects');
+  mkdirSync(objects, { recursive: true });
+  const churn = Bun.spawn(['bun', '-e', `
+    const { mkdirSync, rmSync, writeFileSync } = require('node:fs'); const { join } = require('node:path');
+    const end = Date.now() + 3000;
+    while (Date.now() < end) for (let i = 0; i < 64; i++) {
+      const dir = join(${JSON.stringify(objects)}, i.toString(16).padStart(2, '0'));
+      mkdirSync(join(dir, 'pack'), { recursive: true }); writeFileSync(join(dir, 'pack', 'o'), 'x');
+      rmSync(dir, { recursive: true, force: true });
+    }`]);
+  const { assertNoPhysicalRootOverlap } = await import('../src/core/persistence/physical-root-record.ts');
+  const failures: string[] = [];
+  let scans = 0;
+  while (churn.exitCode === null) {
+    try { assertNoPhysicalRootOverlap(root); } catch (error) { failures.push((error as Error).message); }
+    scans++;
+    await delay(0);
+  }
+  expect(await churn.exited).toBe(0);
+  expect(scans).toBeGreaterThan(10);
+  expect(failures).toEqual([]);
+});

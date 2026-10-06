@@ -10,6 +10,9 @@ Two decisions shape every gbrain lookup, and this guide covers both:
    `gbrain query` (hybrid), or `gbrain get` (direct). This is the
    per-lookup decision an agent makes on every question.
 
+To see how a specific result was ranked, or why an expected page is missing,
+see [Explaining search results](search-explain.md).
+
 ## The three mode bundles
 
 A search mode is a named preset for retrieval knobs. Operation-level options

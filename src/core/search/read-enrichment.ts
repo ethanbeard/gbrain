@@ -1,7 +1,8 @@
-import type { PageReadScope, PageReadPolicy, AdjacencyRow, RelationalFanoutOpts, RelationalFanoutRow } from '../types.ts';
+import type { PageReadScope, PageReadPolicy, AdjacencyRow, RelationalFanoutOpts, RelationalFanoutRow, ChainHopOpts, ChainHopEdge } from '../types.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
-import { currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
+import { currentTextProjectionFilter, protectedBodyFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
+import { relationshipFilterSql } from '../link-validity.ts';
 
 /** Narrow query dependency shared by both engines. */
 export type ReadQuery = <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T[]>;
@@ -35,6 +36,13 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
     typeFilter = `AND l.link_type = ANY($${params.length}::text[])`;
   }
   const mentionsFilter = opts?.includeMentions ? '' : `AND l.link_source IS DISTINCT FROM 'mentions'`;
+  const edgeExpr = direction === 'out'
+    ? `w.slug || '|' || l.link_type || '|' || p2.slug`
+    : direction === 'in'
+      ? `p2.slug || '|' || l.link_type || '|' || w.slug`
+      : `CASE WHEN l.from_page_id = w.id THEN w.slug || '|' || l.link_type || '|' || p2.slug
+              ELSE p2.slug || '|' || l.link_type || '|' || w.slug END`;
+  const temporalFilter = opts?.temporal ? `AND ${relationshipFilterSql('l', { ...opts.temporal, excludePrivate: opts.excludePrivate })}` : '';
   const recurStep = direction === 'out'
     ? 'JOIN links l ON l.from_page_id = w.id JOIN pages p2 ON p2.id = l.to_page_id'
     : direction === 'in'
@@ -45,21 +53,23 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
     WITH RECURSIVE walk AS (
       SELECT p.id, p.slug, p.source_id, 0::int AS depth,
         ARRAY[p.id] AS visited, ARRAY[p.slug] AS path,
-        p.source_id AS seed_source, NULL::text AS last_link_type
+        p.source_id AS seed_source, NULL::text AS last_link_type, ARRAY[]::text[] AS edges
       FROM pages p WHERE p.slug = ANY($1::text[]) AND p.deleted_at IS NULL AND ${seed} ${seedIdentities}
       UNION ALL
       SELECT p2.id, p2.slug, p2.source_id, w.depth + 1,
-        w.visited || p2.id, w.path || p2.slug, w.seed_source, l.link_type
+        w.visited || p2.id, w.path || p2.slug, w.seed_source, l.link_type, w.edges || (${edgeExpr})
       FROM walk w ${recurStep}
       WHERE w.depth < $2 AND NOT (p2.id = ANY(w.visited))
         AND p2.source_id = w.seed_source AND p2.deleted_at IS NULL
-        AND ${step} AND ${origin} ${mentionsFilter} ${typeFilter}
+        AND ${step} AND ${origin} ${mentionsFilter} ${typeFilter} ${temporalFilter}
     )
     SELECT n.source_id, n.slug, MIN(n.depth) AS hop,
       COUNT(DISTINCT n.last_link_type) AS edge_count,
       array_agg(DISTINCT n.last_link_type) FILTER (WHERE n.last_link_type IS NOT NULL) AS via_link_types,
       (array_agg(array_to_string(n.path, chr(9)) ORDER BY n.depth ASC,
         array_length(n.path, 1) ASC, array_to_string(n.path, chr(9)) ASC))[1] AS path_str,
+      (array_agg(array_to_string(n.edges, chr(9)) ORDER BY n.depth ASC,
+        array_length(n.path, 1) ASC, array_to_string(n.path, chr(9)) ASC))[1] AS edges_str,
       (SELECT cc.id FROM content_chunks cc WHERE cc.page_id = n.id
         ${requiresSafeChunks(opts) ? `AND EXISTS (SELECT 1 FROM pages cp WHERE cp.id = n.id AND ${safeChunksFilter('cp')})` : ''}
         ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
@@ -70,7 +80,162 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
     hop: Number(row.hop), edge_count: Number(row.edge_count),
     via_link_types: Array.isArray(row.via_link_types) ? row.via_link_types as string[] : [],
     path: row.path_str ? String(row.path_str).split('\t') : [],
+    path_edges: row.edges_str ? String(row.edges_str).split('\t') : [],
     canonical_chunk_id: row.canonical_chunk_id == null ? null : Number(row.canonical_chunk_id),
+  }));
+}
+
+/**
+ * Degree used for hub weighting saturates here: a node with at least this many
+ * readable typed link rows counts as this degree (its hub weight is already
+ * ~0.01). Below saturation the degree is the number of distinct neighbors the
+ * caller may read. Rows to unreadable neighbors, or written on unreadable
+ * origin pages, never count.
+ */
+export const CHAIN_DEGREE_SATURATION = 300;
+
+/** Integer ids inlined into SQL (never bound): see readAdjacencyBoosts for the generic-plan reason. */
+function inlineIds(ids: number[], label: string): string {
+  return `ARRAY[${ids.map(id => {
+    if (!Number.isSafeInteger(id)) throw new TypeError(`${label}: page id ${String(id)} is not an integer`);
+    return id;
+  }).join(',')}]::int[]`;
+}
+
+/**
+ * One oriented, authorized, bounded expansion step of a relational chain.
+ *
+ * Orientation: canonical provenance rows (frontmatter, manual, oriented
+ * attendance) keep stored direction; body-extracted rows are read by the
+ * relation's type signature: forward fit = stored, reverse fit = flipped,
+ * both = uncertain (stored direction), neither = not a hop. Every endpoint,
+ * origin and degree contributor passes the read policy (and, with `temporal`,
+ * the relationship-validity predicate) before anything is returned; edge context is returned only when the evidence page's text is
+ * readable under the policy.
+ */
+export async function readChainHop(query: ReadQuery, frontier: number[], opts: ChainHopOpts): Promise<ChainHopEdge[]> {
+  if (!frontier.length || !opts.linkTypes.length) return [];
+  const ids = inlineIds([...new Set(frontier)], 'readChainHop');
+  // Pages are fetched by primary key behind an optimization fence: the read
+  // policy's archived-source EXISTS otherwise lets a statistics-less planner
+  // (PGLite) scan every page of a source per link row.
+  const byId = (idExpr: string) => `(SELECT * FROM pages WHERE id = ${idExpr} OFFSET 0)`;
+  const policy: PageReadPolicy = opts;
+  const params: unknown[] = [opts.linkTypes, opts.subjectTypes, opts.objectTypes, opts.degreeLinkTypes, Math.max(1, Math.min(opts.neighborCap, 1000))];
+  const branch = (frontierCol: 'from_page_id' | 'to_page_id', a: string) => {
+    const pf = pageReadFilter(`${a}f`, policy, params, true);
+    const pt = pageReadFilter(`${a}t`, policy, params, true);
+    const og = pageReadFilter(`${a}g`, policy, params, true);
+    const origin = `(${a}l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM ${byId(`${a}l.origin_page_id`)} ${a}g WHERE ${og}))`;
+    const live = opts.temporal ? `AND ${relationshipFilterSql(`${a}l`, { ...opts.temporal, excludePrivate: opts.excludePrivate })}` : '';
+    return `SELECT f.id AS fid, ${a}l.id AS lid, ${a}l.link_type, ${a}l.from_page_id, ${a}l.to_page_id, ${a}l.origin_page_id,
+        ${a}l.link_source, ${a}f.type AS from_type, ${a}t.type AS to_type, ${a}f.source_id
+      FROM f CROSS JOIN LATERAL (
+        SELECT x.* FROM links x WHERE x.${frontierCol} = f.id AND x.link_type = ANY($1::text[])
+          AND x.from_page_id <> x.to_page_id AND x.link_source IS DISTINCT FROM 'mentions'
+        OFFSET 0
+      ) ${a}l
+      CROSS JOIN LATERAL ${byId(`${a}l.from_page_id`)} ${a}f
+      CROSS JOIN LATERAL ${byId(`${a}l.to_page_id`)} ${a}t
+      WHERE ${a}f.source_id = ${a}t.source_id AND ${pf} AND ${pt} AND ${origin} ${live}`;
+  };
+  // The LATERAL link scan is fenced the same way, so the walk always starts
+  // from the frontier's links.
+  const outBranch = branch('from_page_id', 'o');
+  const inBranch = branch('to_page_id', 'i');
+  const nb = pageReadFilter('nb', policy, params, true);
+  const dg = pageReadFilter('dg', policy, params, true);
+  const degreeLive = opts.temporal ? `AND ${relationshipFilterSql('dl', { ...opts.temporal, excludePrivate: opts.excludePrivate })}` : '';
+  const ev = pageReadFilter('ev', policy, params, true);
+  const textGate = requiresSafeChunks(policy) ? `AND ${safeChunksFilter('ev')} AND NOT ${protectedBodyFilter('ev')}` : '';
+  params.push(opts.toward);
+  const toward = `$${params.length}`;
+  const rows = await query<Record<string, unknown>>(`
+    WITH f AS (SELECT DISTINCT unnest(${ids}) AS id),
+    cand AS (${outBranch} UNION ${inBranch}),
+    classified AS (
+      SELECT c.*, CASE
+          WHEN c.link_source IN ('frontmatter', 'manual') OR (c.link_type = 'attended' AND c.origin_page_id IS NOT NULL)
+            THEN CASE WHEN c.from_type = ANY($2::text[]) AND c.to_type = ANY($3::text[]) THEN 'canonical' END
+          WHEN c.from_type = ANY($2::text[]) AND c.to_type = ANY($3::text[])
+            AND c.to_type = ANY($2::text[]) AND c.from_type = ANY($3::text[]) THEN 'uncertain'
+          WHEN c.from_type = ANY($2::text[]) AND c.to_type = ANY($3::text[]) THEN 'stored'
+          WHEN c.to_type = ANY($2::text[]) AND c.from_type = ANY($3::text[]) THEN 'flipped'
+        END AS orientation
+      FROM cand c
+    ),
+    semantic AS (
+      SELECT k.*,
+        CASE WHEN k.orientation = 'flipped' THEN k.to_page_id ELSE k.from_page_id END AS subject_id,
+        CASE WHEN k.orientation = 'flipped' THEN k.from_page_id ELSE k.to_page_id END AS object_id
+      FROM classified k WHERE k.orientation IS NOT NULL
+    ),
+    stepped AS (
+      SELECT s.*, CASE WHEN ${toward} = 'object' THEN s.object_id ELSE s.subject_id END AS next_id,
+        CASE s.orientation WHEN 'canonical' THEN 0 WHEN 'stored' THEN 1 WHEN 'flipped' THEN 2 ELSE 3 END AS orient_rank
+      FROM semantic s
+      WHERE (CASE WHEN ${toward} = 'object' THEN s.subject_id ELSE s.object_id END) = s.fid
+    ),
+    logical AS (
+      SELECT fid, next_id, MIN(source_id) AS source_id, MIN(lid) AS min_lid,
+        array_agg(lid ORDER BY lid) AS link_ids,
+        (array_agg(lid ORDER BY orient_rank, lid))[1] AS evidence_lid,
+        (array_agg(orientation ORDER BY orient_rank, lid))[1] AS orientation
+      FROM stepped GROUP BY fid, next_id
+    ),
+    ranked AS (
+      SELECT g.*, ROW_NUMBER() OVER (PARTITION BY g.fid ORDER BY g.min_lid) AS rn,
+        COUNT(*) OVER (PARTITION BY g.fid) AS per_frontier
+      FROM logical g
+    ),
+    deg_rows AS (
+      SELECT f.id AS fid, d.nb_id FROM f CROSS JOIN LATERAL (
+        SELECT dn.nb_id FROM (
+          SELECT CASE WHEN dl.from_page_id = f.id THEN dl.to_page_id ELSE dl.from_page_id END AS nb_id, dl.id AS lid, dl.origin_page_id
+          FROM links dl
+          WHERE (dl.from_page_id = f.id OR dl.to_page_id = f.id) AND dl.from_page_id <> dl.to_page_id
+            AND dl.link_type = ANY($4::text[]) AND dl.link_source IS DISTINCT FROM 'mentions' ${degreeLive}
+          OFFSET 0
+        ) dn
+        CROSS JOIN LATERAL ${byId('dn.nb_id')} nb
+        WHERE ${nb} AND (dn.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM ${byId('dn.origin_page_id')} dg WHERE ${dg}))
+        ORDER BY dn.lid LIMIT ${CHAIN_DEGREE_SATURATION}
+      ) d
+    ),
+    deg AS (
+      SELECT f.id AS fid, CASE
+        WHEN (SELECT COUNT(*) FROM deg_rows r WHERE r.fid = f.id) >= ${CHAIN_DEGREE_SATURATION} THEN ${CHAIN_DEGREE_SATURATION}
+        ELSE (SELECT COUNT(DISTINCT r.nb_id) FROM deg_rows r WHERE r.fid = f.id)
+      END AS degree FROM f
+    )
+    SELECT r.fid, r.next_id, np.slug AS next_slug, np.type AS next_type, r.source_id, el.link_type, r.orientation,
+      r.link_ids, sf.slug AS stored_from_slug, st.slug AS stored_to_slug,
+      CASE WHEN ev.id IS NOT NULL ${textGate} THEN el.context END AS context,
+      el.origin_page_id, op.slug AS origin_slug, deg.degree AS from_degree, (r.per_frontier > $5) AS cap_hit,
+      (SELECT cc.id FROM content_chunks cc WHERE cc.page_id = r.next_id
+        ${requiresSafeChunks(policy) ? `AND EXISTS (SELECT 1 FROM pages cp WHERE cp.id = r.next_id AND ${safeChunksFilter('cp')})` : ''}
+        ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
+    FROM ranked r
+    JOIN pages np ON np.id = r.next_id
+    JOIN links el ON el.id = r.evidence_lid
+    JOIN pages sf ON sf.id = el.from_page_id
+    JOIN pages st ON st.id = el.to_page_id
+    LEFT JOIN pages op ON op.id = el.origin_page_id
+    LEFT JOIN LATERAL (SELECT ev0.* FROM ${byId('COALESCE(el.origin_page_id, el.from_page_id)')} ev0) ev ON ${ev}
+    JOIN deg ON deg.fid = r.fid
+    WHERE r.rn <= $5
+    ORDER BY r.fid ASC, r.min_lid ASC`, params);
+  return rows.map(row => ({
+    from_page_id: Number(row.fid), to_page_id: Number(row.next_id), to_slug: row.next_slug as string,
+    to_type: row.next_type as string, source_id: row.source_id as string, link_type: row.link_type as string,
+    orientation: row.orientation as ChainHopEdge['orientation'],
+    link_ids: (Array.isArray(row.link_ids) ? row.link_ids : []).map(Number),
+    stored_from_slug: row.stored_from_slug as string, stored_to_slug: row.stored_to_slug as string,
+    context: row.context == null ? null : String(row.context),
+    origin_page_id: row.origin_page_id == null ? null : Number(row.origin_page_id),
+    origin_slug: row.origin_slug == null ? null : String(row.origin_slug),
+    canonical_chunk_id: row.canonical_chunk_id == null ? null : Number(row.canonical_chunk_id),
+    from_degree: Number(row.from_degree ?? 0), neighbor_cap_hit: row.cap_hit === true,
   }));
 }
 
@@ -98,7 +263,15 @@ export async function readBacklinkCounts(query: ReadQuery, ids: number[], scope?
 
 export async function readAdjacencyBoosts(query: ReadQuery, ids: number[], scope?: PageReadScope): Promise<Map<number, AdjacencyRow>> {
   if (!ids.length) return new Map();
-  const params: unknown[] = [ids];
+  // The candidate ids are inlined (integers only), never a bound parameter: once a
+  // statement has run five times Postgres may reuse a generic plan, and without
+  // planner statistics (PGLite) the generic plan of this read walks pages against
+  // links (~7 s per search at 2k pages instead of ~45 ms).
+  const idArray = `ARRAY[${ids.map(id => {
+    if (!Number.isSafeInteger(id)) throw new TypeError(`readAdjacencyBoosts: page id ${String(id)} is not an integer`);
+    return id;
+  }).join(',')}]::int[]`;
+  const params: unknown[] = [];
   const from = pageReadFilter('p', scope, params, !!scope);
   const to = pageReadFilter('t', scope, params, !!scope);
   const origin = originFilter(scope, params);
@@ -107,7 +280,7 @@ export async function readAdjacencyBoosts(query: ReadQuery, ids: number[], scope
       COUNT(DISTINCT CASE WHEN p.source_id <> t.source_id THEN p.source_id END)::int AS cross_source_hits
     FROM links l JOIN pages p ON p.id = l.from_page_id AND p.deleted_at IS NULL
       JOIN pages t ON t.id = l.to_page_id AND t.deleted_at IS NULL
-    WHERE l.from_page_id = ANY($1::int[]) AND l.to_page_id = ANY($1::int[])
+    WHERE l.from_page_id = ANY(${idArray}) AND l.to_page_id = ANY(${idArray})
       AND ${from} AND ${to} AND ${origin}
     GROUP BY l.to_page_id HAVING COUNT(DISTINCT l.from_page_id) >= 1`, params);
   return new Map(rows.map(row => [Number(row.to_page_id), { hits: Number(row.hits), cross_source_hits: Number(row.cross_source_hits) }]));
@@ -170,13 +343,36 @@ export async function readAliases(query: ReadQuery, aliases: string[], scope?: P
   const out = new Map<string, PageRef[]>();
   if (!aliases.length) return out;
   const params: unknown[] = [aliases];
+  const aliasScope = pageReadFilter('m', scope && { sourceId: scope.sourceId, sourceIds: scope.sourceIds }, params);
   const filter = pageReadFilter('p', scope, params, true);
-  const rows = await query<PageRef & { alias_norm: string }>(`
-    SELECT a.alias_norm, a.slug, a.source_id FROM page_aliases a
-    JOIN pages p ON p.source_id = a.source_id AND p.slug = a.slug
-    WHERE a.alias_norm = ANY($1::text[]) AND ${filter}
-    ORDER BY a.alias_norm, a.source_id, a.slug`, params);
+  // Alias matches first, then one unique-key page lookup each (OFFSET 0 keeps the
+  // read filter out of that lookup): without planner statistics (PGLite has no
+  // autovacuum) the page_aliases -> sources foreign key otherwise makes the planner
+  // walk every readable page and probe aliases per page.
+  // Precedence: within a source, only the claims at the best origin answer
+  // (frontmatter > declared > subject), and a derived (declared or subject)
+  // alias never answers for a name that is another live page's exact title,
+  // so "Acme Example" stays the company page beside "CRM record: Acme Example".
+  const rows = await query<PageRef & { alias_norm: string; rank: number }>(`
+    WITH a AS MATERIALIZED (
+      SELECT m.alias_norm, m.slug, m.source_id,
+             CASE m.origin WHEN 'subject' THEN 2 WHEN 'declared' THEN 1 ELSE 0 END AS rank
+      FROM page_aliases m
+      WHERE m.alias_norm = ANY($1::text[]) AND ${aliasScope}
+    )
+    SELECT a.alias_norm, a.slug, a.source_id, a.rank FROM a
+    CROSS JOIN LATERAL (SELECT * FROM pages WHERE source_id = a.source_id AND slug = a.slug OFFSET 0) p
+    WHERE ${filter}
+      AND (a.rank = 0 OR NOT EXISTS (SELECT 1 FROM pages t WHERE t.source_id = a.source_id AND t.deleted_at IS NULL
+                                     AND lower(t.title) = a.alias_norm AND t.slug <> a.slug))
+    ORDER BY a.alias_norm, a.source_id, a.rank, a.slug`, params);
+  const best = new Map<string, number>();
   for (const row of rows) {
+    const k = `${row.alias_norm}\0${row.source_id}`;
+    best.set(k, Math.min(best.get(k) ?? Infinity, Number(row.rank)));
+  }
+  for (const row of rows) {
+    if (Number(row.rank) > best.get(`${row.alias_norm}\0${row.source_id}`)!) continue;
     const refs = out.get(row.alias_norm) ?? [];
     if (!refs.some(ref => ref.slug === row.slug && ref.source_id === row.source_id)) refs.push({ slug: row.slug, source_id: row.source_id });
     out.set(row.alias_norm, refs);

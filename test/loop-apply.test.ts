@@ -80,6 +80,25 @@ function inboundThread(from: string, threadId = '18c2f4a9b3d21e07'): GmailThread
 }
 
 describe('applyThreadLoopVerdict', () => {
+  test('N7-6: opened_at is the request time, so a backfill ranks a 30-day wait older than a 30-hour one', async () => {
+    for (const [tid, age] of [['18c2f4a9b3d21e01', 720], ['18c2f4a9b3d21e02', 30]] as const) {
+      await applyThreadLoopVerdict(engine, 'g1', thread([msg({ from: `${tid}@example.com`, to: ['me@example.com'], ageHours: age, threadId: tid })], tid), MY, null, NOW);
+    }
+    const rows = await listOpenLoops(engine, { sourceIds: ['g1'], status: 'open' });
+    const opened = new Map(rows.map((r) => [r.thread_id, Date.parse(r.opened_at)]));
+    expect(opened.get('18c2f4a9b3d21e01')).toBe(NOW.getTime() - 720 * 3_600_000);
+    expect(opened.get('18c2f4a9b3d21e02')).toBe(NOW.getTime() - 30 * 3_600_000);
+  });
+
+  test('N7-6: a re-apply keeps the earlier opened_at and repairs a detection-time one', async () => {
+    const t = thread([msg({ from: 'carol@example.com', to: ['me@example.com'], ageHours: 300 })]);
+    await applyThreadLoopVerdict(engine, 'g1', t, MY, null, NOW);
+    await engine.executeRaw(`UPDATE open_loops SET opened_at = now()`);
+    await applyThreadLoopVerdict(engine, 'g1', t, MY, null, NOW);
+    const [row] = await listOpenLoops(engine, { sourceIds: ['g1'], status: 'open' });
+    expect(Date.parse(row.opened_at)).toBe(NOW.getTime() - 300 * 3_600_000);
+  });
+
   test('creates the loop row with dedup thread:<tid>:unanswered_inbound and merges page_slug into evidence', async () => {
     await applyThreadLoopVerdict(
       engine,

@@ -221,10 +221,9 @@ describe('E2E synthesize — no API key skip path', () => {
     try {
       await rig.engine.setConfig('dream.synthesize.enabled', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
-      // A 1ms budget + 25 uncached files: the budget check runs after each
-      // per-file cache lookup, and 25 PGLite roundtrips take well over 1ms,
-      // so at least the tail of the corpus is guaranteed to defer (exact
-      // count depends on wall-clock — assert >= 1, not equality).
+      // Advance the triage clock past the 1ms budget on the first cache miss.
+      // Cache lookup speed varies with machine load, so real elapsed time
+      // cannot guarantee that any file is deferred.
       await rig.engine.setConfig('dream.triage.max_ms', '1');
       for (let i = 0; i < 25; i++) {
         writeFileSync(
@@ -233,14 +232,19 @@ describe('E2E synthesize — no API key skip path', () => {
         );
       }
       await withoutAnthropicKey(async () => {
+        let triageClock = 0;
         const result = await runPhaseSynthesize(rig.engine, {
           brainDir: rig.brainDir,
           dryRun: true,
+          triageNow: () => (triageClock += 2),
         });
         expect(result.status).toBe('ok');
+        // The phase must have read the injected clock; otherwise the counts
+        // below would again depend on real elapsed time.
+        expect(triageClock).toBeGreaterThan(0);
         const triage = (result.details as { triage: { deferred: number; degraded: number } }).triage;
-        expect(triage.deferred).toBeGreaterThanOrEqual(1);
-        expect(triage.deferred + triage.degraded).toBe(25);
+        expect(triage.deferred).toBe(25);
+        expect(triage.degraded).toBe(0);
         expect(result.summary).toContain('not yet triaged');
         expect(result.summary).toContain('dream retriage');
       });

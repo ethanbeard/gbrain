@@ -103,12 +103,12 @@ export interface WritePageThroughOpts {
   logger?: WriteThroughLogger;
 }
 
-export function withNoRepoWriteThroughWarning<T extends { written: boolean; skipped?: string; warning?: string }>(result: T, sourceId: string): T {
+export function withNoRepoWriteThroughWarning<T extends { written: boolean; skipped?: string; warning?: string }>(result: T, sourceId: string, operation = 'put_page'): T {
   if (result.written || result.skipped !== 'no_repo_configured') return result;
   return {
     ...result,
     warning:
-      `put_page wrote only to the database for source '${sourceId}': no repo/local_path is configured, so no durable markdown file was created. ` +
+      `${operation} wrote only to the database for source '${sourceId}': no repo/local_path is configured, so no durable markdown file was created. ` +
       'Bind this MCP server/token to a git-backed source or configure source local_path/sync.repo_path before relying on the write.',
   } as T;
 }

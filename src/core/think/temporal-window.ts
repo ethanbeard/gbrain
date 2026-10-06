@@ -61,7 +61,12 @@ export function resolvePageDateMs(page: DatedPage): number | null {
   if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : null;
   if (typeof value === 'string' && value.trim()) {
     const day = DAY.exec(value.trim());
-    if (day) return Date.UTC(+day[1], +day[2] - 1, +day[3], 12);
+    if (day) {
+      const parsed = new Date(12 * 3600_000); // setUTCFullYear, not Date.UTC: Date.UTC maps years 0-99 to 1900-1999
+      parsed.setUTCFullYear(+day[1], +day[2] - 1, +day[3]);
+      return parsed.getUTCFullYear() === +day[1] && parsed.getUTCMonth() === +day[2] - 1 && parsed.getUTCDate() === +day[3]
+        ? parsed.getTime() : null;
+    }
     const ms = Date.parse(value);
     if (Number.isFinite(ms)) return ms;
   }

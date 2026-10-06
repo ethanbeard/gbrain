@@ -484,7 +484,11 @@ export function syncFingerprint(p: { sourceId?: string; lastCommit: string }): s
 /**
  * Cycle's purge phase calls this to drop stale checkpoints. 7-day TTL is
  * deliberately generous — any reasonable long-running op finishes inside
- * that window, and the row is cheap (few KB).
+ * that window, and the row is cheap (few KB). Durable state is exempt: Git
+ * sync holds, their summary while it counts any, retry requests, sync
+ * import provenance and the blocked-cursor conversion log of a live source
+ * incarnation leave only on resolution (or with the incarnation),
+ * and connector hold-retry requests never expire (#5988).
  */
 export async function purgeStaleCheckpoints(
   engine: BrainEngine,
@@ -499,6 +503,11 @@ export async function purgeStaleCheckpoints(
          DELETE FROM op_checkpoints
          WHERE updated_at < now() - ($1 || ' days')::interval
            AND op NOT IN ('managed-atoms','managed-atoms-generation','managed-connector','managed-connector-retry','managed-connector-state','managed-connector-migration')
+           AND op<>'connector-hold-retry'
+           AND NOT (op IN ('sync-hold','sync-hold-retry','sync-import-provenance','sync-hold-summary','sync-conversions')
+             AND NOT (op='sync-hold-summary' AND COALESCE((completed_keys->0->>'count')::int,0)=0)
+             AND EXISTS (SELECT 1 FROM sources s WHERE s.id=op_checkpoints.completed_keys->0->>'source_id'
+               AND s.incarnation::text=op_checkpoints.completed_keys->0->>'incarnation'))
            AND NOT (op='managed-sync' AND (COALESCE(completed_keys->0->>'done','false')<>'true' OR EXISTS (
              SELECT 1 FROM op_checkpoints f WHERE f.op='managed-sync-failure' AND f.fingerprint=op_checkpoints.fingerprint)))
            AND op<>'managed-sync-failure'

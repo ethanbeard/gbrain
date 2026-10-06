@@ -283,6 +283,9 @@ describe('computeAtomProvenanceDriftCheck', () => {
     expect(c.status).toBe('warn');
     expect(c.message).toContain('30/30');
     expect(c.message).toContain('source page is gone');
+    // #5432: says what was measured (hash comparison), not a quote verdict.
+    expect(c.message).toContain('compares source_hash only');
+    expect(c.message).not.toContain('no current page contains');
   });
   it('does not count a slug-unbound atom (source_path only, no source_slug) as source_gone — or as drift at all (#4806)', async () => {
     // Transcript-origin atoms carry `source_path` but no `source_slug`

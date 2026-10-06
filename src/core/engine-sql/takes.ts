@@ -10,7 +10,7 @@
 import type {
   BatchOpts,
   TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow,
-  TakeEmbeddingInput,
+  TakeEmbeddingInput, StaleTakeOpts,
   TakeResolution, SynthesisEvidenceInput,
   TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
 } from '../engine.ts';
@@ -73,6 +73,10 @@ async function _addTakesBatchOnce(exec: SqlExecutor, rowsIn: TakeBatchInput[]): 
          since_date text, until_date text, source text, superseded_by int, active boolean
        )
        ON CONFLICT (page_id, row_num) DO UPDATE SET
+         embedding          = CASE WHEN takes.claim IS DISTINCT FROM EXCLUDED.claim THEN NULL ELSE takes.embedding END,
+         embedded_at        = CASE WHEN takes.claim IS DISTINCT FROM EXCLUDED.claim THEN NULL ELSE takes.embedded_at END,
+         embedding_model    = CASE WHEN takes.claim IS DISTINCT FROM EXCLUDED.claim THEN NULL ELSE takes.embedding_model END,
+         embedded_text_hash = CASE WHEN takes.claim IS DISTINCT FROM EXCLUDED.claim THEN NULL ELSE takes.embedded_text_hash END,
          claim         = EXCLUDED.claim,
          kind          = EXCLUDED.kind,
          holder        = EXCLUDED.holder,
@@ -395,19 +399,37 @@ export async function getTakeEmbeddings(exec: LegacyUnscopedRead, ids: number[])
     return out;
   }
 
-export async function countStaleTakes(exec: LegacyUnscopedRead): Promise<number> {
+/**
+ * #5885 take vector lifecycle: an active take on a live page in an
+ * unarchived source is stale when it has no vector, its vector was computed
+ * from other claim text, or (when the caller names the target) another model
+ * or width produced it. Legacy vectors with no recorded provenance are stale.
+ */
+function staleTakeWhere(opts?: StaleTakeOpts) {
+  return sqlFragment`t.active
+        AND p.deleted_at IS NULL
+        AND EXISTS (SELECT 1 FROM sources s WHERE s.id = p.source_id AND NOT s.archived)
+        AND (${opts?.sourceId ?? null}::text IS NULL OR p.source_id = ${opts?.sourceId ?? null}::text)
+        AND (t.embedding IS NULL
+          OR t.embedded_text_hash IS DISTINCT FROM md5(t.claim)
+          OR (${opts?.model ?? null}::text IS NOT NULL AND t.embedding_model IS DISTINCT FROM ${opts?.model ?? null}::text)
+          OR (${opts?.dims ?? null}::int IS NOT NULL AND vector_dims(t.embedding) <> ${opts?.dims ?? null}::int))`;
+}
+
+export async function countStaleTakes(exec: LegacyUnscopedRead, opts?: StaleTakeOpts): Promise<number> {
     const [row] = (await exec.run(sqlFragment`
-      SELECT count(*)::int AS count FROM takes WHERE active AND embedding IS NULL
+      SELECT count(*)::int AS count FROM takes t JOIN pages p ON p.id = t.page_id
+      WHERE ${staleTakeWhere(opts)}
     `)).rows;
     return Number((row as { count?: number } | undefined)?.count ?? 0);
   }
 
-export async function listStaleTakes(exec: LegacyUnscopedRead): Promise<StaleTakeRow[]> {
+export async function listStaleTakes(exec: LegacyUnscopedRead, opts?: StaleTakeOpts): Promise<StaleTakeRow[]> {
     const rows = (await exec.run(sqlFragment`
       SELECT t.id AS take_id, p.slug AS page_slug, t.row_num, t.claim
       FROM takes t
       JOIN pages p ON p.id = t.page_id
-      WHERE t.active AND t.embedding IS NULL
+      WHERE ${staleTakeWhere(opts)}
       ORDER BY t.id
       LIMIT 100000
     `)).rows;
@@ -434,25 +456,31 @@ async function _updateTakeEmbeddingsOnce(
   rowsIn: TakeEmbeddingInput[],
 ): Promise<number> {
   const seen = new Set<number>();
-  const rows = rowsIn.map(({ take_id, embedding }) => {
+  const rows = rowsIn.map(({ take_id, embedding, claim, model }) => {
     if (!Number.isInteger(take_id) || take_id <= 0) throw new Error(`invalid take_id: ${take_id}`);
     if (seen.has(take_id)) throw new Error(`duplicate take_id in embedding batch: ${take_id}`);
     seen.add(take_id);
+    if (typeof claim !== 'string' || typeof model !== 'string' || model.length === 0) {
+      throw new Error(`take embedding for take_id=${take_id} must name its claim text and model`);
+    }
     const values = Array.from(embedding);
     if (values.length === 0 || values.some(v => !Number.isFinite(v))) {
       throw new Error(`invalid embedding for take_id=${take_id}`);
     }
-    return { take_id, embedding: `[${values.join(',')}]` };
+    return { take_id, embedding: `[${values.join(',')}]`, claim, model };
   });
+  // The claim compare discards a vector whose row was edited while it was in flight.
   const result = await executeRawJsonb(
       exec,
     `WITH updated AS (
        UPDATE takes AS t
           SET embedding = v.embedding::vector,
               embedded_at = now(),
+              embedding_model = v.model,
+              embedded_text_hash = md5(v.claim),
               updated_at = now()
-         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(take_id bigint, embedding text)
-        WHERE t.id = v.take_id AND t.active
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(take_id bigint, embedding text, claim text, model text)
+        WHERE t.id = v.take_id AND t.active AND t.claim = v.claim
         RETURNING t.id
      )
      SELECT id FROM updated`,

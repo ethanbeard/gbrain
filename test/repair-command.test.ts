@@ -12,6 +12,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { resolveRepairScope, runRepair } from '../src/core/repair/core.ts';
@@ -75,7 +76,7 @@ async function pageWithHistory(engine: BrainEngine, sourceId: string, slug: stri
   await submitPageMutation(ctxFor(engine, sourceId), { operation: 'put_page', params: { slug, content: page(`Body of ${slug}.`), request_id: randomUUID() } });
   await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw(
     `INSERT INTO timeline_entries(page_id,date,source,summary,detail) SELECT id,'2026-07-01','legacy',$3,'' FROM pages WHERE source_id=$1 AND slug=$2`,
-    [sourceId, slug, `History of ${slug}`])));
+    [sourceId, slug, `History of ${slug}`]), TEST_WRITE_ATTRIBUTION));
 }
 
 const markedPages = async (engine: BrainEngine, sourceId: string) => (await engine.executeRaw<{ slug: string }>(
@@ -174,7 +175,7 @@ describe('gbrain repair timeline', () => {
       } finally { console.log = log; }
       const json = JSON.parse(out[0]);
       expect(json.scope.source_ids).toEqual([source]);
-      expect(json.results.map((r: { kind: string }) => r.kind)).toEqual(['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'orphan-bindings', 'embedding-effects']);
+      expect(json.results.map((r: { kind: string }) => r.kind)).toEqual(['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats']);
       expect(json.results[0]).toMatchObject({ mode: 'dry_run', affected: 1 });
       expect(out[1]).toContain(`Scope: brain `);
       expect(out[1]).toContain(`sources ${source}`);
@@ -192,7 +193,7 @@ describe('timeline_history doctor check', () => {
       await pageWithHistory(engine, source, 'notes/a');
       await pageWithHistory(engine, source, 'notes/b');
       await engine.transaction(tx => withCoordinatedWrite(tx, [source], () => tx.executeRaw(
-        `INSERT INTO timeline_entries(page_id,date,source,summary,detail) SELECT id,'2026-07-02','','No source row','' FROM pages WHERE source_id=$1 AND slug='notes/a'`, [source])));
+        `INSERT INTO timeline_entries(page_id,date,source,summary,detail) SELECT id,'2026-07-02','','No source row','' FROM pages WHERE source_id=$1 AND slug='notes/a'`, [source]), TEST_WRITE_ATTRIBUTION));
       const full = await timelineHistoryCheck(engine, source);
       expect(full.status).toBe("warn");
       expect(full.details).toMatchObject({ materializable_rows: 2, kept_unrenderable_rows: 1, pages_affected: 2, count: 'exact', truncated: false });

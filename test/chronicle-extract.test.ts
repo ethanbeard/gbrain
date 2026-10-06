@@ -1,15 +1,15 @@
 /**
  * v0.42.x — Life Chronicle (#2390) auto-emit extractor (Phase A.3).
  * PGLite in-memory. Covers eligibility, the extractor's parse barrier +
- * idempotent writes (event pages + timeline projection), and the backstop's
- * auto_chronicle gating + enqueue. The LLM judge is stubbed so the deterministic
+ * idempotent writes (event pages + timeline projection). The write-path
+ * decision and execution live in test/chronicle-auto-*.test.ts. The LLM judge is stubbed so the deterministic
  * write path is tested without a gateway.
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { isChronicleEligible } from '../src/core/chronicle/eligibility.ts';
 import { runChronicleExtract, parseJudgeJson, type ChronicleJudge } from '../src/core/chronicle/extract-events.ts';
-import { runChronicleBackstop } from '../src/core/chronicle/backstop.ts';
+import { configureGateway, resetGateway, __setChatTransportForTests } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 const LONG_BODY = 'A'.repeat(120);
@@ -173,27 +173,26 @@ describe('parseJudgeJson failure signalling (#2606)', () => {
   });
 });
 
-describe('runChronicleBackstop gating', () => {
+// #5876 (E2): the default judge used to map a thrown provider error and a
+// refusal to `{events: []}`, so a failed call was recorded as no_events and
+// its content never retried.
+describe('default judge failure classes (#5876)', () => {
   beforeEach(async () => {
-    await engine.unsetConfig('auto_chronicle');
-    await engine.putPage('meetings/bs', { type: 'meeting', title: 'bs', compiled_truth: LONG_BODY });
+    await engine.executeRaw(`DELETE FROM pages WHERE type = 'event' OR slug = 'meetings/judge-classes'`);
+    await engine.putPage('meetings/judge-classes', { type: 'meeting', title: 'Judge', compiled_truth: LONG_BODY });
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-test' } });
+  });
+  afterAll(() => { __setChatTransportForTests(null); resetGateway(); });
+
+  test('a provider error is judge_chat_error, not no_events', async () => {
+    __setChatTransportForTests(async () => { throw new Error('provider 503'); });
+    expect(await runChronicleExtract(engine, { slug: 'meetings/judge-classes' }))
+      .toMatchObject({ status: 'skipped', reason: 'judge_chat_error', events_written: 0 });
   });
 
-  test('skips when auto_chronicle is off (default)', async () => {
-    const r = await runChronicleBackstop({ slug: 'meetings/bs', type: 'meeting', compiled_truth: LONG_BODY }, { engine, sourceId: 'default' });
-    expect(r).toEqual({ enqueued: false, skipped: 'auto_chronicle_off' });
-  });
-
-  test('skips a diary page before consulting the flag', async () => {
-    const r = await runChronicleBackstop({ slug: 'life/diary/x', type: 'diary', compiled_truth: LONG_BODY }, { engine, sourceId: 'default' });
-    expect(r).toEqual({ enqueued: false, skipped: 'diary_excluded' });
-  });
-
-  test('enqueues a chronicle_extract job when enabled + eligible', async () => {
-    await engine.setConfig('auto_chronicle', 'true');
-    const r = await runChronicleBackstop({ slug: 'meetings/bs', type: 'meeting', compiled_truth: LONG_BODY }, { engine, sourceId: 'default' });
-    expect(r.enqueued).toBe(true);
-    const jobs = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM minion_jobs WHERE name = 'chronicle_extract'`);
-    expect(Number(jobs[0].n)).toBeGreaterThanOrEqual(1);
+  test('a refusal is judge_refused, not no_events', async () => {
+    __setChatTransportForTests(async () => ({ text: '', blocks: [], stopReason: 'refusal', model: 'anthropic:claude-sonnet-4-6', providerId: 'anthropic',
+      usage: { input_tokens: 1, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 } }) as never);
+    expect(await runChronicleExtract(engine, { slug: 'meetings/judge-classes' })).toMatchObject({ status: 'skipped', reason: 'judge_refused' });
   });
 });

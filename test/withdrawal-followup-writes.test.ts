@@ -18,6 +18,7 @@ import type { OperationContext } from '../src/core/ops/contract.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { localHostId, registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
@@ -63,7 +64,7 @@ async function entity(engine: BrainEngine) {
   const snapshot = await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], async () => {
     await tx.putPage(slug, { type: 'person', title: 'Hazel Example', compiled_truth: 'Fictional.', timeline: '', frontmatter: {} }, { sourceId });
     return (await tx.readPageSnapshot(slug, { sourceId }))!;
-  }));
+  }, TEST_WRITE_ATTRIBUTION));
   const file = join(root, `${slug}.md`); mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, serializePageToMarkdown(snapshot.page, snapshot.tags));
   const ctx = context(engine, sourceId);

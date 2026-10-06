@@ -122,3 +122,41 @@ export function parseItemLog(log: string): ItemResult[] {
   }
   return results;
 }
+
+/** The project's total vCPUs from `ubi-runner.sh usage` (its `total VMS VCPUS` row), or null. */
+export function parseUsageTotal(report: string): number | null {
+  const total = /^total\s+\d+\s+(\d+)\s*$/m.exec(report);
+  return total ? Number(total[1]) : null;
+}
+
+export interface FleetOpts {
+  /** vCPUs the project's VMs hold now; null when usage could not be read. */
+  usedVcpus: number | null;
+  vmVcpus: number;
+  defaultVms: number;
+  maxVms: number;
+  /** Never push the project's VM vCPUs past this. */
+  ceilingVcpus: number;
+  /** VMs the run's work can keep busy. */
+  workVms: number;
+}
+
+/**
+ * Burst sizing: as many VMs as fit under the ceiling, between the default and
+ * the burst maximum, and no more than the work can use. A busy project gets the
+ * default; a VM the quota then refuses just shrinks the fleet.
+ */
+export function burstVms(o: FleetOpts): { vms: number; reason: string } {
+  if (o.usedVcpus === null) {
+    const vms = Math.min(o.defaultVms, o.workVms);
+    return { vms, reason: `project usage unreadable, using ${vms} VM(s)` };
+  }
+  const fit = Math.floor((o.ceilingVcpus - o.usedVcpus) / o.vmVcpus);
+  const target = Math.max(o.defaultVms, Math.min(o.maxVms, fit));
+  const vms = Math.max(1, Math.min(o.workVms, target));
+  const why = vms < target ? "all the work can use"
+    : fit >= o.maxVms ? `burst maximum ${o.maxVms}`
+    : fit > o.defaultVms ? `room for ${fit} under the ceiling`
+    : `quota busy, default ${o.defaultVms}`;
+  return { vms, reason: `project VMs hold ${o.usedVcpus} vCPUs, ceiling ${o.ceilingVcpus}: ${vms} VM(s) × ${o.vmVcpus} vCPUs (${why})` };
+}

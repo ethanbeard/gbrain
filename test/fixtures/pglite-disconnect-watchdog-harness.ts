@@ -1,5 +1,5 @@
 /**
- * Fixture for test/pglite-disconnect-watchdog.serial.test.ts. Spawned via `bun`.
+ * Fixture for test/pglite-disconnect-watchdog.test.ts. Spawned via `bun`.
  *
  * Usage: bun pglite-disconnect-watchdog-harness.ts <mode>
  *   wedge-watchdog — monkeypatch close() into the measured #4284 wedge (a

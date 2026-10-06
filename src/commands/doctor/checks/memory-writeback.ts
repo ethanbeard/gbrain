@@ -21,8 +21,10 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
+import type { Effect } from '../../../core/agent-output.ts';
 import { loadConfig } from '../../../core/config.ts';
 import { resolveGbrainHome } from '../../../core/gbrain-home.ts';
 import {
@@ -36,7 +38,9 @@ import { classifyBrainAudience } from '../../../core/facts/writeback-audience.ts
 import { readVerbUsage } from '../../../core/verbs/usage-log.ts';
 import { readClientOpUsage } from '../../../core/mcp-usage.ts';
 import { readHeartbeatTail } from '../../../core/context/hook-heartbeat.ts';
+import { CORPUS_UNINGESTED_RETENTION_FACTOR, corpusBacklog } from '../../../core/context/corpus-segments.ts';
 import { readHarnessReceiptState } from '../../../core/bootstrap/format.ts';
+import { mutedFirstRunDecisionsNotice } from '../../../core/onboard/mcp-onboarding.ts';
 import {
   probeAmbientBlock,
   renderAmbientInstructionBlock,
@@ -50,6 +54,13 @@ import {
 export const MEMORY_WRITEBACK_CHECK_NAME = 'memory_writeback';
 
 const COUNTER_WINDOW_DAYS = 7;
+/**
+ * #5557: share of finished serve-side harvests (ok + error; a busy-writer
+ * re-queue is not finished) that fails before the check warns, judged on at
+ * least this many harvests.
+ */
+const HARVEST_FAILURE_WARN_SHARE = 0.2;
+const HARVEST_FAILURE_MIN_FINISHED = 10;
 
 /** Every path an ambient block could live at: the receipt's recorded
  * `instructions` targets UNION the two canonical install paths — an
@@ -92,6 +103,29 @@ async function remoteFactReaders(engine: BrainEngine): Promise<string[]> {
   return readers;
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * E-N1: corpus turn files nothing has extracted yet. Retention keeps them up
+ * to CORPUS_UNINGESTED_RETENTION_FACTOR x `corpus_retention_days`; once one is
+ * past plain retention it is on its way to deletion, so the check says so.
+ * Records `details.corpus_backlog`; returns the warning text or null.
+ */
+async function corpusBacklogProblem(engine: BrainEngine, fileCfg: ReturnType<typeof loadConfig>, details: Record<string, unknown>): Promise<string | null> {
+  const synth = fileCfg?.dream?.synthesize as Record<string, unknown> | undefined;
+  const configured = (await engine.getConfig('dream.synthesize.session_corpus_dir').catch(() => null)) ?? synth?.session_corpus_dir;
+  const dir = typeof configured === 'string' && isAbsolute(configured) ? configured : join(resolveGbrainHome(), 'transcripts', 'corpus');
+  const days = typeof synth?.corpus_retention_days === 'number' && synth.corpus_retention_days > 0 ? synth.corpus_retention_days : 30;
+  const now = Date.now();
+  const backlog = corpusBacklog(dir, days * DAY_MS, now);
+  const oldestDays = backlog.oldestPendingMtimeMs === null ? null : Math.floor((now - backlog.oldestPendingMtimeMs) / DAY_MS);
+  const purgeDays = days * CORPUS_UNINGESTED_RETENTION_FACTOR;
+  details.corpus_backlog = { pending: backlog.pending, oldest_pending_days: oldestDays, past_retention: backlog.pastRetention, retention_days: days, deleted_after_days: purgeDays };
+  if (backlog.pastRetention === 0) return null;
+  return `${backlog.pastRetention} of ${backlog.pending} captured session file(s) are older than the ${days}-day corpus retention and were never extracted `
+    + `(oldest ${oldestDays}d); they are deleted at ${purgeDays}d. Extract them now: gbrain sweep --once --budget-ms 600000`;
+}
+
 export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Promise<Check> {
   try {
     const fileCfg = loadConfig();
@@ -131,6 +165,16 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
       ...(wb.plane_drift ? { plane_drift: true } : {}),
       counters_note: `local, append-only, loss-tolerant observability over the last ${COUNTER_WINDOW_DAYS}d — never a source of truth`,
     };
+
+    // #5888: capture-lane exact duplicates dropped (every capture lane runs
+    // whether or not writeback is on) and near duplicates counted in shadow
+    // mode only (kept, never dropped).
+    try {
+      const cutoff = Date.now() - COUNTER_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+      const dedup = (await readHeartbeatTail(2000)).filter((e) => e.event === 'writeback_dedup' && Date.parse(e.ts) >= cutoff);
+      details.cross_lane_duplicates_7d = dedup.reduce((n, e) => n + (e.duplicate ?? 0), 0);
+      details.near_duplicates_shadow_7d = dedup.reduce((n, e) => n + (e.near_duplicate ?? 0), 0);
+    } catch { /* heartbeat unreadable — counters stay absent */ }
 
     // Plane comparison (the dual-write design's promised surfacing): the DB
     // row is authoritative at runtime; a disagreeing file mirror means a
@@ -191,6 +235,8 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
     }
 
     const problems: string[] = [];
+    const corpusProblem = await corpusBacklogProblem(engine, fileCfg, details).catch(() => null);
+    if (corpusProblem) problems.push(corpusProblem);
     if (!wb.ttl_valid) {
       problems.push(`memory.auto_writeback_transient_ttl is invalid — using '${wb.transient_ttl}'`);
     }
@@ -225,19 +271,19 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
           }
           if (!existsSync(t.path)) {
             entry.probe = 'missing';
-            problems.push(`${t.host} instruction block missing at ${t.path} — re-run: gbrain bootstrap harness --yes`);
+            problems.push(`${t.host} instruction block missing at ${t.path} — after the user agrees, reinstall: gbrain bootstrap harness --yes`);
           } else {
             const probe = probeAmbientBlock(readFileSync(t.path, 'utf8'));
             if (probe.state === 'absent' || probe.state === 'damaged') {
               entry.probe = probe.state === 'damaged' ? 'damaged' : 'missing';
-              problems.push(`${t.host} instruction block ${probe.state === 'damaged' ? 'has damaged markers' : 'missing'} at ${t.path} — re-run: gbrain bootstrap harness --yes`);
+              problems.push(`${t.host} instruction block ${probe.state === 'damaged' ? 'has damaged markers' : 'missing'} at ${t.path} — after the user agrees, reinstall: gbrain bootstrap harness --yes`);
             } else if (probe.interior !== expectedBody) {
               entry.probe = 'drift';
               // The combo converges even when the file-plane posture stamp is
               // stale (e.g. facts.default_visibility flipped on ANOTHER
               // machine of a shared Postgres brain): the config set re-stamps
               // the mirror from DB truth, then the harness re-renders from it.
-              problems.push(`${t.host} instruction block is stale (config changed since install) — re-run: gbrain config set memory.auto_writeback ${wb.mode} && gbrain bootstrap harness --yes`);
+              problems.push(`${t.host} instruction block is stale (config changed since install) — after the user agrees, refresh: gbrain config set memory.auto_writeback ${wb.mode} && gbrain bootstrap harness --yes`);
             } else {
               entry.probe = 'current';
             }
@@ -302,16 +348,37 @@ export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Pro
         // flush_skip_* = the turn IS banked; only the prompt-harvest enqueue
         // was declined (cap/queue policy) — the sweep extracts it later.
         turns_banked: bank.filter((e) => e.reason === 'wb_scheduled' || e.reason === 'wb_banked' || e.reason?.startsWith('flush_skip_')).length,
+        last_ok_at: harvest.filter((e) => e.outcome === 'ok').map((e) => e.ts).sort().at(-1) ?? null,
       };
+      const failures = harvest.filter((e) => e.outcome === 'error');
+      const finished = failures.length + harvest.filter((e) => e.outcome === 'ok').length;
+      if (finished >= HARVEST_FAILURE_MIN_FINISHED && failures.length / finished > HARVEST_FAILURE_WARN_SHARE) {
+        const counts = new Map<string, number>();
+        for (const e of failures) counts.set(e.reason ?? 'error', (counts.get(e.reason ?? 'error') ?? 0) + 1);
+        const [topReason, topN] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]!;
+        problems.push(`${failures.length}/${finished} writeback harvests failed in ${COUNTER_WINDOW_DAYS}d (top: ${topReason} x${topN}); `
+          + 'failed turns wait for the next serve sweep or corpus drain; clear them now with gbrain sweep --once --budget-ms 600000; '
+          + 'serve\'s stderr names the first failure of each reason');
+      }
     } catch { /* heartbeat unreadable — counters stay absent */ }
 
+    const mutedDecisions = await mutedFirstRunDecisionsNotice(engine).catch(() => null);
+    if (mutedDecisions) details.first_run_decisions_muted = { why: mutedDecisions.why, unmute: mutedDecisions.fix?.argv };
     return {
       name: MEMORY_WRITEBACK_CHECK_NAME,
       status: problems.length ? 'warn' : 'ok',
-      message: problems.length
+      message: (problems.length
         ? `ambient writeback ${wb.mode}: ${problems.join('; ')}`
-        : `ambient writeback ${wb.mode} (ttl ${wb.transient_ttl}, template visibility ${wb.visibility}, audience ${audience.audience})`,
+        : `ambient writeback ${wb.mode} (ttl ${wb.transient_ttl}, template visibility ${wb.visibility}, audience ${audience.audience})`)
+        + (mutedDecisions ? '; first-run decisions are open but muted (`gbrain notices unmute first_run_decisions` shows them again)' : ''),
       details,
+      ...(problems.some((p) => p.includes('gbrain bootstrap harness'))
+        ? { fix: {
+          argv: ['gbrain', 'bootstrap', 'harness', '--yes'], consent: ['persistent_install'] as Effect[], actor: 'agent' as const, requires_exclusive: false,
+          why: 'Rewrites the gbrain memory instruction block in each harness config from the current writeback settings.',
+          user_message: "gbrain's memory instructions in your agent app's config are missing or out of date. OK if I reinstall them?",
+          verify: { argv: ['gbrain', 'doctor', '--only', MEMORY_WRITEBACK_CHECK_NAME, '--json'] } } }
+        : problems.length ? { fix_unavailable_reason: 'operator_judgement' as const } : {}),
     };
   } catch (e) {
     return {

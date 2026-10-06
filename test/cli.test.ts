@@ -128,6 +128,65 @@ describe('BigInt-safe output normalization (#2450)', () => {
   });
 });
 
+// #5433: `gbrain list` (formatResult('list_pages', ...) at src/cli.ts) joined
+// raw fields with \t and rows with \n. Titles are free text; a title with a
+// newline turns one page into two output lines, a tab adds a column. Anything
+// that pipes `gbrain list` into `cut`/`awk`/`while read` miscounts or
+// misattributes pages. The fix escapes \n/\r/\t/\\ in every cell so the row
+// boundary is always the single \n the caller asked for. --json output is
+// untouched (the JSON path carries the raw characters).
+describe("list_pages TSV escaping (#5433)", () => {
+  async function render(pages: unknown[]): Promise<string> {
+    const { formatResult } = await import('../src/cli.ts');
+    return formatResult('list_pages', pages, {});
+  }
+
+  test('a title with a newline stays on one output line', async () => {
+    const out = await render([
+      { slug: 'notes/example-one', type: 'note', updated_at: '2026-01-05T10:00:00Z', title: 'first line\nsecond\tpart' },
+    ]);
+    // Exactly one row (plus the trailing newline) — the embedded \n /\t are
+    // escaped as two-character sequences, not emitted as record separators.
+    expect(out.split('\n').length).toBe(2);
+    expect(out).toContain('first line\\nsecond\\tpart');
+  });
+
+  test('a title with a tab does not add a column', async () => {
+    const out = await render([
+      { slug: 'notes/example-one', type: 'note', updated_at: '2026-01-05T10:00:00Z', title: 'a\tb' },
+    ]);
+    // The escaped title sits in column 4; column counts stay at 4 per row.
+    const rows = out.trim().split('\n');
+    for (const r of rows) expect(r.split('\t').length).toBe(4);
+  });
+
+  test('a title with a literal backslash is escaped first so later escapes do not double-escape', async () => {
+    const out = await render([
+      { slug: 'notes/example-one', type: 'note', updated_at: '2026-01-05T10:00:00Z', title: 'a\\b\nc' },
+    ]);
+    // \\ escapes to \\\\, then \n escapes to \\n. Final: a\\\\b\\nc.
+    expect(out).toContain('a\\\\b\\nc');
+  });
+
+  test('multiple rows with adversarial titles all stay on their own lines', async () => {
+    const out = await render([
+      { slug: 'a', type: 'note', updated_at: '2026-01-05T10:00:00Z', title: 'plain' },
+      { slug: 'b', type: 'note', updated_at: '2026-01-05T10:00:00Z', title: 'has\nnewline' },
+      { slug: 'c', type: 'note', updated_at: '2026-01-05T10:00:00Z', title: 'has\ttab' },
+      { slug: 'd', type: 'note', updated_at: '2026-01-05T10:00:00Z', title: 'has\r\nwindows-end' },
+    ]);
+    const rows = out.trim().split('\n');
+    expect(rows.length).toBe(4);
+    // 4 columns per row.
+    for (const r of rows) expect(r.split('\t').length).toBe(4);
+  });
+
+  test('empty list still prints the "No pages found." sentinel', async () => {
+    const out = await render([]);
+    expect(out).toBe('No pages found.\n');
+  });
+});
+
 describe('CLI version', () => {
   test('VERSION matches package.json', async () => {
     const { VERSION } = await import('../src/version.ts');
@@ -180,7 +239,7 @@ describe('CLI dispatch integration', () => {
     expect(stdout.trim()).toMatch(/^gbrain \d+\.\d+\.\d+/);
   });
 
-  test('unknown command prints error and exits 1', async () => {
+  test('unknown command prints error and exits 2 (usage)', async () => {
     const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'notacommand'], {
       cwd: new URL('..', import.meta.url).pathname,
       stdout: 'pipe',
@@ -189,7 +248,7 @@ describe('CLI dispatch integration', () => {
     const stderr = await new Response(proc.stderr).text();
     const exitCode = await proc.exited;
     expect(stderr).toContain('Unknown command: notacommand');
-    expect(exitCode).toBe(1);
+    expect(exitCode).toBe(2);
   });
 
   test('per-command --help prints usage without DB connection', async () => {
@@ -285,6 +344,11 @@ describe('CLI dispatch integration', () => {
       expect(stdout).toContain('ENGINE SELECTION');
       // ...and confirm the generic stub (printCliOnlyHelp) did NOT fire.
       expect(stdout).not.toContain('run gbrain --help for the full command list');
+      // #5800: the thin-client example must name the flags initRemoteMcp
+      // actually reads (--issuer-url/--mcp-url/oauth), not `--url`, which it
+      // ignores while requiring --issuer-url.
+      expect(stdout).toContain('--mcp-only --issuer-url');
+      expect(stdout).not.toContain('--mcp-only --url');
       expect(existsSync(join(home, '.gbrain', 'config.json'))).toBe(false);
       expect(exitCode).toBe(0);
     } finally {
@@ -319,5 +383,40 @@ describe('CLI dispatch integration', () => {
     expect(tools[0]).toHaveProperty('name');
     expect(tools[0]).toHaveProperty('description');
     expect(tools[0]).toHaveProperty('parameters');
+  });
+
+  test("--tools-json carries each op's access contract after the legacy keys (#5953)", async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-tools-json-'));
+    try {
+      const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', '--tools-json'], {
+        cwd: repoRoot,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: isolatedEnv(home),
+      });
+      const stdout = await new Response(proc.stdout).text();
+      expect(await proc.exited).toBe(0);
+      const tools = JSON.parse(stdout) as Array<Record<string, unknown>>;
+      const byName = new Map(tools.map(t => [t.name as string, t]));
+
+      expect(Object.keys(byName.get('get_page')!)).toEqual([
+        'name', 'description', 'parameters', 'schema', 'scope', 'required_scopes', 'mutating', 'idempotent', 'local_only',
+      ]);
+      expect(byName.get('get_page')).toMatchObject({ scope: 'read', required_scopes: [], mutating: false, idempotent: true, local_only: false });
+      expect(byName.get('put_page')).toMatchObject({ scope: 'write', mutating: true, local_only: false });
+      expect(byName.get('think')).toMatchObject({ scope: 'read', mutating: true });
+      expect(byName.get('join_brain')).toMatchObject({ scope: 'read', required_scopes: ['skills_member_self'] });
+      expect(byName.get('sync_brain')).toMatchObject({ scope: 'admin', local_only: true });
+
+      const { operations } = await import('../src/core/operations.ts');
+      for (const op of operations) {
+        const t = byName.get(op.name)!;
+        expect([t.scope, t.required_scopes, t.mutating, t.idempotent, t.local_only], op.name).toEqual([
+          op.scope ?? 'read', op.requiredScopes ?? [], op.mutating === true, op.idempotent === true, op.localOnly === true,
+        ]);
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

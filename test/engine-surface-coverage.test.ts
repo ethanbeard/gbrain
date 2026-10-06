@@ -63,7 +63,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'countStalePagesForExtraction', 'listStalePagesForExtraction', 'markPagesExtractedBatch', 'markPagesAttendanceBlocked',
   // Links + graph
   'addLink', 'addLinksBatch', 'replaceDerivedLinks', 'removeLink', 'getLinks', 'getBacklinks', 'listLinkSources',
-  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'getBacklinkCounts',
+  'findByTitleFuzzy', 'traverseGraph', 'traversePaths', 'traversePathsDetailed', 'relationalFanout', 'relationalChainHop', 'getBacklinkCounts',
   'getAdjacencyBoosts', 'getContentFlagsByPageIds', 'getUnverifiedExtractionPageIds',
   'getPageTimestamps', 'getEffectiveDates', 'getSalienceScores', 'findOrphanPages',
   // Tags
@@ -87,7 +87,7 @@ const INTERFACE_METHODS: readonly string[] = [
   'getContradictionCacheEntry', 'putContradictionCacheEntry', 'sweepContradictionCache',
   // Facts (hot memory)
   'insertFact', 'insertFacts', 'deleteFactsForPage', 'expireFact', 'listFactsByEntity',
-  'listFactsSince', 'listFactsBySession', 'listSupersessions', 'countUnconsolidatedFacts',
+  'listFactsSince', 'listFactsKeyset', 'listFactsBySession', 'listSupersessions', 'countUnconsolidatedFacts',
   'findCandidateDuplicates', 'consolidateFact', 'findTrajectory', 'getFactsHealth',
   // Versions
   'createVersion', 'getVersions', 'revertToVersion',
@@ -131,6 +131,9 @@ const ENGINE_INTERNAL_HELPERS: readonly string[] = [
   'codeEdgesDeps',
   // refactor wave 1 C9: per-call engine-sql executor getter (EO1).
   'engineSql',
+  // Engine graduation: PGLite close/open that keeps the kernel lock across the custody window.
+  'closeRetainingLock',
+  'connectWithHeldLock',
 ];
 
 /**

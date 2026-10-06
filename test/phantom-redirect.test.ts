@@ -593,9 +593,10 @@ describe('runExtractFacts — phantom-redirect integration', () => {
         // Seed a legacy v0.31 fact row (row_num NULL, entity_slug NOT NULL).
         // `source` is NOT NULL in the schema; the v0.31 path always set it.
         // #2484: the guard only gates on rows whose entity_slug resolves to a
-        // LIVE page (genuine backfill candidates), so seed the backing page too.
+        // LIVE page, so seed the backing page too. #5299: the phase fences a
+        // row whose canonical file exists, so the page has no file here and the
+        // row stays unfenced, which is what gates.
         await putPage('people/legacy', '# legacy\n', { type: 'person' });
-        writeMd(brainDir, 'people/legacy', '# legacy\n');
         await engine.executeRaw(
           `INSERT INTO facts (source_id, entity_slug, fact, kind, valid_from, source)
            VALUES ('default', 'people/legacy', 'Legacy claim', 'fact', '2020-01-01'::date, 'legacy-import')`,

@@ -30,7 +30,7 @@ export interface SyncResult {
   /** Pages re-embedded during this sync's auto-embed step. 0 if --no-embed or skipped. */
   embedded: number;
   embedDeferralReason?: 'large_sync';
-  pagesAffected: string[];
+  pagesAffected: string[]; /** #5867: a Google sweep's loops_extract enqueue (sweep plus managed catch-up). */ loops_enqueue?: { enqueued: number; deferred: number; skipped_reason: string | null };
   failedFiles?: number; // count of parse failures (Bug 9)
   /**
    * #3875: code breakdown of the blocking failures (set on
@@ -47,7 +47,7 @@ export interface SyncResult {
    */
   malformedSkipped?: number;
   /** #5751: unchanged managed working-tree files skipped although a no-op publication cannot resolve their admit reason. */
-  legacySkips?: { contextualMode: number; canonicalBytes: number };
+  legacySkips?: { contextualMode: number; canonicalBytes: number }; /** #5984: managed entries advanced without a write (DX-A7), and how a still-unfinished managed write's wait ended (DX-A3). */ waived?: { imports: number; deletes: number }; writeWait?: import('../core/persistence/sync-run.ts').ManagedSyncWriteWait;
   /** Managed sync: files skipped because another origin keeps their slug, and links derived after the checkpoint. */
   slugCollisions?: import('../core/persistence/sync-discovery.ts').SyncSlugCollision[];
   fileRefusals?: import('../core/persistence/sync-discovery.ts').SyncFileRefusal[]; links?: import('../core/persistence/links-maintenance.ts').ManagedLinkExtraction;
@@ -82,10 +82,10 @@ export interface SyncResult {
    *
    * `files_imported` reflects ACTUAL persisted count (not the
    * not-yet-attempted set). `reason` distinguishes the partial cause so
-   * cron operators can disambiguate timeout vs pull-timeout in monitoring.
+   * cron operators can disambiguate timeout vs pull-timeout in monitoring; connector item failures / early stop exit 1 (isFailedPartial).
    */
   filesImported?: number;
-  reason?: 'timeout' | 'pull_timeout' | 'pull_failed' | 'stall_timeout' | 'checkpoint_unavailable' | 'writer_pending' | 'writer_yield';
+  reason?: 'timeout' | 'pull_timeout' | 'pull_failed' | 'stall_timeout' | 'checkpoint_unavailable' | 'writer_pending' | 'writer_yield' | 'connector_item_failures' | 'connector_partial';
   /**
    * v0.42.x (#1794): cumulative file paths durably banked to the checkpoint
    * across THIS run + prior resumed runs. Surfaced on every partial/blocked
@@ -94,8 +94,35 @@ export interface SyncResult {
    * everything," the exact misdiagnosis in the #1794 recurrence report.
    */
   bankedFiles?: number;
+  /** #5984: the managed drain's verdict and the next step for the agent (see sync-drain.ts). */
+  drain?: import('../core/persistence/sync-drain.ts').DrainReport;
+  /** #5984: managed cursor position (`index` of `total` manifest entries) and its active drain window. */
+  managedCursor?: { index: number; total: number; progress?: import('../core/persistence/sync-run.ts').CursorProgress };
   /** Fix wave 4: connector items held after repeated item-scoped failures (not blocking freshness). */
   connectorHolds?: { held: number; newly_held: number; retry_command: string; status_command: string };
+  /**
+   * #5988 Git holds: files held this run instead of blocking (detail capped at
+   * `sync.hold_cap`), their count, the source's outstanding total and the
+   * exact inspect and repair commands. Remote callers get `held_count` and
+   * `holds_fix` (a host-operator relay) only.
+   */
+  held?: import('../core/persistence/sync-holds.ts').GitHoldItem[];
+  held_count?: number;
+  holds_outstanding?: number;
+  holds_escalated?: boolean;
+  holds_truncated?: boolean;
+  /** A sliced run (`writer_yield`) has not screened every entry yet. */
+  holds_pending_screen?: boolean;
+  holds_fix?: import('../core/agent-output.ts').Action;
+  /** Requests of a blocked cursor this run converted in place (held, or re-frozen after the file was fixed). */
+  converted_from_failed?: string[];
+  /** Files imported by quoting unquoted frontmatter values, cumulative for the run. */
+  recovered_frontmatter?: import('../core/persistence/sync-holds.ts').RecoveredFrontmatter;
+  /** Dry run: files the run would hold, and entries the screen could not judge (never holds). */
+  dry_run?: true;
+  would_hold?: import('../core/persistence/sync-holds.ts').GitHoldItem[];
+  would_hold_count?: number;
+  screen_skipped?: Array<{ path: string; code: string }>;
 }
 
 // The cost-gate / token-estimate cluster (estimateSourceTreeTokens,
@@ -301,7 +328,19 @@ export interface SyncOpts {
    * `sync_status` IPC polls read. Absent for direct CLI runs (stderr
    * breadcrumbs already cover that surface).
    */
-  onProgress?: (p: { phase: string; bankedFiles?: number }) => void;
+  onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number;
+    /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } }) => void;
+  /**
+   * #5984: managed sync only. Re-enter the single-pass managed sync until the
+   * cursor is done, the caller's signal/deadline stops it, or it is blocked
+   * (src/core/persistence/sync-drain.ts). Set by the CLI; jobs and library
+   * callers keep the single-pass contract.
+   */
+  drain?: boolean;
+  /** #5984: wall-clock ms the current drain started; managed cursors measure their rate from it. */
+  drainStartedAt?: number;
+  /** #5984: `--no-bulk`; and the drain's resolved bulk settings (internal; absent = one request per pass step). */ noBulk?: boolean; bulk?: import('../core/persistence/sync-group.ts').BulkSettings;
+  /** #5984 lanes: `--lanes N` (1..8) or `--no-lanes` (1). */ lanes?: number;
 }
 
 // The git-plumbing cluster (git(), discoverGitRoot, createSyncBaselineCommit,

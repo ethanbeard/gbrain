@@ -391,6 +391,19 @@ export async function runBacklinksCore(opts: BacklinksOpts): Promise<BacklinksRe
   if (!existsSync(opts.dir)) {
     throw new Error(`Directory not found: ${opts.dir}`);
   }
+  // #5341: the fixer writes markdown files directly, which a managed
+  // canonical worktree refuses page by page. Refuse once, before the scan,
+  // and for --dry-run too, so a preview never claims fixes that cannot apply.
+  if (opts.action === 'fix') {
+    const { isManagedFilesystemPath } = await import('../core/persistence/filesystem-guard.ts');
+    if (isManagedFilesystemPath(opts.dir)) {
+      throw new Error(
+        `check-backlinks fix is not supported on a managed canonical worktree (${opts.dir}): it writes markdown files directly, ` +
+        'and managed brains accept file changes only through the persistence coordinator. ' +
+        '`gbrain check-backlinks check` still reports the gaps; the graph extractor already stores these links as edges.',
+      );
+    }
+  }
 
   // findBacklinkGaps is a sync double-walk of the brain dir. On 50K-page
   // brains that can take seconds — heartbeat so agents see we're working.

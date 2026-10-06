@@ -13,6 +13,7 @@ import { writeBackupArchive } from '../src/core/backup/archive.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { acquireLock, releaseLock, PgliteBusyError } from '../src/core/pglite-lock.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -31,7 +32,7 @@ async function withBrain<T>(at: string, fn: (engine: PGLiteEngine) => Promise<T>
 }
 
 async function withFixtureWrite<T>(at: string, sourceIds: string[], fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
-  return withBrain(at, engine => engine.transaction(tx => withCoordinatedWrite(tx, sourceIds, () => fn(tx))));
+  return withBrain(at, engine => engine.transaction(tx => withCoordinatedWrite(tx, sourceIds, () => fn(tx), TEST_WRITE_ATTRIBUTION)));
 }
 
 async function launched(args: string[], at = root): Promise<string> {

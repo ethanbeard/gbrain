@@ -29,6 +29,7 @@ import {
   type OrphanPageMeta,
 } from '../core/orphan-policy.ts';
 import { quarantineFilterFragment } from '../core/quarantine.ts';
+import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
 
 // --- Types ---
 
@@ -36,6 +37,9 @@ export interface OrphanPage {
   slug: string;
   title: string;
   domain: string;
+  /** #5891: the page's source and type, so a federated caller can tell rows apart. */
+  source_id?: string;
+  type?: string | null;
 }
 
 export interface OrphanResult {
@@ -44,6 +48,20 @@ export interface OrphanResult {
   total_linkable: number;
   total_pages: number;
   excluded: number;
+  /** #5877: orphaned connector renders (email/meeting pages of a google/github source), counted apart and left out of both totals. */
+  connector_renders_excluded?: number;
+}
+
+const CONNECTOR_RENDER_TYPES = new Set(['email', 'meeting']);
+
+/**
+ * #5877: ids of connector-kind sources. Their `email`/`meeting` pages are
+ * leaf renders (participants are raw addresses, never wikilinks), so an
+ * islanded render is expected and is reported apart rather than as an orphan.
+ */
+async function loadConnectorSourceIds(engine: BrainEngine): Promise<Set<string>> {
+  const rows = await engine.executeRaw<{ id: string; kind: string | null }>(`SELECT id, config->>'kind' AS kind FROM sources`);
+  return new Set(rows.filter(r => isConnectorSourceKind(r.kind)).map(r => r.id));
 }
 
 // --- Filter logic ---
@@ -82,7 +100,7 @@ export function deriveDomain(frontmatterDomain: string | null | undefined, slug:
  */
 export async function queryOrphanPages(
   engine: BrainEngine,
-): Promise<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }[]> {
+): Promise<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }[]> {
   return engine.findOrphanPages();
 }
 
@@ -124,10 +142,13 @@ export async function findOrphans(
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('orphans.scan');
   const stopHb = startHeartbeat(progress, 'scanning pages for missing inbound links…');
-  let allOrphans: { slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }[];
+  let allOrphans: { slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }[];
   let total: number;
   let excludedAll: number;
   const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
+  const connectorSources = includePseudo ? new Set<string>() : await loadConnectorSourceIds(engine);
+  const isConnectorRender = (row: { type?: string | null; source_id?: string }) =>
+    !!row.source_id && connectorSources.has(row.source_id) && !!row.type && CONNECTOR_RENDER_TYPES.has(row.type);
   try {
     allOrphans = await engine.findOrphanPages({
       excludePrivate: opts.excludePrivate,
@@ -160,17 +181,21 @@ export async function findOrphans(
     progress.finish();
   }
 
-  const filtered = includePseudo
+  const policyKept = includePseudo
     ? allOrphans
     : allOrphans.filter(row => !shouldExclude(row.slug, overrides, row));
+  const filtered = policyKept.filter(row => !isConnectorRender(row));
+  const connectorRendersExcluded = policyKept.length - filtered.length;
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,
     title: row.title,
     domain: deriveDomain(row.domain, row.slug),
+    ...(row.source_id !== undefined ? { source_id: row.source_id } : {}),
+    ...(row.type !== undefined ? { type: row.type } : {}),
   }));
 
-  const excluded = allOrphans.length - filtered.length;
+  const excluded = allOrphans.length - policyKept.length;
 
   return {
     orphans,
@@ -178,9 +203,10 @@ export async function findOrphans(
     // v0.41.29.0 (Codex F6): denominator = live pages minus ALL excluded
     // pages (orphan or not), so excluded pages with inbound links no longer
     // inflate it.
-    total_linkable: total - excludedAll,
+    total_linkable: total - excludedAll - connectorRendersExcluded,
     total_pages: total,
     excluded,
+    connector_renders_excluded: connectorRendersExcluded,
   };
 }
 
@@ -198,9 +224,10 @@ export const getOrphansData = findOrphans;
 export function formatOrphansText(result: OrphanResult): string {
   const lines: string[] = [];
 
-  const { orphans, total_orphans, total_linkable, total_pages, excluded } = result;
+  const { orphans, total_orphans, total_linkable, total_pages, excluded, connector_renders_excluded } = result;
+  const renders = connector_renders_excluded ? `; ${connector_renders_excluded} connector renders reported apart` : '';
   lines.push(
-    `${total_orphans} orphans out of ${total_linkable} linkable pages (${total_pages} total; ${excluded} excluded)\n`,
+    `${total_orphans} orphans out of ${total_linkable} linkable pages (${total_pages} total; ${excluded} excluded${renders})\n`,
   );
 
   if (orphans.length === 0) {

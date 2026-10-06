@@ -2,16 +2,20 @@ import { readFileSync } from 'node:fs';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { OperationContext } from '../ops/contract.ts';
+import type { Action } from '../agent-output.ts';
 import { acceptedPendingReceipt } from './accepted-pending.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { authorizeStoredRequest, authorizeWrite, submissionAuthority } from './authority.ts';
 import { currentVerifiedLocalWriter, localHostId, registerLocalWriter } from './identity.ts';
 import { admitWriteInTransaction, getWriteRequest, receiptFor } from './journal.ts';
 import { digest, requireUuid, sha256 } from './digest.ts';
-import { acquireWorktree, getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
+import { getWorktreeBinding, managedPersistenceEnabled, probeWorktreeWriter, type WorktreeBinding } from './ownership.ts';
+import { isConnectorSourceKind } from './connector-identity.ts';
 import { preparePageMutation } from './page-prepare.ts';
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
+import { MaintenanceWriteWait } from './maintenance-wait.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteAuthority, WriteRequest } from './model.ts';
 import type { WriteReceipt } from './types.ts';
@@ -34,6 +38,8 @@ export interface ManagedAtomSession {
   authority: WriteAuthority;
   binding: WorktreeBinding | null;
   config: GBrainConfig;
+  /** #5854: the publish wait of the job this session runs in (a drain attempt shares one across its batches). */
+  wait: MaintenanceWriteWait;
   retry?: { runKey: string; checkpointKey: string; expectedCheckpoint: unknown; rows: WriteRequest[]; origin: AtomOrigin };
 }
 export interface AtomIntent extends Record<string, unknown> {
@@ -49,58 +55,112 @@ export interface AtomIntent extends Record<string, unknown> {
   expectedCheckpoint?: unknown;
 }
 
-export async function managedAtomSession(engine: BrainEngine, sourceId: string, retry?: { requestId: string; retryId: string }): Promise<ManagedAtomSession | null> {
+const ownerStatusFix = (sourceId: string): Action => readFix(
+  `Shows source ${sourceId}'s canonical owner, its state and any write in flight, read-only.`,
+  { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] });
+const receiptFix = (requestId: string): Action => readFix(
+  'Reads the atom request\'s durable receipt: its state, outcome and error, read-only.',
+  { argv: ['gbrain', 'write-request', '--', requestId] });
+const drainFix = (sourceId: string): Action => ({
+  argv: ['gbrain', 'dream', '--drain', '--source', sourceId, '--json'], consent: ['paid'], actor: 'agent', requires_exclusive: false,
+  why: `Re-reads source ${sourceId}'s current content and extracts its atom backlog under a new run; extraction calls the configured LLM.`,
+});
+const pageFix = (sourceId: string, slug: string): Action => readFix(
+  `Shows which page holds ${slug} in source ${sourceId} now, with its type and revision.`,
+  { argv: ['gbrain', 'get', '--source', sourceId, '--', slug] });
+
+/**
+ * The managed atom write target of a source and the owner refusal its session raises (null when it can run).
+ * An unbound connector source is database-only by design (connector_database), like its connector sync:
+ * its local_path is the connector's state directory, not a canonical checkout.
+ */
+async function atomOwnerTarget(engine: BrainEngine, sourceId: string, source: { local_path: string | null; kind: string | null }) {
+  const binding = await getWorktreeBinding(engine, sourceId);
+  const root = source.local_path || (sourceId === 'default' ? await engine.getConfig('sync.repo_path') : null);
+  const writeThrough = !/^(false|0|off|no)$/i.test(await engine.getConfig('sync.write_through') ?? 'true');
+  const connectorDatabase = writeThrough && !binding && isConnectorSourceKind(source.kind);
+  const refusal = writeThrough && root && !binding && !connectorDatabase ? 'Atom maintenance requires the configured canonical owner.'
+    : writeThrough && binding && (binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path)
+      ? 'The canonical atom owner is unavailable; no extraction was started.' : null;
+  return { binding, writeThrough, connectorDatabase, refusal };
+}
+
+/** #5856: the owner refusal a managed atom drain of this source would hit in its session preflight, or null (always null when unmanaged). */
+export async function atomDrainOwnerRefusal(engine: BrainEngine, sourceId: string): Promise<string | null> {
+  if (!(await managedPersistenceEnabled(engine))) return null;
+  const [source] = await engine.executeRaw<{ local_path: string | null; kind: string | null }>(
+    "SELECT local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  return source ? (await atomOwnerTarget(engine, sourceId, source)).refusal : null;
+}
+
+export async function managedAtomSession(engine: BrainEngine, sourceId: string, retry?: { requestId: string; retryId: string },
+  wait: MaintenanceWriteWait = new MaintenanceWriteWait()): Promise<ManagedAtomSession | null> {
   if (!(await managedPersistenceEnabled(engine))) return null;
   assertPersistenceAccepting(engine);
   const caller = currentSubmissionAuthority();
   if (caller && caller.kind !== 'application' || currentVerifiedLocalWriter()?.remote) {
-    throw new OperationError('permission_denied', 'Atom extraction cannot mutate a managed brain through an untrusted caller; a trusted local, source-wide writer is required.');
+    throw opError('permission_denied', 'Atom extraction cannot mutate a managed brain through an untrusted caller; a trusted local, source-wide writer is required.',
+      `Run atom extraction for source ${sourceId} from the gbrain CLI in a terminal on the brain host; MCP and delegated callers cannot publish atoms. Nothing was extracted.`,
+      { reason: 'trusted_cli_required', fix: { ...drainFix(sourceId), actor: 'user',
+        user_message: 'Atom extraction has to run from a terminal on the machine that hosts this brain. Please run the command shown there; it calls the configured LLM.' } });
   }
-  const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null }>(
-    'SELECT incarnation,archived,local_path FROM sources WHERE id=$1', [sourceId]);
-  if (!source || source.archived) throw new OperationError('source_changed', 'The atom source is unavailable.');
+  const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null; kind: string | null }>(
+    "SELECT incarnation,archived,local_path,config->>'kind' AS kind FROM sources WHERE id=$1", [sourceId]);
+  if (!source || source.archived) throw opError('source_changed', 'The atom source is unavailable.',
+    `Source ${sourceId} is missing or archived, so no atoms were extracted. Check the registered sources and run extraction against an active one (or restore ${sourceId} first).`,
+    { fix: readFix('Lists the registered sources with their archived state, read-only.', { argv: ['gbrain', 'sources', 'list', '--json'] }) });
   if (!currentVerifiedLocalWriter()) await registerLocalWriter(engine, 'cli');
   const authority = await submissionAuthority({ engine, remote: false, sourceId } as OperationContext,
     'submit_job', sourceId, source.incarnation, '__managed_atom_complete__');
   if (authority.slugPrefixes || authority.restrictedNamespace || authority.delegated) {
-    throw new OperationError('permission_denied', 'Atom maintenance requires a source-wide grant.');
+    throw opError('permission_denied', 'Atom maintenance requires a source-wide grant.',
+      `This host's CLI writer registration is limited to slug prefixes, a restricted namespace or a delegation, so it cannot publish atoms across source ${sourceId}. Review the registration; widening it is the user's decision.`,
+      { fix: readFix('Shows the CLI writer registrations and their grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
   }
   await authorizeWrite(engine, authority, 'put_page', 'atoms/preflight');
   await authorizeWrite(engine, authority, 'delete_page', 'atoms/preflight');
-  const binding = await getWorktreeBinding(engine, sourceId);
-  const root = source.local_path || (sourceId === 'default' ? await engine.getConfig('sync.repo_path') : null);
-  const writeThrough = !/^(false|0|off|no)$/i.test(await engine.getConfig('sync.write_through') ?? 'true');
-  if (writeThrough && root && !binding) throw new OperationError('owner_unavailable', 'Atom maintenance requires the configured canonical owner.');
-  if (writeThrough && binding && (binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path)) {
-    throw new OperationError('owner_unavailable', 'The canonical atom owner is unavailable; no extraction was started.');
-  }
+  const { binding, writeThrough, connectorDatabase, refusal } = await atomOwnerTarget(engine, sourceId, source);
+  if (refusal) throw opError('owner_unavailable', refusal,
+    `No extraction was started for source ${sourceId}. Check its canonical owner: run atom extraction on the host that owns the checkout, or have the user claim the checkout on this host with gbrain sources writer claim.`,
+    { fix: ownerStatusFix(sourceId) });
   if (writeThrough && binding) {
-    const lock = await acquireWorktree(binding, 0, undefined, engine);
-    if (!lock) throw new OperationError('writer_lock_unavailable', 'The canonical atom writer is busy; no extraction was started.');
-    await lock.release();
+    if (!await probeWorktreeWriter(binding, engine)) throw opError('writer_lock_unavailable', 'The canonical atom writer is busy; no extraction was started.',
+      `Another write holds source ${sourceId}'s canonical writer. Nothing was started, so run the atom drain again once the owner status shows it idle.`,
+      { fix: ownerStatusFix(sourceId) });
   }
   if (!writeThrough) authority.databaseOnlyReason = 'disabled_by_config';
+  else if (connectorDatabase) authority.databaseOnlyReason = 'connector_database';
   else if (!binding) authority.databaseOnlyReason = 'no_repo_configured';
-  const session: ManagedAtomSession = { sourceId, incarnation: source.incarnation, authority, binding: writeThrough ? binding : null, config: { engine: engine.kind } as GBrainConfig };
+  const session: ManagedAtomSession = { sourceId, incarnation: source.incarnation, authority, binding: writeThrough ? binding : null, config: { engine: engine.kind } as GBrainConfig, wait };
   if (retry) {
-    if (!retry.retryId || retry.retryId.length > 128) throw new OperationError('invalid_params', 'A bounded explicit atom retry identity is required.');
+    if (!retry.retryId || retry.retryId.length > 128) throw opError('invalid_params', 'A bounded explicit atom retry identity is required.',
+      `Submit the atom retry for request ${retry.requestId} as an extract-atoms-drain job; the job supplies its own bounded retry identity. Nothing was started.`,
+      { fix: { argv: ['gbrain', 'jobs', 'submit', 'extract-atoms-drain', '--params', JSON.stringify({ sourceId, retryRequestId: retry.requestId })],
+        consent: ['paid'], actor: 'agent', requires_exclusive: false,
+        why: 'Queues one reviewed retry of the retained atom batch; extraction calls the configured LLM.' } });
     const prior = await getWriteRequest(engine, authority.principal, requireUuid(retry.requestId));
     if (!prior || prior.operation !== 'submit_job' || prior.source_id !== sourceId || prior.source_incarnation !== source.incarnation) {
-      throw new OperationError('not_found', 'No retained atom batch belongs to this writer, source and request.');
+      throw opError('not_found', 'No retained atom batch belongs to this writer, source and request.',
+        `Request ${retry.requestId} is not an atom batch this CLI writer accepted for source ${sourceId}. Read the receipt to see which operation and source it belongs to; nothing was retried.`,
+        { fix: receiptFix(retry.requestId) });
     }
     await authorizeStoredRequest(engine, prior);
     if (prior.compacted && !prior.intent) expiredAtomReceipt(prior);
-    if (!String(prior.intent?.kind).startsWith('managed_atom_')) throw new OperationError('not_found', 'No retained atom batch belongs to this writer, source and request.');
+    if (!String(prior.intent?.kind).startsWith('managed_atom_')) throw opError('not_found', 'No retained atom batch belongs to this writer, source and request.',
+      `Request ${retry.requestId} in source ${sourceId} is a ${prior.operation} request, not an atom batch, so atom retry does not apply. Read its receipt instead; nothing was retried.`,
+      { fix: receiptFix(retry.requestId) });
     const p = prior.intent as AtomIntent;
     const rows = await atomBatchRows(engine, session, p.runKey);
     for (let i = 0; i < rows.length; i++) {
       await authorizeStoredRequest(engine, rows[i]);
-      if (['queued', 'running', 'recovering'].includes(rows[i].state)) rows[i] = await waitForWrite(engine, rows[i], session.config);
+      if (['queued', 'running', 'recovering'].includes(rows[i].state)) rows[i] = session.wait.observe(await waitForWrite(engine, rows[i], session.config, session.wait.ms()));
       if (['queued', 'running', 'recovering'].includes(rows[i].state)) writeResponse(rows[i]);
     }
     const expired = rows.find(row => row.compacted && !row.intent);
     if (expired) expiredAtomReceipt(expired);
-    if (!rows.some(row => row.state !== 'committed' || row.outcome?.failure)) throw new OperationError('invalid_params', 'This atom batch already completed successfully.');
+    if (!rows.some(row => row.state !== 'committed' || row.outcome?.failure)) throw opError('invalid_params', 'This atom batch already completed successfully.',
+      `Every request in atom batch ${retry.requestId} for source ${sourceId} committed without a failure, so there is nothing to retry. Its receipt shows the outcome; new content is extracted by the regular atom drain.`,
+      { fix: receiptFix(retry.requestId) });
     const checkpointKey = p.checkpointKey ?? p.runKey;
     const [checkpoint] = await engine.executeRaw<{ completed_keys: unknown }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-atoms' AND fingerprint=$1", [checkpointKey]);
     session.retry = { runKey: digest([checkpointKey, prior.id, retry.retryId]), checkpointKey,
@@ -112,13 +172,17 @@ export async function managedAtomSession(engine: BrainEngine, sourceId: string, 
 export async function readAtomOrigin(engine: BrainEngine, session: ManagedAtomSession,
   item: { kind: 'page'; slug: string; content: string; contentHash: string } | { kind: 'transcript'; filePath: string; content: string; contentHash: string }): Promise<AtomOrigin> {
   if (item.kind === 'transcript') {
-    if (sha256(readFileSync(item.filePath)) !== sha256(item.content)) throw new OperationError('source_changed', 'The atom transcript changed before extraction.');
+    if (sha256(readFileSync(item.filePath)) !== sha256(item.content)) throw opError('source_changed', 'The atom transcript changed before extraction.',
+      `The transcript was edited while source ${session.sourceId}'s atom extraction read it; nothing was extracted from it. Run the drain again to extract the current file.`,
+      { fix: drainFix(session.sourceId) });
     return { kind: item.kind, locator: item.filePath, contentHash: item.contentHash, textHash: sha256(item.content), pageId: null, revision: null,
       visibility: effectiveVisibility({ kind: 'transcript' }) };
   }
   const snapshot = await engine.readPageSnapshot(item.slug, { sourceId: session.sourceId });
   if (!snapshot || snapshot.sourceIncarnation !== session.incarnation || snapshot.page.content_hash !== item.contentHash || snapshot.page.compiled_truth !== item.content) {
-    throw new OperationError('revision_conflict', 'The atom input changed before extraction.');
+    throw opError('revision_conflict', 'The atom input changed before extraction.',
+      `Page ${item.slug} in source ${session.sourceId} changed while its atoms were being prepared; nothing was extracted from it. Run the drain again to extract the current revision.`,
+      { fix: drainFix(session.sourceId) });
   }
   const generation = await atomGeneration(engine, snapshot.page.id, item.contentHash);
   return { kind: item.kind, locator: item.slug, contentHash: item.contentHash, textHash: sha256(item.content), pageId: snapshot.page.id,
@@ -183,10 +247,15 @@ export function atomRetryInputKey(session: ManagedAtomSession, origin: AtomOrigi
 
 function runKey(session: ManagedAtomSession, origin: AtomOrigin): string {
   if (session.retry) {
-    if (atomRetryInputKey(session, session.retry.origin) !== atomRetryInputKey(session, origin)) throw new OperationError('source_changed', 'The atom retry input no longer matches its accepted source snapshot.');
+    if (atomRetryInputKey(session, session.retry.origin) !== atomRetryInputKey(session, origin)) throw opError('source_changed', 'The atom retry input no longer matches its accepted source snapshot.',
+      `${origin.kind === 'page' ? `Page ${origin.locator}` : 'The transcript'} in source ${session.sourceId} changed after the reviewed atom batch was accepted, so the retry cannot replay it. Nothing was retried; the regular drain extracts the current content as a new run.`,
+      { fix: drainFix(session.sourceId) });
     return session.retry.runKey;
   }
-  return atomInputKey(session, origin);
+  // A database-only connector run is its own run: once an owner claims the source, the owner's
+  // run extracts again instead of replaying the batch the claim refused (claiming keeps the incarnation).
+  const key = atomInputKey(session, origin);
+  return session.authority.databaseOnlyReason === 'connector_database' ? digest([key, 'connector_database']) : key;
 }
 
 function atomRequestId(key: string, slug: string): string {
@@ -199,7 +268,9 @@ async function atomBatchRows(engine: BrainEngine, session: ManagedAtomSession, k
   const completion = await getWriteRequest(engine, session.authority.principal, completionId);
   if (completion && (completion.operation !== 'submit_job' || completion.source_id !== session.sourceId ||
     completion.source_incarnation !== session.incarnation || completion.slug !== '__managed_atom_complete__')) {
-    throw new OperationError('idempotency_conflict', 'The atom completion request ID belongs to another accepted operation.');
+    throw opError('idempotency_conflict', 'The atom completion request ID belongs to another accepted operation.',
+      `Atom completion request ${completionId} is already held by a ${completion.operation} request for ${completion.slug} in source ${completion.source_id}; nothing was admitted. Read that receipt and report the collision to the user with it rather than resubmitting.`,
+      { fix: receiptFix(completionId) });
   }
   const children = (completion?.intent as AtomIntent | null)?.children ?? [];
   return engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE source_id=$1 AND source_incarnation=$2::uuid
@@ -240,11 +311,13 @@ export async function resumeManagedAtoms(engine: BrainEngine, session: ManagedAt
   if (!rows.length) return false;
   for (const row of rows) {
     await authorizeStoredRequest(engine, row);
-    const completed = await waitForWrite(engine, row, session.config);
+    const completed = session.wait.observe(await waitForWrite(engine, row, session.config, session.wait.ms()));
     writeResponse(completed);
     if (completed.outcome?.failure) malformedAtomReceipt(completed);
   }
-  if (!rows.some(row => row.request_id === atomRequestId(key, '__managed_atom_complete__'))) throw new OperationError('storage_error', 'The accepted atom batch has no completion receipt.');
+  if (!rows.some(row => row.request_id === atomRequestId(key, '__managed_atom_complete__'))) throw opError('storage_error', 'The accepted atom batch has no completion receipt.',
+    `Source ${session.sourceId}'s atom pages were accepted but the batch's completion was never journaled, so its outcome is unconfirmed. Inspect the accepted request ${rows[0].request_id} and the owner before resubmitting anything.`,
+    { fix: receiptFix(rows[0].request_id) });
   return true;
 }
 
@@ -264,11 +337,15 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
     const snapshot = await engine.readPageSnapshot(atom.slug, { sourceId: session.sourceId, includeDeleted: true });
     if (snapshot && ((snapshot.page.deleted_at && !snapshot.page.frontmatter.retired_by) || snapshot.page.type !== 'atom' ||
       (origin.kind === 'page' ? snapshot.page.frontmatter.source_slug !== origin.locator : snapshot.page.frontmatter.source_path !== origin.locator))) {
-      throw new OperationError('page_identity_changed', 'The atom target belongs to another origin or was removed.');
+      throw opError('page_identity_changed', 'The atom target belongs to another origin or was removed.',
+        `Atom slug ${atom.slug} in source ${session.sourceId} is held by a page this extraction does not own (another origin, a non-atom page or a deleted page); nothing was admitted. Read that page; whether to move or remove it is the user's decision.`,
+        { fix: pageFix(session.sourceId, atom.slug) });
     }
     const target = atom.expectedTarget ?? { pageId: snapshot?.page.id ?? null, revision: snapshot?.revision ?? null };
     if ((snapshot?.page.id ?? null) !== target.pageId || (snapshot?.revision ?? null) !== target.revision) {
-      throw new OperationError('page_identity_changed', 'The reviewed atom retry target changed before admission.');
+      throw opError('page_identity_changed', 'The reviewed atom retry target changed before admission.',
+        `Atom page ${atom.slug} in source ${session.sourceId} changed after the retry was reviewed; nothing was admitted. Read its current revision; the regular drain extracts against it as a new run.`,
+        { fix: pageFix(session.sourceId, atom.slug) });
     }
     inputs.push({ slug: atom.slug, pageId: target.pageId, intent: { kind: 'managed_atom_page', runKey: key, origin,
       ...(session.retry ? { checkpointKey: session.retry.checkpointKey, expectedCheckpoint: session.retry.expectedCheckpoint } : {}),
@@ -310,7 +387,7 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
   });
   const receipts: WriteReceipt[] = [];
   for (const row of rows) {
-    const finished = await waitForWrite(engine, row, session.config);
+    const finished = session.wait.observe(await waitForWrite(engine, row, session.config, session.wait.ms()));
     try { writeResponse(finished); }
     catch (error) {
       // #5601: an accepted batch still publishing is progress; its deterministic request ids resume it next run.
@@ -327,16 +404,28 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
 export async function prepareManagedAtomMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const p = row.intent as AtomIntent | null;
   if (!p || !['managed_atom_page', 'managed_atom_delete', 'managed_atom_complete'].includes(p.kind) || !p.origin || row.authority.remote) {
-    throw new OperationError('permission_denied', 'Unsupported atom maintenance intent.');
+    throw opError('permission_denied', 'Unsupported atom maintenance intent.',
+      `Request ${row.request_id} in source ${row.source_id} is not an atom maintenance intent the trusted local writer can publish, so the coordinator refused it before any change. Atom extraction runs only from the gbrain CLI on the brain host; inspect the owner before resubmitting anything.`,
+      { fix: ownerStatusFix(row.source_id) });
   }
   const validate = async (tx: BrainEngine) => {
+    // A connector preflighted as unbound publishes database-only; one claimed since then must use its owner.
+    if (row.authority.databaseOnlyReason === 'connector_database' && await getWorktreeBinding(tx, row.source_id)) {
+      throw opError('source_changed', 'The connector source gained a canonical owner after atom preflight; the next run extracts through its owner.',
+        `Connector source ${row.source_id} was claimed by a canonical owner after this database-only atom run started; request ${row.request_id} changed nothing. Run the atom drain on the owning host.`,
+        { fix: ownerStatusFix(row.source_id) });
+    }
     if (p.origin.kind === 'transcript') {
-      if (sha256(readFileSync(p.origin.locator)) !== p.origin.textHash) throw new OperationError('source_changed', 'The accepted atom transcript changed.');
+      if (sha256(readFileSync(p.origin.locator)) !== p.origin.textHash) throw opError('source_changed', 'The accepted atom transcript changed.',
+        `The transcript behind atom request ${row.request_id} in source ${row.source_id} was edited after acceptance, so the request published nothing. Run the atom drain again to extract the current file.`,
+        { fix: drainFix(row.source_id) });
     } else {
       await authorizeWrite(tx, row.authority, 'submit_job', p.origin.locator);
       const snapshot = await tx.readPageSnapshot(p.origin.locator, { sourceId: row.source_id });
       if (!snapshot || snapshot.page.id !== p.origin.pageId || snapshot.revision !== p.origin.revision || snapshot.page.content_hash !== p.origin.contentHash) {
-        throw new OperationError('revision_conflict', 'The accepted atom source page changed.');
+        throw opError('revision_conflict', 'The accepted atom source page changed.',
+          `Page ${p.origin.locator} in source ${row.source_id} changed after atom request ${row.request_id} was accepted, so the request published nothing. Run the atom drain again to extract the current revision.`,
+          { fix: drainFix(row.source_id) });
       }
     }
   };
@@ -376,10 +465,14 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
           AND atom.knowledge_revision::text=r.outcome->>'revision' AND atom.deleted_at IS NULL)
           OR (COALESCE(r.intent->>'kind',r.outcome->>'atom_kind')='managed_atom_delete'
           AND atom.id=r.page_id AND atom.deleted_at IS NOT NULL))`, [children, row.source_incarnation, p.runKey]);
-      if (committed.length !== children.length) throw new OperationError('revision_conflict', 'The atom batch is not fully committed.');
+      if (committed.length !== children.length) throw opError('revision_conflict', 'The atom batch is not fully committed.',
+        `Some atom pages in batch ${row.request_id} for source ${row.source_id} did not commit or changed afterwards, so the batch was not marked complete. Read the batch receipt; the next atom drain extracts the source again.`,
+        { fix: receiptFix(row.request_id) });
       if (p.origin.kind === 'page') {
         const snapshot = await tx.readPageSnapshot(p.origin.locator, { sourceId: row.source_id });
-        if (!snapshot) throw new OperationError('revision_conflict', 'The accepted atom source page changed.');
+        if (!snapshot) throw opError('revision_conflict', 'The accepted atom source page changed.',
+          `Page ${p.origin.locator} in source ${row.source_id} is gone since atom batch ${row.request_id} was accepted, so the batch was not marked complete. Read the page to confirm; nothing more is extracted from a removed page.`,
+          { fix: pageFix(row.source_id, p.origin.locator) });
         await writeAtomPageState(tx, row.source_id, { slug: p.origin.locator, content: snapshot.page.compiled_truth,
           contentHash: p.origin.contentHash, identity: { pageId: p.origin.pageId!, sourceIncarnation: row.source_incarnation,
             revision: p.origin.revision! } }, p.failure ? 'failure' : 'complete');
@@ -393,7 +486,9 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
           ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()
           WHERE op_checkpoints.completed_keys=$3::text::jsonb RETURNING fingerprint`,
         [p.checkpointKey, checkpoint, p.expectedCheckpoint === null ? null : JSON.stringify(p.expectedCheckpoint)]);
-        if (!advanced.length) throw new OperationError('revision_conflict', 'The reviewed atom retry checkpoint changed.');
+        if (!advanced.length) throw opError('revision_conflict', 'The reviewed atom retry checkpoint changed.',
+          `Another atom run completed source ${row.source_id}'s reviewed checkpoint after retry ${row.request_id} was accepted, so the retry was not recorded. Read the retry receipt; the later run's atoms stand.`,
+          { fix: receiptFix(row.request_id) });
       }
       return { status: p.failure ? 'failed' : 'completed',
         atoms: committed.filter(child => child.kind === 'managed_atom_page').length,

@@ -19,7 +19,7 @@ export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler
       const { retryManagedAtomBatch } = await import('../../persistence/atom-retry.ts');
       return retryManagedAtomBatch(engine, job.data.sourceId, job.data.retryRequestId, `job:${job.id}`);
     }
-    const { formatDrainProviderFailure, runExtractAtomsDrainForSource } =
+    const { formatDrainProviderFailure, runExtractAtomsDrainForSource, structuralAtomRefusal } =
       await import('../../cycle/extract-atoms-drain.ts');
     const { LockUnavailableError } = await import('../../db-lock.ts');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
@@ -73,6 +73,9 @@ export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler
       if (e instanceof LockUnavailableError) {
         return { phase: 'extract_atoms', status: 'skipped', deferred: true, reason: 'cycle_already_running' };
       }
+      // #5856: the session preflight refused the writer itself (no owner, untrusted caller); a retry cannot change that.
+      const structural = structuralAtomRefusal(e);
+      if (structural) throw new UnrecoverableError(structural);
       if (e instanceof UnrecoverableError || !pastDeadline()) throw e;
       throw new UnrecoverableError(e instanceof Error ? e.message : String(e));
     }

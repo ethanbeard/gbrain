@@ -20,12 +20,23 @@
 // to quote). It NEVER fails the install: every path exits 0.
 
 import { which } from 'bun';
-import { unsupportedBunMessage } from '../src/core/runtime-version.ts';
+
+// Repo modules load dynamically inside try/catch: a static import of a file
+// that is not on disk (a Docker dependency layer, a partial checkout) would
+// exit 1 before any line here runs and fail the whole install.
+async function runtimeRefusalMessage(): Promise<string | null> {
+  try {
+    const { unsupportedBunMessage } = await import('../src/core/runtime-version.ts');
+    return unsupportedBunMessage();
+  } catch {
+    return null;
+  }
+}
 
 // The install itself runs on the user's Bun, so this is the first place an
 // upgrade onto a newer Bun floor can say so. Nothing else here would work:
 // every gbrain command refuses until Bun is upgraded.
-const runtimeRefusal = unsupportedBunMessage();
+const runtimeRefusal = await runtimeRefusalMessage();
 if (runtimeRefusal) {
   console.error(`[gbrain] Installed, but gbrain will not start on this Bun.\n${runtimeRefusal}`);
   process.exit(0);

@@ -24,7 +24,7 @@ import { REPAIR_HELP, parseRepairArgs, runRepairCommand } from '../src/commands/
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 import { withEnv } from './helpers/with-env.ts';
 
-const EXPLICIT: RepairKind[] = ['google-file-modes', 'stale-atoms', 'extractor-facts'];
+const EXPLICIT: RepairKind[] = ['google-file-modes', 'stale-atoms', 'extractor-facts', 'captured-facts', 'loop-facts', 'orphan-children', 'failed-writes', 'frontmatter'];
 let engine: PGLiteEngine;
 const home = mkdtempSync(join(tmpdir(), 'gbrain-repair-explicit-'));
 
@@ -62,7 +62,7 @@ function withExplicitCheck<T>(run: (spec: WaveCheckSpec) => T): T {
 }
 
 describe('registry', () => {
-  test('google-file-modes, stale-atoms and extractor-facts are registered explicit-only and excluded from the --all set', () => {
+  test('google-file-modes, stale-atoms, extractor-facts and loop-facts are registered explicit-only and excluded from the --all set', () => {
     expect(EXPLICIT_REPAIR_REGISTRY.map(spec => spec.kind)).toEqual(EXPLICIT);
     for (const kind of EXPLICIT) expect(REPAIR_REGISTRY.map(spec => spec.kind)).toContain(kind);
     expect(AUTO_REPAIR_REGISTRY.some(spec => spec.explicit_only)).toBe(false);
@@ -109,7 +109,7 @@ describe('surfaces that list instead of run', () => {
       expect(out.explicit_kinds).toEqual(EXPLICIT.map(kind => ({ kind, code: 'explicit_kind_required', preview_command: `gbrain repair ${kind}`,
         docs: 'docs/guides/repair.md#explicit-only-repair-kinds' })));
     }
-    expect(await captured(['--all'])).toContain('Explicit-only kinds (not run without their name; preview each): gbrain repair google-file-modes; gbrain repair stale-atoms; gbrain repair extractor-facts');
+    expect(await captured(['--all'])).toContain('Explicit-only kinds (not run without their name; preview each): gbrain repair google-file-modes; gbrain repair stale-atoms; gbrain repair extractor-facts; gbrain repair captured-facts; gbrain repair loop-facts');
   });
 
   test('gbrain repair --all --apply exits 0 when explicit kinds are the only ones left', async () => {

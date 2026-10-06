@@ -1,7 +1,8 @@
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import { validateMountId } from '../brain-registry.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { isWriteRequestId } from '../persistence/types.ts';
 import { digest } from '../persistence/digest.ts';
 import { parseSourceConfig } from '../sources-load.ts';
@@ -46,7 +47,9 @@ export function companyBrainProfile(config: unknown): CompanyBrainProfile | null
   if (source.company_brain === undefined) return null;
   const parsed = profileSchema.safeParse(source.company_brain);
   if (!parsed.success || typeof source.federated !== 'boolean' || source.strategy !== 'markdown' || source.slug_root_mode !== 'source-root' || source.kind != null || source.remote_url != null) {
-    throw new OperationError('profile_incompatible', 'The persisted company profile is invalid. Reinspect and reconnect explicitly; missing policy values are never defaulted.');
+    throw opError('profile_incompatible', 'The persisted company profile is invalid. Reinspect and reconnect explicitly; missing policy values are never defaulted.',
+      'The stored company-brain profile of this source fails validation, usually because its config was edited. Do not edit it back by hand: preview the source\'s removal with gbrain sources remove and --dry-run, and only after the user\'s destructive approval remove it, then inspect and connect the checkout again.',
+      { docs: 'docs/guides/company-brain-ingestion.md#resume-and-verify' });
   }
   return parsed.data;
 }
@@ -65,7 +68,11 @@ export function assertCompanyBrainPolicy(profile: CompanyBrainProfile, receipt: 
   if (profile.databaseId !== databaseId || profile.repository.root !== localPath || profile.receiptId !== receipt.id ||
     companyBrainPolicyFingerprint(profile, receipt.sourceId) !== receipt.policyFingerprint || profile.approvedRevision !== receipt.approvedRevision ||
     profile.schema.resolved_digest !== receipt.schemaFingerprint || profile.extractorVersion !== receipt.extractorVersion || receipt.profile !== 'company-brain') {
-    throw new OperationError('profile_incompatible', 'The source policy no longer matches its immutable ingestion approval. Reinspect and reconnect explicitly; v1 cannot reapprove an existing source in place.');
+    throw opError('profile_incompatible', 'The source policy no longer matches its immutable ingestion approval. Reinspect and reconnect explicitly; v1 cannot reapprove an existing source in place.',
+      `Source ${receipt.sourceId} no longer matches receipt ${receipt.id}'s approval. Preview its removal (read-only); only after the user's destructive approval remove it with --confirm-destructive, then inspect and connect the checkout again, or use a separate checkout and destination.`,
+      { docs: 'docs/guides/company-brain-ingestion.md#resume-and-verify',
+        fix: readFix(`Previews what removing source ${receipt.sourceId} from brain ${profile.brainId} would change; changes nothing.`,
+          { argv: ['gbrain', 'sources', 'remove', receipt.sourceId, '--brain', profile.brainId, '--dry-run'] }) });
   }
 }
 

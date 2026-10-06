@@ -11,7 +11,7 @@ import { localHostId, registerLocalWriter } from '../src/core/persistence/identi
 import { preparePageMutation } from '../src/core/persistence/page-prepare.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { claimPersistenceEffect, publicEffectsForRequest } from '../src/core/persistence/effect-journal.ts';
-import { dispatchFactsBackstopEffect, readFactsBackstopJobPage } from '../src/core/persistence/effect-facts.ts';
+import { authorizeFactsBackstop, dispatchFactsBackstopEffect, readFactsBackstopJobPage } from '../src/core/persistence/effect-facts.ts';
 import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -127,3 +127,9 @@ test('confined writers and disabled extraction never receive a queued claim', ()
   const disabled = await publishMutation(engine, updated.row, updated.prepared);
   expect(disabled.outcome?.facts_backstop).toEqual({ skipped: 'extraction_disabled' });
 }));
+
+test('a slug-bound writer\'s backstop refusal says the page was written and who widens the grant', async () => {
+  const row = { slug: 'notes/a', authority: { slugPrefixes: ['notes/'] } } as unknown as WriteRequest;
+  await expect(authorizeFactsBackstop(engine, row)).rejects.toMatchObject({ code: 'permission_denied',
+    suggestion: expect.stringContaining('the page itself is written') });
+});

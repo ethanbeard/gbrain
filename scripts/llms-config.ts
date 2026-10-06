@@ -28,7 +28,7 @@ export type DocSection = {
 export const PROJECT = {
   name: "GBrain",
   summary:
-    "GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, 26 fat-markdown skills. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.",
+    "GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, fat-markdown skills, and one agent operator contract for every error and recommendation. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.",
   repoUrl: "https://github.com/garrytan/gbrain",
   rawBaseUrl:
     process.env.LLMS_REPO_BASE ??
@@ -56,7 +56,7 @@ export const SECTIONS: DocSection[] = [
       {
         title: "AGENTS.md",
         description:
-          "Start here if you are not Claude Code. Install order, trust boundary, skill resolver, config/debug/migration pointers.",
+          "Start here if you are not Claude Code. Install order, the agent operator quick contract, trust boundary, skill resolver, config/debug/migration pointers.",
         path: "AGENTS.md",
       },
       {
@@ -81,8 +81,14 @@ export const SECTIONS: DocSection[] = [
       },
       {
         title: "INSTALL_FOR_AGENTS.md",
-        description: "9-step agent installation.",
+        description: "Step-by-step agent installation (steps 0-9): install, keyless init, the first-run decision bundle, harness wiring, verification and upgrades.",
         path: "INSTALL_FOR_AGENTS.md",
+      },
+      {
+        title: "docs/protocol/AGENT_OPERATOR_v1.md",
+        description:
+          "The agent operator contract: read `code`, follow `fix.next` (run / ask_user / tell_user_to_run / wait / report), run `fix.verify`. Error envelope, notices and mute, effects/actor/next table, consent and preapproval, exit codes, marker grammar, compatibility policy, first run, and how to make gbrain work better for your user.",
+        path: "docs/protocol/AGENT_OPERATOR_v1.md",
       },
       {
         title: "skills/RESOLVER.md",
@@ -100,9 +106,22 @@ export const SECTIONS: DocSection[] = [
     heading: "Configuration",
     entries: [
       {
+        title: "docs/guides/multi-hop.md",
+        description: "Multi-hop relationship questions: typed hop chains over links (search planner + traverse_graph hops), evidence edges, refusals, notices, settings.",
+        path: "docs/guides/multi-hop.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/ENGINES.md",
         description: "PGLite vs Postgres trade-off and when to migrate.",
         path: "docs/ENGINES.md",
+      },
+      {
+        title: "docs/guides/move-to-postgres.md",
+        description:
+          "Move a PGLite brain to Postgres with its history: --url-env target setup, plan (exit 3) then --yes --expect, status/resume/rollback, what moves vs stays on this computer, recovery by error code.",
+        path: "docs/guides/move-to-postgres.md",
+        includeInFull: false,
       },
       {
         title: "docs/GBRAIN_RECOMMENDED_SCHEMA.md",
@@ -120,13 +139,13 @@ export const SECTIONS: DocSection[] = [
         // headroom, so this value-explainer rides the single-fetch bundle again.
         title: "docs/what-schemas-unlock.md",
         description:
-          "Why schemas matter: 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) + the structural argument for typed page kinds. Read this before pitching schema authoring (v0.40.7.0).",
+          "Why schemas matter: 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) + the structural argument for typed page kinds. Read this before pitching schema authoring.",
         path: "docs/what-schemas-unlock.md",
       },
       {
         title: "docs/schema-author-tutorial.md",
         description:
-          "5-minute walkthrough: fork the bundled pack, add a custom `researcher` type, backfill existing pages via `gbrain schema sync --apply`, prove the T1.5 wiring via `gbrain whoknows` (v0.40.7.0).",
+          "5-minute walkthrough: fork the bundled pack, add a custom `researcher` type, backfill existing pages via `gbrain schema sync --apply`, prove the T1.5 wiring via `gbrain whoknows`.",
         path: "docs/schema-author-tutorial.md",
       },
       {
@@ -134,6 +153,13 @@ export const SECTIONS: DocSection[] = [
         description:
           "System One decision support (TypeSafe Jev or an llm: provider): every slot off or on, executed quickstart (`gbrain decide probe`, `probe --query`, `enable --recommended`, `status`), each slot in plain words, calibration and qualification, fail directions, egress rules, reading status/doctor, receipts, troubleshooting by refusal reason.",
         path: "docs/guides/system-one.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/retrieval-feedback.md",
+        description:
+          "Use-attributed retrieval feedback: answer ids, `rate_answer` / `gbrain rate` (whole answer or single pages), how ratings move page weights and ranking (bounded ±λ), citation learning, revision handling, who may teach the brain, `gbrain feedback status|reset`, config keys and every refusal code.",
+        path: "docs/guides/retrieval-feedback.md",
         includeInFull: false,
       },
       {
@@ -166,14 +192,35 @@ export const SECTIONS: DocSection[] = [
       {
         title: "docs/guides/scaling-skills.md",
         description:
-          "Three-tier architecture for agents with 300+ skills: always-loaded, resolver-routed, and dormant. Per-turn token math, the v0.41.7.0 compact list-format resolver, and the `gbrain doctor` safety net. 306 skills, ~21K tokens freed per turn, zero capability loss.",
+          "Three-tier architecture for agents with 300+ skills: always-loaded, resolver-routed, and dormant. Per-turn token math, the compact list-format resolver, and the `gbrain doctor` safety net. 306 skills, ~21K tokens freed per turn, zero capability loss.",
         path: "docs/guides/scaling-skills.md",
+      },
+      {
+        title: "docs/guides/life-chronicle.md",
+        description:
+          "Life Chronicle automatic event extraction (on by default): what qualifies, per-page cost and daily ceiling, privacy, the receipt -> `gbrain dream --phase chronicle` -> `gbrain day` check, skip/failure codes with fixes, opt-out `gbrain config set auto_chronicle false`, history backfill.",
+        path: "docs/guides/life-chronicle.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/facts-drain.md",
+        description:
+          "Automatic facts drain on PGLite (on by default): queued facts-absorb jobs run inside gbrain serve, serve --http and the facts_drain cycle phase with no command; per-run, daily and job-count caps, deferrals that never drop work, doctor facts_drain, opt-out `gbrain config set facts.extraction_enabled false`.",
+        path: "docs/guides/facts-drain.md",
+        includeInFull: false,
       },
       {
         title: "docs/guides/push-context.md",
         description:
           "Push-based context: the brain volunteers confidence-gated pages from the rolling conversation window. Three channels (ambient reflex, volunteer_context op, gbrain watch), config knobs, and the volunteered-vs-used feedback loop.",
         path: "docs/guides/push-context.md",
+      },
+      {
+        title: "docs/guides/time-aware-recall.md",
+        description:
+          "Time-aware recall in `gbrain think`: the current date in brain.timezone (or `--reference-date`) and content dates on each page block, with the measured accuracy gain.",
+        path: "docs/guides/time-aware-recall.md",
+        includeInFull: false,
       },
       {
         title: "docs/evidence-delivery.md",
@@ -196,7 +243,7 @@ export const SECTIONS: DocSection[] = [
       {
         title: "docs/protocol/MEMORY_VERBS_v1.md",
         description:
-          "The frozen five-verb memory protocol (recall/remember/entity/synthesize/forget): response envelopes, error contract, additive-forever versioning, surface modes, conformance certification, per-harness installs.",
+          "The frozen memory-verb protocol (recall/remember/entity/synthesize/forget plus context_pack and delta): response envelopes, error contract, additive-forever versioning, surface modes, conformance certification, per-harness installs.",
         path: "docs/protocol/MEMORY_VERBS_v1.md",
       },
     ],
@@ -226,8 +273,26 @@ export const SECTIONS: DocSection[] = [
       {
         title: "docs/GBRAIN_VERIFY.md",
         description:
-          "7-check post-setup verification. Start here when something feels off.",
+          "Post-setup verification checks for the capabilities you enabled. When a gbrain call fails or something feels off, start with docs/protocol/AGENT_OPERATOR_v1.md, then run these checks.",
         path: "docs/GBRAIN_VERIFY.md",
+      },
+      {
+        title: "docs/guides/troubleshooting.md",
+        description:
+          "Symptom table with who acts, consent and a read-only verify step per row, then the long-form fixes.",
+        path: "docs/guides/troubleshooting.md",
+      },
+      {
+        title: "docs/guides/error-codes.md",
+        description:
+          "Generated: every error code with meaning, why, next step, who acts and consent, verify, exit code and retryability. Offline: `gbrain errors <code>`.",
+        path: "docs/guides/error-codes.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/exit-codes.md",
+        description: "Exit statuses (3 = confirmation_required only, 10 pending write, 11 resumable budget stop) and what the agent does on each.",
+        path: "docs/guides/exit-codes.md",
       },
       {
         title: "docs/guides/minions-fix.md",
@@ -237,14 +302,15 @@ export const SECTIONS: DocSection[] = [
       {
         title: "docs/guides/repair.md",
         description:
-          "`gbrain repair timeline|visibility|safe-chunks`: dry run vs --apply, --source/--limit/--json, resume, capacity stop, thin-client refusal, what each kind fixes and costs.",
+          "`gbrain repair <kind>`: dry run vs --apply, --source/--limit/--json, resume, capacity stop, thin-client refusal, what each kind fixes and costs; held files walkthrough (sync holds a broken file, `gbrain repair frontmatter` two-pass preview and apply).",
         path: "docs/guides/repair.md",
       },
       {
         title: "docs/guides/write-refusals.md",
         description:
-          "Refusal reasons (file_database_drift, ambiguous_source_path, physical_root_device_changed, cursor_processing_options_conflict, take_row_collision, invalid_source_uri, queue_capacity, parked effects) with the exact recovery command.",
+          "Refusal reasons (file_database_drift, ambiguous_source_path, physical_root_device_changed, cursor_processing_options_conflict, take_row_collision, invalid_source_uri, queue_capacity, parked effects) and held-file content refusals (invalid_frontmatter and its reasons, frontmatter_slug_conflict, file_too_large, content_rejected, rename_held, sync_parser_regression) with the exact recovery command. Every refusal's `docs` field links its row directly.",
         path: "docs/guides/write-refusals.md",
+        includeInFull: false,
       },
       {
         title: "docs/integrations/reliability-repair.md",
@@ -354,6 +420,7 @@ export const INLINE_TIPS = [
   "`gbrain repair-jsonb [--dry-run]` - repair v0.12.0 double-encoded JSONB rows.",
   "`gbrain repair [<kind>] [--apply]` - preview, then fix timeline, visibility and safe-chunk damage doctor reports.",
   "`gbrain upgrade` runs post-upgrade + apply-migrations.",
+  "`gbrain errors <code> [--json]` - explain any error code offline; follow its `fix.next`.",
 ];
 
 // Target ~800KB so llms-full.txt fits in ~200k-token contexts with room to spare.

@@ -1,7 +1,7 @@
 import { normalizeAlias, normalizeAliasList } from './search/alias-normalize.ts';
 import { buildBasenameIndex, queryBasenameIndex, normalizeBasename, FRONTMATTER_LINK_MAP, type LinkExtractionPack } from './link-extraction.ts';
 import { slugifyPath, slugifySegment } from './sync.ts';
-import { OperationError } from './ops/contract.ts';
+import { opError } from './ops/contract.ts';
 
 export interface SourceLocalReferencePage {
   slug: string;
@@ -10,7 +10,8 @@ export interface SourceLocalReferencePage {
 }
 
 export function buildSourceLocalReferenceIndex(pages: readonly SourceLocalReferencePage[]) {
-  if (pages.length > 100_000) throw new OperationError('request_too_large', 'Reference metadata exceeds 100,000 pages; partition the source.');
+  if (pages.length > 100_000) throw opError('request_too_large', 'Reference metadata exceeds 100,000 pages; partition the source.',
+    `The source has ${pages.length} pages and reference resolution handles 100,000 per source. Split it into smaller sources; for a company import, inspect again with narrower --include and --exclude globs.`);
   const slugs = new Map<string, string[]>();
   const names = new Map<string, Set<string>>();
   let bytes = 0;
@@ -18,7 +19,8 @@ export function buildSourceLocalReferenceIndex(pages: readonly SourceLocalRefere
   for (const page of pages) {
     const aliases = normalizeAliasList(page.aliases);
     bytes += Buffer.byteLength(JSON.stringify([page.slug, page.title, aliases]));
-    if (bytes > 16 * 1024 ** 2) throw new OperationError('request_too_large', 'Reference metadata exceeds 16 MiB; narrow the source.');
+    if (bytes > 16 * 1024 ** 2) throw opError('request_too_large', 'Reference metadata exceeds 16 MiB; narrow the source.',
+      'The slugs, titles and aliases of this source exceed 16 MiB. Split it into smaller sources, or trim very long aliases; for a company import, inspect again with narrower --include and --exclude globs.');
     const sameSlug = slugs.get(page.slug) ?? [];
     sameSlug.push(page.slug);
     slugs.set(page.slug, sameSlug);

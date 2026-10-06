@@ -1,11 +1,42 @@
 /** NULL marks a legacy snapshot whose deletion state was not recorded. */
 export const PAGE_VERSION_DELETION_SCHEMA_SQL = `ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN;`;
 
-/** Shared by migration 150 and both schema blobs. Statements stay idempotent. */
+/**
+ * Shared by migration 150 and both schema blobs, so Postgres also replays it
+ * before pending migrations. Statements stay idempotent. #5216: a column with
+ * a volatile default added NOT NULL rewrites the whole table (and reads every
+ * TOAST value, failing on a torn one), so both UUID columns are added
+ * nullable, get their default separately, and become NOT NULL only when no
+ * row needs a value: `sources` is backfilled here (a handful of rows), an
+ * empty `pages` (fresh install) is constrained here, and existing pages are
+ * backfilled in committed batches by page-state/revision-backfill-schema.ts.
+ */
 export const PAGE_STATE_SCHEMA_STATEMENTS = [
-  `ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID NOT NULL DEFAULT gen_random_uuid()`,
+  `DO $do$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attisdropped) THEN
+      ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND atthasdef) THEN
+      ALTER TABLE sources ALTER COLUMN incarnation SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attnotnull) THEN
+      UPDATE sources SET incarnation = gen_random_uuid() WHERE incarnation IS NULL;
+      ALTER TABLE sources ALTER COLUMN incarnation SET NOT NULL;
+    END IF;
+  END $do$`,
   `CREATE UNIQUE INDEX IF NOT EXISTS sources_incarnation_key ON sources(incarnation)`,
-  `ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID NOT NULL DEFAULT gen_random_uuid()`,
+  `DO $do$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attisdropped) THEN
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND atthasdef) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attnotnull)
+       AND NOT EXISTS (SELECT 1 FROM pages) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET NOT NULL;
+    END IF;
+  END $do$`,
   `ALTER TABLE pages ADD COLUMN IF NOT EXISTS text_projection_revision UUID`,
   `ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS knowledge_revision UUID`,
   `ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS timeline TEXT`,
@@ -18,8 +49,13 @@ export const PAGE_STATE_SCHEMA_STATEMENTS = [
     slug TEXT NOT NULL,
     PRIMARY KEY (source_incarnation, slug)
   )`,
-  `CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql AS $fn$
+  `CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
     BEGIN
+      IF OLD.knowledge_revision IS NULL THEN
+        NEW.knowledge_revision := COALESCE(NEW.knowledge_revision, gen_random_uuid());
+        NEW.text_projection_revision := NULL;
+        RETURN NEW;
+      END IF;
       IF (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.compiled_truth,
           NEW.timeline, NEW.frontmatter, NEW.deleted_at)
          IS DISTINCT FROM
@@ -42,7 +78,7 @@ export const PAGE_STATE_SCHEMA_STATEMENTS = [
   `DROP TRIGGER IF EXISTS pages_knowledge_revision ON pages`,
   `CREATE TRIGGER pages_knowledge_revision BEFORE UPDATE ON pages
     FOR EACH ROW EXECUTE FUNCTION gbrain_advance_page_revision()`,
-  `CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql AS $fn$
+  `CREATE OR REPLACE FUNCTION gbrain_advance_tag_revision() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
     BEGIN
       IF TG_OP = 'UPDATE' AND (NEW.page_id, NEW.tag) IS NOT DISTINCT FROM (OLD.page_id, OLD.tag) THEN
         RETURN NULL;

@@ -31,13 +31,12 @@ describe('takes-quality DEFAULT_MODEL_PANEL ↔ recipe consistency', () => {
     }
   });
 
-  test('every default panel model prices via canonical AND the takes-quality allowlist', () => {
+  test('every default panel model prices via canonical AND takes-quality pricing', () => {
     for (const id of DEFAULT_MODEL_PANEL) {
       expect(canonicalLookup(id), `"${id}" missing from CANONICAL_PRICING`).toBeDefined();
-      // getPricing throws PricingNotFoundError if the model is missing from
-      // SUPPORTED_MODELS — a default that can't be budget-gated aborts every
-      // `--budget-usd` run before the first call.
-      expect(getPricing(id)).toBeDefined();
+      // An unpriced default refuses every `--budget-usd` run with no_pricing
+      // before the first call.
+      expect(getPricing(id), `"${id}" unpriced for takes-quality`).not.toBeNull();
     }
   });
 

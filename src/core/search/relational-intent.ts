@@ -30,6 +30,8 @@
  * Tested in test/relational-intent.test.ts.
  */
 
+import { relationQueryStatus, type EdgeStatusFilter } from '../link-validity.ts';
+
 export type RelationalKind = 'who_rel' | 'who_at' | 'connects' | 'intro';
 export type RelationDirection = 'in' | 'out' | 'both';
 
@@ -44,6 +46,8 @@ export interface RelationalQuery {
   direction: RelationDirection;
   /** The matched relation phrase, for telemetry / --explain. */
   relationPhrase: string;
+  /** Which relationships the question is about: live (now), ended (former), all (history). */
+  edgeStatus: EdgeStatusFilter;
 }
 
 /** Schema-pack vocab extension (D2=B). */
@@ -346,12 +350,12 @@ export function parseRelationalQuery(query: string, vocab?: RelationVocab): Rela
       const a = cleanSeed(m[1] ?? '');
       const b = cleanSeed(m[2] ?? '');
       if (!validSeed(a) || !validSeed(b)) continue;
-      return { kind: p.kind, seeds: [a, b], linkTypes: p.linkTypes, direction: p.direction, relationPhrase: m[0].trim() };
+      return { kind: p.kind, seeds: [a, b], linkTypes: p.linkTypes, direction: p.direction, relationPhrase: m[0].trim(), edgeStatus: relationQueryStatus(query) };
     }
 
     const seed = cleanSeed(m[1] ?? '');
     if (!validSeed(seed)) continue;
-    return { kind: p.kind, seeds: [seed], linkTypes: p.linkTypes, direction: p.direction, relationPhrase: m[0].trim() };
+    return { kind: p.kind, seeds: [seed], linkTypes: p.linkTypes, direction: p.direction, relationPhrase: m[0].trim(), edgeStatus: relationQueryStatus(query) };
   }
 
   return null;

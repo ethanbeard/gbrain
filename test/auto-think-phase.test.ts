@@ -151,6 +151,30 @@ describe('runPhaseAutoThink', () => {
     expect(['partial', 'skipped']).toContain(r.status);
     await engine.setConfig('dream.auto_think.enabled', 'false');
   });
+
+  test('a source-scoped cycle saves its synthesis into that source, not the default', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name, config) VALUES ('auto-think-scoped', 'auto-think-scoped', '{}'::jsonb) ON CONFLICT DO NOTHING`);
+    await engine.setConfig('dream.auto_think.enabled', 'true');
+    await engine.setConfig('dream.auto_think.questions', JSON.stringify(['Which scoped founders matter?']));
+    await engine.setConfig('dream.auto_think.max_per_cycle', '1');
+    await engine.setConfig('dream.auto_think.budget', '10.0');
+    await engine.setConfig('dream.auto_think.auto_commit', 'true');
+    await engine.setConfig('dream.auto_think.cooldown_days', '0');
+    await engine.setConfig('dream.auto_think.last_completion_ts', '');
+    const before = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE slug LIKE 'synthesis/%'`);
+    const r = await runPhaseAutoThink(engine, {
+      dryRun: false,
+      client: makeStubClient('A scoped synthesis about founders.'),
+      auditPath: join(tmpDir, 'b-scoped.jsonl'),
+      sourceId: 'auto-think-scoped',
+    });
+    expect(r.status).toBe('complete');
+    const saved = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages WHERE slug LIKE 'synthesis/%' AND NOT (id = ANY($1::int[]))`, [before.map(row => row.id)]);
+    expect(saved.map(row => row.source_id)).toEqual(['auto-think-scoped']);
+    await engine.setConfig('dream.auto_think.enabled', 'false');
+    await engine.setConfig('dream.auto_think.auto_commit', 'false');
+  });
 });
 
 describe('parseDriftOutput', () => {

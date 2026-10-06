@@ -172,7 +172,7 @@ async function defaultFetchRelease(): Promise<{ tag: string; assets: ReleaseAsse
   }
 }
 
-async function defaultDownload(url: string, destPath: string): Promise<void> {
+export async function defaultDownload(url: string, destPath: string): Promise<void> {
   const res = await fetch(url, {
     headers: { 'User-Agent': 'gbrain-self-upgrade' },
     redirect: 'follow',
@@ -181,10 +181,11 @@ async function defaultDownload(url: string, destPath: string): Promise<void> {
   if (!res.ok) throw new Error(`download HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length === 0) throw new Error('downloaded asset is empty');
-  writeFileSync(destPath, buf);
-  // fsync so a crash between write and rename can't leave a torn file.
-  const fd = openSync(destPath, 'r');
+  // fsync the descriptor that wrote the bytes, so a crash between write and
+  // rename can't leave a torn file. A read-only reopen fails on Windows (EPERM).
+  const fd = openSync(destPath, 'w');
   try {
+    writeFileSync(fd, buf);
     fsyncSync(fd);
   } finally {
     closeSync(fd);

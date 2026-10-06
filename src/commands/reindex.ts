@@ -34,6 +34,8 @@ import { resolve } from 'path';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
+import { managedPersistenceEnabled } from '../core/persistence/ownership.ts';
+import { loadConfig } from '../core/config.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -70,6 +72,8 @@ export interface ReindexResult {
   dryRun: boolean;
   chunkerVersion: number;
   type: string | null;
+  /** Parallel writers used for the run (#5181); absent when nothing ran. */
+  workers?: number;
 }
 
 // #3686: real usage, reachable via `gbrain reindex --help` (the generic
@@ -79,7 +83,7 @@ export interface ReindexResult {
 const REINDEX_HELP = `gbrain reindex — re-chunk / re-embed existing pages after a pipeline upgrade
 
 USAGE
-  gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--dry-run] [--no-embed] [--json] [--repo PATH]
+  gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--workers N] [--dry-run] [--no-embed] [--json] [--repo PATH]
   gbrain reindex --multimodal [--limit N] [--workers N] [--dry-run] [--cost-estimate] [--no-embed] [--yes] [--json]
   gbrain reindex --aliases    [--limit N] [--dry-run] [--json] [--source <id>]
   gbrain reindex --vectors    [--dry-run] [--json]
@@ -87,7 +91,10 @@ USAGE
 TARGETS (exactly one required)
   --markdown        Re-chunk markdown pages whose chunker_version lags the
                     current chunker (or whose contextual-retrieval state is
-                    unset when embedding is on).
+                    unset when embedding is on). On a managed brain it
+                    runs gbrain repair safe-chunks (and contextual-mode
+                    unless --no-embed) instead: no page writes; --type is
+                    refused there.
   --multimodal      Re-embed image/PDF chunks through the multimodal
                     embedding pipeline (Voyage batches).
   --aliases         Backfill the free-text alias layer (page_aliases) for
@@ -98,8 +105,10 @@ TARGETS (exactly one required)
 OPTIONS
   --type <t>        --markdown only: restrict to one page type
   --limit N         Cap pages/chunks processed this run
-  --workers N       --multimodal only: parallel UPDATEs per batch
-                    (--concurrency is an alias)
+  --workers N       --markdown and --multimodal: parallel writers per batch
+                    (--concurrency is an alias). --markdown on Postgres
+                    defaults to 4 when more than 100 pages are pending;
+                    PGLite always uses 1
   --dry-run         Report what would change; write nothing
   --cost-estimate   --multimodal only: print the embed cost estimate and stop
   --no-embed        Skip re-embedding (chunk-only reindex)
@@ -143,6 +152,8 @@ function pendingDriftPredicate(noEmbed: boolean): string {
 
 export function validateReindexModeScope(args: string[]): string | null {
   args = normalizeReindexArgs(args);
+  // #5937: --limit is validated for every mode (--multimodal/--aliases parsed it with parseInt).
+  if (invalidPositiveIntegerFlag(args, '--limit')) return 'invalid --limit: expected a positive integer';
   if (!args.includes('--type')) return null;
   if (args.includes('--multimodal')) return '--type is only supported with reindex --markdown, not --multimodal';
   if (args.includes('--aliases')) return '--type is only supported with reindex --markdown, not --aliases';
@@ -153,7 +164,8 @@ function invalidPositiveIntegerFlag(args: string[], flag: string): boolean {
   return args.some((arg, index) => {
     if (arg !== flag) return false;
     const raw = args[index + 1];
-    return raw == null || raw.startsWith('--') || !/^\d+$/.test(raw) || Number(raw) <= 0;
+    return raw == null || raw.startsWith('--') || !/^\d+$/.test(raw) ||
+      !Number.isSafeInteger(Number(raw)) || Number(raw) <= 0;
   });
 }
 
@@ -358,6 +370,8 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     return { pending, pendingAfter: pending, reindexed: 0, skipped: 0, failed: 0, dryRun: true, chunkerVersion: MARKDOWN_CHUNKER_VERSION, type };
   }
 
+  if (await managedPersistenceEnabled(engine)) return reindexManaged(engine, opts, type, pending);
+
   const reporter = createProgress(cliOptsToProgressOptions(getCliOptions()));
   reporter.start('reindex.markdown', target);
 
@@ -367,6 +381,9 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   let afterId: number | null = null;
   const BATCH = 100;
   const repoPath = opts.repoPath ? resolve(opts.repoPath) : null;
+  // #5181: size the pool from the whole run, not one batch. A full batch is
+  // exactly the auto threshold (100), so batch length never enabled it.
+  const { workers } = resolveWorkersWithClamp(engine, opts.workers, 'reindex', target);
 
   while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
@@ -380,15 +397,9 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     // v0.41.15.0 (T10, D9): per-batch sliding pool. Counters are JS-
     // single-thread atomic so reindexed++ / failed++ are race-free
     // across workers.
-    const writersResolved = resolveWorkersWithClamp(
-      engine,
-      opts.workers,
-      'reindex',
-      batch.length,
-    );
     await runSlidingPool({
       items: batch,
-      workers: writersResolved.workers,
+      workers,
       failureLabel: (row) => row.slug,
       onItem: async (row) => {
         reporter.tick();
@@ -473,6 +484,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     dryRun: false,
     chunkerVersion: MARKDOWN_CHUNKER_VERSION,
     type,
+    workers,
   };
 
   if (opts.json) {
@@ -480,11 +492,61 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
       pending, pending_after: pendingAfter, reindexed, skipped, failed,
       chunker_version: MARKDOWN_CHUNKER_VERSION,
       type,
+      workers,
     }) + '\n');
   } else {
     const scope = type ? ` type=${type}` : '';
-    process.stderr.write(`[reindex] Done.${scope} reindexed=${reindexed} skipped=${skipped} failed=${failed} pending_before=${pending} pending_after=${pendingAfter}\n`);
+    process.stderr.write(`[reindex] Done.${scope} reindexed=${reindexed} skipped=${skipped} failed=${failed} pending_before=${pending} pending_after=${pendingAfter} workers=${workers}\n`);
   }
 
   return result;
+}
+
+/**
+ * #5377: a managed brain cannot re-import through the legacy writer, so the
+ * sweep delegates to the projection repairs: `safe-chunks` re-seals every page
+ * chunked before the current chunker and `contextual-mode` stamps pages imported
+ * without a contextual mode (skipped under --no-embed, which does not count
+ * them as pending). Neither writes a page revision, journal request or
+ * canonical file. `--type` cannot narrow those repairs, so it is refused with
+ * the repair commands instead.
+ */
+async function reindexManaged(engine: BrainEngine, opts: ReindexOpts, type: string | null, pending: number): Promise<ReindexResult> {
+  const base = { pending, dryRun: false, chunkerVersion: MARKDOWN_CHUNKER_VERSION, type };
+  const repairs = opts.noEmbed ? ['safe-chunks'] : ['safe-chunks', 'contextual-mode'];
+  const redirect = repairs.map(kind => `gbrain repair ${kind} --apply${opts.noEmbed ? ' --no-embed' : ''}`).join(' && ');
+  if (type) {
+    const error = `--type cannot narrow a managed reindex; re-chunk every drifted page with: ${redirect}`;
+    if (opts.json) process.stdout.write(JSON.stringify({ error, delegated_to: repairs }) + '\n');
+    else process.stderr.write(`[reindex] ${error}\n`);
+    setCliExitVerdict(2);
+    return { ...base, pendingAfter: pending, reindexed: 0, skipped: 0, failed: 0 };
+  }
+  const { contextualModeRepair } = await import('../core/repair/contextual-mode.ts');
+  const { safeChunksRepair } = await import('../core/repair/safe-chunks.ts');
+  const { resolveRepairScope, runRepair } = await import('../core/repair/core.ts');
+  const ctx = { engine, config: loadConfig() ?? { engine: engine.kind }, remote: false, dryRun: false, sourceId: 'default',
+    logger: { info: (msg: string) => process.stderr.write(`${msg}\n`), warn: (msg: string) => process.stderr.write(`${msg}\n`), error: (msg: string) => process.stderr.write(`${msg}\n`) } };
+  const scope = await resolveRepairScope(engine);
+  const stopped: string[] = [];
+  let unsupported = 0;
+  for (const handler of opts.noEmbed ? [safeChunksRepair] : [safeChunksRepair, contextualModeRepair]) {
+    const run = await runRepair(ctx as Parameters<typeof runRepair>[0], handler, scope, { apply: true, limit: opts.limit, embed: !opts.noEmbed });
+    if (run.stopped) stopped.push(run.stopped.message);
+    unsupported += Object.values(run.residuals).reduce((sum, count) => sum + count, 0);
+  }
+  if (pending > 0) await refreshProjectionStatistics(engine);
+  const pendingAfter = await countPending(engine, type, !!opts.noEmbed);
+  const reindexed = Math.max(0, pending - pendingAfter);
+  if (stopped.length) setCliExitVerdict(1);
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({ pending, pending_after: pendingAfter, reindexed, skipped: 0, failed: 0, chunker_version: MARKDOWN_CHUNKER_VERSION, type,
+      delegated_to: repairs, ...(unsupported ? { unsupported_pages: unsupported } : {}), ...(stopped.length ? { stopped } : {}) }) + '\n');
+  } else {
+    process.stderr.write(`[reindex] Managed brain: re-chunked through ${repairs.map(kind => `gbrain repair ${kind}`).join(' and ')} (no page writes). `
+      + `reindexed=${reindexed} pending_before=${pending} pending_after=${pendingAfter}\n`);
+    if (unsupported) process.stderr.write(`[reindex] ${unsupported} page(s) the projection repairs cannot rebuild (code without a source path, or another page kind) are left for their importer.\n`);
+    for (const message of stopped) process.stderr.write(`[reindex] ${message}\n`);
+  }
+  return { ...base, pendingAfter, reindexed, skipped: 0, failed: 0 };
 }

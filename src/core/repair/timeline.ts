@@ -25,6 +25,20 @@ async function removedRowIds(engine: BrainEngine, page: TimelinePage): Promise<S
   return new Set(removed.map(row => Number(row.id)));
 }
 
+async function classifyTimelinePage(engine: BrainEngine, page: TimelinePage) {
+  return pendingTimelineRows(engine, { ...page, timeline: page.timeline ?? '' }, await removedRowIds(engine, page));
+}
+
+/** Current counts for specific pages (doctor rechecks pages an earlier run of a multi-run pass found). */
+export async function recountTimelinePages(engine: BrainEngine, sourceIds: string[], ids: number[]) {
+  if (ids.length === 0) return [];
+  const pages = await engine.executeRaw<TimelinePage>(`SELECT p.id,p.source_id,p.slug,p.compiled_truth,p.timeline FROM pages p
+    WHERE p.id = ANY($1::bigint[]) AND p.source_id=ANY($2::text[]) AND p.deleted_at IS NULL`, [ids, sourceIds]);
+  const counted = [];
+  for (const page of pages) counted.push({ id: page.id, ...await classifyTimelinePage(engine, page) });
+  return counted;
+}
+
 /**
  * Pages carrying non-event timeline rows, in id order after `afterId`, each
  * classified exactly. `budget` caps the pages inspected (doctor's bound).
@@ -41,14 +55,14 @@ export async function scanTimelineHistory(engine: BrainEngine, sourceIds: string
     for (const page of batch) {
       if ((budget.pages !== undefined && inspected >= budget.pages) || (budget.deadline !== undefined && Date.now() > budget.deadline)) {
         truncated = true;
-        return { pages, inspected, truncated };
+        return { pages, inspected, truncated, cursor };
       }
       inspected++;
       cursor = page.id;
-      const counts = await pendingTimelineRows(engine, { ...page, timeline: page.timeline ?? '' }, await removedRowIds(engine, page));
+      const counts = await classifyTimelinePage(engine, page);
       if (counts.materializable || counts.unrenderable) pages.push({ ...page, ...counts });
     }
-    if (batch.length < BATCH) return { pages, inspected, truncated };
+    if (batch.length < BATCH) return { pages, inspected, truncated, cursor };
   }
 }
 

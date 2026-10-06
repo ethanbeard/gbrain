@@ -1122,7 +1122,8 @@ export async function resolveFrozenHits(
  * (default trusted local).
  */
 export async function assembleEvidenceForHits(engine: BrainEngine, input: AssembleEvidenceInput): Promise<AssembleEvidenceOutput> {
-  if (!Array.isArray(input.hits)) throw new OperationError('invalid_params', 'hits must be an array of { source_id, slug, chunk_id }.');
+  if (!Array.isArray(input.hits)) throw new OperationError('invalid_params', 'hits must be an array of { source_id, slug, chunk_id }.',
+    'Pass hits as an array of { source_id, slug, chunk_id } objects, e.g. [{ "source_id": "default", "slug": "notes/a", "chunk_id": 12 }], ranked best first.');
   if (input.hits.length > MAX_ASSEMBLE_HITS) {
     throw new OperationError('invalid_params', `hits holds at most ${MAX_ASSEMBLE_HITS} entries (got ${input.hits.length}).`, 'Pass the top-ranked hits only.');
   }

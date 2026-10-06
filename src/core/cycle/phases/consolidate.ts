@@ -3,7 +3,8 @@
  *
  * Per /plan-eng-review Phase 5:
  *
- *   For each (source_id, entity_slug) bucket of unconsolidated active facts:
+ *   For each (source_id, entity_slug) bucket of unconsolidated active facts
+ *   the user asserted (or with no recorded speaker):
  *     1. Skip if count < 3 OR oldest fact age < 24h.
  *     2. Cluster by embedding cosine — greedy threshold 0.85.
  *     3. For each cluster ≥ 2: pick the highest-confidence fact's text as
@@ -29,6 +30,7 @@ import { createHash } from 'node:crypto';
 import { isAborted } from '../../abort-check.ts';
 import { maintenancePreflight, submitMaintenanceConsolidation } from '../../persistence/prepared-maintenance.ts';
 import { managedPersistenceEnabled } from '../../persistence/ownership.ts';
+import { maintenanceTransaction } from '../../persistence/attribution.ts';
 
 export interface ConsolidatePhaseOpts {
   dryRun?: boolean;
@@ -40,7 +42,7 @@ export interface ConsolidatePhaseOpts {
    * force-evict instead of running to completion after cancellation.
    */
   signal?: AbortSignal;
-  /** Cosine cluster threshold. Default 0.85. */
+  /** Cosine cluster threshold. Overrides `cycle.consolidate.cluster_threshold`; default 0.85. */
   clusterThreshold?: number;
   /** Minimum facts per (source, entity) bucket before consolidation. Default 3. */
   minFactsPerBucket?: number;
@@ -49,13 +51,41 @@ export interface ConsolidatePhaseOpts {
   sourceId?: string;
 }
 
+export const CLUSTER_THRESHOLD_KEY = 'cycle.consolidate.cluster_threshold';
+export const DEFAULT_CLUSTER_THRESHOLD = 0.85;
+
+/**
+ * #5363: parse `cycle.consolidate.cluster_threshold`. A cosine similarity in
+ * (0, 1]; lower values merge more facts into one take. Throws on anything
+ * else so `gbrain config set` can refuse it.
+ */
+export function parseClusterThreshold(value: string): number {
+  const n = Number(value.trim());
+  if (value.trim() === '' || !Number.isFinite(n) || n <= 0 || n > 1) {
+    throw new Error(`${CLUSTER_THRESHOLD_KEY} must be a number greater than 0 and at most 1 (default ${DEFAULT_CLUSTER_THRESHOLD}); got '${value}'.`);
+  }
+  return n;
+}
+
 export async function runPhaseConsolidate(
   engine: BrainEngine,
   opts: ConsolidatePhaseOpts = {},
 ): Promise<PhaseResult> {
   const dryRun = opts.dryRun === true;
   const managed = await managedPersistenceEnabled(engine);
-  const threshold = opts.clusterThreshold ?? 0.85;
+  // #5363: the knob was unreachable (cycle.ts never passed it); the phase now
+  // reads its own config key. A malformed stored value keeps the default and
+  // is reported in details instead of failing the cycle.
+  let thresholdInvalid: string | undefined;
+  let threshold = opts.clusterThreshold;
+  if (threshold === undefined) {
+    const configured = await engine.getConfig(CLUSTER_THRESHOLD_KEY);
+    threshold = DEFAULT_CLUSTER_THRESHOLD;
+    if (configured != null && configured.trim() !== '') {
+      try { threshold = parseClusterThreshold(configured); }
+      catch { thresholdInvalid = configured; }
+    }
+  }
   const minPerBucket = opts.minFactsPerBucket ?? 3;
   const minOldestAgeMs = opts.minOldestAgeMs ?? 24 * 60 * 60 * 1000;
 
@@ -78,6 +108,7 @@ export async function runPhaseConsolidate(
         AND expired_at IS NULL
         AND (valid_until IS NULL OR valid_until > now())
         AND entity_slug IS NOT NULL
+        AND (attributed_to IS NULL OR attributed_to = 'user')
         AND ($2::boolean=false OR visibility='world')
         AND ($1::text IS NULL OR source_id=$1)
       GROUP BY source_id, entity_slug
@@ -115,7 +146,9 @@ export async function runPhaseConsolidate(
       visibility: managed ? ['world'] : undefined,
       limit: 100,
     });
-    const unconsolidated = managed ? candidates.filter(f => f.visibility === 'world') : candidates;
+    // Takes here are the user's own (holder 'self'): a claim the assistant or
+    // a named third party asserted is never promoted into one.
+    const unconsolidated = candidates.filter(f => (!managed || f.visibility === 'world') && (!f.attributed_to || f.attributed_to === 'user'));
     if (unconsolidated.length < minPerBucket) {
       bucketsSkipped += 1;
       continue;
@@ -131,7 +164,8 @@ export async function runPhaseConsolidate(
     }
 
     bucketsProcessed += 1;
-    const clusters = clusterFacts(unconsolidated, threshold);
+    const claims = await loadClaimShapes(engine, unconsolidated.map(f => f.id));
+    const clusters = clusterFacts(unconsolidated, threshold, claims);
 
     // Resolve entity_slug → page_id. If page missing in this source, skip.
     const pageRows = await engine.executeRaw<{ id: number }>(
@@ -225,13 +259,13 @@ export async function runPhaseConsolidate(
         // would bypass that guard. Reuse its id so the facts still consolidate
         // into it, but leave the row untouched.
         if (existing[0].resolved_at === null) {
-          await engine.executeRaw(
+          await maintenanceTransaction(engine, tx => tx.executeRaw(
             `UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`,
             [sources.slice(0, 200), takeId],
-          );
+          ));
         }
       } else {
-        const inserted = await engine.addTakesBatch([{
+        const inserted = await maintenanceTransaction(engine, tx => tx.addTakesBatch([{
           page_id: pageId,
           row_num: nextRowNum,
           claim: best.fact,
@@ -241,7 +275,7 @@ export async function runPhaseConsolidate(
           since_date: sinceISO,
           source: sources.slice(0, 200),
           active: true,
-        }]);
+        }]));
         if (inserted < 1) continue;
 
         const idRows = await engine.executeRaw<{ id: number }>(
@@ -258,10 +292,10 @@ export async function runPhaseConsolidate(
       }
 
       // Mark all contributing facts consolidated.
-      for (const f of cluster) {
-        await engine.consolidateFact(f.id, takeId);
-        factsConsolidated += 1;
-      }
+      await maintenanceTransaction(engine, async tx => {
+        for (const f of cluster) await tx.consolidateFact(f.id, takeId);
+      });
+      factsConsolidated += cluster.length;
 
       // v0.35.4 (D-CDX-4 part 2) — chronological valid_until writeback.
       // Sort the cluster by (valid_from ASC, id ASC); walk consecutive
@@ -279,20 +313,22 @@ export async function runPhaseConsolidate(
         if (t !== 0) return t;
         return a.id - b.id;
       });
-      for (let i = 0; i < chronological.length - 1; i++) {
-        const older = chronological[i];
-        const newer = chronological[i + 1];
-        await engine.executeRaw(
-          // Only UPDATE when the new value would actually change. Avoids
-          // touching updated_at on no-op rewrites and keeps idempotency
-          // observable in the DB (zero affected rows on stable re-run).
-          `UPDATE facts
-             SET valid_until = $1
-           WHERE id = $2
-             AND (valid_until IS DISTINCT FROM $1)`,
-          [newer.valid_from, older.id],
-        );
-      }
+      await maintenanceTransaction(engine, async tx => {
+        for (let i = 0; i < chronological.length - 1; i++) {
+          const older = chronological[i];
+          const newer = chronological[i + 1];
+          await tx.executeRaw(
+            // Only UPDATE when the new value would actually change. Avoids
+            // touching updated_at on no-op rewrites and keeps idempotency
+            // observable in the DB (zero affected rows on stable re-run).
+            `UPDATE facts
+               SET valid_until = $1
+             WHERE id = $2
+               AND (valid_until IS DISTINCT FROM $1)`,
+            [newer.valid_from, older.id],
+          );
+        }
+      });
     }
   }
 
@@ -306,6 +342,8 @@ export async function runPhaseConsolidate(
         (clustersSkippedRetired ? `; skipped ${clustersSkippedRetired} clusters with retired takes` : ''),
     details: {
       dryRun,
+      cluster_threshold: threshold,
+      ...(thresholdInvalid !== undefined ? { cluster_threshold_invalid: thresholdInvalid } : {}),
       facts_consolidated: factsConsolidated,
       takes_written: takesWritten,
       buckets_processed: bucketsProcessed,
@@ -316,17 +354,47 @@ export async function runPhaseConsolidate(
   };
 }
 
+/** The typed-claim columns of a fact (FactRow does not carry them). */
+export interface ClaimShape {
+  metric: string | null;
+  unit: string | null;
+  period: string | null;
+}
+
+async function loadClaimShapes(engine: BrainEngine, ids: number[]): Promise<Map<number, ClaimShape>> {
+  const rows = ids.length === 0 ? [] : await engine.executeRaw<{
+    id: number; claim_metric: string | null; claim_unit: string | null; claim_period: string | null;
+  }>(`SELECT id, claim_metric, claim_unit, claim_period FROM facts WHERE id = ANY($1::bigint[])`, [ids]);
+  return new Map(rows.map(r => [Number(r.id), { metric: r.claim_metric, unit: r.claim_unit, period: r.claim_period }]));
+}
+
+/**
+ * #5363: two facts may share a take only when their typed claims agree.
+ * Untyped facts (no metric) cluster with untyped facts; a typed fact
+ * clusters only with facts of the same metric, unit and period (a monthly
+ * and an annual MRR, or USD and EUR, never merge however close their text
+ * embeddings are). A fact whose claim columns are unknown is treated as
+ * untyped.
+ */
+export function claimsCompatible(a: ClaimShape | undefined, b: ClaimShape | undefined): boolean {
+  const metricA = a?.metric ?? null;
+  const metricB = b?.metric ?? null;
+  if (metricA === null || metricB === null) return metricA === metricB;
+  return metricA === metricB && (a?.unit ?? null) === (b?.unit ?? null) && (a?.period ?? null) === (b?.period ?? null);
+}
+
 /**
  * Greedy cosine clustering. Iterate facts sorted by valid_from DESC; each
  * fact joins the first cluster whose centroid (the first member, for
- * simplicity) is within `threshold` cosine. Otherwise starts a new cluster.
+ * simplicity) is within `threshold` cosine and whose typed claim is
+ * compatible (#5363). Otherwise starts a new cluster.
  *
  * Facts with no embedding cluster on their own (single-element cluster);
  * the consolidate phase only writes takes from clusters of size ≥ 2, so
  * no-embedding singletons sit out the cycle. v0.32+ fact-extraction
  * pipeline ensures embeddings are computed at insertFact time.
  */
-function clusterFacts(facts: FactRow[], threshold: number): FactRow[][] {
+export function clusterFacts(facts: FactRow[], threshold: number, claims: Map<number, ClaimShape> = new Map()): FactRow[][] {
   const sorted = [...facts].sort((a, b) => b.valid_from.getTime() - a.valid_from.getTime());
   const clusters: FactRow[][] = [];
   for (const f of sorted) {
@@ -339,7 +407,8 @@ function clusterFacts(facts: FactRow[], threshold: number): FactRow[][] {
       const head = c[0];
       if (!head.embedding || f.embedding_model !== head.embedding_model
         || head.embedded_text_hash !== createHash('md5').update(head.fact).digest('hex')
-        || f.embedding.length !== head.embedding.length) continue;
+        || f.embedding.length !== head.embedding.length
+        || !claimsCompatible(claims.get(f.id), claims.get(head.id))) continue;
       if (cosineSimilarity(f.embedding, head.embedding) >= threshold) {
         c.push(f);
         placed = true;

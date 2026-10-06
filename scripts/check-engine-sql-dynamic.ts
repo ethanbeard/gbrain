@@ -47,6 +47,7 @@ const CONSTANT_ALLOWLIST: Record<string, string> = {
   EMBED_SKIP_FILTER_FRAGMENT: 'src/core/embed-skip.ts: constant embed_skip predicate over alias p',
   QUARANTINE_FILTER_FRAGMENT: 'src/core/quarantine.ts: constant quarantine visibility predicate over the pages alias p',
   PAGE_SORT_SQL: 'src/core/types.ts: ORDER BY text keyed by the PageFilters sort union (whitelisted enum)',
+  TEMPORAL_LINK_SELECT_SQL: 'src/core/link-validity.ts: constant select list over the lr_t relationship-state join',
 };
 
 const VETTED_BUILDERS: Record<string, string> = {
@@ -64,6 +65,8 @@ const VETTED_BUILDERS: Record<string, string> = {
   privateTimelineEventFilterFragment: 'src/core/search/private-visibility.ts: constant timeline-event visibility predicate over a caller alias',
   privateSnapshotFilterFragment: 'src/core/search/private-visibility.ts: constant snapshot visibility predicate over a caller alias',
   vectorLiteralSql: 'src/core/engine-sql/facts.ts: master\'s inlined vector literal; toPgVectorLiteral output (numbers joined by commas) + a ::vector/::halfvec constant',
+  temporalLinkJoinSql: 'src/core/link-validity.ts: constant LEFT JOIN onto link_relationships over a caller alias; scope is one of two literals',
+  relationshipFilterSql: 'src/core/link-validity.ts: relationship-state probe over a caller alias; dates pass isCalendarDate and inline as DATE literals, status/scope are literals',
 };
 
 const SQL_ARG_METHODS: Record<string, number> = { query: 0, unsafe: 0, executeRaw: 0 };

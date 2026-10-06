@@ -30,6 +30,7 @@ tools:
 mutating: true
 writes_pages: false
 upstream: fact-check@fc834ee
+when_to_use: "Use when the user asks: \"fact check\", \"fact-check\", \"verify the facts\", \"check the claims\", \"is this accurate\"."
 ---
 
 # Fact-Check — Claim-by-Claim Verification Before Anything Ships
@@ -412,6 +413,14 @@ Confirmation bias is the fact-checker's enemy.
 **The "Common Knowledge" Pattern:** The most dangerous errors are the ones
 everybody "knows" are true. Zombie statistics, misattributed quotes, and
 folk history survive fact-checking because nobody thinks to check them.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A claim's supporting page returns `page_not_found`, or the search is empty with a degraded notice: mark the claim UNSUPPORTED (it blocks delivery), and say the search was keyword-only when it was.
+- A `gbrain graph-query` walk returns nothing: verify the slug and link type before concluding a relationship does not exist.
+- Applying a correction returns `revision_conflict`: re-read and apply it to the current text.
 
 ## Anti-Patterns
 

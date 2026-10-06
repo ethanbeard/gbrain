@@ -1,7 +1,13 @@
 import type { WriteRequest } from './model.ts';
 import type { WithdrawalTarget } from '../facts/withdrawal-discovery.ts';
 
-export type EffectKind = 'git' | 'embedding' | 'withdrawal-mirror' | 'facts-backstop';
+export type EffectKind = 'git' | 'embedding' | 'withdrawal-mirror' | 'facts-backstop' | 'links';
+/** Brain config key gating the remote mention-links effect; unset is on, false/0/no/off turns it off. */
+export const REMOTE_AUTO_LINKS_KEY = 'mcp.remote_auto_links';
+/** link_source owned by the `links` effect; reconciliation of this producer never touches other producers' edges. */
+export const REMOTE_MENTION_LINK_SOURCE = 'mcp-remote-mention';
+/** Operations whose remote publications queue a `links` effect. */
+export const REMOTE_MENTION_OPERATIONS: readonly string[] = ['put_page', 'capture', 'edit_page'];
 export interface ParkedTarget { slug?: string; error_code: string }
 export interface SkippedTarget { slug: string; reason: 'metafile' | 'file_database_drift' }
 /** A Git or withdrawal target parks after this many consecutive execution failures. */

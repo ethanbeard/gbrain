@@ -71,6 +71,27 @@ No server, no tunnel, no token needed. Works on both PGLite and Postgres engines
 `--surface starter` sits between (~27 ops: the verbs plus the daily-driver set);
 omit the flag (default `full`) for every operation.
 
+`--surface` is the callable ceiling. To keep every operation callable while
+listing fewer tools to the agent, set `mcp.advertised_surface`:
+
+```bash
+gbrain config set mcp.advertised_surface verbs   # list the 7 verbs; everything else stays callable
+```
+
+Unset is the recommended default. In a held-out agent benchmark, listing only
+`starter` or `verbs` lowered task success by 8–10 points pooled across four
+frontier models, mostly on tasks that need an unlisted tool (agents rarely
+reached for `request_tools`), and saved no tokens. Narrow the list only for a
+client that cannot hold the full catalog.
+
+`tools/list` then shows the advertised surface, and the initialize
+instructions tell the agent how many more tools are callable. On stdio,
+`request_tools` with `tools: [names]` returns their schemas and adds them to
+that session's list (the server sends `tools/list_changed`). On the OAuth HTTP
+server, a client that set its own surface (`request_tools` with `surface`, or
+`gbrain auth rescope-client`) has that surface listed in full. Unset
+advertises the whole callable set.
+
 #### Stdio source binding
 
 Do not inherit `GBRAIN_SOURCE=__all__` from a trusted CLI session into a
@@ -624,6 +645,44 @@ allowlist-validated (alphanumeric + hyphens; no control chars, RTL overrides,
 or backslashes). Local CLI callers (`gbrain files upload ...`) keep
 unrestricted filesystem access since the user owns the machine.
 
+## Status-only mode
+
+A `gbrain serve --http` that cannot open its brain (another serve holds the
+PGLite lock, no brain is configured yet, the brain is missing or damaged, or
+the config is unreadable) keeps its port and answers in status-only mode
+instead of exiting, so a supervisor does not crash-loop it and every client
+sees the cause:
+
+```text
+$ curl -i localhost:3131/health
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Retry-After: 5
+
+{"status":"unavailable","reason":"unavailable","why":"This gbrain server cannot open its brain; its host operator can see why with `gbrain doctor`.","fix":{"argv":["gbrain","doctor","--json"],"command":"gbrain doctor --json","consent":[],"actor":"host_admin","next":"tell_user_to_run",...},"user_message":"The gbrain memory server is running but cannot open its brain, so memory is offline. ...","retry_after_s":5,"contract_version":1,"instance":"<nonce>"}
+```
+
+- `/mcp` offers only `gbrain_status`; OAuth and admin routes answer `503` with
+  the `serve_status_only` envelope. Responses never name the reason, a path or
+  a PID: Tailscale Funnel delivers public requests from a loopback address, so
+  every request is treated as remote.
+- On the host, stderr prints the reason and its fix ("Re-checking every 5 s;
+  Ctrl-C to stop; `--fail-fast` to exit instead"), the marker
+  `GBRAIN_HOME/serve-http-status-<port>.json` records it, and
+  `gbrain doctor --only harness_wiring` reports `serve_status_only` with the
+  fix. `gbrain mcp expose` reports `verify.local` as status-only with the
+  reason.
+- The server re-checks every 5 s and, once the brain opens, serves the full app
+  on the same port. Clients reconnect: a client that connected during status
+  mode receives `401` with `WWW-Authenticate` resource metadata and completes
+  OAuth again.
+- Container health checks that probe `/health` treat the `503` as unhealthy and
+  restart the container. Pass `--fail-fast` (or set `GBRAIN_SERVE_FAIL_FAST=1`)
+  there so the process exits non-zero with the classified envelope on stderr.
+- A second `gbrain serve --http` on a port another server already holds exits
+  with `serve_port_in_use`. A Postgres connect failure keeps the degraded-engine
+  path (`GBRAIN_DB_ACCESS` marker, `gbrain db-repair`).
+
 ## Deployment Options
 
 Tailscale via `gbrain mcp expose` is the recommended shape for a brain on your
@@ -734,11 +793,29 @@ are in [CHATGPT.md](CHATGPT.md#troubleshooting).
 
 **A claude.ai connector can search but not save**
 The `/mcp` challenge hints `read write`, and each token is capped to the
-client's registered scope. A connector approved before v0.60.5.0 was
-approved with the old `read` hint and keeps a read-only grant. Remove and
+client's registered scope. A connector approved before v0.60.5.0 received a
+`read`-only hint and keeps a read-only grant. Remove and
 re-add the connector, and approve `write` on the consent screen. If the
 client is registered with `read` only, widen it first
 ([ADMIN.md](ADMIN.md#inspect-clients-and-edit-access)).
+
+<a id="stall-watchdog"></a>**`serve --http` stops answering and spins at full CPU**
+Turn on the loop-stall watchdog so a wedged process exits instead of
+spinning until the host runs out of memory:
+`export GBRAIN_SERVE_STALL_WATCHDOG_MS=60000` in the serve process's
+environment (systemd `Environment=`, launchd `EnvironmentVariables`), then
+restart `gbrain serve --http`. A watchdog thread checks the main event loop;
+when the loop has not answered for that many milliseconds, it logs and sends
+SIGTERM, and 30 seconds later, if the loop is still stuck, SIGKILL, so a
+supervisor restarts the server. It is off by default (unset or `0`); values
+below 15000 are raised to 15000. Large PGLite brains pause the loop for tens of
+seconds during checkpoints, so keep 60000 or more there. The watchdog covers
+`serve --http` only; stdio `serve` exits with its client. Before every tool
+call, `serve --http` writes `[gbrain-serve] dispatch op=<name>
+args_sha256=<16 hex>` to stderr, so the last such line before a stall names the
+request that caused it. The digest is a SHA-256 of the call's JSON arguments
+(compute it on the client to match); the arguments themselves are never
+logged.
 
 **Claude Desktop doesn't connect**
 Remote servers must be added via Settings > Integrations, NOT

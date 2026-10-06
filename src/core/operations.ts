@@ -13,13 +13,14 @@ export { MEMORY_VERBS_VERSION };
 
 import type { Operation } from './ops/contract.ts';
 import { withOutputRedaction } from './search/output-redaction.ts';
+import { registerOpRoutes } from './fix-routing.ts';
 
 // Re-exports: the full previously-exported foundation surface of this module.
 // The formerly file-private helpers (enforceSubagentSlugFence, slugUnderSubagentFence,
 // slugOutsideCallerFence, enforceClientSlugFence, BOUND_CLIENT_META_OPS,
 // stampEvidenceSafe, maybeCaptureSearch) are deliberately NOT re-exported —
 // they were never part of this module's surface; import them from ops/context.ts.
-export { OperationError, verbError } from './ops/contract.ts';
+export { OperationError, verbError, opError } from './ops/contract.ts';
 export type {
   ErrorCode,
   ParamDef,
@@ -77,6 +78,7 @@ export { MANAGED_LINK_SOURCES } from './ops/links.ts';
 // contractual — docs/TOOL_CATALOG.md is generated from it).
 
 import { adminOperations } from './ops/admin.ts';
+import { attributionOperations } from './ops/attribution.ts';
 import { skillsCatalogOperations } from './ops/skills-catalog.ts';
 import { brainMembershipOperations } from './ops/brain-membership.ts';
 import { syncStatusOperations } from './ops/sync-status.ts';
@@ -115,6 +117,10 @@ import { chronicleOperations } from './ops/chronicle.ts';
 import { extractionOperations } from './ops/extraction.ts';
 import { entityIdentityOperations } from './ops/entity-identity.ts';
 import { requestToolsOperations } from './ops/request-tools.ts';
+import { noticesOperations } from './ops/notices.ts';
+import { pageEditOperations } from './ops/page-edit.ts';
+import { pageBatchOperations } from './ops/page-batch.ts';
+import { feedbackOperations } from './ops/feedback.ts';
 
 // parseTtlParam moved to ops/facts.ts with the facts cluster; the `remember`
 // verb (verbs.ts) loads it from THIS module at runtime — re-exported so every
@@ -132,10 +138,11 @@ export const operations: Operation[] = [
   ...verbOperations,
   // Page CRUD (get_page, put_page, delete_page, list_pages + the v0.26.5
   // destructive-guard ops restore_page, purge_deleted_pages) — ops/pages.ts
-  ...pagesOperations,
+  ...pagesOperations, ...pageEditOperations, ...pageBatchOperations,
   ...persistenceOperations,
   // Search (search, query) — ops/search.ts
   ...searchOperations,
+  ...feedbackOperations,
   // v0.36 Phase 2: image-as-query (search_by_image) — ops/image.ts
   ...imageOperations,
   // Tags (add_tag, remove_tag, get_tags) — ops/tags.ts
@@ -146,8 +153,8 @@ export const operations: Operation[] = [
   // Timeline (add_timeline_entry, get_timeline) — ops/timeline.ts
   ...timelineOperations,
   // Admin (get_stats, get_health, run_doctor, get_versions, revert_version
-  // + the v0.31.1 banner packet get_brain_identity) — ops/admin.ts
-  ...adminOperations,
+  // + get_brain_identity) — ops/admin.ts; get_write_attribution — ops/attribution.ts
+  ...adminOperations, ...attributionOperations,
   // PR1: skill catalog over MCP (list_skills, get_skill, list_brain_skillpack,
   // advisor) + v0.41.19.0 get_status_snapshot — ops/skills-catalog.ts
   ...skillsCatalogOperations,
@@ -217,7 +224,7 @@ export const operations: Operation[] = [
   // v0.41.18.0 run_onboard + v0.41.20.0 run_skillopt — ops/skillopt.ts
   ...skilloptOperations,
   // v0.47: open-loop engine (who is waiting on you) — ops/loops.ts
-  ...loopsOperations,
+  ...loopsOperations, ...noticesOperations, // + agent contract v1 A6 mute_notice — ops/notices.ts
 ];
 
 // ---------------------------------------------------------------------------
@@ -252,6 +259,7 @@ const OP_AREAS: Record<string, string> = {
   add_link: 'links', remove_link: 'links', get_links: 'links',
   get_backlinks: 'links', list_link_sources: 'links', traverse_graph: 'links',
   find_orphans: 'links',
+  wanted_pages: 'links',
   // timeline
   add_timeline_entry: 'timeline', get_timeline: 'timeline',
   // life chronicle
@@ -262,9 +270,9 @@ const OP_AREAS: Record<string, string> = {
   ontology_get: 'ontology', ontology_propose: 'ontology',
   ontology_dimensions: 'ontology', ontology_conflicts: 'ontology',
   // admin + operations
-  get_stats: 'admin', get_health: 'admin', run_doctor: 'admin',
+  get_stats: 'admin', get_health: 'admin', run_doctor: 'admin', mute_notice: 'admin',
   get_status_snapshot: 'admin', run_onboard: 'admin', run_skillopt: 'admin',
-  migrate_embeddings: 'admin', code_traversal_cache_clear: 'admin',
+  migrate_embeddings: 'admin', code_traversal_cache_clear: 'admin', get_write_attribution: 'admin',
   // identity
   whoami: 'identity', get_brain_identity: 'identity',
   // skills
@@ -329,3 +337,4 @@ for (const op of operations) {
 export const operationsByName = Object.fromEntries(
   operations.map(op => [op.name, op]),
 ) as Record<string, Operation>;
+registerOpRoutes(operations); // A1 render-time routing pin (src/core/fix-routing.ts)

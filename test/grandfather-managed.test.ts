@@ -12,6 +12,7 @@ import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { grandfatherCanonicalPage } from '../src/core/persistence/grandfather.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { runPersistenceEffects } from '../src/core/persistence/effects.ts';
 import { declarePersistenceProtocol } from '../src/core/persistence/protocol.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
@@ -55,7 +56,7 @@ async function preservesManagedPage(databaseUrl?: string) {
       await tx.executeRaw("UPDATE content_chunks SET embedding=('['||array_to_string(array_fill(0.1::real,ARRAY[$1::int]),',')||']')::vector WHERE page_id=$2", [column.width, before.page.id]);
       await tx.executeRaw('INSERT INTO extract_atoms_page_state(source_incarnation,page_id,content_hash,fail_count,tombstoned) VALUES($1::uuid,$2,$3,2,true)',
         [before.sourceIncarnation, before.page.id, before.page.content_hash]);
-    }));
+    }, TEST_WRITE_ATTRIBUTION));
     const chunks = await engine.executeRaw('SELECT id,chunk_text,embedding::text FROM content_chunks WHERE page_id=$1 ORDER BY id', [before.page.id]);
     expect(chunks.length).toBeGreaterThan(0);
     const result = await phaseCGrandfather(engine, { yes: true, dryRun: false, noAutopilotInstall: true });
@@ -140,7 +141,7 @@ test('archived sources and non-Markdown artifacts are not rewritten by managed g
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
     await tx.executeRaw("UPDATE sources SET archived=false WHERE id='default'");
-    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE pages SET source_path='source/example.ts' WHERE slug=$1", [slug]));
+    await withCoordinatedWrite(tx, ['default'], () => tx.executeRaw("UPDATE pages SET source_path='source/example.ts' WHERE slug=$1", [slug]), TEST_WRITE_ATTRIBUTION);
   });
   expect((await phaseCGrandfather(engine, { yes: true, dryRun: false, noAutopilotInstall: true })).detail).toMatchObject({ touched: 0, skipped: 1, failed: 0 });
   expect(readFileSync(path, 'utf8')).toBe(bytes);
@@ -302,6 +303,6 @@ test('verify reports a managed page rewritten after grandfathering without faili
   const { detail } = await phaseCGrandfather(engine, { yes: true, dryRun: false, noAutopilotInstall: true });
   expect(await phaseDVerify(engine, detail.grandfathered)).toMatchObject({ status: 'complete', detail: 'verified=1 rewritten_concurrently=0' });
   await engine.transaction(tx => withCoordinatedWrite(tx, ['default'], () =>
-    tx.executeRaw("UPDATE pages SET frontmatter=frontmatter-'validate' WHERE source_id='default' AND slug=$1", [slug])));
+    tx.executeRaw("UPDATE pages SET frontmatter=frontmatter-'validate' WHERE source_id='default' AND slug=$1", [slug]), TEST_WRITE_ATTRIBUTION));
   expect(await phaseDVerify(engine, detail.grandfathered)).toMatchObject({ status: 'complete', detail: 'verified=0 rewritten_concurrently=1' });
 }), 120_000);

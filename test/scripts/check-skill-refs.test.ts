@@ -88,6 +88,20 @@ describe('check-skill-refs', () => {
     expect(pass.code).toBe(0);
   });
 
+  test('fails on an allowlist entry whose file has no donor hit (stale) or does not exist', () => {
+    const setup = (skills: string) => {
+      mkdirSync(join(skills, 'alpha'));
+      writeFileSync(join(skills, 'alpha', 'SKILL.md'), '---\nname: alpha\n---\nclean body\n');
+    };
+    const clean = runOn(setup, 'skills/alpha/SKILL.md\n');
+    expect(clean.code).toBe(1);
+    expect(clean.out).toContain('[stale-allowlist] skills/alpha/SKILL.md');
+    expect(clean.out).toContain('Fix: delete the line "skills/alpha/SKILL.md"');
+    const missing = runOn(setup, 'skills/gone/SKILL.md\n');
+    expect(missing.code).toBe(1);
+    expect(missing.out).toContain('[stale-allowlist] skills/gone/SKILL.md');
+  });
+
   test('scans .jsonl (routing-eval) files for donor remnants; allowlist ratchets them too', () => {
     // Assemble the banned prefix at runtime (repo-wide privacy check bans the literal).
     const bannedPath = ['/data', 'brain', 'fixture.md'].join('/');

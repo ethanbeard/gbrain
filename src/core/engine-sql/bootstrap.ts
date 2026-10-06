@@ -1,8 +1,6 @@
 /**
  * Forward-reference bootstrap: one implementation for both engines (refactor
- * wave 1, E1). Replaces `PGLiteEngine#applyForwardReferenceBootstrap` and
- * `src/core/postgres-engine/forward-reference-bootstrap.ts`, which carried
- * the same probes and DDL twice (per-probe inventory:
+ * wave 1, E1), so the probes and DDL exist once (per-probe inventory:
  * docs/designs/refactor-wave-1/w1-inventory.md, "Forward-reference
  * bootstrap (E1)").
  *
@@ -103,8 +101,6 @@ export function postgresBootstrapTarget(conn: ReturnType<typeof postgres>): Forw
 /**
  * Probe + patch every forward-reference target SCHEMA_SQL needs, on the
  * caller-provided connection (see the module header for the lock contract).
- * Kept under this name for `postgres-engine/forward-reference-bootstrap.ts`,
- * which re-exports it.
  */
 export async function applyPostgresForwardReferenceBootstrap(conn: ReturnType<typeof postgres>): Promise<void> {
   await applyForwardReferenceBootstrap(postgresBootstrapTarget(conn));

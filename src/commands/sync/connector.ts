@@ -30,10 +30,27 @@ export async function runConnectorSync(engine: BrainEngine, opts: SyncOpts, mana
   const options = signal ? { ...opts, signal } : opts;
   const fallbackDir = source.local_path ?? (managed ? '' : (await import('../../core/sources-ops.ts')).defaultCloneDir(`${sourceId}-${config.kind}`));
   serr(`[gbrain phase] sync.${config.kind}_materialize`);
+  let result: SyncResult;
   if (config.kind === 'github') {
     const { parseGitHubSourceConfig, runGitHubSync } = await import('../../core/github-source.ts');
-    return runGitHubSync(engine, sourceId, parseGitHubSourceConfig(config, fallbackDir), options);
+    result = await runGitHubSync(engine, sourceId, parseGitHubSourceConfig(config, fallbackDir), options);
+  } else {
+    const { parseGoogleSourceConfig, runGoogleSync } = await import('../../core/google/google-source.ts');
+    result = await runGoogleSync(engine, sourceId, parseGoogleSourceConfig(config, fallbackDir), options);
   }
-  const { parseGoogleSourceConfig, runGoogleSync } = await import('../../core/google/google-source.ts');
-  return runGoogleSync(engine, sourceId, parseGoogleSourceConfig(config, fallbackDir), options);
+  return withConnectorPartialReason(result, signal);
+}
+
+/**
+ * #5012: a connector partial never reports the git path's `timeout` default.
+ * Failed items name `connector_item_failures`; an early stop with no cause is
+ * `connector_partial` unless the run's signal aborted it (`timeout`).
+ */
+export function withConnectorPartialReason(result: SyncResult, signal?: AbortSignal): SyncResult {
+  if (result.status !== 'partial' || result.reason) return result;
+  return {
+    ...result,
+    filesImported: result.filesImported ?? result.added + result.modified,
+    reason: (result.failedFiles ?? 0) > 0 ? 'connector_item_failures' : signal?.aborted ? 'timeout' : 'connector_partial',
+  };
 }

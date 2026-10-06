@@ -24,6 +24,7 @@
  */
 
 import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 const DEDUP_THRESHOLD = 0.95;
 const DEDUP_CANDIDATE_LIMIT = 5;
@@ -114,7 +115,8 @@ export async function writeSingleFact(
   let embedding: Float32Array | null = null;
   let embeddingModel: string | null = null;
   let degradedDedup = false;
-  if (isAvailable('embedding')) {
+  const { factEmbeddingDisabled } = await import('../embedding-disabled.ts');
+  if (!await factEmbeddingDisabled(engine) && isAvailable('embedding')) {
     try {
       embeddingModel = getEmbeddingModel();
       embedding = await embedOne(factText, { embeddingModel, inputType: 'document' });
@@ -247,10 +249,10 @@ export async function writeSingleFact(
     // tree unusable) → DB-only path below.
   }
 
-  const inserted = await engine.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
+  const inserted = await maintenanceTransaction(engine, tx => tx.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
     source_id: sourceId,
     ...(supersedeId !== null ? { supersedeId } : {}),
-  });
+  }));
 
   return {
     id: inserted.id,
@@ -285,7 +287,7 @@ async function expireSuperseded(engine: BrainEngine, oldId: number, newId: numbe
     report('fence strike', err);
   }
   try {
-    await engine.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]);
+    await maintenanceTransaction(engine, tx => tx.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]));
   } catch (err) {
     report('superseded_by link', err);
   }

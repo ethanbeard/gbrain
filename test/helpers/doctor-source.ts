@@ -22,12 +22,7 @@
  *   would let those match across file boundaries, which is weaker than the
  *   guard intends. Callers name the file that holds the code post-peel.
  */
-import { surfaceFileSource, surfaceFiles, surfaceSource } from './source-surface.ts';
-
-/** Every file on the doctor surface, façade first, then sorted module paths. */
-export function doctorSourceFiles(): string[] {
-  return surfaceFiles('doctor');
-}
+import { surfaceFileSource, surfaceSource } from './source-surface.ts';
 
 /** Concatenated doctor surface for containment assertions. */
 export function doctorSource(): string {

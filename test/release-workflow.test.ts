@@ -183,3 +183,28 @@ Release summary line.
     expect(run('0.42.67').code).not.toBe(0);
   });
 });
+
+describe('release.yml publish-template skip is visible (D-10)', () => {
+  test('an empty TEMPLATE_REPO_PAT warns with the owner-only fix and writes a step summary', async () => {
+    const { load } = await import('js-yaml');
+    const wf = load(WORKFLOW) as { jobs: Record<string, { steps: Array<{ id?: string; run?: string }> }> };
+    const gate = wf.jobs['publish-template']!.steps.find(s => s.id === 'gate')!.run!;
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-publish-template-gate-'));
+    try {
+      const output = join(dir, 'output');
+      const summary = join(dir, 'summary');
+      writeFileSync(output, '');
+      const stdout = execFileSync('bash', ['-euo', 'pipefail', '-c', gate], {
+        cwd: ROOT, encoding: 'utf8',
+        env: { PATH: process.env.PATH, TEMPLATE_REPO_PAT: '', TEMPLATE_REPO: 'owner/template-example', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+      });
+      expect(readFileSync(output, 'utf8')).toContain('publish=false');
+      expect(stdout).toContain('::warning::Agent template NOT published to owner/template-example');
+      expect(stdout).toContain('Fix (owner-only): gh secret set TEMPLATE_REPO_PAT');
+      expect(readFileSync(summary, 'utf8')).toContain('## Agent template not published');
+      expect(stdout).not.toContain('SKIP:');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

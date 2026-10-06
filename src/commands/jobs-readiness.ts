@@ -2,6 +2,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { VERSION } from '../version.ts';
 import { assertWorkerDbReadiness } from '../core/minions/db-probe.ts';
 import { checkChildReadiness, CHILD_READINESS_PROTOCOL_VERSION } from '../core/minions/child-readiness.ts';
+import { noteChildSpendEnforcement } from '../core/minions/spend-authorization.ts';
 import { childConfigurationError, resolveChildCliInvocation, type ChildCliInvocation } from '../core/minions/job-isolation.ts';
 import type { LocalConfigurationError } from '../core/minions/configuration-error.ts';
 import { writeWorkerProcessingStatus, type ProcessingRuntimeIdentity, type WorkerProcessingUpdate, type WorkerStartupStage } from '../core/minions/processing-state.ts';
@@ -26,6 +27,10 @@ export async function checkWorkerStartup(
   if (!invocation) return undefined;
   reportWorkerStarting('child_readiness');
   const child = await checkChildReadiness({ invocation, tiniPath });
+  noteChildSpendEnforcement(child.features);
+  if (!child.features.includes('spend-enforcement-v1')) {
+    console.error(`[gbrain jobs] selected child ${child.version} cannot enforce spend authorizations; spend-authorized jobs are released for an upgraded worker instead of running.`);
+  }
   if (child.versionSkew) {
     console.error(`[gbrain jobs] selected child version ${child.version} differs from worker ${VERSION}; required protocol and capabilities are compatible.`);
   }

@@ -60,6 +60,9 @@ export const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   relationalRetrieval: 'Typed-edge relational recall arm (relational queries walk the graph; no-op otherwise)',
   relational_retrieval_depth: 'Max hops for relational traversal (1..3, 2 default)',
   relational_rerank_pin: 'Relational-arm rows re-pinned above reranked text rows in fused order (0 = off; 0..10, 3 default)',
+  relational_planner: 'Multi-hop planner: questions chaining 2-3 typed relations walk typed hop chains with evidence (also keyless recall)',
+  relational_orient_onehop: 'Typed one-hop walks read edges written on either page by the relation type signature (opt-in; null = follow relational_planner)',
+  relational_chain_slots: 'When a multi-hop chain fired, up to this many chain rows (answers, then evidence pages) lead page 1 (0..10; 0 = single evidence slot)',
   // Ranker wave (Phase E2) arm-confidence fusion
   keyword_arm_confidence_floor: 'Keyword-arm confidence floor: below this margin ratio the keyword + title lists fuse at half weight (null = off; (0, 1])',
   // Ranker wave (Phase E3) metadata boost gate

@@ -34,10 +34,12 @@ WORKFLOW="$ROOT/.github/workflows/heavy-tests.yml"
 
 if [ ! -f "$WORKFLOW" ]; then
   echo "check-opencode-pin: SKIP (no $WORKFLOW)"
+  echo "GBRAIN_CHECK_SKIPPED: no heavy-tests.yml"
   exit 0
 fi
 if ! grep -q '^  opencode-door:' "$WORKFLOW"; then
   echo "check-opencode-pin: SKIP (no opencode-door job in heavy-tests.yml yet)"
+  echo "GBRAIN_CHECK_SKIPPED: no opencode-door job in heavy-tests.yml"
   exit 0
 fi
 # Once the opencode-door job EXISTS, a missing pin doc is a FAILURE, not a skip —

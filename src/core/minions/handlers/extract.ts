@@ -27,7 +27,7 @@ export function makeExtractHandler(engine: BrainEngine): MinionHandler {
       // continuation job so a very large deferred backlog converges without
       // waiting for the next sync. Forward-progress guard (pagesProcessed >
       // 0) prevents an infinite chain if the sweep can't advance.
-      if (!job.data.dryRun && r.staleRemaining > 0 && r.pagesProcessed > 0) {
+      if (!job.data.dryRun && r.staleRemaining > 0 && (r.pagesProcessed > 0 || (r.mentions?.pages ?? 0) > 0)) {
         try {
           const queue = new MinionQueue(engine);
           // NO maxWaiting: with an unscoped (NULL-sourceId) payload the
@@ -55,6 +55,9 @@ export function makeExtractHandler(engine: BrainEngine): MinionHandler {
     // drops every row on a non-'default' brain (silent "created 0"), and the
     // full-walk watermark stamp targets the wrong source.
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
-    return await runExtractCore(engine, { mode, dir, dryRun: !!job.data.dryRun, sourceId });
+    const result = await runExtractCore(engine, { mode, dir, dryRun: !!job.data.dryRun, sourceId });
+    // #5904: refused timeline writes fail the job instead of completing over rows that were never written.
+    if (result.timeline_refused) throw new Error(`extract: ${result.timeline_refused} timeline write(s) refused; nothing written for them. Run gbrain extract --stale.`);
+    return result;
   };
 }

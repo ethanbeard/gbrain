@@ -25,6 +25,7 @@ import {
 import type { GBrainConfig } from '../src/core/config.ts';
 import { discoverOAuth, mintClientCredentialsToken } from '../src/core/remote-mcp-probe.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { VERSION } from '../src/version.ts';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 
 let server: ReturnType<typeof Bun.serve>;
@@ -45,6 +46,7 @@ let onHangClosed: (() => void) | undefined;
 let toolExecutions = 0;
 let initializeTokens: string[] = [];
 let toolArguments: Record<string, unknown>[] = [];
+let clientHeaders: Array<string | null> = [];
 
 function intercept(stage: Stage, req: Request): Response | Promise<Response> | undefined {
   requests[stage] = (requests[stage] ?? 0) + 1;
@@ -91,6 +93,7 @@ beforeAll(() => {
       if (path === '/mcp' && req.method === 'POST') {
         const body = await req.json() as { id?: number; method: string; params?: { protocolVersion?: string } };
         if (body.method === 'initialize') initializeTokens.push(req.headers.get('authorization') ?? '');
+        clientHeaders.push(req.headers.get('x-gbrain-client'));
         if (body.method === 'tools/call') toolArguments.push((body.params as any)?.arguments ?? {});
         const intercepted = intercept(body.method as Stage, req);
         if (intercepted) return intercepted;
@@ -135,6 +138,7 @@ beforeEach(() => {
   mcpResponseFor = () => ({ content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] });
   _clearMcpClientTokenCache();
   toolArguments = [];
+  clientHeaders = [];
 });
 
 function makeConfig(): GBrainConfig {
@@ -227,6 +231,20 @@ describe('callRemoteTool — happy path', () => {
     };
     await callRemoteTool(makeConfig(), 'with_args', { foo: 'bar', n: 42 });
     expect(captured).toEqual({ name: 'with_args', arguments: { foo: 'bar', n: 42 } });
+  });
+});
+
+describe('callRemoteTool — thin-client identity (C1)', () => {
+  test('every MCP request names gbrain\'s thin client so hosts keep full search rows', async () => {
+    await callRemoteTool(makeConfig(), 'search', { query: 'x' });
+    expect(clientHeaders.length).toBeGreaterThanOrEqual(2);
+    for (const h of clientHeaders) expect(h).toBe(`gbrain-remote-cli/${VERSION}`);
+  });
+
+  test('the thin client never sends `fields`, so strict-params hosts of any version accept its calls', async () => {
+    await callRemoteTool(makeConfig(), 'search', { query: 'x' });
+    await callRemoteTool(makeConfig(), 'query', { query: 'x' });
+    for (const args of toolArguments) expect(args).not.toHaveProperty('fields');
   });
 });
 
@@ -511,5 +529,18 @@ describe('unpackToolResult', () => {
   test('throws RemoteMcpError(parse) on wrong content type', () => {
     const wire = { content: [{ type: 'image', data: 'xxx' }] };
     expect(() => unpackToolResult(wire)).toThrow(RemoteMcpError);
+  });
+});
+
+describe('agent contract v1: tool_error body is content[0] alone', () => {
+  test('an extra block never joins the envelope; v1 fields survive', async () => {
+    mcpResponseFor = () => ({ isError: true, content: [
+      { type: 'text', text: JSON.stringify({ error: 'permission_denied', code: 'insufficient_scope', message: 'needs write', suggestion: 'ask the host', contract_version: 1 }) },
+      { type: 'text', text: '[gbrain notice backup_coverage kind=coaching]\nwhy: stray block' },
+    ] });
+    await expect(callRemoteTool(makeConfig(), 'get_page', { slug: 'notes/x' })).rejects.toMatchObject({
+      reason: 'tool_error',
+      detail: { code: 'permission_denied', canonical_code: 'insufficient_scope', suggestion: 'ask the host', contract_version: 1 },
+    });
   });
 });

@@ -66,7 +66,10 @@ export async function computeGoogleOauthCheck(): Promise<Check> {
     return {
       name: 'google_oauth',
       status: 'ok',
-      message: `${metas.length} Google account(s) connected, refresh healthy`,
+      // #5012: doctor never probes the network, so it cannot call a refresh token healthy;
+      // a token revoked since the last successful refresh shows only on a live probe.
+      message: `${metas.length} Google account(s) connected, recent refreshes succeeded (not probed online; ` +
+        '`gbrain google status` tests each refresh token)',
     };
   } catch (e) {
     return {

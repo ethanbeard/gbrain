@@ -2,6 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PENDING_WRITE_EXIT_CODE } from '../src/core/exit-codes.ts';
 
 // Real CLI subprocesses against a loopback-only MCP fixture; no datastore or keys.
 const roots: string[] = [];
@@ -45,7 +46,8 @@ async function run(mode: 'timeout' | 'pending' | 'conflict' | 'interrupt', json 
     issuer_url: `http://127.0.0.1:${server.port}`, mcp_url: `http://127.0.0.1:${server.port}/mcp`,
     oauth_client_id: 'fixture', oauth_client_secret: 'fixture',
   } }));
-  const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: root, GBRAIN_BRAIN_ID: 'host', GBRAIN_NO_BANNER: '1', GBRAIN_BACKUP_CHECK: '0' };
+  // #5232: no client-side replay here; the fixture answers pending forever.
+  const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: root, GBRAIN_BRAIN_ID: 'host', GBRAIN_NO_BANNER: '1', GBRAIN_BACKUP_CHECK: '0', GBRAIN_WRITE_WAIT_MS: '0' };
   for (const name of ['DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_SOURCE']) delete env[name];
   const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), ...command, ...(json ? ['--json'] : []), mode === 'interrupt' ? '--timeout=10s' : '--timeout=500ms'], {
     cwd: root, env, stdout: 'pipe', stderr: 'pipe',
@@ -70,7 +72,7 @@ test.each(['timeout', 'interrupt'] as const)('thin CLI %s exposes the generated 
 
 test.each(['pending', 'conflict'] as const)('thin CLI renders the frozen %s receipt as JSON', async mode => {
   const result = await run(mode);
-  expect({ code: result.code, stderr: result.stderr }).toMatchObject({ code: 1 });
+  expect({ code: result.code, stderr: result.stderr }).toMatchObject({ code: mode === 'pending' ? PENDING_WRITE_EXIT_CODE : 1 });
   const body = JSON.parse(result.stdout);
   expect(body).toMatchObject({ error: mode === 'conflict' ? 'invalid_params' : 'unavailable', protocol_version: 1,
     write_error: mode === 'conflict' ? 'revision_conflict' : 'write_pending',
@@ -80,14 +82,14 @@ test.each(['pending', 'conflict'] as const)('thin CLI renders the frozen %s rece
 
 test('human thin CLI errors retain the request UUID too', async () => {
   const result = await run('pending', false);
-  expect(result.code).toBe(1);
+  expect(result.code).toBe(PENDING_WRITE_EXIT_CODE);
   expect(result.stdout).toBe('');
   expect(result.stderr).toContain(`Request: ${result.args!.request_id}`);
 }, 15_000);
 
 test.each(['timeout', 'pending'] as const)('thin takes %s preserves the same structured retry identity as page writes', async mode => {
   const result = await run(mode, true, ['takes', 'add', 'page', '--claim', 'Example preference', '--kind', 'take', '--who', 'world']);
-  expect({ code: result.code, stderr: result.stderr }).toMatchObject({ code: 1 });
+  expect({ code: result.code, stderr: result.stderr }).toMatchObject({ code: mode === 'pending' ? PENDING_WRITE_EXIT_CODE : 1 });
   const body = JSON.parse(result.stdout);
   expect(body.request_id).toBe(result.args!.request_id);
   if (mode === 'timeout') {
@@ -105,7 +107,7 @@ test.each([
   const requestId = '31000000-0000-4000-8000-000000000001';
   const revision = '32000000-0000-4000-8000-000000000001';
   const result = await run('pending', true, ['takes', verb, 'page', ...options, '--request-id', requestId, '--expected-revision', revision]);
-  expect(result.code).toBe(1);
+  expect(result.code).toBe(PENDING_WRITE_EXIT_CODE);
   expect(result.args).toMatchObject({ request_id: requestId, expected_revision: revision });
   expect(JSON.parse(result.stdout).write_request).toMatchObject({ request_id: requestId, state: 'queued' });
 }, 15_000);

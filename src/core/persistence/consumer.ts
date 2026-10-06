@@ -1,15 +1,38 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { CLAIMABLE_WRITE_SQL, claimNextWrite, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
+import { CLAIMABLE_WRITE_SQL, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
 import { finishUnpublishedFailure, publishMutation, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
+import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX } from './group-publish.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { PROJECTION_RETRY_READY_SQL, rebuildPendingPageProjections } from '../page-state/projections.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
+import { cancelOrphanedWindowGroup } from './sync-window.ts';
+import { laneOf, laneRoots, laneTask } from './sync-lanes.ts';
 import { runPersistenceEffects } from './effects.ts';
 import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { isWriteErrorCode } from './types.ts';
+import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
+import { maybeRefreshPlannerStats } from '../planner-stats.ts';
+import { refreshFenceClear } from './worktree-refresh-schema.ts';
+import { faultPoint } from './fault-points.ts';
+import { releaseAbandonedClaims } from './effect-journal.ts';
+
+type PhaseObservation = { name: string; started_at: string; deadline_exceeded: boolean; attempt: number; first_conn_ms?: number };
+/** When this process started; on PGLite no claim written earlier can belong to a live owner. */
+const PROCESS_STARTED_AT = new Date(performance.timeOrigin);
+/** #5801: the phase a connection checkout belongs to, carried through its async chain. */
+const phaseScope = new AsyncLocalStorage<{ observation: PhaseObservation; startedAt: number }>();
+
+/** #5233: one-line, redacted, length-capped error text for the consumer's stderr line. */
+function errorDetail(error: unknown): string | undefined {
+  const message = (error as { message?: unknown } | null)?.message;
+  if (typeof message !== 'string' || !message.trim()) return undefined;
+  return redactConnectionInfo(message).replace(/\s+/g, ' ').replaceAll('"', "'").trim().slice(0, 200);
+}
 
 /**
  * #5401: one resident projection invocation takes up to this many pages and
@@ -30,6 +53,8 @@ export async function runResidentProjectionInvocation(engine: BrainEngine, hostI
     { deadlineMs: RESIDENT_PROJECTION_BUDGET_MS, now, retryCooldown: true });
 }
 
+const PARKED_WORKER: Promise<void> = Promise.resolve();
+
 export type PrepareMutation = (engine: BrainEngine, row: WriteRequest, config: GBrainConfig, signal?: AbortSignal) => Promise<PreparedMutation>;
 export class PersistenceConsumer {
   private stopping = false;
@@ -45,6 +70,8 @@ export class PersistenceConsumer {
   private idleLaneRetryAt = 0;
   private active = new Set<Promise<void>>();
   private activeRoots = new Set<string>();
+  /** #5984 lanes: running lane tasks per worktree. */
+  private laneTasks = new Map<string, number>();
   private foregroundCounts = new Map<string, number>();
   private rootRetryAfter = new Map<string, number>();
   private projectionWorker: Promise<unknown> | undefined;
@@ -58,18 +85,35 @@ export class PersistenceConsumer {
   private progressWake = false;
   private lastError: { code: string; at: string; phase?: string } | undefined;
   private abort = new AbortController();
-  private phaseObservation: { name: string; started_at: string; deadline_exceeded: boolean; attempt: number } | undefined;
+  private phaseObservation: PhaseObservation | undefined;
+  private phaseStartedAt = 0;
+  private lastPhaseTiming: string | undefined;
+  private loopDelay: IntervalHistogram | null | undefined;
+  private unobserveCheckout: (() => void) | undefined;
   private phaseAttempts = 0;
   private lastLog: { key: string; at: number } | undefined;
   private lastPhaseError: string | undefined;
   private preparationAttempts = 0;
   private preparing = new Map<string, { request_id: string; started_at: string; deadline_exceeded: boolean; attempt: number }>();
+  private executing = new Set<string>();
+  private abandonedReleased = false;
   readonly hostId: string;
   constructor(readonly engine: BrainEngine, readonly config: GBrainConfig, readonly prepare: PrepareMutation,
-    private opts: { hostId?: string; concurrency?: number; pollMs?: number; idleMaxMs?: number; phaseMs?: number; preparationMs?: number; onError?: (error: unknown) => void } = {}) {
+    private opts: { hostId?: string; concurrency?: number; pollMs?: number; idleMaxMs?: number; phaseMs?: number; preparationMs?: number; onError?: (error: unknown) => void;
+      onSettled?: (row: WriteRequest) => void;
+      /** Engine graduation drain: claim, recover and publish requests only; effect, projection, topology and maintenance workers never start. */
+      requestsOnly?: boolean } = {}) {
     this.hostId = opts.hostId ?? localHostId();
   }
-  start(): void { this.stopping = false; this.abort = new AbortController(); this.fullTickRequested = true; this.idleDelayMs = this.pollMs; this.schedule(0); }
+  private get checkoutObservable(): ((listener: () => void) => () => void) | undefined {
+    const engine = this.engine as { onCheckout?: unknown };
+    return typeof engine.onCheckout === 'function' ? (engine.onCheckout as (listener: () => void) => () => void).bind(this.engine) : undefined;
+  }
+  start(): void {
+    this.stopping = false; this.abort = new AbortController(); this.fullTickRequested = true; this.idleDelayMs = this.pollMs;
+    if (this.opts.requestsOnly) this.projectionWorker = this.effectsWorker = this.topologyWorker = this.maintenanceWorker = PARKED_WORKER;
+    this.schedule(0);
+  }
   /**
    * Work admitted by this process: tick now instead of waiting out the idle
    * backoff. Like a completed publication, it claims at once and leaves scans
@@ -120,7 +164,7 @@ export class PersistenceConsumer {
         AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid)))
       OR EXISTS (SELECT 1 FROM persistence_effects e LEFT JOIN persistence_worktrees w ON w.id=e.worktree_id
         WHERE (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
-        AND (e.worktree_id IS NULL OR w.owner_host_id=$1::uuid) AND e.recovery IS NULL
+        AND (e.worktree_id IS NULL OR w.owner_host_id=$1::uuid) AND (e.worktree_id IS NULL OR ${refreshFenceClear('e')}) AND e.recovery IS NULL
         AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
         AND (e.kind='withdrawal-mirror' OR NOT EXISTS (SELECT 1 FROM persistence_effects mirror
@@ -142,7 +186,8 @@ export class PersistenceConsumer {
    * probe every few seconds would keep ceil(idle_timeout / interval) sockets
    * alive. Idle probes therefore share one reserved connection; the rest of
    * the pool drains through idle_timeout. Pools too small to spare a long-hold
-   * permit fall back to pooled probes.
+   * permit fall back to pooled probes. The lane always comes from the ordinary
+   * pool, never the direct/session route, whose clients are scarcer (#5233).
    */
   private async acquireIdleLane(signal?: AbortSignal): Promise<ReservedConnection | undefined> {
     if (this.idleLane) return this.idleLane.conn;
@@ -152,7 +197,7 @@ export class PersistenceConsumer {
     if (!pool?.poolMax || pool.poolMax < 3 || Object.values(pool.tracked).some(count => count > 0)) return undefined;
     const held = Promise.withResolvers<void>();
     const reserved = Promise.withResolvers<ReservedConnection>();
-    const done = this.engine.withReservedConnection(async conn => { reserved.resolve(conn); await held.promise; })
+    const done = this.engine.withReservedConnection(async conn => { reserved.resolve(conn); await held.promise; }, { route: 'ordinary' })
       .catch(error => { reserved.reject(error); });
     const aborted = Promise.withResolvers<undefined>();
     const onAbort = () => aborted.resolve(undefined);
@@ -228,8 +273,9 @@ export class PersistenceConsumer {
           this.nextMaintenance = Date.now() + 300_000;
           await this.phase('refresh_roots', signal => refreshManagedFilesystemRoots(this.engine,
             this.engine.kind === 'pglite' ? this.config.database_path : undefined, signal));
-          this.maintenanceWorker = compactWriteReceipts(this.engine).catch(error => this.report(error))
-            .finally(() => { this.maintenanceWorker = undefined; });
+          // F4b: idle maintenance also refreshes stale PGLite planner statistics (a no-op on Postgres).
+          this.maintenanceWorker = compactWriteReceipts(this.engine).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
+            .catch(error => this.report(error)).finally(() => { this.maintenanceWorker = undefined; });
         }
         return;
       }
@@ -265,6 +311,10 @@ export class PersistenceConsumer {
       .catch(error => this.report(error)).finally(() => { this.projectionWorker = undefined; });
     // Recover only our owner roots. Kernel exclusion, not elapsed heartbeat,
     // proves that a previous process can no longer be publishing this root.
+    if (scan && this.engine.kind === 'pglite' && !this.abandonedReleased) {
+      await this.phase('abandoned_claims', () => releaseAbandonedClaims(this.engine, PROCESS_STARTED_AT));
+      this.abandonedReleased = true;
+    }
     const now = Date.now();
     for (const [root, retryAt] of this.rootRetryAfter) if (retryAt <= now) this.rootRetryAfter.delete(root);
     if (scan) {
@@ -283,6 +333,7 @@ export class PersistenceConsumer {
         this.rootRetryAfter.set(root, Date.now() + delay);
         try {
           const recovered = await this.phase('recovery', () => recoverPublication(this.engine, row.id, this.hostId));
+          if (isTerminal(recovered)) this.settled(recovered);
           if (!recovered.recovery) this.rootRetryAfter.delete(root);
           else if (recovered.blocked_reason === 'unexpected_file_bytes') this.rootRetryAfter.set(root, Date.now() + Math.max(delay, 30_000));
         } catch (error) {
@@ -304,23 +355,47 @@ export class PersistenceConsumer {
       return;
     }
     const concurrency = this.opts.concurrency ?? 2;
-    const attemptedRoots = new Set([...this.activeRoots, ...this.rootRetryAfter.keys()]);
-    while (!this.stopping && this.active.size < concurrency) {
+    const attemptedRoots = new Set([...this.activeRoots, ...this.laneTasks.keys(), ...this.rootRetryAfter.keys()]);
+    while (!this.stopping && this.active.size - this.laneTaskCount() < concurrency) {
       const row = await this.phase('claim', () => claimNextWrite(this.engine, this.hostId, 30_000, [...attemptedRoots]));
       if (!row) break;
       if (this.stopping) { await releaseUnpublishedClaim(this.engine, row, 'consumer_stopping'); break; }
       const key = row.worktree_id ?? `db:${row.source_incarnation}`;
       attemptedRoots.add(key);
+      // #5984 lanes: the FIFO head of an open lane run runs as the run's first lane.
+      if (laneOf(row)) { this.startLaneTask(row, key); continue; }
       if (this.activeRoots.has(key)) { await releaseUnpublishedClaim(this.engine, row, 'writer_busy'); break; }
       this.activeRoots.add(key);
-      let progressed = false;
-      const task = this.execute(row).then(result => { progressed = result; }).catch(error => this.report(error)).finally(() => {
-        if (!progressed) this.rootRetryAfter.set(key, Date.now() + (this.opts.pollMs ?? 250));
-        else { this.progressWake = true; this.publishedSinceMaintenance++; }
-        this.active.delete(task); this.activeRoots.delete(key); this.schedule(progressed ? 0 : this.opts.pollMs ?? 250);
-      });
-      this.active.add(task);
+      this.track(row, () => this.activeRoots.delete(key), key);
     }
+    await this.claimLanes();
+  }
+  /** #5984 lanes: claims the next group heads of every open lane run in this process, up to its effective lane count. */
+  private async claimLanes(): Promise<void> {
+    for (const { worktreeId, run, capacity } of laneRoots()) {
+      if (this.rootRetryAfter.has(worktreeId) || this.activeRoots.has(worktreeId)) continue;
+      while (!this.stopping && (this.laneTasks.get(worktreeId) ?? 0) < capacity) {
+        const row = await this.phase('claim', () => claimNextLaneHead(this.engine, this.hostId, worktreeId, run));
+        if (!row) break;
+        this.startLaneTask(row, worktreeId);
+      }
+    }
+  }
+  private laneTaskCount(): number { let count = 0; for (const n of this.laneTasks.values()) count += n; return count; }
+  private startLaneTask(row: WriteRequest, key: string): void {
+    this.laneTasks.set(key, (this.laneTasks.get(key) ?? 0) + 1);
+    const state = laneOf(row);
+    const release = state ? laneTask(state) : () => undefined;
+    this.track(row, () => { release(); const n = (this.laneTasks.get(key) ?? 1) - 1; if (n > 0) this.laneTasks.set(key, n); else this.laneTasks.delete(key); }, key);
+  }
+  private track(row: WriteRequest, done: () => void, key: string): void {
+    let progressed = false;
+    const task = this.executeOrGroup(row).then(result => { progressed = result; }).catch(error => this.report(error)).finally(() => {
+      if (!progressed) this.rootRetryAfter.set(key, Date.now() + (this.opts.pollMs ?? 250));
+      else { this.progressWake = true; this.publishedSinceMaintenance++; }
+      this.active.delete(task); done(); this.schedule(progressed ? 0 : this.opts.pollMs ?? 250);
+    });
+    this.active.add(task);
   }
   /** Effects keep pace with publication: full batches continue without waiting for the next tick. */
   private async drainEffects(): Promise<void> {
@@ -329,23 +404,59 @@ export class PersistenceConsumer {
       { hostId: this.hostId, limit, signal: this.abort.signal }) >= limit);
   }
   foregroundCompletions(worktreeId: string): number { return this.foregroundCounts.get(worktreeId) ?? 0; }
+  /** CEO-A7: this process holds the claim, so its outcome reaches waiters through `onSettled` without a read. */
+  holds(id: string): boolean { return this.executing.has(id); }
+  private settled(row: WriteRequest): boolean {
+    try { this.opts.onSettled?.(row); } catch (error) { this.report(error); }
+    return isTerminal(row);
+  }
   status() {
     return { accepting: !this.stopping, active_preparations: this.active.size, active_worktrees: this.activeRoots.size,
       sampled_at: new Date().toISOString(), observation_scope: 'current_process_reset_on_restart',
       preparation_attempts: this.preparationAttempts,
-      phase: this.phaseObservation ? { ...this.phaseObservation } : null,
+      phase: this.phaseObservation ? { ...this.phaseObservation, ...this.phaseTiming(this.phaseObservation, this.phaseStartedAt) } : null,
       preparations: [...this.preparing.values()].map(value => ({ ...value })),
       ...(this.lastError ? { last_error: { ...this.lastError } } : {}) };
   }
+  /**
+   * #5801: connection-wait and event-loop evidence for a phase. A checkout is
+   * observed only after a connection was obtained inside this phase's async
+   * chain; until then the phase reports how long it has been waiting.
+   */
+  private phaseTiming(observation: PhaseObservation, startedAt: number): { checkout?: 'not_observed'; conn_wait_ms?: number; loop_lag_ms?: number } {
+    let lag: number | undefined;
+    try { if (this.loopDelay) lag = Math.round(this.loopDelay.max / 1e6); } catch { /* fail-open */ }
+    return {
+      ...(this.unobserveCheckout && observation.first_conn_ms === undefined
+        ? { checkout: 'not_observed' as const, conn_wait_ms: Math.round(performance.now() - startedAt) } : {}),
+      ...(lag === undefined ? {} : { loop_lag_ms: lag }),
+    };
+  }
+  private timingText(observation: PhaseObservation, startedAt: number): string {
+    const fields: Record<string, unknown> = { first_conn_ms: observation.first_conn_ms, ...this.phaseTiming(observation, startedAt) };
+    return Object.entries(fields).filter(([, value]) => value !== undefined).map(([key, value]) => ` ${key}=${value}`).join('');
+  }
   private async phase<T>(name: string, run: (signal?: AbortSignal) => Promise<T>): Promise<T> {
-    const observation = { name, started_at: new Date().toISOString(), deadline_exceeded: false, attempt: ++this.phaseAttempts };
+    const observation: PhaseObservation = { name, started_at: new Date().toISOString(), deadline_exceeded: false, attempt: ++this.phaseAttempts };
+    const startedAt = performance.now();
     this.phaseObservation = observation;
+    this.phaseStartedAt = startedAt;
+    this.unobserveCheckout ??= this.checkoutObservable?.(() => {
+      const scope = phaseScope.getStore();
+      if (scope && scope.observation.first_conn_ms === undefined) scope.observation.first_conn_ms = Math.round(performance.now() - scope.startedAt);
+    });
+    if (this.loopDelay === undefined) {
+      try { this.loopDelay = monitorEventLoopDelay({ resolution: 10 }); this.loopDelay.enable(); } catch { this.loopDelay = null; }
+    }
+    try { this.loopDelay?.reset(); } catch { /* fail-open */ }
     const abort = new AbortController();
     const stop = () => abort.abort(this.abort.signal.reason);
     this.abort.signal.addEventListener('abort', stop, { once: true });
     if (this.stopping) stop();
-    const timer = setTimeout(() => { observation.deadline_exceeded = true; abort.abort(); this.log(name, 'deadline_exceeded'); }, this.opts.phaseMs ?? 5000);
-    try { return await run(this.engine.kind === 'postgres' ? abort.signal : undefined); }
+    const timer = setTimeout(() => {
+      observation.deadline_exceeded = true; abort.abort(); this.log(name, 'deadline_exceeded', undefined, this.timingText(observation, startedAt));
+    }, this.opts.phaseMs ?? 5000);
+    try { return await phaseScope.run({ observation, startedAt }, () => run(this.engine.kind === 'postgres' ? abort.signal : undefined)); }
     catch (error) {
       const cancelled = error as { name?: unknown; code?: unknown; message?: unknown } | null;
       if (this.stopping && abort.signal.aborted && abort.signal.reason === this.abort.signal.reason
@@ -354,7 +465,7 @@ export class PersistenceConsumer {
             && /^(?:57014: )?canceling statement due to user request$/.test(cancelled.message))) {
         throw this.abort.signal.reason;
       }
-      this.lastPhaseError = name; throw error;
+      this.lastPhaseError = name; this.lastPhaseTiming = this.timingText(observation, startedAt); throw error;
     }
     finally { clearTimeout(timer); this.abort.signal.removeEventListener('abort', stop); this.phaseObservation = undefined; }
   }
@@ -364,14 +475,16 @@ export class PersistenceConsumer {
     this.lastError = { code: typeof code === 'string' && (/^[A-Z0-9]{5}$/.test(code) || isWriteErrorCode(code)) ? code : 'storage_error', at: new Date().toISOString(),
       ...(this.lastPhaseError ? { phase: this.lastPhaseError } : {}) };
     if (this.opts.onError) this.opts.onError(error);
-    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code);
+    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined);
     this.lastPhaseError = undefined;
+    this.lastPhaseTiming = undefined;
   }
-  private log(phase: string, code: string): void {
+  private log(phase: string, code: string, detail?: string, timing = ''): void {
     const key = `${phase}:${code}`, at = Date.now();
     if (this.lastLog && (at - this.lastLog.at < 1000 || this.lastLog.key === key && at - this.lastLog.at < 30_000)) return;
     this.lastLog = { key, at };
-    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}; unfinished work remains tracked; inspect writer status.\n`);
+    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${detail ? ` message="${detail}"` : ''}${timing}`
+      + '; unfinished work remains tracked; fix: gbrain sources writer status --json; docs: docs/ENGINES.md#persistence-consumer-log\n');
   }
   private async execute(row: WriteRequest): Promise<boolean> {
     let renewing: Promise<unknown> | undefined;
@@ -381,9 +494,11 @@ export class PersistenceConsumer {
     const abort = new AbortController();
     const observation = { request_id: row.request_id, started_at: new Date().toISOString(), deadline_exceeded: false, attempt: ++this.preparationAttempts };
     this.preparing.set(row.id, observation);
+    this.executing.add(row.id);
     const stop = () => abort.abort({ code: 'consumer_stopping' });
     this.abort.signal.addEventListener('abort', stop, { once: true });
-    const bounded = row.operation === 'remember' || row.operation === 'put_page' && !row.intent?.kind;
+    // edit_page (#5616) builds its content during preparation like put_page, so it shares the deadline.
+    const bounded = row.operation === 'remember' || (row.operation === 'put_page' || row.operation === 'edit_page') && !row.intent?.kind;
     const budget = this.opts.preparationMs ?? 30_000;
     const deadline = performance.now() + budget;
     const timeout = bounded ? setTimeout(() => {
@@ -413,11 +528,13 @@ export class PersistenceConsumer {
       }
       this.preparing.delete(row.id);
       preparationActive = false;
+      await faultPoint('consumer:prepared', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
       const done = await publishMutation(this.engine, row, prepared, this.hostId);
+      if (done.state === 'failed') this.log('publication', done.error_code ?? 'storage_error', done.error_message ?? undefined);
       if (done.state === 'committed' && row.worktree_id && !String(row.intent?.kind).startsWith('managed_sync_')) {
         this.foregroundCounts.set(row.worktree_id, this.foregroundCompletions(row.worktree_id) + 1);
       }
-      return isTerminal(done);
+      return this.settled(done);
     } catch (error) {
       if (preparationActive && bounded && performance.now() >= deadline) observation.deadline_exceeded = true;
       if (preparationActive && (abort.signal.aborted || observation.deadline_exceeded)) {
@@ -426,13 +543,40 @@ export class PersistenceConsumer {
       }
       const current = await getWriteRequestById(this.engine, row.id);
       if (current && !isTerminal(current) && current.execution_token === row.execution_token && !current.recovery) {
-        return isTerminal(await finishUnpublishedFailure(this.engine, current, error));
+        const done = await finishUnpublishedFailure(this.engine, current, error, preparationActive ? 'preparation' : 'publication');
+        if (done.state === 'failed') this.log(preparationActive ? 'preparation' : 'publication', done.error_code ?? 'storage_error', done.error_message ?? undefined);
+        return this.settled(done);
       }
       throw error;
     } finally {
       closed = true; clearInterval(interval); if (timeout) clearTimeout(timeout);
-      this.abort.signal.removeEventListener('abort', stop); this.preparing.delete(row.id); await renewing;
+      this.abort.signal.removeEventListener('abort', stop); this.preparing.delete(row.id); this.executing.delete(row.id); await renewing;
     }
+  }
+  /** #5984: a claimed bulk sync head takes its directly following group members along; one row runs the single path. */
+  private async executeOrGroup(row: WriteRequest): Promise<boolean> {
+    // #5984 admit-ahead: a window group whose predecessor did not commit is cancelled, never published after it.
+    // A lane group may be claimed while its predecessor still publishes; its commit wait decides instead.
+    const lane = laneOf(row);
+    const orphaned = lane ? null : await cancelOrphanedWindowGroup(this.engine, row);
+    if (orphaned) { for (const done of orphaned) this.settled(done); return true; }
+    const group = publicationGroupKey(row);
+    if (!group || this.engine.kind !== 'postgres') return this.execute(row);
+    // #6007: a put_pages batch publishes in groups of at most PAGE_BATCH_GROUP_MAX pages.
+    const followers = await claimGroupFollowers(this.engine, row, group, group.startsWith('batch:') ? PAGE_BATCH_GROUP_MAX - 1 : 63);
+    if (!followers.length && !lane) return this.execute(row);
+    const rows = [row, ...followers];
+    for (const member of rows) this.executing.add(member.id);
+    try {
+      return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane, prepare: member => this.prepare(this.engine, member, this.config),
+        settled: done => {
+          this.executing.delete(done.id);
+          if (done.state === 'committed' && done.worktree_id && !String(done.intent?.kind).startsWith('managed_sync_')) {
+            this.foregroundCounts.set(done.worktree_id, this.foregroundCompletions(done.worktree_id) + 1);
+          }
+          this.settled(done);
+        } });
+    } finally { for (const member of rows) this.executing.delete(member.id); }
   }
   /** Mandatory barrier: engine.close must be sequenced AFTER this promise. */
   async stop(): Promise<void> {
@@ -446,5 +590,9 @@ export class PersistenceConsumer {
     await this.effectsWorker;
     await this.topologyWorker;
     await this.maintenanceWorker;
+    this.unobserveCheckout?.();
+    this.unobserveCheckout = undefined;
+    try { this.loopDelay?.disable(); } catch { /* fail-open */ }
+    this.loopDelay = undefined;
   }
 }

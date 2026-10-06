@@ -1,6 +1,6 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { chat, configureGateway, type ChatOpts, type ChatResult } from '../src/core/ai/gateway.ts';
+import { chat, type ChatOpts, type ChatResult } from '../src/core/ai/gateway.ts';
 import { withAIInvocationGuard, type AIInvocationUsage } from '../src/core/ai/invocation-guard.ts';
 import { BudgetTracker } from '../src/core/budget/budget-tracker.ts';
 import { canonicalLookup } from '../src/core/model-pricing.ts';
@@ -10,6 +10,7 @@ import { buildReaderUserText, READER_SYSTEM_TEXT, READER_MAX_TOKENS, READER_MAX_
 import { sanitizeChatContent } from '../src/eval/longmemeval/sanitize.ts';
 import { buildJudgePrompt, classifyJudgeResponse, DEFAULT_JUDGE_MODEL, JUDGE_MAX_TOKENS, JUDGE_TEMPERATURE } from '../src/eval/longmemeval/judge.ts';
 import { runJudge } from '../src/eval/shared/judge-runner.ts';
+import { configureEvalGateway } from '../src/eval/shared/gateway-bootstrap.ts';
 import { bootstrapMeanCi } from '../src/eval/shared/bootstrap.ts';
 import { redactSecrets, sha256Hex, stableStringify } from '../src/eval/longmemeval/run-config.ts';
 
@@ -300,7 +301,7 @@ async function main(args: string[]) {
       if (frozen.variant !== variant || frozen.manifest_sha !== sha256Hex(stableStringify(pins))) throw new Error('Holdout differs from frozen algorithm');
     }
     if (!process.env.ANTHROPIC_API_KEY || !process.env.OPENAI_API_KEY) throw new Error('Both reader and judge credentials are required');
-    configureGateway({ env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY, OPENAI_API_KEY: process.env.OPENAI_API_KEY } });
+    configureEvalGateway();
     appendRecord(journal, { event: 'phase_start', phase, variant, timestamp: new Date().toISOString() });
     for (const [index, id] of cohorts[phase].entries()) {
       if (readRecords(pairsPath).some(r => r.phase === phase && r.variant === variant && r.question_id === id)) continue;
