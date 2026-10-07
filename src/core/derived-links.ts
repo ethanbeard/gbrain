@@ -6,6 +6,7 @@ import { replaceWantedLinks, type WantedLinksReplacement } from './wanted-links-
 import { applyTemporalEvidence, relationshipKeysForOrigin } from './link-temporal-apply.ts';
 import { primeRelationSemantics } from './link-semantics-pack.ts';
 import { effectiveRangesEnabled } from './line-grammar.ts';
+import { isLockTimeoutError } from './retry-matcher.ts';
 
 export interface DerivedLinkOrigin {
   slug: string;
@@ -19,6 +20,8 @@ export interface DerivedLinkReplacementOptions {
   preserveExisting?: boolean;
   includeLegacyNullProducer?: boolean;
   expectedEndpoints?: Array<{ slug: string; sourceId: string; revision: string }>;
+  /** Bounds only the page-lock acquisition. */
+  lockTimeoutMs?: number;
   /** The origin's unresolved authored references, replaced in the same transaction (wanted pages). */
   wanted?: WantedLinksReplacement;
 }
@@ -33,6 +36,14 @@ export class DerivedLinkRepairRequiredError extends Error {
 
 export class DerivedLinkEndpointChangedError extends Error {
   readonly code = 'revision_conflict';
+}
+
+export class PageLockBusyError extends Error {
+  readonly code = 'page_lock_busy';
+  constructor(origin: Pick<DerivedLinkOrigin, 'sourceId' | 'slug'>, cause: unknown) {
+    super(`Page write lock is busy for ${origin.sourceId}:${origin.slug}`, { cause });
+    this.name = 'PageLockBusyError';
+  }
 }
 
 export async function applyAttendanceDelta(tx: Pick<BrainEngine, 'executeRaw' | 'addLinksBatch'>,
@@ -85,9 +96,23 @@ export async function replaceDerivedLinks(
   const rows = [...unique.values()];
   return engine.transaction(async tx => {
     await primeRelationSemantics(tx);
-    await tx.lockPageKeys([{ sourceId: origin.sourceId, slug: origin.slug }, ...rows.flatMap(row => [
-      { sourceId: row.from_source_id!, slug: row.from_slug }, { sourceId: row.to_source_id!, slug: row.to_slug },
-    ])]);
+    let priorLockTimeout: string | undefined;
+    if (opts.lockTimeoutMs !== undefined) {
+      const [{ prior }] = await tx.executeRaw<{ prior: string }>("SELECT current_setting('lock_timeout') AS prior");
+      priorLockTimeout = prior;
+      await tx.executeRaw("SELECT set_config('lock_timeout', $1, true)", [`${Math.max(1, Math.floor(opts.lockTimeoutMs))}ms`]);
+    }
+    try {
+      await tx.lockPageKeys([{ sourceId: origin.sourceId, slug: origin.slug }, ...rows.flatMap(row => [
+        { sourceId: row.from_source_id!, slug: row.from_slug }, { sourceId: row.to_source_id!, slug: row.to_slug },
+      ])]);
+    } catch (error) {
+      if (isLockTimeoutError(error)) throw new PageLockBusyError(origin, error);
+      throw error;
+    }
+    if (priorLockTimeout !== undefined) {
+      await tx.executeRaw("SELECT set_config('lock_timeout', $1, true)", [priorLockTimeout]);
+    }
     const snapshot = await tx.readPageSnapshot(origin.slug, { sourceId: origin.sourceId });
     assertPageRevision(snapshot, { expectedRevision: origin.expectedRevision });
     if (!snapshot || snapshot.sourceIncarnation !== origin.sourceIncarnation || snapshot.page.deleted_at) {

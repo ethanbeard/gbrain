@@ -48,7 +48,7 @@ import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import { resolveCandidateSources, resolveLinkFallbackDefault, loadLinkPageMetadata, capturedLinkEndpoints, fileLinkOwnership, replaceFileLinks, replacePageFileLinks, type LinkPageMetadata } from '../core/link-reconciliation.ts';
 import { collectWantedLinks, isWantedPagesEnabled } from '../core/wanted-links.ts';
-import { DerivedLinkEndpointChangedError } from '../core/derived-links.ts';
+import { DerivedLinkEndpointChangedError, PageLockBusyError } from '../core/derived-links.ts';
 import { lineGrammarOptions, statedRelationTypes } from '../core/line-grammar.ts';
 export { reconcileSourceLinks, type SourceLinkReconciliationResult } from '../core/link-reconciliation.ts';
 export { extractMarkdownLinks } from '../core/link-extraction.ts';
@@ -253,8 +253,19 @@ interface ExtractResult {
   skipped_attendance_incomplete?: number;
   skipped_cross_source?: number;
   skipped_endpoint_changed?: number;
+  skipped_lock_busy?: number;
   /** #5904: timeline writes the writer refused or left pending (DB path); the command exits non-zero. */
   timeline_refused?: number;
+}
+
+export function extractLockTimeoutMs(): number {
+  const raw = process.env.GBRAIN_EXTRACT_LOCK_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return 5000;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 100) {
+    throw new Error('GBRAIN_EXTRACT_LOCK_TIMEOUT_MS must be an integer >= 100 (ms)');
+  }
+  return value;
 }
 
 // --- Shared walker ---
@@ -1236,6 +1247,7 @@ export async function runExtract(engine: BrainEngine, args: string[], authority?
           result.skipped_missing_target = r.skippedMissingTarget;
           result.skipped_cross_source = r.skippedCrossSource;
           result.skipped_endpoint_changed = r.skippedEndpointChanged;
+          result.skipped_lock_busy = r.skippedLockBusy;
           if (r.skippedAttendanceIncomplete) result.skipped_attendance_incomplete = r.skippedAttendanceIncomplete;
         }
         if (subcommand === 'timeline' || subcommand === 'all') {
@@ -1793,9 +1805,10 @@ async function extractLinksFromDB(
   typeFilter: PageType | undefined,
   since: string | undefined,
   opts?: { includeFrontmatter?: boolean; sourceIdFilter?: string; stampWatermark?: boolean },
-): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[]; skippedMissingTarget: number; skippedCrossSource: number; skippedAttendanceIncomplete: number; skippedEndpointChanged: number }> {
+): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[]; skippedMissingTarget: number; skippedCrossSource: number; skippedAttendanceIncomplete: number; skippedEndpointChanged: number; skippedLockBusy: number }> {
   const includeFrontmatter = opts?.includeFrontmatter ?? false;
   const sourceIdFilter = opts?.sourceIdFilter;
+  const lockTimeoutMs = extractLockTimeoutMs();
   // C3 (D6): the links_extracted_at watermark covers links AND timeline, so a
   // links-ONLY run must NOT stamp it (that would hide timeline staleness for
   // `gbrain extract links --source db`). Only stamp when the caller ran BOTH
@@ -1870,6 +1883,7 @@ async function extractLinksFromDB(
   // from a genuinely missing target.
   let skippedCrossSource = 0;
   let skippedEndpointChanged = 0;
+  let skippedLockBusy = 0;
   // v0.42.7 (#1696): pages whose links we extracted this run — stamped after
   // the loop so a manual `gbrain extract links|all --source db` clears the
   // links_extraction_lag doctor signal. Non-dry-run only.
@@ -1956,11 +1970,14 @@ async function extractLinksFromDB(
         const written = await engine.replaceDerivedLinks({ slug, sourceId: source_id, expectedRevision: snapshot.revision,
           sourceIncarnation: snapshot.sourceIncarnation }, batch, { includeFrontmatter,
           wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] : ['body'], rows: wanted },
-          expectedEndpoints: capturedLinkEndpoints(batch, targetMetadata) });
+          expectedEndpoints: capturedLinkEndpoints(batch, targetMetadata), lockTimeoutMs });
         created += written.created;
       } catch (error) {
         if (error instanceof DerivedLinkEndpointChangedError) {
           skippedEndpointChanged++;
+          continue;
+        } else if (error instanceof PageLockBusyError) {
+          skippedLockBusy++;
           continue;
         }
         if (jsonMode) process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, code: 'graph_write_failed' }) + '\n');
@@ -1997,6 +2014,9 @@ async function extractLinksFromDB(
     if (skippedEndpointChanged > 0) {
       console.log(`Skipped ${skippedEndpointChanged} page(s) whose link endpoints changed mid-run; left stale for the next run.`);
     }
+    if (skippedLockBusy > 0) {
+      console.log(`Skipped ${skippedLockBusy} page(s) whose write lock was busy; left stale for the next run.`);
+    }
     if (includeFrontmatter && unresolved.length > 0) {
       // Top-20 preview of unresolvable frontmatter names so the user can
       // see where the graph has holes (codex tension 6.4).
@@ -2015,7 +2035,7 @@ async function extractLinksFromDB(
   // #2589: the counters ride the return value so machine consumers (and the
   // --json path, which has no summary event on this path) can see the drops —
   // "counted, never silent" must hold beyond human-mode console lines.
-  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource, skippedAttendanceIncomplete, skippedEndpointChanged };
+  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource, skippedAttendanceIncomplete, skippedEndpointChanged, skippedLockBusy };
 }
 
 /**
@@ -2053,8 +2073,9 @@ export async function extractStaleFromDB(
      */
     timeBudgetMs?: number;
   },
-): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number; skippedCrossSource?: number; skippedAttendanceIncomplete?: number; skippedEndpointChanged?: number; skippedChanged?: number; mentions?: MentionPassResult }> {
+): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number; skippedCrossSource?: number; skippedAttendanceIncomplete?: number; skippedEndpointChanged?: number; skippedLockBusy?: number; skippedChanged?: number; mentions?: MentionPassResult }> {
   const { dryRun, jsonMode, sourceIdFilter, catchUp } = opts;
+  const lockTimeoutMs = extractLockTimeoutMs();
   const includeFrontmatter = opts.includeFrontmatter ?? await resolveIncludeFrontmatter(engine);
   const log = opts.quiet ? (..._args: unknown[]) => {} : console.log;
   const timeBudgetMs = opts.timeBudgetMs ?? STALE_TIME_BUDGET_MS;
@@ -2141,6 +2162,7 @@ export async function extractStaleFromDB(
   // from a genuinely missing target.
   let skippedCrossSource = 0;
   let skippedEndpointChanged = 0;
+  let skippedLockBusy = 0;
 
   const wantedEnabled = await isWantedPagesEnabled(engine);
   for (;;) {
@@ -2199,7 +2221,7 @@ export async function extractStaleFromDB(
         crossSourceAllowed: federatedSourceIds.has(page.source_id) || crossSource, resolve: c => resolveCandidateSources(c, page.slug,
           page.source_id, allSlugs, slugToSources, federatedSourceIds.has(page.source_id), { crossSource, defaultSourceId: linkDefaultSourceId }) }) : [];
       const linkOpts = { includeFrontmatter, expectedEndpoints: capturedLinkEndpoints(linkRows, targetMetadata),
-        wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] as const : ['body'] as const, rows: wanted } };
+        wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] as const : ['body'] as const, rows: wanted }, lockTimeoutMs };
       const stampIso = page.updated_at.getTime() >= Date.parse(versionTs) ? page.updated_at_iso : versionTs;
       let written;
       try {
@@ -2207,6 +2229,9 @@ export async function extractStaleFromDB(
       } catch (error) {
         if (error instanceof DerivedLinkEndpointChangedError) {
           skippedEndpointChanged++;
+          continue;
+        } else if (error instanceof PageLockBusyError) {
+          skippedLockBusy++;
           continue;
         }
         throw error;
@@ -2276,6 +2301,9 @@ export async function extractStaleFromDB(
     if (skippedEndpointChanged > 0) {
       log(`Skipped ${skippedEndpointChanged} page(s) whose link endpoints changed mid-run; left stale for the next run.`);
     }
+    if (skippedLockBusy > 0) {
+      log(`Skipped ${skippedLockBusy} page(s) whose write lock was busy; left stale for the next run.`);
+    }
     if (budgetHit && staleRemaining > 0) {
       log(`Time budget reached — ${staleRemaining} page(s) still stale. Re-run 'gbrain extract --stale' (or pass --catch-up) to continue.`);
     }
@@ -2285,10 +2313,11 @@ export async function extractStaleFromDB(
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
       skipped_missing_target: skippedMissingTarget, skipped_cross_source: skippedCrossSource,
       skipped_endpoint_changed: skippedEndpointChanged,
+      skipped_lock_busy: skippedLockBusy,
       ...(skippedAttendanceIncomplete ? { skipped_attendance_incomplete: skippedAttendanceIncomplete } : {}), ...mentionJsonFields(mentions),
     }) + '\n');
   }
-  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource, skippedEndpointChanged,
+  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource, skippedEndpointChanged, skippedLockBusy,
     ...(skippedAttendanceIncomplete ? { skippedAttendanceIncomplete } : {}), mentions };
 }
 
