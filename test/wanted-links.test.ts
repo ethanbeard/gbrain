@@ -50,6 +50,13 @@ describe('collectWantedLinks', () => {
     expect(run([candidate('people/x', 'ref:1')], { 'people/x': 'missing_from' })).toEqual([]);
   });
 
+  test('invalid slug refs are ignored while valid mixed-case refs retain their original target', () => {
+    expect(run([candidate('//x.com/a', 'ref:url')], {})).toEqual([]);
+    expect(run([candidate('People/Missing-Person', 'ref:person')], {})).toMatchObject([
+      { producer: 'body', ref_kind: 'slug', target_ref: 'People/Missing-Person' },
+    ]);
+  });
+
   test('unresolved frontmatter names become name refs; qualified slugs keep their source', () => {
     expect(collectWantedLinks({ candidates: [], originSourceId: 'src-a', crossSourceAllowed: false, resolve: () => ({ ok: true }),
       frontmatterUnresolved: [{ field: 'company', name: 'Acme Example' }, { field: 'key_people', name: '[[people/bob-example]]' },

@@ -48,6 +48,7 @@ import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import { resolveCandidateSources, resolveLinkFallbackDefault, loadLinkPageMetadata, capturedLinkEndpoints, fileLinkOwnership, replaceFileLinks, replacePageFileLinks, type LinkPageMetadata } from '../core/link-reconciliation.ts';
 import { collectWantedLinks, isWantedPagesEnabled } from '../core/wanted-links.ts';
+import { DerivedLinkEndpointChangedError } from '../core/derived-links.ts';
 import { lineGrammarOptions, statedRelationTypes } from '../core/line-grammar.ts';
 export { reconcileSourceLinks, type SourceLinkReconciliationResult } from '../core/link-reconciliation.ts';
 export { extractMarkdownLinks } from '../core/link-extraction.ts';
@@ -251,6 +252,7 @@ interface ExtractResult {
   skipped_missing_target?: number;
   skipped_attendance_incomplete?: number;
   skipped_cross_source?: number;
+  skipped_endpoint_changed?: number;
   /** #5904: timeline writes the writer refused or left pending (DB path); the command exits non-zero. */
   timeline_refused?: number;
 }
@@ -1233,6 +1235,7 @@ export async function runExtract(engine: BrainEngine, args: string[], authority?
           // additive fields, only present on the DB links path.
           result.skipped_missing_target = r.skippedMissingTarget;
           result.skipped_cross_source = r.skippedCrossSource;
+          result.skipped_endpoint_changed = r.skippedEndpointChanged;
           if (r.skippedAttendanceIncomplete) result.skipped_attendance_incomplete = r.skippedAttendanceIncomplete;
         }
         if (subcommand === 'timeline' || subcommand === 'all') {
@@ -1790,7 +1793,7 @@ async function extractLinksFromDB(
   typeFilter: PageType | undefined,
   since: string | undefined,
   opts?: { includeFrontmatter?: boolean; sourceIdFilter?: string; stampWatermark?: boolean },
-): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[]; skippedMissingTarget: number; skippedCrossSource: number; skippedAttendanceIncomplete: number }> {
+): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[]; skippedMissingTarget: number; skippedCrossSource: number; skippedAttendanceIncomplete: number; skippedEndpointChanged: number }> {
   const includeFrontmatter = opts?.includeFrontmatter ?? false;
   const sourceIdFilter = opts?.sourceIdFilter;
   // C3 (D6): the links_extracted_at watermark covers links AND timeline, so a
@@ -1866,6 +1869,7 @@ async function extractLinksFromDB(
   // design (source isolation) unless the #3908 flag is on, but distinct
   // from a genuinely missing target.
   let skippedCrossSource = 0;
+  let skippedEndpointChanged = 0;
   // v0.42.7 (#1696): pages whose links we extracted this run — stamped after
   // the loop so a manual `gbrain extract links|all --source db` clears the
   // links_extraction_lag doctor signal. Non-dry-run only.
@@ -1955,6 +1959,10 @@ async function extractLinksFromDB(
           expectedEndpoints: capturedLinkEndpoints(batch, targetMetadata) });
         created += written.created;
       } catch (error) {
+        if (error instanceof DerivedLinkEndpointChangedError) {
+          skippedEndpointChanged++;
+          continue;
+        }
         if (jsonMode) process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, code: 'graph_write_failed' }) + '\n');
         throw error;
       }
@@ -1986,6 +1994,9 @@ async function extractLinksFromDB(
     if (skippedCrossSource > 0) {
       console.log(`Skipped ${skippedCrossSource} cross-source candidate(s) — target exists only in another source. Enable with \`gbrain config set link_resolution.cross_source true\` — see docs/architecture/brains-and-sources.md (#2589).`);
     }
+    if (skippedEndpointChanged > 0) {
+      console.log(`Skipped ${skippedEndpointChanged} page(s) whose link endpoints changed mid-run; left stale for the next run.`);
+    }
     if (includeFrontmatter && unresolved.length > 0) {
       // Top-20 preview of unresolvable frontmatter names so the user can
       // see where the graph has holes (codex tension 6.4).
@@ -2004,7 +2015,7 @@ async function extractLinksFromDB(
   // #2589: the counters ride the return value so machine consumers (and the
   // --json path, which has no summary event on this path) can see the drops —
   // "counted, never silent" must hold beyond human-mode console lines.
-  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource, skippedAttendanceIncomplete };
+  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource, skippedAttendanceIncomplete, skippedEndpointChanged };
 }
 
 /**
@@ -2042,7 +2053,7 @@ export async function extractStaleFromDB(
      */
     timeBudgetMs?: number;
   },
-): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number; skippedCrossSource?: number; skippedAttendanceIncomplete?: number; skippedChanged?: number; mentions?: MentionPassResult }> {
+): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number; skippedCrossSource?: number; skippedAttendanceIncomplete?: number; skippedEndpointChanged?: number; skippedChanged?: number; mentions?: MentionPassResult }> {
   const { dryRun, jsonMode, sourceIdFilter, catchUp } = opts;
   const includeFrontmatter = opts.includeFrontmatter ?? await resolveIncludeFrontmatter(engine);
   const log = opts.quiet ? (..._args: unknown[]) => {} : console.log;
@@ -2129,6 +2140,7 @@ export async function extractStaleFromDB(
   // design (source isolation) unless the #3908 flag is on, but distinct
   // from a genuinely missing target.
   let skippedCrossSource = 0;
+  let skippedEndpointChanged = 0;
 
   const wantedEnabled = await isWantedPagesEnabled(engine);
   for (;;) {
@@ -2189,7 +2201,16 @@ export async function extractStaleFromDB(
       const linkOpts = { includeFrontmatter, expectedEndpoints: capturedLinkEndpoints(linkRows, targetMetadata),
         wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] as const : ['body'] as const, rows: wanted } };
       const stampIso = page.updated_at.getTime() >= Date.parse(versionTs) ? page.updated_at_iso : versionTs;
-      const written = await engine.replaceDerivedLinks(origin, linkRows, linkOpts);
+      let written;
+      try {
+        written = await engine.replaceDerivedLinks(origin, linkRows, linkOpts);
+      } catch (error) {
+        if (error instanceof DerivedLinkEndpointChangedError) {
+          skippedEndpointChanged++;
+          continue;
+        }
+        throw error;
+      }
       linksCreated += written.created;
       await retractRemovedTimelineEntries(engine, page.slug, page.source_id, fullContent);
       for (const entry of parseTimelineEntries(fullContent)) {
@@ -2252,6 +2273,9 @@ export async function extractStaleFromDB(
     if (skippedCrossSource > 0) {
       log(`Skipped ${skippedCrossSource} cross-source candidate(s) — target exists only in another source. Enable with \`gbrain config set link_resolution.cross_source true\`, then run \`gbrain extract links --source db\` — a --stale re-run will NOT revisit these pages (their extraction watermark is already stamped) — see docs/architecture/brains-and-sources.md (#2589).`);
     }
+    if (skippedEndpointChanged > 0) {
+      log(`Skipped ${skippedEndpointChanged} page(s) whose link endpoints changed mid-run; left stale for the next run.`);
+    }
     if (budgetHit && staleRemaining > 0) {
       log(`Time budget reached — ${staleRemaining} page(s) still stale. Re-run 'gbrain extract --stale' (or pass --catch-up) to continue.`);
     }
@@ -2260,10 +2284,11 @@ export async function extractStaleFromDB(
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
       skipped_missing_target: skippedMissingTarget, skipped_cross_source: skippedCrossSource,
+      skipped_endpoint_changed: skippedEndpointChanged,
       ...(skippedAttendanceIncomplete ? { skipped_attendance_incomplete: skippedAttendanceIncomplete } : {}), ...mentionJsonFields(mentions),
     }) + '\n');
   }
-  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource,
+  return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource, skippedEndpointChanged,
     ...(skippedAttendanceIncomplete ? { skippedAttendanceIncomplete } : {}), mentions };
 }
 

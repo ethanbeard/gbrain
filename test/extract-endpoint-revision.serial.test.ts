@@ -82,17 +82,20 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
             return original.call(engine, origin, links, opts);
           };
           const errors: string[] = [];
+          const logs: string[] = [];
           const errorSpy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+          const logSpy = spyOn(console, 'log').mockImplementation((...args) => { logs.push(args.join(' ')); });
           const exitSpy = spyOn(process, 'exit').mockImplementation(code => { throw new Error(`extract exited ${code}`); });
           try {
-            await expect(run()).rejects.toThrow(mode === 'stale' ? 'endpoint changed after type resolution' : 'extract exited 1');
-            if (mode !== 'stale') {
-              expect(exitSpy).toHaveBeenCalledWith(1);
-              expect(errors).toContain('A derived link endpoint changed after type resolution');
-            }
+            const result = await run();
+            expect(exitSpy).not.toHaveBeenCalled();
+            expect(errors).toEqual([]);
+            if (mode === 'stale') expect((result as { skippedEndpointChanged: number }).skippedEndpointChanged).toBe(1);
+            else expect(logs.join('\n')).toContain('"skipped_endpoint_changed": 1');
           } finally {
             engine.replaceDerivedLinks = original;
             errorSpy.mockRestore();
+            logSpy.mockRestore();
             exitSpy.mockRestore();
           }
           expect(retyped).toBe(true);

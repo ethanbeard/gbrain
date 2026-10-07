@@ -16,6 +16,7 @@ import type { BrainEngine } from './engine.ts';
 import type { LinkCandidate, UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { normalizeBasename, unwrapWikilink } from './link-extraction.ts';
 import { isValidSourceId } from './source-id.ts';
+import { validateSlug } from './utils.ts';
 import type { WantedLinkInput } from './wanted-links-store.ts';
 
 export type { WantedLinkInput, WantedLinksReplacement, WantedProducer } from './wanted-links-store.ts';
@@ -56,6 +57,13 @@ export function collectWantedLinks(input: {
   for (const { first, resolved, missing } of groups.values()) {
     if (resolved || !missing) continue;
     const ref = first.authoredRef!;
+    if (ref.kind === 'slug') {
+      try {
+        validateSlug(ref.target);
+      } catch {
+        continue;
+      }
+    }
     const targetSourceId = ref.targetSourceId ?? input.originSourceId;
     if (targetSourceId !== input.originSourceId && !input.crossSourceAllowed) continue;
     add({ producer: 'body', ref_kind: ref.kind, target_source_id: targetSourceId, target_ref: ref.target,
