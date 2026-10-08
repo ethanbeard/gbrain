@@ -11,8 +11,10 @@ import {
 } from '../core/search/embedding-column.ts';
 
 import { redactPgUrl } from '../core/url-redact.ts';
+import { PUBLISH_GATE_KEYS } from '../mcp/publish-gates.ts';
 import { isConsentConfigKey, setConsentPreapproval, unsetConsentPreapproval } from '../core/consent-preapproval.ts';
 import { WRITER_ADMIN_LOCK_KEY } from '../core/persistence/admin-contract.ts';
+import { CONFIG_SUBCOMMANDS, ROUTERS, subcommandHelpRequested } from '../cli/subcommands.ts';
 import {
   SELF_UPGRADE_CONFIG_LEAVES,
   isSelfUpgradeConfigLeaf,
@@ -132,6 +134,7 @@ const MEMORY_DUAL_PLANE_KEYS: ReadonlySet<string> = new Set(
  * audience must be readable by the ENGINE-FREE bootstrap-harness lane so a
  * shared-declared brain never gets the enable-nudge advisory. */
 const BRAIN_AUDIENCE_KEY = 'brain.audience';
+
 
 /** `embedding_disabled` is dual-plane too: the DB row is authoritative (a
  * mounted brain has no other plane) and the host's file mirror keeps the
@@ -377,12 +380,25 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     const err = validateDecideConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
+  (await import('./config/enumerated-keys.ts')).refuseUnregisteredEnumeratedKey(key, force);
+  const searchRefusal = key.startsWith('search.') ? (await import('../core/search/config-values.ts')).searchConfigValueRefusal(key, value) : null;
+  if (searchRefusal) {
+    const { exitCliError, usageError } = await import('../cli/cli-error.ts');
+    exitCliError(usageError(searchRefusal.message, `Re-run with a valid value, e.g. gbrain config set ${key} ${searchRefusal.example}.`,
+      { fix: { argv: ['gbrain', 'config', 'get', key], consent: [], actor: 'agent', why: 'Shows the value in effect; nothing was written.', requires_exclusive: false } }), 'config');
+  }
   if (key === 'auto_chronicle' || key.startsWith('chronicle.')) await refuseInvalidChronicleValue(key, value, force);
-  if (key.startsWith('facts.drain_')) {
-    const { validateFactsDrainConfigValue } = await import('../core/facts/drain-config.ts');
-    const err = validateFactsDrainConfigValue(key, value);
+  if (key.startsWith('fences.')) {
+    const { validateFenceConfigValue } = await import('../core/fence-repair/config.ts');
+    const err = validateFenceConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
+  if (key === 'persistence.max_claim_ms') {
+    const { validateMaxClaimConfigValue } = await import('../core/persistence/claim-phase.ts');
+    const err = validateMaxClaimConfigValue(key, value);
+    if (err) { console.error(`[config] ${err}`); process.exit(1); }
+  }
+  if (key.startsWith('facts.')) await (await import('./config/facts-values.ts')).refuseInvalidFactsConfigValue(key, value);
   await engine.setConfig(key, value);
   if (key === 'auto_chronicle') await acknowledgeAutoChronicle(engine, value);
   if (!key.startsWith('decide.slots.')) return;
@@ -645,8 +661,27 @@ async function showConfig(engine: BrainEngine): Promise<void> {
   }
 }
 
+export { CONFIG_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
+
+const USAGE = `Usage: gbrain config [show|get|set|unset] <key> [value]
+       gbrain config unset --pattern <prefix>
+
+Subcommands:
+  show                         Print the effective configuration
+  get <key> [--raw]            Print one value (--raw: no secret redaction)
+  set <key> <value>            Write a value. --force accepts an unknown key;
+                               --coverage-override (or --yes) passes the embedding
+                               coverage gate; --yes accepts a disclosure prompt
+  unset <key>                  Remove one key
+  unset --pattern <prefix>     Remove every key under a prefix`;
+
+export function printUsage(): void {
+  console.log(USAGE);
+}
+
 export async function runConfig(engine: BrainEngine, args: string[]) {
-  const action = args[0];
+  if (subcommandHelpRequested(args, ROUTERS.config)) { printUsage(); return; }
+  const action = args[0] as (typeof CONFIG_SUBCOMMANDS)[number] | undefined;
 
   // The writer admin lock is reserved for `gbrain sources writer lock|unlock`; --force is no escape.
   if (action === 'set' || action === 'unset') {
@@ -769,7 +804,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       if (fileHad || dbDeleted > 0) {
         console.log(`Unset ${key} (${[fileHad ? 'file plane' : null, dbDeleted > 0 ? 'db plane' : null].filter(Boolean).join(' + ')})`);
         if (key === 'memory.auto_writeback') {
-          console.log('Ambient writeback resolves off while unset. If harness instruction blocks were installed, remove them: gbrain bootstrap harness --yes (converges on off).');
+          for (const line of (await import('../core/facts/writeback-config.ts')).writebackUnsetMessage()) console.log(line);
         }
       } else {
         console.error(`Config key not found: ${key}`);
@@ -876,7 +911,10 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // serves the previous DB value — exactly the lie the off switch's
     // non-zero exit exists to prevent. Everything else keeps the #2120
     // file/env-wins resolution.
-    const dbAuthoritative = MEMORY_DUAL_PLANE_KEYS.has(key) || key === BRAIN_AUDIENCE_KEY;
+    // Publish-gate keys (#5358) are DB-authoritative too: readPublishGate
+    // resolves DB > file, so a file-first answer would print a stale mirror
+    // while the gate already hides the tools.
+    const dbAuthoritative = MEMORY_DUAL_PLANE_KEYS.has(key) || key === BRAIN_AUDIENCE_KEY || (PUBLISH_GATE_KEYS as ReadonlySet<string>).has(key);
     // File-plane keys have no DB reader: a DB row is a stale pre-routing
     // write, never the answer (#5489).
     const fileOnly = isFilePlaneDottedKey(key);
@@ -892,7 +930,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       const out = typeof val === 'string' ? val : JSON.stringify(val);
       console.log(rawFlag ? out : redactConfigValue(key, out));
       if (dbAuthoritative) {
-        console.error(`[config] source: ${dbVal !== null && dbVal !== undefined ? 'db plane (authoritative for this key)' : 'file mirror (no DB row)'}`);
+        console.error(`[config] source: ${dbVal !== null && dbVal !== undefined ? 'db plane (authoritative for this key)' : 'file mirror (no DB row)'}${await writebackLanesNote(engine, key)}`);
         if (dbVal !== null && dbVal !== undefined && fileVal !== undefined && fileVal !== null && String(fileVal) !== String(dbVal)) {
           console.error(`[config] WARN: file mirror disagrees ('${String(fileVal)}') — planes diverged; re-run: gbrain config set ${key} ${String(dbVal)}`);
         }
@@ -1070,7 +1108,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         // The off switch gates instructions + extraction immediately, but
         // previously-installed harness instruction blocks keep directing new
         // sessions until converged — say so (red-team review, this wave).
-        console.log('Ambient writeback off. If harness instruction blocks were installed, remove them: gbrain bootstrap harness --yes (converges on off).');
+        for (const line of (await import('../core/facts/writeback-config.ts')).writebackOffMessage()) console.log(line);
       }
       return;
     }
@@ -1183,6 +1221,13 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     const { INVENTORY_LIMIT_KEYS, parseInventoryLimitValue } = await import('../core/shared-skills/inventory-limits.ts');
     if (INVENTORY_LIMIT_KEYS.includes(key)) {
       try { parseInventoryLimitValue(key, value); }
+      catch (error) { (await import('../cli/cli-error.ts')).exitCliError(error, 'config'); }
+    }
+
+    // #4907: a phase knob the phase would ignore is refused before the write.
+    const [{ PHASE_CONFIG_KEYS, parsePhaseConfigValue }, { CYCLE_GUARDED_KEYS, assertCycleConfigValue }] = await Promise.all([import('../core/cycle/phase-config-values.ts'), import('../core/cycle/config-guards.ts')]);
+    if (PHASE_CONFIG_KEYS.includes(key) || CYCLE_GUARDED_KEYS.includes(key)) { // #6134/#6177: lint_exclude paths, the last_run state key
+      try { if (PHASE_CONFIG_KEYS.includes(key)) parsePhaseConfigValue(key, value); else assertCycleConfigValue(key, value); }
       catch (error) { (await import('../cli/cli-error.ts')).exitCliError(error, 'config'); }
     }
 
@@ -1405,8 +1450,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       }
     }
   } else {
-    console.error('Usage: gbrain config [show|get|set|unset] <key> [value]');
-    console.error('       gbrain config unset --pattern <prefix>');
+    console.error(USAGE);
     process.exit(1);
   }
 }
@@ -1442,4 +1486,11 @@ async function refuseSchemaSizingKey(key: 'embedding_model' | 'embedding_dimensi
   console.error(`[config]`);
   console.error(`[config] No --force escape: silently writing a no-op preserves the bug class this rejection closes.`);
   process.exit(1);
+}
+
+/** #6091: the per-lane effective state of `memory.auto_writeback`, appended to `config get`'s stderr source line. */
+async function writebackLanesNote(engine: BrainEngine, key: string): Promise<string> {
+  if (key !== 'memory.auto_writeback') return '';
+  const { captureLaneSummary, resolveWritebackConfig } = await import('../core/facts/writeback-config.ts');
+  return `; capture lanes: ${captureLaneSummary(await resolveWritebackConfig(engine, loadConfig(), { gate: true }))}`;
 }

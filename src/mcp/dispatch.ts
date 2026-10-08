@@ -380,6 +380,8 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
     type_filter_notice?: unknown;
     other_names?: Array<{ name: string; alias: string; slug: string }>;
     saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string }>;
+    answer_id?: unknown;
+    feedback?: { rateable?: boolean; how_to_rate?: string };
   };
   const blocks: string[] = empty ? [empty] : [];
   if (typeof r.type_filter_notice === 'string') blocks.push(r.type_filter_notice);
@@ -394,12 +396,24 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
       '\n', SAVED_FACTS_NOTICE_MAX_CHARS);
     blocks.push(more ? `${text}\n(+${more} more; recall returns them)` : text);
   }
+  if (typeof r.answer_id === 'string' && r.feedback?.rateable === true) blocks.push(rateLine(r.answer_id, typeof r.feedback.how_to_rate === 'string'));
   return blocks;
+}
+
+/**
+ * #6192: the rateable answer's id on the model-visible channel (hosts that
+ * show only `content[]` never see `_meta`). Short on every rateable answer;
+ * the fuller wording on the answers where the `how_to_rate` cadence fires.
+ */
+function rateLine(answerId: string, coach: boolean): string {
+  const call = `rate_answer { answer_id: "${answerId}", rating: 1-5 }`;
+  return (coach ? `Rate this answer after you use it: ${call}. Ratings tune this brain's ranking.` : `Rate after use: ${call}`).slice(0, RATE_LINE_MAX_CHARS);
 }
 
 /** C4: character ceilings for the model-visible notice blocks (header included). */
 export const SAVED_FACTS_NOTICE_MAX_CHARS = 1_500;
 export const OTHER_NAMES_NOTICE_MAX_CHARS = 400;
+export const RATE_LINE_MAX_CHARS = 160;
 
 /**
  * Whole items after `head` while the block stays within `max` characters;
@@ -631,6 +645,16 @@ const stderrLogger: OperationContext['logger'] = {
 
 /** CX2-11: clamp an opaque session id to 256 chars (cache-key hygiene). */
 const SESSION_ID_MAX_CHARS = 256;
+
+/**
+ * CX2-11: the request-level session — MCP carries `_meta.session_id` as a sibling of `arguments` in
+ * `request.params`. Every transport threads it the same way, so a fact `remember`s the session over
+ * HTTP exactly as over stdio. Non-string / empty values are ignored; dispatch clamps the length.
+ */
+export function requestMetaSessionId(requestParams: unknown): string | undefined {
+  const raw = (requestParams as { _meta?: { session_id?: unknown } } | undefined)?._meta?.session_id;
+  return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+}
 
 /**
  * Read `_meta.session_id` out of the tool arguments when present. The MCP

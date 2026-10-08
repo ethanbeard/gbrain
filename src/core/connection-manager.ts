@@ -38,7 +38,7 @@
 
 import postgres from '#postgres'
 import { traceSqlOptions } from './sql-trace.ts';
-import { resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, endPoolBounded } from './db.ts';
+import { resolvePrepare, resolveSessionTimeouts, resolvePoolSize, resolveMaxLifetimeSeconds, resolveUrlConnectTimeout, resolveSharedTypes, endPoolBounded } from './db.ts';
 import { redactPgUrl } from './url-redact.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 
@@ -347,12 +347,13 @@ export class ConnectionManager {
     const opts: Record<string, unknown> = {
       max: resolvePoolSize(this.opts.readPoolSize),
       idle_timeout: 20,
-      connect_timeout: 10,
+      connect_timeout: resolveUrlConnectTimeout(this.opts.url),
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),
       types: { bigint: postgres.BigInt },
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       onpoisoned: (status: string) => this.opts.onpoisoned?.('read', status),
+      shared_types: resolveSharedTypes(),
     };
     const timeouts = resolveSessionTimeouts();
     if (Object.keys(timeouts).length > 0) opts.connection = timeouts;
@@ -495,7 +496,7 @@ export class ConnectionManager {
     const opts: Record<string, unknown> = {
       max: size,
       idle_timeout: 20,
-      connect_timeout: 10,
+      connect_timeout: resolveUrlConnectTimeout(this._directUrl),
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),
       types: { bigint: postgres.BigInt },
@@ -504,6 +505,7 @@ export class ConnectionManager {
       prepare: true,
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       onpoisoned: (status: string) => this.opts.onpoisoned?.('direct', status),
+      shared_types: resolveSharedTypes(),
       // Apply DDL session GUCs as connection startup parameters (durable
       // through any intermediary pooling layer, same trick as
       // resolveSessionTimeouts).

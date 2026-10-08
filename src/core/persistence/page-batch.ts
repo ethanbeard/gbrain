@@ -10,7 +10,9 @@
  * `put_pages` with only `request_id` reads the batch status without resending
  * any content.
  */
+import { pageQuarantinedNotice } from '../quarantine.ts';
 import type { OperationContext } from '../ops/contract.ts';
+import { fenceNormalizedNotice, mergeFencesNormalized, type FencesNormalized } from '../fence-repair/report.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { admitWriteGroupInTransaction, type WriteAdmission } from './journal.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
@@ -34,8 +36,8 @@ export const PAGE_BATCH_DEFAULT_WAIT_MS = 25_000;
 const PREPARE_CONCURRENCY = 8;
 /** Batch admission is one transaction over every page; it gets more than a single write's budget. */
 const BATCH_ADMISSION_BUDGET_MS = 30_000;
-const PAGE_KEYS = new Set(['slug', 'content', 'expected_revision', 'allow_empty']);
-interface BatchPage { slug: string; content: string; expected_revision?: unknown; allow_empty?: unknown }
+const PAGE_KEYS = new Set(['slug', 'content', 'expected_revision', 'allow_empty', 'drop_timeline']);
+interface BatchPage { slug: string; content: string; expected_revision?: unknown; allow_empty?: unknown; drop_timeline?: unknown }
 interface PageResult { index: number; slug: string; row?: WriteRequest; refusal?: OperationError; typeWarning?: PageTypeWarning | null }
 interface BatchMarker { id: string; index: number; size: number }
 
@@ -49,10 +51,10 @@ function parsePages(value: unknown): BatchPage[] {
   const seen = new Set<string>();
   let bytes = 0;
   const pages = value.map((page, index) => {
-    if (!page || typeof page !== 'object' || Array.isArray(page)) throw invalid(`pages[${index}] must be an object {slug, content}; nothing was written.`, 'Pass each page as {slug, content} with optional expected_revision and allow_empty.');
+    if (!page || typeof page !== 'object' || Array.isArray(page)) throw invalid(`pages[${index}] must be an object {slug, content}; nothing was written.`, 'Pass each page as {slug, content} with optional expected_revision, allow_empty and drop_timeline.');
     const record = page as Record<string, unknown>;
     const extra = Object.keys(record).filter(key => !PAGE_KEYS.has(key));
-    if (extra.length) throw invalid(`pages[${index}] has unsupported fields (${extra.join(', ')}); nothing was written.`, 'Each page accepts only slug, content, expected_revision and allow_empty; put frontmatter inside content.');
+    if (extra.length) throw invalid(`pages[${index}] has unsupported fields (${extra.join(', ')}); nothing was written.`, 'Each page accepts only slug, content, expected_revision, allow_empty and drop_timeline; put frontmatter inside content.');
     if (typeof record.slug !== 'string' || !record.slug) throw invalid(`pages[${index}].slug must be a non-empty string; nothing was written.`, 'Give every page its slug, for example "notes/topic-name".');
     if (typeof record.content !== 'string') throw invalid(`pages[${index}].content must be a string; nothing was written.`, 'Pass the complete markdown page, frontmatter included, as content.');
     const key = record.slug.toLowerCase();
@@ -93,7 +95,10 @@ function pageEntry(result: PageResult): Record<string, unknown> {
     const outcome = (receipt.outcome ?? {}) as Record<string, unknown>;
     return { ...base, request_id: row.request_id, state: 'committed', revision: receipt.revision ?? outcome.revision ?? null,
       status: outcome.status, ...(typeof outcome.slug === 'string' && outcome.slug !== result.slug ? { duplicate_of: outcome.slug } : {}),
-      ...(outcome.embedding_state !== undefined ? { embedding_state: outcome.embedding_state } : {}), ...warning };
+      ...(outcome.embedding_state !== undefined ? { embedding_state: outcome.embedding_state } : {}), ...warning,
+      ...(outcome.fences_normalized ? { fences_normalized: outcome.fences_normalized } : {}),
+      ...(outcome.quarantined ? { quarantined: outcome.quarantined } : {}),
+      ...(outcome.timeline_rows_removed ? { timeline_rows_removed: outcome.timeline_rows_removed } : {}) };
   } catch (error) {
     if (!(error instanceof OperationError)) throw error;
     return { ...base, request_id: row.request_id, state: row.state, error: error.toJSON(), ...warning };
@@ -132,8 +137,15 @@ function batchReceipt(ctx: OperationContext, batchId: string, sourceId: string, 
     : failed
       ? { action: 'fix_pages', why: `${failed} page(s) did not commit. Each carries its own error with what to change. Resubmit only those pages, corrected, in a new put_pages call with a new request_id; committed pages are done.` }
       : { action: 'done' };
+  // #6188 (D12, D21): one `fences_normalized` and one coaching notice for every page whose fence Tier 1 rewrote.
+  const fences = mergeFencesNormalized(pages.flatMap(page => page.fences_normalized ? [page.fences_normalized as FencesNormalized] : []));
+  if (fences) ctx.emitNotice?.(fenceNormalizedNotice(fences));
+  // #6259: one safety notice for the pages the content-quality gate quarantined (each page carries `quarantined`).
+  const hidden = pages.filter(page => page.quarantined);
+  if (hidden.length) ctx.emitNotice?.(pageQuarantinedNotice(hidden.length === 1 ? String(hidden[0]!.slug) : `${hidden.length} pages (${hidden.slice(0, 3).map(page => page.slug).join(', ')}${hidden.length > 3 ? ', ...' : ''})`,
+    hidden[0]!.quarantined as { reason: string; detail: string }, 'write'));
   return { batch_request_id: batchId, source_id: sourceId, state, terminal: pending === 0, counts: { total: pages.length, committed, pending, failed },
-    ...(retryAfterMs !== null ? { retry_after_ms: retryAfterMs } : {}), next, links, pages };
+    ...(retryAfterMs !== null ? { retry_after_ms: retryAfterMs } : {}), next, links, pages, ...(fences ? { fences_normalized: fences } : {}) };
 }
 
 /**
@@ -170,6 +182,7 @@ async function preparePages(own: OperationContext, shared: OperationContext, bat
     const params: Record<string, unknown> = { slug: page.slug, content: page.content, source_id: sourceId };
     if (page.expected_revision !== undefined) params.expected_revision = page.expected_revision;
     if (page.allow_empty !== undefined) params.allow_empty = page.allow_empty;
+    if (page.drop_timeline !== undefined) params.drop_timeline = page.drop_timeline;
     try {
       prepared[index] = await preparePageAdmission(ctx, { operation: 'put_page', params,
         batch: { id: batchId, index, size: pages.length, requestId: pageBatchChildRequestId(batchId, index) } });

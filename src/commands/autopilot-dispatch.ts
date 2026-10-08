@@ -9,11 +9,13 @@ import type { MinionQueue } from '../core/minions/queue.ts';
 import { loadAllSources, parseSourceConfig, sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning, type SourceRow } from '../core/sources-load.ts';
 import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
 import { attemptedConnectorSourceIds } from '../core/persistence/connector-state.ts';
+import { automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
 import { isSyncDisabledConfig } from '../core/sync-policy.ts';
 import { loadActivationPendingSourceIds, skipActivationPendingSync } from '../core/sync-policy.ts';
 import { resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
 import {
   autopilotRemediationIdempotencyKey,
+  autopilotTargetedSteps,
   shouldRunAutopilotFullCycle,
   shouldSleepHealthyAutopilot,
 } from './autopilot-remediation-policy.ts';
@@ -181,7 +183,7 @@ export async function dispatchAutopilotTick(
       // the remediation slot forever (#4046).
       // maxWaiting:1 per submit per codex #17 bounds the cross-window
       // backlog if a targeted handler runs longer than one interval.
-      for (const step of plan) {
+      for (const step of autopilotTargetedSteps(plan)) {
         try {
           const isProtected = !!step.protected;
           const submitOpts = {
@@ -296,7 +298,7 @@ export async function dispatchFreshnessSyncs(
             {
               sourceId: src.id,
               repoPath: src.local_path,
-              pull: sourceConfigHasRemoteUrl(src.config),
+              pull: await automaticSyncPull(engine, src),
               auto_embed_backfill: true,
               embed_reason: 'autopilot_freshness',
             },

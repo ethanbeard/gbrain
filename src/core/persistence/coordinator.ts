@@ -23,6 +23,7 @@ import { withFilesystemPublication } from './filesystem-guard.ts';
 import { mayReprepare } from './semantic.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects } from './effect-journal.ts';
+import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
@@ -31,8 +32,10 @@ import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePer
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { databaseRefusal, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { fenceFailureDetail } from '../fence-repair/refusal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
+import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
 
 interface PreparedMutationBase {
   sourceExclusive?: boolean;
@@ -60,8 +63,11 @@ interface PreparedMutationBase {
   postimage?: PageSnapshot | null;
   validate?(tx: BrainEngine): Promise<void>;
 }
-/** A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700. */
-export type PageMutationFile = MutationFile & { publishMode?: number };
+/**
+ * A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700.
+ * `commit` (trusted local preparers only) rides the Git effect into the commit message.
+ */
+export type PageMutationFile = MutationFile & { publishMode?: number; commit?: GitCommitNote };
 export type PreparedMutation = PreparedMutationBase & (
   | { target?: 'page'; file?: PageMutationFile; files?: never }
   | { target: 'skill_bundle'; file?: never; files: MutationFile[]; validate(tx: BrainEngine): Promise<void> }
@@ -112,7 +118,11 @@ function publishFile(file: PageMutationFile, stagingPath?: string, afterStagingF
 // its own recovery record and native root capability.
 export { fileHash as persistenceFileHash, publishFile as publishPersistenceFile };
 function requestError(error: unknown): PublicationFailure {
-  if (error instanceof OperationError) return { code: error.code, message: error.message };
+  if (error instanceof OperationError) {
+    // #6188: a typed fence refusal keeps its location in the bounded detail, which outlives receipt compaction.
+    const fence = fenceFailureDetail(error);
+    return { code: error.code, message: error.message, ...(fence ? { detail: fence } : {}) };
+  }
   const refusal = databaseRefusal(error);
   if (refusal) return refusal;
   const code = (error as { code?: string })?.code;
@@ -121,7 +131,7 @@ function requestError(error: unknown): PublicationFailure {
   }
   // #5216: the row still awaits its revision backfill; the error names the resume command.
   if (code === 'revision_backfill_pending' && error instanceof Error) return { code, message: error.message };
-  return { code: 'storage_error', message: `Publication failed${code ? ` (${code})` : ''}. Inspect owner diagnostics.` };
+  return ownerExceptionFailure(error);
 }
 function conflictCode(code: string): boolean { return ['revision_required','revision_conflict','revision_backfill_pending','source_changed','page_identity_changed'].includes(code); }
 export function transientDatabaseFailure(error: unknown): boolean {
@@ -214,7 +224,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         await releaseUnpublishedClaim(engine, row, 'owner_unavailable');
         return (await getWriteRequestById(engine, row.id))!;
       }
-      lock = await acquireWorktree(binding, 0, undefined, engine);
+      lock = await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
       if (!lock) {
         await releaseUnpublishedClaim(engine, row, 'writer_busy');
         return (await getWriteRequestById(engine, row.id))!;
@@ -334,6 +344,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       if (prepared.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
       const final = skill ? null : await publicationPostimage(tx, row, prepared);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
+      await recordPublicationFenceTrend(tx, row, outcome);
       await queuePublicationEffects(tx, row, final, outcome, prepared);
       await hooks.boundary?.('before_commit', row);
       const committed = await completeWrite(tx, current, 'committed', outcome, undefined, current);
@@ -379,7 +390,7 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
   if (!binding || binding.owner_host_id !== hostId) throw opError('owner_unavailable', 'Recovery requires the canonical owner.',
     `Request ${row.request_id} in source ${row.source_id} holds a publication recovery record that only the host owning the source's canonical worktree can finish, and this host does not own it. Inspect the owner; its resident writer finishes the recovery.`,
     { fix: ownerStatusFix(row.source_id) });
-  const lock = alreadyLocked ? null : await acquireWorktree(binding, 0, undefined, engine);
+  const lock = alreadyLocked ? null : await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
   if (!alreadyLocked && !lock) return row;
   const releaseCapacity = capacityAlreadyHeld ? null : tryAcquirePublicationCapacity(engine);
   try {

@@ -495,3 +495,26 @@ describe('security fix wave shapes are linear (A1 walks, A2, A3, A5; ENG-15, ENG
     expect(ms).toBeLessThan(300);
   });
 });
+
+describe('labeled_credential (transcript lane): every candidate start does constant work', () => {
+  const LABELED = { highEntropy: true, labeledCredentials: true } as const;
+  const adversaries: Array<[string, string]> = [
+    ['240 KB of `login `', 'login '.repeat(40_000)],
+    ['220 KB of `login: a / `', 'login: a / '.repeat(20_000)],
+    ['200 KB of `password: `', 'password: '.repeat(20_000)],
+    ['a label, 200k spaces, then a value', 'password:' + ' '.repeat(200_000) + 'x'],
+    ['200 KB of `a/` after a login label', 'login: ' + 'a/'.repeat(100_000)],
+    ['20000 dangling pair lines', Array.from({ length: 20_000 }, () => 'login: alice-example /').join('\n')],
+    ['20000 dangling single labels', Array.from({ length: 20_000 }, () => 'password:').join('\n')],
+    ['a 10k-row table with two credential columns', ['| user | password | pwd |', '|---|---|---|', ...Array.from({ length: 10_000 }, (_, k) => `| u${k} | s3cret${k} | p${k}x\\|y |`)].join('\n')],
+    ['a 200 KB row of escaped pipes', '| password | ' + '\\|'.repeat(100_000) + ' |'],
+    ['200 KB of `--password `', '--password '.repeat(20_000)],
+    ['a 64k-cell row of label cells under 64k password columns (W12 S3)', ['|' + 'password|'.repeat(64_000), '|' + '---|'.repeat(64_000), '|' + 'pwd|'.repeat(64_000)].join('\n')],
+  ];
+  for (const [name, text] of adversaries) {
+    test(`${name}: redact < 400ms`, () => {
+      const ms = elapsedMs(() => { redactFindings(text, LABELED); });
+      expect(ms).toBeLessThan(400);
+    });
+  }
+});

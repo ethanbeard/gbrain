@@ -24,7 +24,7 @@ import { REPAIR_HELP, parseRepairArgs, runRepairCommand } from '../src/commands/
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 import { withEnv } from './helpers/with-env.ts';
 
-const EXPLICIT: RepairKind[] = ['google-file-modes', 'stale-atoms', 'extractor-facts', 'captured-facts', 'loop-facts', 'orphan-children', 'failed-writes', 'frontmatter'];
+const EXPLICIT: RepairKind[] = ['google-file-modes', 'stale-atoms', 'extractor-facts', 'conversation-labels', 'captured-facts', 'loop-facts', 'ontology-facts', 'orphan-children', 'failed-writes', 'frontmatter', 'timeline-comments'];
 let engine: PGLiteEngine;
 const home = mkdtempSync(join(tmpdir(), 'gbrain-repair-explicit-'));
 
@@ -109,7 +109,7 @@ describe('surfaces that list instead of run', () => {
       expect(out.explicit_kinds).toEqual(EXPLICIT.map(kind => ({ kind, code: 'explicit_kind_required', preview_command: `gbrain repair ${kind}`,
         docs: 'docs/guides/repair.md#explicit-only-repair-kinds' })));
     }
-    expect(await captured(['--all'])).toContain('Explicit-only kinds (not run without their name; preview each): gbrain repair google-file-modes; gbrain repair stale-atoms; gbrain repair extractor-facts; gbrain repair captured-facts; gbrain repair loop-facts');
+    expect(await captured(['--all'])).toContain('Explicit-only kinds (not run without their name; preview each): gbrain repair google-file-modes; gbrain repair stale-atoms; gbrain repair extractor-facts; gbrain repair conversation-labels; gbrain repair captured-facts; gbrain repair loop-facts');
   });
 
   test('gbrain repair --all --apply exits 0 when explicit kinds are the only ones left', async () => {
@@ -132,8 +132,13 @@ describe('surfaces that list instead of run', () => {
     for (const kind of EXPLICIT) expect(allLine).not.toContain(kind);
     expect(parseRepairArgs(['stale-atoms', '--apply', '--expect', 'abc'])).toMatchObject({ kind: 'stale-atoms', apply: true, expect: 'abc' });
     expect(parseRepairArgs(['extractor-facts', '--include-ambiguous'])).toMatchObject({ includeAmbiguous: true });
-    for (const args of [['timeline', '--expect', 'abc'], ['--all', '--expect', 'abc'], ['visibility', '--include-ambiguous']]) {
-      expect(() => parseRepairArgs(args)).toThrow(/applies only to an explicit-only kind/);
+    // #6188 (D8): a preview-bound kind that is not explicit-only (fences) accepts --expect, never --include-ambiguous.
+    expect(parseRepairArgs(['fences', '--apply', '--expect', 'abc'])).toMatchObject({ kind: 'fences', apply: true, expect: 'abc' });
+    for (const args of [['timeline', '--expect', 'abc'], ['--all', '--expect', 'abc']]) {
+      expect(() => parseRepairArgs(args)).toThrow(/--expect applies only to an explicit-only or preview-bound kind/);
+    }
+    for (const args of [['visibility', '--include-ambiguous'], ['fences', '--include-ambiguous']]) {
+      expect(() => parseRepairArgs(args)).toThrow(/--include-ambiguous applies only to an explicit-only kind/);
     }
   });
 

@@ -26,6 +26,21 @@ import {
 
 const SANITY_OFF = { disabled: true } as const;
 
+// #6133: inline code spans (CommonMark backtick runs, double-backtick spans included) are code too.
+describe('#6133 placeholder-date skips inline code spans', () => {
+  test('inline, table-cell and double-backtick spans give no hits; prose and frontmatter still fire', () => {
+    const content = [
+      '---', 'title: Formats', 'type: note', 'created: YYYY-MM-DD', '---', '',
+      'Use `YYYY-MM-DD` for dates.',
+      '| field | format |', '|---|---|', '| created | `2026-XX-XX` |',
+      'A span with a tick inside: `` `XX-XX` stays code ``.',
+      'This event is still 2026-XX-XX in prose.',
+    ].join('\n');
+    const hits = lintContent(content, 'test.md', { contentSanity: SANITY_OFF }).filter(i => i.rule === 'placeholder-date');
+    expect(hits.map(h => h.line)).toEqual([4, 12]);
+  });
+});
+
 describe('#3958 placeholder-date skips fenced code blocks', () => {
   test('YYYY-MM-DD inside a ``` fence is not a placeholder', () => {
     const content =
@@ -58,6 +73,49 @@ describe('#3958 placeholder-date skips fenced code blocks', () => {
     const content = '---\ntitle: T\ntype: note\ncreated: YYYY-MM-DD\n---\n\n# T\n';
     const issues = lintContent(content, 'test.md', { contentSanity: SANITY_OFF });
     expect(issues.some(i => i.rule === 'placeholder-date')).toBe(true);
+  });
+});
+
+// #6257: `## ` lines inside code fences are code, not sections.
+describe('#6257 empty-section ignores headings inside code fences', () => {
+  const FM = ['---', 'title: Meeting template', 'type: note', 'created: 2026-01-05', '---', ''];
+  const sections = (content: string) =>
+    lintContent(content, 'test.md', { contentSanity: SANITY_OFF }).filter(i => i.rule === 'empty-section');
+
+  test('a ```markdown template with `## ` lines gives no findings', () => {
+    const content = [...FM,
+      '## Template', '',
+      '```markdown',
+      '## One-line overview',
+      '## Decisions',
+      '## Action items',
+      '```', '',
+      'Copy it into each meeting note.',
+    ].join('\n');
+    expect(sections(content)).toEqual([]);
+  });
+
+  test('a real empty section after a fenced block still fires, with the right line and title', () => {
+    const content = [...FM,
+      '## Example', '',
+      '~~~',
+      '## not a heading',
+      '~~~', '',
+      '## Open `questions`', '',
+      '## Notes', '', 'Some text.',
+    ].join('\n');
+    const hits = sections(content);
+    expect(hits.map(h => [h.line, h.message])).toEqual([[13, 'Empty section: ## Open `questions`']]);
+  });
+
+  test('a section whose only body is a code block is not empty', () => {
+    const content = [...FM, '## Example', '', '```bash', 'gbrain doctor', '```', '', '## Notes', '', 'Text.'].join('\n');
+    expect(sections(content)).toEqual([]);
+  });
+
+  test('an unclosed fence masks every heading after it', () => {
+    const content = [...FM, '## Usage', '', 'Run this:', '', '```', '## Empty one', '', '## Empty two', ''].join('\n');
+    expect(sections(content)).toEqual([]);
   });
 });
 

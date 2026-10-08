@@ -14,14 +14,17 @@
  * engine-shaped check gets a stub with just `getConfig`).
  */
 import { describe, test, expect, afterAll, spyOn } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 import { bootstrapDoctorChecks, type Check } from '../src/commands/doctor.ts';
+import { finalizeCheckFixes } from '../src/commands/doctor/check-fix.ts';
 import { readBootId, readPidNs } from '../src/core/pglite-lock.ts';
 import { writeHarnessReceipt } from '../src/core/bootstrap/format.ts';
+import { buildClaudeHookCommand } from '../src/core/bootstrap/hooks.ts';
+import { GBRAIN_HARNESS_MARKER_VALUE } from '../src/core/bootstrap/host-specs.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
 import { VERSION } from '../src/version.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -274,6 +277,103 @@ describe('bootstrap_harness_health (#4043)', () => {
   }, T);
 });
 
+// ── 0b. harness hook carrier rows (#6171) ──────────────────────────────────
+
+const HOOK_BIN = '/opt/fake/gbrain';
+const HOOK_ENV = { GBRAIN_SOURCE: 'default', GBRAIN_HOOK_LANE: 'harness' };
+
+/** A receipt whose claude-code hooks target names `settingsPath` (recorded launcher, no seat). */
+function writeHookReceipt(home: string, settingsPath: string, scope = 'user'): void {
+  writeHarnessReceipt(home, harnessReceiptFixture([{ state: 'confirmed' }], {
+    targets: [
+      { host: 'claude-code', kind: 'mcp', scope: 'user', name: 'gbrain', state: 'confirmed' },
+      { host: 'claude-code', kind: 'hooks', scope, path: settingsPath, marker: GBRAIN_HARNESS_MARKER_VALUE, launcher: HOOK_BIN, seat: '', state: 'confirmed' },
+    ],
+  }));
+}
+
+function hookGroups(events: readonly string[], marked: boolean, bin = HOOK_BIN): Record<string, unknown[]> {
+  return Object.fromEntries(events.map((e) => [e, [{ hooks: [{
+    type: 'command', command: buildClaudeHookCommand(bin, e as never, HOOK_ENV), ...(marked ? { _gbrain: GBRAIN_HARNESS_MARKER_VALUE } : {}),
+  }] }]]));
+}
+
+describe('bootstrap_harness_health hook carrier (#6171)', () => {
+  const rows = (checks: Check[]) => checks.filter((c) => c.name === 'bootstrap_harness_health' && (c.details?.code || c.details?.reason));
+  /** The serve /health probe is irrelevant here; fail it at once instead of waiting out its timeout. */
+  const offlineRun = async (parent: string): Promise<Check[]> => {
+    const fetchSpy = spyOn(globalThis, 'fetch').mockRejectedValue(new Error('offline'));
+    try {
+      return await run(parent);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  };
+
+  test('a duplicated event warns harness_hook_duplicates with a consented re-run of the install\'s own flags', async () => {
+    const { parent, home } = makeHome();
+    const settings = join(parent, 'settings.json');
+    const marked = hookGroups(['SessionStart', 'UserPromptSubmit', 'PreCompact'], true);
+    const unmarked = hookGroups(['SessionStart', 'UserPromptSubmit', 'PreCompact'], false);
+    const hooks = Object.fromEntries(Object.keys(marked).map((e) => [e, [...marked[e]!, ...unmarked[e]!]]));
+    writeFileSync(settings, JSON.stringify({ hooks }));
+    const project = join(parent, 'proj');
+    writeHookReceipt(home, settings, project);
+    const [row] = rows(await offlineRun(parent));
+    expect(row?.status).toBe('warn');
+    expect(row?.details?.code).toBe('harness_hook_duplicates');
+    expect(row?.details?.events).toEqual(['SessionStart', 'UserPromptSubmit', 'PreCompact']);
+    const fix = row?.fix as { argv: string[]; consent: string[]; user_message?: string };
+    expect(fix.argv).toEqual(['gbrain', 'bootstrap', 'harness', '--project', project, '--no-capture', '--yes']);
+    expect(fix.consent).toEqual(['persistent_install']);
+    expect(fix.user_message).toBeTruthy();
+    const { parseHarnessArgs } = await import('../src/core/bootstrap/harness.ts');
+    const parsed = parseHarnessArgs(fix.argv.slice(3));
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.projects).toEqual([project]);
+    expect(parsed.noCapture).toBe(true);
+    const [rendered] = finalizeCheckFixes([row!]);
+    expect((rendered!.fix as { next: string }).next).toBe('ask_user');
+  }, T);
+
+  test('marker-stripped entries only → ok info note, never a warning', async () => {
+    const { parent, home } = makeHome();
+    const settings = join(parent, 'settings.json');
+    writeFileSync(settings, JSON.stringify({ hooks: hookGroups(['SessionStart', 'Stop'], false) }));
+    writeHookReceipt(home, settings);
+    const [row] = rows(await offlineRun(parent));
+    expect(row?.status).toBe('ok');
+    expect(row?.details?.reason).toBe('harness_hook_marker_stripped');
+    expect(row?.message).toMatch(/2 harness hook entries .* carry no _gbrain marker/);
+  }, T);
+
+  test('another launcher\'s lookalike → warn harness_hook_unowned; an unparseable carrier → warn naming the file', async () => {
+    const { parent, home } = makeHome();
+    const settings = join(parent, 'settings.json');
+    writeFileSync(settings, JSON.stringify({ hooks: { ...hookGroups(['Stop'], true), ...hookGroups(['SessionEnd'], false, '/opt/other/gbrain') } }));
+    writeHookReceipt(home, settings);
+    const [row] = rows(await offlineRun(parent));
+    expect(row?.status).toBe('warn');
+    expect(row?.details?.code).toBe('harness_hook_unowned');
+    expect(row?.details?.events).toEqual(['SessionEnd']);
+    expect(row?.fix_unavailable_reason).toBe('operator_judgement');
+
+    writeFileSync(settings, '{ "hooks": ');
+    const [broken] = rows(await offlineRun(parent));
+    expect(broken?.status).toBe('warn');
+    expect(broken?.message).toContain(settings);
+    expect(broken?.details?.reason).toBe('harness_hook_carrier_unparseable');
+  }, T);
+
+  test('one marked entry per event → no carrier row', async () => {
+    const { parent, home } = makeHome();
+    const settings = join(parent, 'settings.json');
+    writeFileSync(settings, JSON.stringify({ hooks: hookGroups(['SessionStart', 'Stop', 'SessionEnd'], true) }));
+    writeHookReceipt(home, settings);
+    expect(rows(await offlineRun(parent))).toEqual([]);
+  }, T);
+});
+
 // ── 1. hook heartbeat failure rate [B3] ─────────────────────────────────────
 
 describe('bootstrap_hooks_heartbeat thresholds', () => {
@@ -361,8 +461,7 @@ describe('bootstrap_push_health', () => {
     writePushStatus(home, JSON.stringify({ ts: new Date().toISOString(), ok: true }));
     const c = byName(await run(parent), 'bootstrap_push_health');
     expect(c?.status).toBe('warn');
-    expect(c?.message).toContain('1 commit(s) not on origin');
-    expect(c?.message).toContain(ws);
+    expect(c?.message).toBe(`last push ok (${JSON.parse(readFileSync(join(home, 'bootstrap', 'push-status.json'), 'utf8')).ts}), but ${ws} has 1 commit(s) not on origin — recent agent memory is unpushed. Run \`gbrain sources push --path ${ws}\`.`);
   }, T);
 
   test('last push FAILED → warn naming the reason (regardless of age)', async () => {
@@ -443,6 +542,8 @@ describe('bootstrap_push_health', () => {
     expect(c?.status).toBe('fail');
     expect(c?.message).toContain('DIRTY');
     expect(c?.message).toContain(ws);
+    expect(c?.message).toContain(`Run \`gbrain sources push --path ${ws}\`.`);
+    expect(c?.fix).toBeUndefined();
   }, T);
 
   test('unparseable ts → not stale (NaN guard) → ok', async () => {
@@ -805,5 +906,97 @@ describe('fail-soft umbrella', () => {
     expect(byName(checks, 'bootstrap_push_health')?.status).toBe('warn');
     expect(checks.every((c) => c.name.startsWith('bootstrap_'))).toBe(true);
     expect(checks.some((c) => c.status === 'fail')).toBe(false);
+  }, T);
+});
+
+// #5371: a managed canonical worktree refuses `gbrain sources push`, and the
+// ownership stamp gbrain writes into it is not unpushed work.
+describe('bootstrap_push_health on a managed canonical worktree (#5371)', () => {
+  const stamp = (ws: string) => writeFileSync(join(ws, '.gbrain-owner.json'), '{}');
+  const MANAGED_PROBE = 'gbrain sources writer status --probe --json';
+  function expectManagedGuidance(c: Check | undefined, ws: string): void {
+    expect(c?.message).toContain(`${ws} is a managed canonical worktree`);
+    expect(c?.message).toContain('legacy bulk push is not available');
+    expect(c?.message).toContain(MANAGED_PROBE);
+    expect(c?.message).not.toContain('gbrain sources push');
+  }
+
+  test('stale push + tree whose only change is the ownership stamp → ok, confirmed clean', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ clean: true });
+    stamp(ws);
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('ok');
+    expect(c?.message).toContain('confirmed clean');
+  }, T);
+
+  test('stale push + a real page beside the stamp → still fail, with the managed-writer remedy', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ clean: true });
+    stamp(ws);
+    writeFileSync(join(ws, 'unpushed-note.md'), 'recent agent memory\n');
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('fail');
+    expect(c?.message).toContain('DIRTY');
+    expectManagedGuidance(c, ws);
+    expect(c?.message).toContain('direct file edits here are not published');
+  }, T);
+
+  test('a recorded managed-writer refusal stays warn and points at the writer status probe', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ clean: true });
+    stamp(ws);
+    writePushStatus(home, JSON.stringify({
+      ts: new Date().toISOString(), ok: false, repoRoot: ws,
+      reason: 'writer_coordinator_required: This path belongs to the managed canonical worktree.',
+    }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('FAILED');
+    expectManagedGuidance(c, ws);
+  }, T);
+
+  test('fresh push but AHEAD of origin (wave 9 path) → warn with the managed-writer remedy', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ ahead: true });
+    stamp(ws);
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: new Date().toISOString(), ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('1 commit(s) not on origin');
+    expectManagedGuidance(c, ws);
+  }, T);
+
+  test('stale push + failed git probe → still warn "unverified", never ok, with the managed-writer remedy', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace();
+    stamp(ws);
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const c = byName(await run(parent), 'bootstrap_push_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('git probe failed');
+    expectManagedGuidance(c, ws);
+  }, T);
+
+  test('the managed finding renders the agent contract: a read-only probe with a doctor verify', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace({ dirty: true });
+    stamp(ws);
+    writeReceipt(home, ws);
+    writePushStatus(home, JSON.stringify({ ts: STALE_TS, ok: true }));
+    const [c] = finalizeCheckFixes((await run(parent)).filter((x) => x.name === 'bootstrap_push_health'));
+    expect(c?.status).toBe('fail');
+    expect(c?.fix_unavailable_reason).toBeUndefined();
+    expect(c?.fix).toMatchObject({
+      next: 'run', command: MANAGED_PROBE, consent: [], actor: 'agent',
+      verify: { argv: ['gbrain', 'doctor', '--only', 'bootstrap_push_health', '--json'] },
+    });
+    expect(String((c?.fix as { why?: string }).why)).toContain('changes nothing');
   }, T);
 });

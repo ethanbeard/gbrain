@@ -69,6 +69,10 @@ of making a duplicate.
 | <a id="managed_pull_skipped"></a>`managed_pull_skipped` (cycle warn); doctor `sync_freshness` "upstream unknown" or "upstream N commit(s) ahead" | `managed_pull_skipped` | A managed brain never runs `git pull` inside a cycle: Git pull needs an explicit drained maintenance window, so an explicit `gbrain sync` without `--no-pull` is refused with `writer_coordinator_required`. An unattended cycle asked to pull (autopilot passes `pull: true`, `gbrain dream --pull`) instead syncs the checkout as it is and reports it: the sync phase result carries `details.upstream_refresh` (`pulled`, `failed`, `skipped_managed` or `not_requested`), and when the checkout tracks an upstream the phase is `warn` with `details.warning` (`code`, `cause`, `fix`, `docs`). Every sync also records the checkout's last upstream observation (the upstream commit, when it was last fetched or pushed, and how many upstream commits the synced commit lacks) in the source row. Doctor `sync_freshness` reports that separately from the local projection: a source with a `remote_url` whose observation is missing or older than 24 hours is "upstream unknown", and any source whose observation saw upstream commits it has not synced is "behind"; neither is reported fresh. `details.upstream_unknown_count` and `details.upstream_behind_count` count them. | `gbrain sources refresh <source>` (the printed `fix` fills in the source). It drains writes to the source's checkout, fast-forwards it to its upstream and runs the managed sync for every source bound to that checkout; see [worktree refresh refusals](#worktree-refresh-refusals) for what it can refuse. On a brain that is not managed, `gbrain sync --source <source>` pulls and records the observation. |
 | <a id="facts_absorb_write_refused"></a>`facts_absorb_write_refused (<code>)`; `ingest_log` `write_refused: <code> …` | `facts_absorb_write_refused` | A durable `facts-absorb` job extracted facts but the write path refused to store them, for example `writer_coordinator_required` because the entity's Markdown file sits in a claimed canonical worktree before `sources writer activate`, or `permission_denied`, `invalid_params` or `writer_registration_required`. These refusals do not change on retry, so the job goes straight to `dead` on its first attempt instead of re-running inference; on a brain that is not yet activated, a job whose source root is a claimed worktree is refused before extraction starts, so it makes no model call; the `facts:absorb` row in `ingest_log` (and doctor `facts_extraction_health`) records `write_refused` with the real code, not a provider failure. The source page itself was already saved. | Fix the named cause first: `gbrain sources writer status <source>`, then finish the [claim and activate runbook](../architecture/topologies.md#claim-and-activate-runbook) for a claimed worktree, or fix the grant. Then `gbrain jobs retry <job id>` (the error names the id). |
 | <a id="no_pricing"></a>`no_pricing` | `no_pricing` | A cost cap you set (`--max-cost`, `--max-usd`, `--max-cost-usd`, or an explicit cap in config such as `cycle.extract_atoms.budget_usd`) cannot be enforced, because gbrain has no price for the model the run was about to call. The run stops before that call. Under a default cap an unpriced model warns and runs instead. The message names the model, provider and kind, and JSON output carries the same guidance as fields: `code`, `model`, `provider`, `kind`, `units`, `lookup`, `register_command`, `register_scope` and `docs`. | Look up the provider's current price for the model, for example by searching the web for its pricing page. A chat model needs USD per 1M input tokens and USD per 1M output tokens; an embedding or reranker model needs USD per 1M tokens. On the brain host, run `gbrain pricing set <model> --input <usd> --output <usd> --source <pricing-page-url>` (or `--rate <usd>`), then retry. An agent connected over MCP cannot register prices: give the command to the brain's operator. See [registering a model price](../operations/spend-controls.md#registering-a-model-price). |
+| <a id="managed_raw_upload"></a>raw upload on a managed brain | `writer_coordinator_required` | `gbrain files upload-raw` of a small (git-storage) file whose `.raw/` destination is inside a managed canonical worktree. The persistence coordinator does not publish raw files yet, so the worktree refuses writes from outside it; starting a `gbrain serve` owner does not change that. The refusal comes before anything is created: no `.raw/` directory and no `files` row. With no storage backend, `file_upload` for such a page no longer suggests `upload-raw`. | Configure `storage` (supabase, s3 or local) in the gbrain config, then run the printed `gbrain files upload <file> --page <slug>`; check it with `gbrain files list <slug>`. |
+| <a id="timeline_rows_would_be_removed"></a>`timeline_rows_would_be_removed` | `timeline_rows_would_be_removed` | A remote `put_page` (or a `put_pages` entry) has no Timeline section at all — no `<!-- timeline -->` sentinel and no `## Timeline` or `## History` heading — and would delete dated entries the page has, including rows `add_timeline_entry` added. `put_page` content replaces the whole page, so the omission must be explicit. Nothing was written. A section that is present but empty is a deliberate delete and is not refused; a local `gbrain put` without `--expected-revision` keeps the rows instead. | Re-read with `get_page include_content:true`, keep the Timeline section and resubmit with a new `request_id`; to remove every dated entry on purpose, resubmit the same content with `drop_timeline: true` (on put_pages, per entry). A successful write that deletes rows reports `timeline_rows_removed {count, earliest, latest, warning, fix}` (dates only); `get_versions` then `revert_version` restores them as new rows. |
+| <a id="reconcile-private-facts"></a>reconcile private facts | `permission_denied` | `gbrain sources reconcile --apply` (and its preview) found a `## Facts` row that would edit, renumber or change the visibility of a stored private fact, copy a stored private claim into a row under another visibility, or copy a stored private row's context (24 characters or longer) verbatim into a world row. A row is identified by its row number and claim, so a world row that only shares a private row's claim is not a private row and publishes. The refusal names the row number, never its text. It guards against verbatim copies only; reworded text is not detected, so it is not a confidentiality proof. Sources are not compared, because rows share provenance such as "Slack import". Nothing was written. | Read the stored page with the printed `gbrain get --source <id> -- <slug>`, keep the named row as stored in the file (or remove the copied text), then run a fresh `gbrain sources reconcile <id> <slug> --preview` and apply it. Change private facts with `remember` and `forget`. |
+| <a id="maintenance_backpressure"></a>`maintenance_backpressure` (exit 12) | `maintenance_backpressure` | A managed maintenance run (`gbrain extract-conversation-facts`, its cycle phase or job) publishes each page as its own request, under the same local CLI writer your own CLI writes use. Before the run it counts the requests the whole run plans; before each page's model work it checks again. It stops admitting once the writer's outstanding requests, reserved receipt bytes (`persistence.limits.principal_terminal_bytes`; each request reserves 16 KiB until its receipt compacts after the retention window) or permanent request ids (`persistence.limits.principal_lifetime_ids`; never freed) would pass 80% of their limit, so the last 20% stays free for your other writes. The message names the resource. Pages already published keep their facts and nothing is half-written. | Outstanding requests: read them with `gbrain sources writer status --source <id> --json`; a resident `gbrain serve`, or the next CLI run, publishes them, then rerun the same command. Receipt bytes or request ids: run the smaller batch the message prints (`gbrain extract-conversation-facts --source-id <id> --limit <n>`), or wait for receipts to compact; raising the named `persistence.limits.*` key is the user's call. |
 
 ### Other error codes
 
@@ -149,9 +153,204 @@ with each file and fix the ones that need no guessing."*
 | <a id="managed_image_sync_unsupported"></a>`managed_image_sync_unsupported` | With multimodal embedding on (`embedding_multimodal` / `GBRAIN_EMBEDDING_MULTIMODAL`), sync admits image files, but managed sync has no image importer yet. Each image import is held instead of refusing the whole sync (#5493); deleting or renaming an image still reconciles its page. These holds count as missing coverage (the image is not searchable) but never escalate, because they are not a content fault. | Nothing is broken; keeping them held is fine. To stop holding images, leave them out of the source (`gbrain config get sync.exclude`, then `gbrain config set sync.exclude '<current list>,**/*.png'`) or turn multimodal embedding off; either clears the holds on the next `gbrain sync --source <source> --no-pull`. A held image is re-screened when it changes and on `gbrain sources retry-held <source>`. |
 | <a id="content_rejected"></a>`content_rejected` | The content-sanity gate matched junk and the operator set `content_sanity.junk_disposition` to `reject`, so the file is never imported and always visible. | Remove the matched junk from the file, or ask the user whether `junk_disposition` should go back to `quarantine`; that setting is the user's decision. |
 | <a id="rename_held"></a><a id="rename_held-rename_source_changed"></a>`rename_held` (`rename_source_changed`) | A renamed file's hold cleared, but the page it was renamed from changed after the rename was recorded, so the page did not move. | `gbrain repair frontmatter --source <source> --include-ambiguous` proposes re-binding the rename to the old page's current revision; apply after the user agrees. Or restore the old file name. |
+| <a id="concurrent_write"></a>`concurrent_write` | Managed sync was importing a newer Git version of the file while a database-only write (write-through off, a sandboxed or derived write) committed a different version of the same page, so the two diverge (#6194). The proof is the page's revision itself: it was written by a committed non-sync request for that page. Neither version was overwritten: the page keeps the database version, the file is held and the rest of the source syncs. A conflict no such request explains still blocks with `revision_conflict`. | `gbrain sources status <source>` names the page and the competing request. Preview with `gbrain sources reconcile <source> <slug> --preview`, decide with the user which content wins, apply the resolved preview, then `gbrain sources retry-held <source>` and `gbrain sync --source <source> --no-pull` re-screen the file. A new commit of the file re-screens it too. |
 | <a id="parser_regression"></a>`parser_regression` | With `sync.parser_regression=hold`, a file whose exact bytes imported under an earlier gbrain is now refused. This is a gbrain bug. | Report it with the gbrain version, the file and the code; upgrade or pin the last good version. After a fixed gbrain is installed, `gbrain sources retry-held <source>` and then `gbrain sync --source <source> --no-pull` re-screen it. |
 | <a id="sync_parser_regression"></a>`sync_parser_regression` | Sync stopped without advancing because it would hold a file whose exact bytes imported before (default `sync.parser_regression=stop`). This is a gbrain bug, not a content problem. | Report it with the gbrain version, the file and the code; upgrade or pin the last good version, then `gbrain sync --source <source> --no-pull --retry-failed`. To keep syncing meanwhile, `gbrain config set sync.parser_regression hold` (ask the user). |
-| <a id="changed_since_preview"></a>`changed_since_preview` | A `gbrain repair frontmatter --apply` found a file, its proposed change or its page different from what the preview showed, so that file was not written. | Preview again, show the user the new diff and approve its new hash. |
+| <a id="changed_since_preview"></a>`changed_since_preview` | A hash-bound repair apply (`gbrain repair frontmatter --apply --expect <hash>`, `gbrain repair fences --apply --expect <hash>`) found a file, its proposed change or its page different from what the preview showed, so that item was not written; the rest of the approved set still applied. | Preview again with the same selection and apply the new hash. For frontmatter, show the user the new diff first; a fence repair needs no extra consent ([fence reason](#fence-changed_since_preview)). |
+
+<a id="invalid_fence"></a>
+### Fence holds (`invalid_fence`)
+
+A page's facts and takes fences are its structured rows
+([format](fence-format.md)). A coordinated write (managed sync, managed
+`gbrain import`, `put_page` on a managed brain, managed file repair) refuses a
+fence it cannot import without dropping or guessing rows: code
+`invalid_fence`, wire `error` `invalid_params` (`take_row_collision` for a
+stored-row collision). During managed sync the file is **held** instead and
+the rest of the source syncs. The message reads
+`Fence <reason>: in the <facts|takes> fence (<body|timeline>), row(s) N, column(s) C, at line L.`
+(the parts that apply; the line counts within the section), then the fix. It
+names fence, section, row numbers, column names and lines only, never a claim,
+holder or cell. A failed receipt keeps the location in
+`write_error_detail.fence` (row numbers stay on the brain host).
+
+<a id="fence-hold"></a>**What a fence hold carries.** Every surface that shows
+a hold (`gbrain sources status <source>`, doctor `git_held_files`,
+`get_page.file_held`, the sync result) gives the same location-only fields:
+
+- `fence`: `reason`, `fence` (`facts` or `takes`), `section` (`body` or
+  `timeline`), `rows` (row numbers), `columns` (column names) and `line` (the
+  first bad line, counted within the section).
+- The reason's `tier`, the repair that clears it (`deterministic`,
+  `resolver`, `llm` or `manual`), and `auto_retry`, whether the maintenance
+  run clears or retries it with no one acting. The table below lists both
+  for every reason.
+- After a repair has tried the file, `fence_repair`: that attempt's `reason`,
+  `tier` and `at`, `next_attempt_after` (when the maintenance run tries it
+  again; null when it will not), and `gate` and `rows` when a proposed repair
+  was rejected.
+- `fix`, the next command (a single held file's preview,
+  `gbrain repair fences --source <source> --only <path>`), and `docs`, the
+  reason's anchor below.
+
+**What gbrain fixes by itself.** Before refusing or holding, every write path
+runs the fence through a lossless normalizer: a missing end marker with only
+blank lines after the table, two-dash takes markers above a table, zero,
+negative or duplicate row numbers (new numbers come after every number the
+page and its stored rows ever used), header aliases and column order,
+header-level defaults (`confidence 1.0`, `notability medium`,
+`visibility private`), enum synonyms (`critical` → `high`; `public` → `world`
+only on a world-visible page, else `private`), invented facts kinds (mapped to
+the closest kind, the original word kept in `context`), a short list of takes
+kind synonyms, assistant holders (`System`, `assistant` → `brain`) and percent
+confidences ([every rule](fence-format.md#normalized)). It never changes a
+claim, an existing row number or a valid cell, and never makes a row more
+visible. A fence it fixes completely is written in its normalized form:
+managed sync commits the rewritten file (a read-only mirror keeps it
+database-only; a company-brain source refuses `source_writeback_required`
+naming the fence), and the result reports `fences_normalized` (`count`,
+`by_class`, `writers`, sample paths for local callers). A write also carries
+one `fence_normalized` coaching notice: the stored page differs from what was
+sent, so re-read it with `get_page` before editing; `remember` and
+`takes_add` write rows that never need it. `gbrain sync --dry-run` lists
+`would_normalize` beside `would_hold`. `gbrain config set fences.normalize false`
+turns normalization off: a fixable fence is then held or refused like any
+other.
+
+What the normalizer cannot fix exactly is refused or held as below; a refusal
+lists every blocking problem in `fence_issues`
+(`[{ fence, section, row, column, line, class, allowed }]`, where `allowed`
+is the column's vocabulary), so the caller can correct all of them at once.
+
+Legacy (unmanaged) sync, `gbrain import` on an unmanaged brain and other
+direct imports store a fence the normalizer cannot fix as written (bad rows
+skipped) and never hold it; the result reports it in `fence_issues`. Two
+documented exceptions keep blocking with the typed refusal instead of
+holding: `sync.holds=fail`, and company-brain sources, which never hold and
+never rewrite repository files (fix the fence in the repository and commit).
+
+<a id="fence-repair"></a>**Repair.** Fence holds clear by themselves: the
+maintenance run's `fence_repair` phase repairs held files and stored pages
+whose fences do not parse, on the brain's owner host. A repaired file is
+committed like any page write on a managed source; on a legacy source it is
+backed up under `~/.gbrain/backups/` and left for you to commit. To see what
+it would change, or to do it now:
+
+```bash
+gbrain repair fences --source <source>                          # preview: read-only, no model call
+gbrain repair fences --source <source> --apply --expect <hash>  # the apply command the preview prints
+```
+
+The preview lists each held file and stored page with its reasons, rows and
+columns, the tier that fixes it and the estimated model cost against the
+remaining daily cap, and prints the apply command with its `--expect` hash.
+Applying needs no extra consent. Tier 1 and 2 changes are exact rules; Tier 3
+sends only the fence header and the rows it must realign (never valid rows,
+never the rest of the page) to the repair model (`models.fence_repair`, or
+unset the first measured model with a key: `openai:gpt-6.1-sol`, else
+`anthropic:claude-opus-5-5`), within `fences.repair.max_usd_per_page` ($0.30) and
+`fences.repair.max_usd_per_day` ($1.00) ([spend](../operations/spend-controls.md#the-gates)).
+Every tier's output passes [gates (a) to (g)](fence-format.md#gates) before
+anything is written. `--no-llm` keeps a run to the free tiers and
+`--max-usd <n>` lowers its cap; raising spend
+(`gbrain config set fences.repair.max_usd_per_day <usd>`) or turning model
+repair back on (`gbrain config set fences.repair.llm true`) is the user's
+call. MCP and thin-client callers cannot run a repair: the hold's fix names
+the owner-host command to hand to the user. Walkthrough with real output:
+[fence repair](repair.md#fences).
+
+A `manual` reason needs a person, because gbrain never guesses it: read the
+page (`gbrain get --source <source> -- <slug>`), edit only the named fence in
+the file (never the frontmatter), commit, then
+`gbrain sync --source <source> --no-pull`. `gbrain sources status <source>`
+lists every fence hold with its location. To add rows without hand-editing a
+table, use `remember` (facts) or `takes_add` (takes).
+
+**Say to your agent:** *"Sync held a page because of its facts table. Show me
+which rows are wrong and fix them."*
+
+<a id="fence-integrity"></a>**How many are left.** `gbrain doctor --only fence_integrity`
+counts, per source, every malformed fence still waiting, once each: a held
+file, a stored page whose fence does not parse (for example one an older
+release imported as written), and a checkout file not yet synced. Each is
+split by the tier that would clear it: `deterministic` (the normalizer fixes
+it the next time the file syncs or the page is written), `resolver` (a
+holder name to resolve), `llm` (a table only a rewrite can realign) and
+`manual` (an edit only a person can decide). It also shows the oldest hold's
+age, the fences normalized in the last 7 days with their top writers (a
+source at 20 or more warns: something keeps writing malformed fences) and the
+model-repair caps `fences.repair.max_usd_per_page` (default $0.30) and
+`fences.repair.max_usd_per_day` (default $1.00) with today's spend. Each run
+scans for at most `GBRAIN_DOCTOR_FENCE_TIMEOUT_MS` (10 s) and resumes where the
+last one stopped; until a scan finishes the check is `partial` and never `ok`.
+The maintenance run repairs the `deterministic` and `resolver` ones by itself,
+and the `llm` ones while model repair is on and within the caps;
+`gbrain repair fences --source <source>` previews the plan.
+
+**Say to your agent:** *"How many broken facts or takes tables are left in my brain?"*
+
+Each reason's **Tier** is the repair that clears it (`-` when that depends on
+the page, which is screened again); **Auto** says whether the maintenance run
+clears or retries it with no one acting.
+
+| `invalid_fence` reason | What it means | Tier | Auto | Recovery |
+| --- | --- | --- | --- | --- |
+| <a id="fence-header_unmapped"></a>`header_unmapped` | The header has a column with no canonical name and no known spelling, so its cells cannot be placed. | `llm` | yes | Repaired by the next maintenance run (preview: `gbrain repair fences --source <source>`). By hand: rename each column to its canonical name. Format: [header spellings](fence-format.md#header-spellings). |
+| <a id="fence-no_header"></a>`no_header` | The fence has table rows but no header row naming `claim` and `kind`. | `llm` | yes | Repaired by the next maintenance run. By hand: add the canonical header as the first table line. Format: [markers](fence-format.md#markers). |
+| <a id="fence-row_before_header"></a>`row_before_header` | Rows sit above the header row. | `llm` | yes | Repaired by the next maintenance run. By hand: move them below the header. Format: [markers](fence-format.md#markers). |
+| <a id="fence-short_row"></a>`short_row` | A row is missing a cell in the middle, so its columns are ambiguous. A row short only in its optional trailing cells parses. | `llm` | yes | Repaired by the next maintenance run. By hand: add the missing cells so every column lines up. Format: [facts](fence-format.md#facts-layouts), [takes](fence-format.md#takes-layouts). |
+| <a id="fence-extra_cells"></a>`extra_cells` | A row has more cells than the header, and removing empty cells does not line it up (stray empty cells with one valid removal are rewritten by themselves). Often an unescaped `\|` cut a cell, usually the claim, in two; no gate can tell that from a misplaced cell, so it is never sent to the model. In a fence with no header, a row that starts with a row number is read by position the same way. | `manual` | no | Join the cut cell with `\|`, or remove the extra cell. Format: [facts](fence-format.md#facts-layouts), [takes](fence-format.md#takes-layouts). |
+| <a id="fence-claim_split"></a>`claim_split` | A facts `kind` cell holds text, not a kind word (more than three words, sentence punctuation, a link or strikethrough): usually the end of a claim an unescaped `\|` cut in two, with the kind cell missing. gbrain does not store it as a kind note. In a fence with no header, a row that starts with a row number is read by position, so its third cell is the kind. | `manual` | no | Join the text back into the claim with `\|` and write the kind. Format: [facts](fence-format.md#facts-columns). |
+| <a id="fence-holder_unresolved"></a>`holder_unresolved` | A takes `who` cell is not `world`, `brain`, `people/<slug>` or `companies/<slug>` (for example a person's display name). | `resolver` | yes | Rewritten by the next maintenance run when it resolves to exactly one verified `people/` or `companies/` page (never a private page on a world-visible page). Otherwise write one of those forms by hand. Format: [holders](fence-format.md#holders). |
+| <a id="fence-missing_begin"></a>`missing_begin` | An end marker has no begin marker before it. | `manual` | no | Add the begin marker above the table, or delete the stray end marker. Format: [markers](fence-format.md#markers). |
+| <a id="fence-split_rows"></a>`split_rows` | A fence has no end marker and its rows are split by blank lines or text, so gbrain cannot tell which rows belong to it. | `manual` | no | Join the rows into one table and add the end marker after the last row. Format: [markers](fence-format.md#markers). |
+| <a id="fence-unclosed_trailing_content"></a>`unclosed_trailing_content` | A fence has no end marker and other text follows its table, so closing it automatically could expose text the privacy boundary hides. | `manual` | no | Add the end marker directly after the last table row, or wrap a mere mention of the marker in backticks. Format: [markers](fence-format.md#markers). |
+| <a id="fence-marker_near_miss"></a>`marker_near_miss` | A line uses the two-dash takes marker (`<!-- gbrain:takes:begin -->`) or mentions it with no takes table after it. Two-dash markers directly above a takes table are rewritten by themselves. | `manual` | no | Use the exact three-dash markers around the takes table, or wrap a mere mention in backticks. Format: [markers](fence-format.md#markers). |
+| <a id="fence-repeated_marker"></a>`repeated_marker` | A body or timeline section has a second begin or end marker for the same fence outside code. | `manual` | no | Keep one begin and one end marker per fence in that section, with every row in one table. Format: [markers](fence-format.md#markers). |
+| <a id="fence-takes_in_facts"></a>`takes_in_facts` | A facts fence holds a takes table. | `manual` | no | Move the rows into a takes fence (or add them with `takes_add`), or rewrite them as facts rows. Format: [takes](fence-format.md#takes-columns). |
+| <a id="fence-superseded_ambiguous"></a>`superseded_ambiguous` | Two rows share a number and a `superseded by #N` reference names that number, so renumbering could repoint the reference. | `manual` | no | Decide which row keeps the number, give the other a number above every number on the page, and fix the reference. Format: [row numbers](fence-format.md#row-numbers). |
+| <a id="fence-enum_unmapped"></a>`enum_unmapped` | A facts `kind`, `visibility` or `notability` cell holds a value outside the allowed list and its synonyms (the message names the column and the allowed values). | `manual` | no | Use one of the allowed values. Format: [facts](fence-format.md#facts-columns). |
+| <a id="fence-weight_missing"></a>`weight_missing` | A takes row has no `weight`, or the header has no weight column. Takes have no default weight. | `manual` | no | Add a weight from 0 to 1. Format: [takes](fence-format.md#takes-columns). |
+| <a id="fence-holder_missing"></a>`holder_missing` | A takes row has no holder, or the header has no `who` column. | `manual` | no | Add the holder: `world`, `brain`, `people/<slug>` or `companies/<slug>`. Format: [holders](fence-format.md#holders). |
+| <a id="fence-confidence_out_of_range"></a>`confidence_out_of_range` | A facts `confidence` or takes `weight` is not a number from 0 to 1 (a percent such as `85%` is rewritten by itself). | `manual` | no | Write the intended value as a decimal such as 0.8. Format: [facts](fence-format.md#facts-columns), [takes](fence-format.md#takes-columns). |
+| <a id="fence-claim_value_invalid"></a>`claim_value_invalid` | A facts `claim_value` is not a number. | `manual` | no | Write a number (1,234 separators and a k/M/B suffix are allowed) or leave it empty. Format: [facts](fence-format.md#facts-columns). |
+| <a id="fence-takes_kind_unsupported"></a>`takes_kind_unsupported` | A takes `kind` is not fact, take, bet or hunch and is not one of the few synonyms gbrain maps (a kind the schema pack declares but the parser does not accept included). gbrain never chooses a takes kind for you. | `manual` | no | Use one of the four kinds. Format: [takes](fence-format.md#takes-columns). |
+| <a id="fence-unparseable"></a>`unparseable` | The fence does not parse cleanly: most often it has no end marker, or a row number is not a positive whole number (`column #`). | `-` | yes | Usually repaired by itself on the next write or maintenance run. By hand: add the end marker directly after the last table row, or fix the named row number. Format: [markers](fence-format.md#markers). |
+| <a id="fence-row_collision"></a>`row_collision` | Two rows of the same fence kind share a row number, in one fence or across the body and timeline (`rows` lists the numbers). | `-` | yes | Usually renumbered by itself. By hand: give one row a new number above every number used on the page. Format: [row numbers](fence-format.md#row-numbers). |
+| <a id="fence-quoted_fence_rows"></a>`quoted_fence_rows` | A fence sits inside a code block or inline code span, so readers treat it as an example and importing would remove the stored rows it holds. | `-` | no | Move the fence out of the code, or delete the fence to remove its rows. Format: [markers](fence-format.md#markers). |
+| <a id="fence-stored_row_collision"></a>`stored_row_collision` | A new takes row's number already names a different stored take that is not in the page's fence (wire `take_row_collision`). | `-` | no | Renumber the new row, or add the stored take back to the fence. Format: [row numbers](fence-format.md#row-numbers). |
+| <a id="fence-withdrawn_claim_in_malformed_fence"></a>`withdrawn_claim_in_malformed_fence` | A facts fence that does not parse holds a claim the user withdrew, so gbrain cannot tell whether the row should stay withdrawn. | `-` | yes | Repair the fence so it parses (`gbrain repair fences --source <source>` previews it); the withdrawn row then stays withdrawn. Format: [examples](fence-format.md#examples). |
+| <a id="fence-target_fence_malformed"></a>`target_fence_malformed` | A verb that appends to or edits a page (`remember`, `extract_facts`, `takes_*`, `facts relink`, `edit_page`) found that page's stored fence does not parse and cannot be normalized in the same write (`edit_page` and the other takes writes never normalize). Memory verbs keep their v1 code (`invalid_params`, `detail: invalid_fence`). | `-` | yes | The maintenance run repairs the stored fence; to do it now, `gbrain repair fences --slug <slug>` on the brain host. Or read the page, fix the named fence (or write the whole page with `put_page`, which normalizes what it can and names every row it cannot), then retry with a new request_id. Format: [examples](fence-format.md#examples). |
+| <a id="fence-prepare_time"></a>`prepare_time` | Hold only: the file passed the content screen, but its fence was refused while it was prepared against the stored page (a stored-row collision, a withdrawn claim, rows quoted in code). `fence.reason` names which. Managed sync holds it in the same run instead of blocking. | `-` | yes | Fix it as its `fence.reason` says. After a database-side fix (for example removing the conflicting take), `gbrain sources retry-held <source>` re-checks the file. Format: [what gbrain never guesses](fence-format.md#never-guessed). |
+| <a id="fence-normalizer_failed"></a>`normalizer_failed` | The normalizer or its validator failed on this fence (a gbrain bug); the fence was not rewritten. A coordinated write refuses; a legacy import stores the page as written. | `manual` | no | Run `gbrain doctor --json` and report it with the gbrain version; an upgrade re-screens the file. Format: [what gbrain fixes](fence-format.md#normalized). |
+| <a id="fence-llm_unavailable"></a>`llm_unavailable` | The repair model timed out, was rate-limited or returned a server error. | `llm` | yes | Nothing to do: the next maintenance run (or `gbrain repair fences --apply`) retries. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-llm_empty"></a>`llm_empty` | The repair model returned nothing for the fence. | `llm` | no | Fix the named rows by hand. The same file is not sent to the model again until it, the model (`models.fence_repair`) or gbrain's repair rules change. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-llm_refused"></a>`llm_refused` | The repair model declined to repair the fence. | `llm` | no | Fix the named rows by hand; the same file is not sent to the model again until it or the model changes. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-llm_malformed"></a>`llm_malformed` | The repair model did not return exactly one table, or wrote text outside it. | `llm` | no | Fix the named rows by hand; the same file is not sent to the model again until it or the model changes. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-llm_truncated"></a>`llm_truncated` | The repair model stopped before finishing; its output is rejected even when it parses. | `llm` | no | Fix the named rows by hand; the same file is not sent to the model again until it or the model changes. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-llm_declined"></a>`llm_declined` | The repair model answered HOLD: a row has more than one reasonable reading (two values for one column, or a cell that fits two columns), so it declined to guess. | `llm` | no | Fix the named rows by hand; the same file is not sent to the model again until it, the model or the rules change. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-llm_disabled"></a>`llm_disabled` | Model repair is off (`fences.repair.llm false`), so a fence only Tier 3 can realign waits. | `llm` | no | Fix the named rows by hand, or ask the user before turning model repair back on: `gbrain config set fences.repair.llm true` (it spends within the caps). Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-no_measured_model"></a>`no_measured_model` | `models.fence_repair` is unset and no model the fence-repair eval measured as accurate enough (`openai:gpt-6.1-sol`, `anthropic:claude-opus-5-5`, `anthropic:claude-fable-5-1`) has a provider key on this brain, so model repair is off by default. | `llm` | no | Fix the named rows by hand, or ask the user which model to trust, then `gbrain config set models.fence_repair <provider:model>` (an explicit model always runs). Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-budget_exhausted"></a>`budget_exhausted` | The page's repair estimate is over `fences.repair.max_usd_per_page` or over what is left of `fences.repair.max_usd_per_day` today (UTC). A repair run stops with exit 1 naming the spend, the cap, the reset time (next 00:00 UTC) and the pages waiting. | `llm` | yes | Nothing to do: repairs resume after 00:00 UTC. Raising a cap is the user's call: `gbrain config set fences.repair.max_usd_per_day <usd>` (or `fences.repair.max_usd_per_page`). Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-no_pricing"></a>`no_pricing` | A spend cap the user set is in force and gbrain has no price for the repair model, so no call was made. Under the default caps an unpriced model runs, metered at an estimated ceiling. | `llm` | no | Look up the model's per-token price and register it on the brain host: `gbrain pricing set <model> --input <usd> --output <usd>` ([registering a model price](../operations/spend-controls.md#registering-a-model-price)). The next run repairs it. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-ledger_unavailable"></a>`ledger_unavailable` | The spend ledger could not be read or written, so no model call was made. | `llm` | yes | Nothing to do: the next run retries. If it keeps happening, check the database with `gbrain doctor --json`. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-owner_unavailable"></a>`owner_unavailable` | This host is not the brain's owner host, and fence repairs run only there. | `-` | yes | Run `gbrain repair fences` on the owner host (`gbrain sources writer status <source>` names it). A remote caller hands that command to the user. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-owner_cli_required"></a>`owner_cli_required` | The maintenance worker may not apply this managed-file repair; it must be applied from the owner host's CLI. | `-` | no | On the owner host: `gbrain repair fences --source <source>`, then the printed apply command. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-sync_in_progress"></a>`sync_in_progress` | A managed sync of the source has an unfinished cursor, or a queued sync request names the file, so the repair skipped it. | `-` | yes | Nothing to do: the next run retries. To finish the sync now: `gbrain sync --source <source> --no-pull`. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-time_budget"></a>`time_budget` | The repair run reached its time budget (the maintenance phase stops at the smaller of 300 s and a third of the job's remaining deadline). | `-` | yes | Nothing to do: the next run resumes where it stopped. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-changed_since_read"></a>`changed_since_read` | The file changed after the repair read it, so nothing was written. | `-` | yes | Nothing to do: the next run reads it again. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-changed_since_preview"></a>`changed_since_preview` | `gbrain repair fences --apply --expect <hash>` found the file's bytes or the page's revision changed since the preview, so that item was not applied. | `-` | no | Preview again with the same selection and apply the new `--expect` hash. Format: [tiers](fence-format.md#never-guessed). |
+| <a id="fence-still_invalid"></a>`still_invalid` | Gate (a): the proposed repair still does not parse cleanly. Nothing was written. | `-` | no | Fix the named rows by hand. Format: [gates](fence-format.md#gates). |
+| <a id="fence-claim_changed"></a>`claim_changed` | Gate (b): the proposed repair changed claim text. Nothing was written. | `-` | no | Fix the named rows by hand. Format: [gates](fence-format.md#gates). |
+| <a id="fence-row_number_changed"></a>`row_number_changed` | Gate (c): the proposed repair changed or dropped an existing valid row number. Nothing was written. | `-` | no | Fix the named rows by hand. Format: [gates](fence-format.md#gates). |
+| <a id="fence-visibility_loosened"></a>`visibility_loosened` | Gate (d): the proposed repair made a row more visible. Nothing was written. | `-` | no | Fix the named rows by hand; ask the user which visibility is intended, never widen it yourself. Format: [gates](fence-format.md#gates). |
+| <a id="fence-row_count_changed"></a>`row_count_changed` | Gate (e): the proposed repair added or dropped a row, or left one outside the fence. Nothing was written. | `-` | no | Fix the named rows by hand. Format: [gates](fence-format.md#gates). |
+| <a id="fence-cell_changed"></a>`cell_changed` | Gate (f): the proposed repair changed a cell no named rule allows (a valid weight, holder, date, source, confidence or context). Nothing was written. | `-` | no | Fix the named columns of the named rows by hand. Format: [gates](fence-format.md#gates). |
+| <a id="fence-protection_loosened"></a>`protection_loosened` | Gate (g): the proposed repair would show text the privacy boundary hid before it. Nothing was written. | `-` | no | Add the end marker where the fence really ends. Format: [gates](fence-format.md#gates). |
+
+A managed source a fence refusal blocked before this release recovers on its
+next sync with no command: the file is held and the rest imports
+(`gbrain sync --source <source> --no-pull` does it now).
 
 A source that a gbrain older than v0.60.47.0 blocked on one of these refusals
 recovers on its next sync (scheduled or manual) with no ledger surgery: the blocked request is
@@ -180,8 +379,9 @@ this anchor (`--json` puts them in one object on stdout); the command exits 1.
 | --- | --- | --- | --- |
 | <a id="refresh_not_managed"></a>`refresh_not_managed` | `refresh_not_managed` | The brain is not managed, or the source has no claimed checkout. Plain sync already pulls such a source, so there is nothing to coordinate. | `gbrain sync --source <source>`. |
 | <a id="refresh_not_owner"></a>`refresh_not_owner` | `refresh_not_owner` | This host is not the source's registered owner, and only the owner may move its checkout. | Run `gbrain sources refresh <source>` on the owner host; `gbrain sources writer status <source>` names it. |
-| <a id="refresh_no_upstream"></a>`refresh_no_upstream` | `refresh_no_upstream` | The checkout's branch tracks no upstream (or HEAD is detached), so there is nothing to fast-forward to. | `git -C <checkout> branch --set-upstream-to <remote>/<branch>` (the fix fills in the real values), then retry. |
+| <a id="refresh_no_upstream"></a>`refresh_no_upstream` | `refresh_no_upstream` | The checkout's branch tracks no upstream, HEAD is detached, or the checkout is not a Git checkout at all (gbrain never initializes Git on its own), so there is nothing to fast-forward to. | `git -C <checkout> branch --set-upstream-to <remote>/<branch>` (the fix fills in the real values), then retry. A checkout that is not Git has nothing to refresh; making it a clone with an upstream is the user's call. |
 | <a id="fetch_failed"></a>`fetch_failed` | `fetch_failed` | `git fetch` failed or did not finish within `sources.refresh_fetch_timeout_ms` (default 120000; `GBRAIN_REFRESH_FETCH_TIMEOUT_MS`; `--fetch-timeout-ms` wins over both). Nothing changed and no refresh record was written. | Retry. For a slow remote, raise the bound with `--fetch-timeout-ms <ms>` or `gbrain config set sources.refresh_fetch_timeout_ms <ms>`. Credentials are the user's: ask them to fix authentication rather than changing the remote. |
+| <a id="refresh_git_unavailable"></a>`git_unavailable` | `git_unavailable` | A git command that reads the checkout's branch or remote (`symbolic-ref`, `remote`, `config --get branch.<branch>.remote` or `.merge`) failed or did not finish, so the checkout's state is unknown. The message names the command and git's first error line. A detached HEAD or an unset key is not this refusal. Nothing changed and no refresh record was written. | Run `git -C <checkout> status` to see why git cannot read the checkout, repair what it reports, then retry `gbrain sources refresh <source>`. |
 | <a id="refresh_diverged"></a>`refresh_diverged` | `refresh_diverged` | The checkout has commits its upstream lacks, so a fast-forward is impossible. Nothing changed. | Reconcile the histories and push from a clone that is not managed, then retry. `gbrain sources reclone <source>` replaces the checkout; ask the user first, because local commits are dropped. |
 | <a id="refresh_dirty"></a>`refresh_dirty` | `refresh_dirty` | Uncommitted or untracked files overlap the incoming upstream changes (the first 20 are named), or `git merge --ff-only` refused for the same reason. HEAD did not move. Uncommitted files outside the incoming changes do not refuse; they are kept and listed as `preserved_uncommitted`. | Commit or discard the named paths, then retry. Check `gbrain sources writer status <source> --json` first: a pending Git effect may be about to commit a gbrain-published file. |
 | <a id="sync_in_progress"></a>`sync_in_progress` | `sync_in_progress` | A managed sync of one of the checkout's sources has an unfinished cursor. Moving the checkout now would strand it, and the refresh never waits on a sync. `gbrain repair frontmatter --apply` refuses the same way while an unfinished cursor still names a selected file. | Run the printed `gbrain sync --source <source> --no-pull ...` resume command (it keeps the cursor's options), then retry (for a repair, preview again and approve the new hash). |

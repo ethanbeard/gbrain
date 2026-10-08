@@ -23,8 +23,10 @@ start here.
    ```
    If `bun install -g` aborts or `gbrain doctor` reports `schema_version: 0`,
    the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218).
-   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services, or fall back to the
-   deterministic install: `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
+   Run `gbrain apply-migrations --yes --no-autopilot-install` to recover without installing services. It exits 0
+   only when the schema is at head; exit 1 with `migrations_pending` means the schema is still behind, and another
+   `--yes` repeats the failure, so run `gbrain doctor --json` and fall back to the deterministic install:
+   `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
 2. Init keyless memory: `gbrain init --pglite --no-embedding` (zero-config). For 1000+ files or
    multi-machine sync, init suggests Postgres + pgvector via Supabase.
 3. **STOP — ask the user about search mode.** `gbrain init` auto-applied a
@@ -127,7 +129,15 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   next sync (`gbrain sync --source <id> --no-pull` does it now). Write brain
   files through `put_page`/`capture` or a YAML serializer and check generated
   content with `gbrain frontmatter validate --stdin --path <p>`. Walkthrough:
-  [held files](docs/guides/repair.md#held-files).
+  [held files](docs/guides/repair.md#held-files). A hold with code
+  `invalid_fence` is a facts or takes table, not frontmatter, and clears
+  automatically on the next maintenance run. `gbrain repair fences --source <id>`
+  previews the repair and its printed apply command runs it now, with no
+  extra consent; a `manual` reason needs the edit the hold names (read the
+  page with `gbrain get --source <id> -- <slug>`, edit only that fence,
+  commit, `gbrain sync --source <id> --no-pull`). Raising spend
+  (`fences.repair.max_usd_per_day`, `fences.repair.llm true`) is the user's
+  call ([fence holds](docs/guides/write-refusals.md#invalid_fence)).
 - **Migrate / upgrade:** `gbrain upgrade` (binary self-update + schema migrations + post-upgrade prompts),
   [`docs/UPGRADING_DOWNSTREAM_AGENTS.md`](./docs/UPGRADING_DOWNSTREAM_AGENTS.md),
   [`skills/migrations/`](./skills/migrations/), `gbrain apply-migrations --yes --no-autopilot-install` (manual migration orchestration without service installation).

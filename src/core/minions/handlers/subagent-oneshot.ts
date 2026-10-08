@@ -31,7 +31,7 @@
  * a completed result.
  */
 
-import { retainToolWriteRequestId, assertToolWriteCommitted, isPendingToolWrite } from '../tool-write-identity.ts';
+import { retainToolWriteRequestId, awaitCommittedToolWrite, isPendingToolWrite } from '../tool-write-identity.ts';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionJobContext, SubagentHandlerData, SubagentResult, ToolDef, ContentBlock, OneshotFallbackReason } from '../types.ts';
@@ -257,7 +257,7 @@ async function loadOneshotLedger(engine: BrainEngine, jobId: number): Promise<Le
 }
 
 export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutcome> {
-  const { engine, ctx, data, model } = args;
+  const { engine, ctx, data, model, putPageTool } = args;
   const chat = args._chat ?? gatewayChat;
   const submitted = snapshotFromJob(ctx.data);
   const checkCurrentWrite = async (slug?: string): Promise<void> => {
@@ -289,15 +289,15 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
       if (row.status !== 'pending') continue;
       const input = { slug: row.slug ?? '', content: row.content ?? '', ...(row.request_id ? { request_id: row.request_id } : {}) };
       retainToolWriteRequestId(input, ctx.id, 1, row.ordinal ?? 0, row.tool_use_id, 'brain_put_page');
-      if (!args.putPageTool || !input.slug || !input.content) {
+      if (!putPageTool || !input.slug || !input.content) {
         await persistToolExecFailed(engine, ctx.id, 1, row.ordinal ?? 0, row.tool_use_id, 'brain_put_page', input,
           'oneshot recovery: pending write could not be re-executed (missing tool or ledger input)');
         row.status = 'failed';
         continue;
       }
       try {
-        const output = await args.putPageTool.execute(input, { engine, jobId: ctx.id, remote: true, signal: ctx.signal });
-        assertToolWriteCommitted(output, 'brain_put_page');
+        const output = await awaitCommittedToolWrite(ctx, 'brain_put_page',
+          () => putPageTool.execute(input, { engine, jobId: ctx.id, remote: true, signal: ctx.signal }));
         await persistToolExecComplete(engine, ctx.id, 1, row.ordinal ?? 0, row.tool_use_id, output);
         row.status = 'complete';
       } catch (e) {
@@ -343,7 +343,7 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
     };
   }
 
-  if (!args.putPageTool) {
+  if (!putPageTool) {
     // No put_page in the registry (misconfigured allow-list) — a config
     // error, not a model failure; distinct reason so telemetry separates it.
     return { kind: 'fallback', reason: 'no_put_page_tool' };
@@ -468,9 +468,11 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
 
   // ── Validate ALL pages before ANY write ─────────────────────────────────
   const prefixes = data.allowed_slug_prefixes ?? [];
-  // CDX-9 task shapes: reflections/originals sub-trees of the allow-list.
-  const taskShapePrefixes = prefixes
-    .filter(p => p.includes('/personal/reflections/') || p.includes('/originals/'))
+  // CDX-9 task shapes: the reflections/originals namespaces. #6160: the cycle
+  // passes its resolved namespaces; jobs queued by older builds derive them
+  // from the allow-list, root-level namespaces included.
+  const taskShapePrefixes = (data.oneshot_task_prefixes ?? prefixes
+    .filter(p => /(?:^|\/)(?:personal\/reflections|originals)\//.test(p)))
     .map(p => (p.endsWith('/*') ? p.slice(0, -1) : p.endsWith('/') ? p : `${p}/`));
   const inBatch = new Set(parsed.pages.map(p => p.slug));
   // Duplicate slugs inside one batch would make the second write silently
@@ -575,13 +577,8 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
     if (ctx.signal?.aborted) throw new DOMException('oneshot write loop aborted by job signal', 'AbortError');
     let output: unknown;
     try {
-      output = await args.putPageTool.execute(input, {
-        engine,
-        jobId: ctx.id,
-        remote: true,
-        signal: ctx.signal,
-      });
-      assertToolWriteCommitted(output, 'brain_put_page');
+      output = await awaitCommittedToolWrite(ctx, 'brain_put_page',
+        () => putPageTool.execute(input, { engine, jobId: ctx.id, remote: true, signal: ctx.signal }));
     } catch (e) {
       // Abort/transient-conn errors are not write verdicts (same rule as
       // recovery): rethrow, row stays pending, retry re-executes.

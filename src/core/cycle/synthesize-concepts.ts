@@ -43,11 +43,13 @@ import { validatePageSlug } from '../ops/context.ts';
 import { privatePagesFilterFragment, strictestVisibility, type Visibility } from '../search/private-visibility.ts';
 import { maintenancePreflight } from '../persistence/prepared-maintenance.ts';
 import { derivedWriteThrough } from './derived-write-through.ts';
+import { canonicalConceptStem, loadConceptRedirects } from './concept-redirects.ts';
 import {
   addManagedProvenanceLinks, CONCEPT_DEFERRAL_CODES, CONCEPT_HOLD_CODES, publishClassicConcept, publishManagedConcept, stripFenceSections,
 } from './concept-publication.ts';
+import { readPhaseConfigNumber, SYNTHESIZE_CONCEPTS_BUDGET_KEY, SYNTHESIZE_CONCEPTS_DEFAULT_BUDGET_USD } from './phase-config-values.ts';
+import { ConceptRetryBound, MAX_CONCEPT_ATTEMPTS } from './concept-retry-bound.ts';
 
-const DEFAULT_BUDGET_USD = 1.5;
 // Miss policy for the shared resolver (`priceFor`: operator overrides, the
 // claude-cli → Anthropic sibling, canonical rows): assume Sonnet-tier
 // pricing for a model nothing prices, and name it in the phase details
@@ -69,6 +71,17 @@ function narrativePricing(model: string, overrides: PricingOverrides | undefined
     console.error(`[synthesize_concepts] ${model} has no pricing; metering it at Sonnet-tier rates against the $${budgetUsd.toFixed(2)} phase budget. To meter its real price, look it up and register it: ${pricingSetCommand(model, 'chat')}`);
   }
   return FALLBACK_PRICING;
+}
+
+/** #4907: the run's named-key budget warnings (invalid stored budget, groups refused at the cap), each echoed once to stderr. */
+function budgetWarnings(configWarning: string | undefined, capped: number, budgetUsd: number): string[] {
+  const warnings = configWarning ? [configWarning] : [];
+  if (capped > 0) {
+    warnings.push(`${capped} LLM-eligible concept(s) got no model narrative because the $${budgetUsd.toFixed(2)} phase budget was reached; they retry next run. ` +
+      `Raise the cap: gbrain config set ${SYNTHESIZE_CONCEPTS_BUDGET_KEY} <usd>. Verify: gbrain config get ${SYNTHESIZE_CONCEPTS_BUDGET_KEY}`);
+  }
+  for (const warning of warnings) console.error(`[synthesize_concepts] ${warning}`);
+  return warnings;
 }
 
 const TIER_T1_MIN = 10;
@@ -203,10 +216,11 @@ export async function runPhaseSynthesizeConcepts(
     };
   }
 
-  // 2. Group atoms by normalized concept slug; one atom counts once per concept.
+  // 2. Group atoms by normalized concept slug (#6161: a merged concept groups under its canonical one); one atom counts once per concept.
+  const redirects = await loadConceptRedirects(engine, opts.sourceId ?? 'default', conceptStemFor).catch(() => new Map<string, string>());
   const groups = new Map<string, { slugs: string[]; titles: string[]; bodies: string[]; visibilities: Visibility[] }>();
   for (const atom of atoms) {
-    const conceptSlugs = new Set(atom.concept_refs.map(conceptStemFor).filter((s): s is string => s !== null));
+    const conceptSlugs = new Set(atom.concept_refs.map(conceptStemFor).filter((s): s is string => s !== null).map((stem) => canonicalConceptStem(stem, redirects)));
     for (const conceptSlug of conceptSlugs) {
       const existing = groups.get(conceptSlug) ?? { slugs: [], titles: [], bodies: [], visibilities: [] };
       existing.slugs.push(atom.slug);
@@ -257,7 +271,9 @@ export async function runPhaseSynthesizeConcepts(
   // 4. Per group: synthesize narrative (LLM for T1/T2, deterministic for T3+)
   let conceptsWritten = 0;
   let estimatedSpendUsd = 0;
-  const budgetCap = DEFAULT_BUDGET_USD;
+  const budget = await readPhaseConfigNumber(engine, SYNTHESIZE_CONCEPTS_BUDGET_KEY);
+  const budgetCap = budget.value ?? SYNTHESIZE_CONCEPTS_DEFAULT_BUDGET_USD;
+  let budgetCapped = 0;
   const failures: Array<{ concept: string; error: string }> = [];
   // #4589 provenance-link problems. Kept OUT of `failures`: that list means
   // "the LLM call failed → template fallback" downstream (summary wording,
@@ -317,16 +333,20 @@ export async function runPhaseSynthesizeConcepts(
   const publicationDeferred: Array<{ concept: string; reason: string }> = [];
   const publicationHeld: Array<{ concept: string; reason: string }> = [];
   const skippedHumanOwned: string[] = [];
+  const skippedDeleted: string[] = [];
   const skippedUnchanged: string[] = [];
   const rehashed: string[] = [];
   const keptExistingNarrative: string[] = [];
   const pricingOverrides = await loadPricingOverrides(engine);
   const pricingFallbackModels = new Set<string>();
+  const retries = await ConceptRetryBound.load(engine); // #6260: bounded paid retries per member hash
+  const skippedRetryBound: string[] = [];
   for (const group of atomGroups) {
     const conceptSlug = `concepts/${group.conceptSlug}`;
     // A concept page this phase did not write belongs to a human (or another
     // writer). Check before any spend; never replace its body.
-    const existingSnapshot = await engine.readPageSnapshot(conceptSlug, { sourceId: opts.sourceId ?? 'default' });
+    const existingSnapshot = await engine.readPageSnapshot(conceptSlug, { sourceId: opts.sourceId ?? 'default', includeDeleted: true });
+    if (existingSnapshot?.page.deleted_at) { skippedDeleted.push(conceptSlug); continue; } // #6161: a deleted concept is never resurrected
     const existing = existingSnapshot?.page ?? null;
     if (existing && !String(existing.frontmatter?.synthesized_by ?? '').startsWith('synthesize_concepts')) {
       skippedHumanOwned.push(conceptSlug);
@@ -365,6 +385,10 @@ export async function runPhaseSynthesizeConcepts(
       if (estimatedSpendUsd >= budgetCap) {
         narrative = deterministicNarrative(group);
         synthesisMode = 'budget_fallback';
+        budgetCapped++;
+      } else if (retries.exhausted(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash)) {
+        skippedRetryBound.push(conceptSlug);
+        continue;
       } else {
         try {
           const result = await chat({
@@ -396,14 +420,18 @@ export async function runPhaseSynthesizeConcepts(
               result.usage.output_tokens * pricing.output) /
             1_000_000;
           const text = result.text.trim();
-          if (text) {
+          // #6260: a narrative stopped before the end never replaces a page or advances its member hash.
+          const stopped = result.stopReason === 'length' || result.stopReason === 'refusal' || result.stopReason === 'content_filter';
+          if (text && !stopped) {
             ({ narrative, unverified: unverifiedClaims } = await groundConceptNarrative(engine, text, group));
             synthesisMode = 'llm';
             if (result.fallbackFrom) fallbackWriter = result.model;
+            retries.succeed(`${opts.sourceId ?? 'default'}:${conceptSlug}`);
           } else {
-            failures.push({ concept: group.conceptSlug, error: 'empty model response' });
+            failures.push({ concept: group.conceptSlug, error: stopped ? `output stopped before the end (stopReason=${result.stopReason})` : 'empty model response' });
             narrative = deterministicNarrative(group);
             synthesisMode = 'error_fallback';
+            retries.fail(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash);
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -426,6 +454,7 @@ export async function runPhaseSynthesizeConcepts(
           if (llmHalt.lastClass() === 'rate_limit') continue;
           narrative = deterministicNarrative(group);
           synthesisMode = 'error_fallback';
+          retries.fail(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash);
         }
       }
     } else {
@@ -472,7 +501,7 @@ export async function runPhaseSynthesizeConcepts(
         // #4416: target the cycle's resolved source, not the 'default' literal.
         baseline = await publishClassicConcept(engine, conceptSlug, opts.sourceId ?? 'default', synthesized(pageVisibility), narrative,
           baseline, { writeThrough: conceptFiles !== null, importPage: (markdown) => importFromContent(engine, conceptSlug, markdown, {
-            noEmbed: !isAvailable('embedding'), sourceId: opts.sourceId,
+            noEmbed: !isAvailable('embedding'), sourceId: opts.sourceId, preserveGateMarkers: true,
           }) });
       };
       // A publication that lost a revision race or would lose canonical
@@ -547,6 +576,8 @@ export async function runPhaseSynthesizeConcepts(
   // survives only as the fallback for legacy unscoped callers. Receipt only
   // fires when concepts were actually written; rollup always fires so doctor
   // sees the phase ran.
+  const warnings = budgetWarnings(budget.warning, budgetCapped, budgetCap);
+  if (!opts.dryRun) await retries.save(engine);
   // Managed brains skip the receipt page (a legacy putPage), like extract_atoms;
   // the rollup row below still records the run for doctor.
   if (!opts.dryRun && !maintenance && conceptsWritten > 0) {
@@ -589,11 +620,13 @@ export async function runPhaseSynthesizeConcepts(
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
       (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
+      (budgetCapped > 0 ? ` (${budgetCapped} over the $${budgetCap.toFixed(2)} budget → template fallback)` : '') +
       (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : '') +
       (skippedHumanOwned.length > 0 ? ` (${skippedHumanOwned.length} human-owned page(s) left untouched)` : '') +
       (skippedUnchanged.length > 0 ? ` (${skippedUnchanged.length} unchanged)` : '') +
       (rehashed.length > 0 ? ` (${rehashed.length} rehashed without synthesis)` : '') +
       (keptExistingNarrative.length > 0 ? ` (${keptExistingNarrative.length} existing narrative(s) kept)` : '') +
+      (skippedRetryBound.length > 0 ? ` (${skippedRetryBound.length} skipped after ${MAX_CONCEPT_ATTEMPTS} failed attempts on unchanged members)` : '') +
       (publicationDeferred.length > 0 ? ` (${publicationDeferred.length} publication(s) deferred: page changed, retried next run)` : '') +
       (publicationHeld.length > 0 ? ` (${publicationHeld.length} publication(s) held: existing page needs import/repair)` : ''),
     details: {
@@ -604,10 +637,13 @@ export async function runPhaseSynthesizeConcepts(
       atoms_seen: atoms.length,
       failures,
       link_warnings: linkWarnings,
+      warnings,
       skipped_human_owned: skippedHumanOwned,
+      skipped_deleted: skippedDeleted,
       skipped_unchanged: skippedUnchanged,
       rehashed,
       kept_existing_narrative: keptExistingNarrative,
+      skipped_retry_bound: skippedRetryBound,
       publication_deferred: publicationDeferred,
       publication_held: publicationHeld,
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),

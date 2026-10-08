@@ -476,7 +476,12 @@ After completing available phases:
    - Calendar: daily cron
    - Email: periodic sweep (4-8 hours)
    - X: daily ingest
-   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes
+   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes. A managed brain
+     (`gbrain sources writer status --json` shows `"mode": "managed"`) refuses
+     that line: use the managed recipe in `skills/cron-scheduler/SKILL.md`
+     ("Managed brain") with `--source <id>`, e.g.
+     `gbrain sources refresh <id>; gbrain sync --source <id> --no-pull --hard-deadline 13m`
+     every 15 minutes on the owner host.
 
 4. **Track state:**
    ```json
@@ -502,7 +507,7 @@ After completing available phases:
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - Every import phase is a user choice: when a command exits 3 (`confirmation_required`) or prints an `[AGENT]` ask, relay the `[SHOW USER]` block and wait; do not chain phases with `--yes`.
 - `gbrain google setup` prints `[SHOW USER]` steps: relay them verbatim and wait for the user to finish the consent click. Credential errors carry their own `fix`; follow it.

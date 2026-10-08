@@ -15,6 +15,7 @@ import type { WriteRequest } from '../../src/core/persistence/model.ts';
 import { disposePersistenceConsumer, waitForWrite } from '../../src/core/persistence/service.ts';
 import { sha256 } from '../../src/core/persistence/digest.ts';
 import { withEnv } from './with-env.ts';
+import { waitFor } from './wait-for.ts';
 
 export const atomCompactionCases = ['all_failed', 'mixed_all', 'completion_only', 'failed_child_only', 'committed_child_only', 'changed_target', 'success', 'malformed'] as const;
 export const atomCompactionActions = ['resume', 'retry'] as const;
@@ -61,6 +62,12 @@ export async function exerciseAtomCompaction(engine: BrainEngine, scenario: type
       expect(accepted).toHaveLength(scenario === 'malformed' ? 1 : 3);
       const completion = await waitForWrite(observedEngine, accepted.at(-1)!, { engine: engine.kind });
       expect(completion.state).toBe(['success', 'malformed'].includes(scenario) ? 'committed' : 'conflict');
+      // A committed atom still has its embedding effect running. Stopping the
+      // consumer requeues it, and compaction retains a receipt whose effect is
+      // unfinished, so settle the source's effects before stopping.
+      await waitFor(async () => (await engine.executeRaw(
+        "SELECT 1 FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id WHERE r.source_id=$1 AND e.state IN ('queued','running')", [sourceId])).length === 0,
+        { label: `${engine.kind}: ${scenario} ${action} atom effects settled` });
       await disposePersistenceConsumer(observedEngine);
       const originals = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId]);
       if (scenario !== 'malformed') expect(originals.map(row => row.state)).toEqual(scenario === 'success' ? ['committed', 'committed', 'committed'] :

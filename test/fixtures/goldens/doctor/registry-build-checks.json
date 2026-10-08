@@ -390,6 +390,10 @@
         "name": "persistence_request_growth"
       },
       {
+        "category": "ops",
+        "name": "persistence_write_stall"
+      },
+      {
         "category": "brain",
         "name": "connector_held_items"
       },
@@ -435,11 +439,23 @@
       },
       {
         "category": "brain",
+        "name": "conversation_label_facts"
+      },
+      {
+        "category": "brain",
+        "name": "conversation_outcomes_stale"
+      },
+      {
+        "category": "brain",
         "name": "captured_facts_active"
       },
       {
         "category": "brain",
         "name": "loop_facts_drift"
+      },
+      {
+        "category": "brain",
+        "name": "ontology_facts_fenced"
       },
       {
         "category": "brain",
@@ -670,12 +686,20 @@
         "name": "retrieval_feedback_health"
       },
       {
+        "category": "brain",
+        "name": "transcript_secret_exposure"
+      },
+      {
         "category": "meta",
         "name": "revision_backfill"
       },
       {
         "category": "brain",
         "name": "core_memory"
+      },
+      {
+        "category": "brain",
+        "name": "fence_integrity"
       },
       {
         "category": "ops",

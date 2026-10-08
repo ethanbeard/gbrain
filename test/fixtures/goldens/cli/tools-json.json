@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 206694,
-    "stdoutSha256": "fad8a83c0ce9f493ab007225aa1098c96dcd3df13702d91049e86be2b03e93c5",
+    "stdoutBytes": 209744,
+    "stdoutSha256": "c6e089c565d3dfd6051c02f362790822322a3328669521135a2a4d4a79acaf29",
     "toolNames": [
       "remember",
       "entity",
@@ -104,6 +104,7 @@
       "takes_resolve",
       "takes_supersede",
       "takes_remove",
+      "takes_rebuild",
       "whoami",
       "sources_add",
       "sources_list",
@@ -361,7 +362,7 @@
         "scope": "write"
       },
       {
-        "description": "Read a page by slug (fuzzy optional; renamed slugs redirect). To edit, pass include_content:true and send `content` to put_page, or use edit_page. Timeline rows need include_timeline_entries.",
+        "description": "Read a page by slug. To edit, pass include_content:true and send `content` to put_page, or use edit_page.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -371,6 +372,7 @@
           "fuzzy": "boolean?",
           "include_content": "boolean?",
           "include_deleted": "boolean?",
+          "include_quarantined": "boolean?",
           "include_timeline_entries": "boolean?",
           "slug": "string",
           "source_id": "string?"
@@ -394,6 +396,10 @@
               "description": "Include soft-deleted pages.",
               "type": "boolean"
             },
+            "include_quarantined": {
+              "description": "Admin: quarantined body.",
+              "type": "boolean"
+            },
             "include_timeline_entries": {
               "description": "Also return timeline rows.",
               "type": "boolean"
@@ -415,7 +421,7 @@
         "scope": "read"
       },
       {
-        "description": "Replace a complete Markdown page: content REPLACES the whole page. Read get_page include_content:true; pass its revision as expected_revision (omit to create). Keep a request_id UUID; retry with identical arguments. Remote callers: [[links]] to existing pages become mentions; typed links are skipped (a stdio `gbrain serve` sweeps them later, `gbrain serve --http` does not self-sweep). Small changes: edit_page. Over 3 pages: put_pages.",
+        "description": "Complete content REPLACES the whole page: read get_page include_content:true; send its revision as expected_revision. Keep a request_id UUID; retry with identical arguments. Remote callers: existing-page [[links]] become mentions; typed links are skipped (stdio `gbrain serve` sweeps them later, `gbrain serve --http` does not self-sweep). Edits: edit_page; >3 pages: put_pages.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
@@ -423,6 +429,7 @@
         "parameters": {
           "allow_empty": "boolean?",
           "content": "string",
+          "drop_timeline": "boolean?",
           "expected_revision": "string?",
           "force": "boolean?",
           "ingested_via": "string?",
@@ -437,12 +444,16 @@
         "schema": {
           "properties": {
             "allow_empty": {
-              "description": "Allow emptying a non-empty page.",
+              "description": "Allow emptying the page.",
               "type": "boolean"
             },
             "content": {
-              "description": "Complete markdown with frontmatter; read get_page include_content:true first.",
+              "description": "Complete markdown (get_page include_content:true).",
               "type": "string"
+            },
+            "drop_timeline": {
+              "description": "No Timeline in content: delete its entries.",
+              "type": "boolean"
             },
             "expected_revision": {
               "description": "Revision read; omit to create.",
@@ -651,13 +662,14 @@
         "scope": "write"
       },
       {
-        "description": "Admin-only. Hard-deletes pages whose deleted_at is older than older_than_hours (default 72). Cascades through content_chunks, page_links, chunk_relations. Local CLI only (not exposed over HTTP MCP). Manual escape hatch alongside the autopilot purge phase.",
+        "description": "Admin-only. Hard-deletes pages whose deleted_at is older than older_than_hours (default 72), in every source. Cascades through content_chunks, page_links, chunk_relations. Trusted local CLI only; the command is `gbrain pages purge-deleted`, which asks first (yes: true is the consent). Manual escape hatch alongside the autopilot purge phase.",
         "idempotent": false,
         "local_only": true,
         "mutating": true,
         "name": "purge_deleted_pages",
         "parameters": {
-          "older_than_hours": "number?"
+          "older_than_hours": "number?",
+          "yes": "boolean?"
         },
         "required_scopes": [],
         "schema": {
@@ -665,6 +677,10 @@
             "older_than_hours": {
               "description": "Age cutoff in hours. Default 72.",
               "type": "number"
+            },
+            "yes": {
+              "description": "Consent to the irreversible brain-wide purge. Ask the user first.",
+              "type": "boolean"
             }
           },
           "required": [],
@@ -763,7 +779,8 @@
         "mutating": false,
         "name": "fetch",
         "parameters": {
-          "id": "string"
+          "id": "string",
+          "include_quarantined": "boolean?"
         },
         "required_scopes": [],
         "schema": {
@@ -771,6 +788,10 @@
             "id": {
               "description": "Opaque result id from a prior `search` call. Pass unchanged. Unambiguous legacy slugs are also accepted.",
               "type": "string"
+            },
+            "include_quarantined": {
+              "description": "Admin: quarantined body.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -871,6 +892,10 @@
                   "content": {
                     "description": "Complete markdown with frontmatter.",
                     "type": "string"
+                  },
+                  "drop_timeline": {
+                    "description": "Content without a Timeline section deletes its dated entries.",
+                    "type": "boolean"
                   },
                   "expected_revision": {
                     "description": "Revision read; omit to create.",
@@ -2104,17 +2129,27 @@
         "scope": "admin"
       },
       {
-        "description": "Page version history. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it).",
+        "description": "Page version history, newest snapshot first. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). `limit` returns only the newest N; `include_body: false` returns metadata only.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "get_versions",
         "parameters": {
+          "include_body": "boolean?",
+          "limit": "number?",
           "slug": "string"
         },
         "required_scopes": [],
         "schema": {
           "properties": {
+            "include_body": {
+              "description": "false omits compiled_truth and timeline from every version (metadata only). Default true.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Return only the newest N versions (a positive integer). Omit for the full history.",
+              "type": "number"
+            },
             "slug": {
               "description": "Slug of the page whose version history to list.",
               "type": "string"
@@ -4312,6 +4347,35 @@
         "scope": "write"
       },
       {
+        "description": "Rebuild one page's takes index from the takes fence the page holds. Local-only. Rows whose number and claim still match keep their resolution; rows the index and the fence disagree on are re-inserted from the fence. CLI: `gbrain takes rebuild <slug>`.",
+        "idempotent": true,
+        "local_only": true,
+        "mutating": true,
+        "name": "takes_rebuild",
+        "parameters": {
+          "request_id": "string?",
+          "slug": "string"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "request_id": {
+              "description": "UUID; retry with it on timeout.",
+              "type": "string"
+            },
+            "slug": {
+              "description": "Page slug.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "scope": "write"
+      },
+      {
         "description": "Your identity: transport, scopes and, over OAuth, client, source_id and federated_read.",
         "idempotent": true,
         "local_only": false,
@@ -5010,7 +5074,7 @@
         "scope": "read"
       },
       {
-        "description": "Life Chronicle: queue existing meeting/conversation/calendar pages (by type or under meetings/, conversations/, cal/, calendar/) for timeline-event extraction. One paid chat call per page, so it needs --yes; --dry-run reports the candidates, an estimated cost and skip reasons. The chronicle_page_state ledger skips content already extracted or queued, so repeats never pay twice. Queued pages run in the `chronicle` cycle phase (`gbrain dream --phase chronicle`), exempt from the daily limit. Local-only bulk op. CLI: `gbrain chronicle-backfill [--since YYYY-MM-DD] [--dated-since YYYY-MM-DD] [--recent] [--limit N] [--dry-run | --yes]`.",
+        "description": "Life Chronicle: queue existing meeting/conversation/calendar pages (by type or under meetings/, conversations/, cal/, calendar/) for timeline-event extraction. One paid chat call per page, so it needs --yes; --dry-run reports the candidates, an estimated cost and skip reasons. The chronicle_page_state ledger skips content already extracted or queued, so repeats never pay twice. Queued pages run in the `chronicle` cycle phase (`gbrain dream --phase chronicle`), exempt from the daily limit. --max-usd is a hard bound counting retries: pages queue only while their worst case fits, and an unpriced chat model then refuses with no_pricing. Local-only bulk op. CLI: `gbrain chronicle-backfill [--since YYYY-MM-DD] [--dated-since YYYY-MM-DD] [--recent] [--limit N] [--max-usd USD] [--dry-run | --yes]`.",
         "idempotent": false,
         "local_only": true,
         "mutating": true,
@@ -5019,6 +5083,7 @@
           "dated_since": "string?",
           "dry_run": "boolean?",
           "limit": "number?",
+          "max_usd": "number?",
           "recent": "boolean?",
           "since": "string?",
           "yes": "boolean?"
@@ -5036,6 +5101,10 @@
             },
             "limit": {
               "description": "Max pages queued in this run, across all types and sources (default 1000).",
+              "type": "number"
+            },
+            "max_usd": {
+              "description": "Hard spend bound in USD for everything this run queues, retries included; pages beyond it are not queued (cap_reached).",
               "type": "number"
             },
             "recent": {
@@ -6364,7 +6433,7 @@
         "scope": "admin"
       },
       {
-        "description": "The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. Grouped by counterparty (default, ranked) or flat. Loops come from the deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and completeness: when it is \"partial\", some mail in the window is held after repeated import failures; present the answer as partial and name the held items and their retry command.",
+        "description": "The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. Grouped by counterparty (default, ranked; each group shows at most 5 loops, the rest counted in loops_omitted) or flat. Loops that name no counterparty are never ranked as a person: they come back in no_counterparty (null when none). Loops come from the deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and completeness: when it is \"partial\", some mail in the window is held after repeated import failures; present the answer as partial and name the held items and their retry command.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -6374,6 +6443,7 @@
           "as_of": "string?",
           "counterparty": "string?",
           "group_by": "string?",
+          "id": "number?",
           "include_context": "boolean?",
           "limit": "number?",
           "loop_type": "string?",
@@ -6403,6 +6473,10 @@
               ],
               "type": "string"
             },
+            "id": {
+              "description": "Fetch the single loop with this id (ids come from earlier open_loops results). Matches any status unless `status` is passed; the source scope still applies, and the grouped view omits `text`.",
+              "type": "number"
+            },
             "include_context": {
               "description": "Attach the counterparty entity card per group (trusted local only). Default true.",
               "type": "boolean"
@@ -6427,7 +6501,7 @@
               "type": "string"
             },
             "status": {
-              "description": "Default 'open'.",
+              "description": "Default 'open', except with `id`, where any status matches.",
               "enum": [
                 "open",
                 "done",

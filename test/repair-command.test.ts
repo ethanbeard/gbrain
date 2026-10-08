@@ -23,6 +23,12 @@ import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { runCli } from './helpers/cli-spawn.ts';
+import { MinionQueue } from '../src/core/minions/queue.ts';
+import { installFaultHook } from '../src/core/persistence/fault-points.ts';
+import { getCliOptions, setCliOptions } from '../src/core/cli-options.ts';
+import { repairRunner } from '../src/core/repair/registry.ts';
+import { planRepairSteps, runRepairSteps } from '../src/core/remediation/repairs.ts';
+
 
 const backends = testBackends();
 const engines: BrainEngine[] = [];
@@ -97,6 +103,33 @@ describe('gbrain repair timeline', () => {
       expect(await markedPages(engine, source)).toEqual(['notes/a']);
       const again = await runRepair(ctxFor(engine, source), timelineRepair, scope, { apply: true });
       expect(again).toMatchObject({ affected: 0, applied: 0, complete: true });
+    });
+  }, 120_000);
+
+  test('#6042: materializing timeline rows into an already-extracted page queues no facts extraction', async () => {
+    await brain(async (engine, [source]) => {
+      const body = 'A synthetic field report with enough substantive text that the facts backstop treats it as eligible for extraction.';
+      await submitPageMutation(ctxFor(engine, source), { operation: 'put_page', params: { slug: 'notes/report', content: page(body), request_id: randomUUID() } });
+      await engine.transaction(tx => withCoordinatedWrite(tx, [source], () => tx.executeRaw(
+        `INSERT INTO timeline_entries(page_id,date,source,summary,detail) SELECT id,'2026-08-02','legacy','A dated event','' FROM pages WHERE source_id=$1 AND slug='notes/report'`,
+        [source]), TEST_WRITE_ATTRIBUTION));
+      // Stand-in for the page's own extraction having run: its outbox entry is settled.
+      await disposePersistenceConsumer(engine);
+      await engine.executeRaw(`UPDATE persistence_effects SET state='committed' WHERE kind='facts-backstop' AND source_id=$1`, [source]);
+      const [{ id: pageId }] = await engine.executeRaw<{ id: number }>(`SELECT id FROM pages WHERE source_id=$1 AND slug='notes/report'`, [source]);
+      const done = await new MinionQueue(engine).add('facts-absorb', { slug: 'notes/report', sourceId: source, page_id: pageId }, { queue: 'default' });
+      await engine.executeRaw(`UPDATE minion_jobs SET status='completed', finished_at=now() WHERE id=$1`, [done.id]);
+      const receipts = async () => engine.executeRaw<{ id: string; facts: unknown }>(
+        `SELECT id, outcome->'facts_backstop' AS facts FROM persistence_requests
+          WHERE source_id=$1 AND slug='notes/report' AND operation='put_page' AND state='committed' ORDER BY created_at`, [source]);
+      expect((await receipts()).map(r => r.facts)).toEqual([{ queued: true }]);
+      const scope = await resolveRepairScope(engine);
+      const repaired = await runRepair(ctxFor(engine, source), timelineRepair, scope, { apply: true });
+      expect(repaired).toMatchObject({ applied: 1, complete: true });
+      expect(await markedPages(engine, source)).toEqual(['notes/report']);
+      const [, repairWrite] = await receipts();
+      expect(repairWrite.facts).toEqual({ skipped: 'body_unchanged' });
+      expect(await engine.executeRaw(`SELECT 1 FROM persistence_effects WHERE request_id=$1::uuid AND kind='facts-backstop'`, [repairWrite.id])).toEqual([]);
     });
   }, 120_000);
 
@@ -175,7 +208,7 @@ describe('gbrain repair timeline', () => {
       } finally { console.log = log; }
       const json = JSON.parse(out[0]);
       expect(json.scope.source_ids).toEqual([source]);
-      expect(json.results.map((r: { kind: string }) => r.kind)).toEqual(['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats']);
+      expect(json.results.map((r: { kind: string }) => r.kind)).toEqual(['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'fences']);
       expect(json.results[0]).toMatchObject({ mode: 'dry_run', affected: 1 });
       expect(out[1]).toContain(`Scope: brain `);
       expect(out[1]).toContain(`sources ${source}`);
@@ -183,6 +216,77 @@ describe('gbrain repair timeline', () => {
       await expect(runRepairCommand(engine, ['bogus'])).rejects.toMatchObject({ code: 'invalid_params' });
       await expect(runRepairCommand(engine, ['--apply'])).rejects.toMatchObject({ code: 'invalid_params' });
       expect(await markedPages(engine, source)).toEqual([]);
+    });
+  }, 120_000);
+});
+
+/** Every publication stalls at the consumer for `ms` before it commits (#6185). */
+async function withSlowPublications<T>(ms: number, run: () => Promise<T>): Promise<T> {
+  installFaultHook(async point => { if (point === 'consumer:prepared') await new Promise(resolve => setTimeout(resolve, ms)); });
+  try { return await run(); } finally { installFaultHook(undefined); }
+}
+
+async function withWriteWait<T>(writeWaitMs: number | undefined, run: () => Promise<T>): Promise<T> {
+  const previous = getCliOptions();
+  setCliOptions({ ...previous, writeWaitMs });
+  try { return await run(); } finally { setCliOptions(previous); }
+}
+
+describe('#6185: repair --apply waits with the CLI write wait', () => {
+  test('a publication slower than the 5 s agent wait commits within the CLI default, and one run repairs every page', async () => {
+    await brain(async (engine, [source]) => {
+      for (const slug of ['notes/a', 'notes/b']) await pageWithHistory(engine, source, slug);
+      const scope = await resolveRepairScope(engine);
+      const runner = await repairRunner(engine, { apply: true, noEmbed: true, logger: { info() {}, warn() {}, error() {} } });
+      const applied = await withSlowPublications(5_500, () => runner.run('timeline', scope));
+      expect(applied.stopped).toBeUndefined();
+      expect(applied).toMatchObject({ applied: 2, complete: true });
+      expect(await markedPages(engine, source)).toEqual(['notes/a', 'notes/b']);
+    });
+  }, 120_000);
+
+  test('--wait 0 still stops at the pending write with the resume message, and the rerun finishes', async () => {
+    await brain(async (engine, [source]) => {
+      await pageWithHistory(engine, source, 'notes/a');
+      const scope = await resolveRepairScope(engine);
+      const quiet = { info() {}, warn() {}, error() {} };
+      const stopped = await withWriteWait(0, async () => withSlowPublications(1_000,
+        async () => (await repairRunner(engine, { apply: true, noEmbed: true, logger: quiet })).run('timeline', scope)));
+      expect(stopped.applied).toBe(0);
+      expect(stopped.stopped).toEqual({ reason: 'write_pending', message: `The repair of ${source}:notes/a was accepted and is still pending publication. `
+        + 'Rerun `gbrain repair timeline --apply` to resume; the same request is replayed.' });
+      const resumed = await (await repairRunner(engine, { apply: true, noEmbed: true, logger: quiet })).run('timeline', scope);
+      expect(resumed).toMatchObject({ complete: true });
+      expect(await markedPages(engine, source)).toEqual(['notes/a']);
+    });
+  }, 120_000);
+
+  test('the doctor remediation run uses the same wait: under --wait 0 a slow publication reports stopped', async () => {
+    await brain(async (engine, [source]) => {
+      await pageWithHistory(engine, source, 'notes/a');
+      const steps = (await planRepairSteps(engine, { noEmbed: true, kinds: ['timeline'] }));
+      expect(steps.map(step => step.kind)).toEqual(['timeline']);
+      const [result] = await withWriteWait(0, () => withSlowPublications(1_000,
+        () => runRepairSteps(engine, steps, { remote: false, noEmbed: true, remainingUsd: () => undefined })));
+      expect(result).toMatchObject({ kind: 'timeline', status: 'stopped', applied: 0 });
+      expect(result.message).toContain('still pending publication');
+    });
+  }, 120_000);
+
+  test('a malformed GBRAIN_WRITE_WAIT_MS refuses the apply before any checkpoint; the preview still runs', async () => {
+    await brain(async (engine, [source]) => {
+      await pageWithHistory(engine, source, 'notes/a');
+      await withEnv({ GBRAIN_WRITE_WAIT_MS: 'soon' }, async () => {
+        await expect(repairRunner(engine, { apply: true, noEmbed: true })).rejects.toMatchObject({ code: 'invalid_write_wait' });
+        await expect(runRepairCommand(engine, ['timeline', '--apply'])).rejects.toMatchObject({ code: 'invalid_write_wait' });
+        expect(await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='repair'")).toEqual([]);
+        expect(await markedPages(engine, source)).toEqual([]);
+        const out: string[] = [];
+        const log = console.log;
+        console.log = (...args: unknown[]) => { out.push(args.join(' ')); };
+        try { await runRepairCommand(engine, ['timeline', '--json']); } finally { console.log = log; }
+        expect(JSON.parse(out[0]).results[0]).toMatchObject({ mode: 'dry_run', affected: 1 });
+      });
     });
   }, 120_000);
 });

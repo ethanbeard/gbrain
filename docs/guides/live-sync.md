@@ -35,36 +35,35 @@ every 10 seconds on stderr:
 [sync] 1240/9382 processed (1200 written, 40 waived this run) · 42.1 pages/min · indexing ETA 3h13m
 ```
 
-On Postgres the drain publishes in **bulk groups**: it freezes up to 16
-following page imports and deletes with the current one, admits them in one
-transaction, and the writer publishes the group in one transaction. Every
-page still gets its own write request, receipt, attribution and failure
-report; if one page fails, the pages before it commit, that page is reported,
-and the pages after it are cancelled and re-frozen once it is fixed. Group size
-adapts so a group takes about `sync.bulk_max_txn_ms` (default 15 s).
+On Postgres the drain publishes in **bulk groups** of up to 16 page imports and
+deletes, each admitted with the cursor step that records it and published in one
+transaction. Every page still gets its own write request, receipt, attribution
+and failure report; if one page fails, the pages before it commit, that page is
+reported, and the pages after it are cancelled and re-frozen once it is fixed.
+The first group is one or two pages; later groups hold about 5 s of measured
+apply time with lanes (2 s while foreground writes are recent), else
+`sync.bulk_max_txn_ms` (default 15 s).
 
-Groups publish in **lanes**: up to six groups at once, each in its own
-transaction on its own connection (`--lanes N` from 1 to 8, `--no-lanes` for
-one at a time, or `gbrain config set sync.lanes N` / `GBRAIN_SYNC_LANES`; the
-count is capped by the connection pool, so a pool of 10 allows 6). Lanes apply
-their pages at the same time but commit in file order: a group commits only
-after the group before it has committed, so a reader never sees a later page
-without the earlier ones. While lanes publish, the drain keeps freezing and
-admitting the next groups. Nothing is admitted ahead while foreground writes
-are recent (one was queued in the last minute), and a foreground write that
-needs the worktree makes the lanes finish their current groups and step
-aside. If a page fails, the groups after it are cancelled with the reason "An
-earlier page of the same sync did not commit" and re-frozen once the failure
-is fixed. A lock or statement timeout in a lane costs one lane for the rest of
-the run. Turn bulk off with
+Up to 16 groups publish at once in **lanes**, each on its own connection
+(`--lanes N`, `--no-lanes`, `sync.lanes` or `GBRAIN_SYNC_LANES`), capped by the
+pool: the default pool of 10 runs 6, `GBRAIN_POOL_SIZE=20` runs 16. Lanes apply pages at the same time but commit in file order, so a reader never
+sees a later page without the earlier ones. While lanes publish, the drain keeps
+freezing and admitting the next groups. A page write goes ahead of
+queued groups that do not name its page (lanes finish their groups, then one
+group runs between writes); `sync.foreground_priority false` restores FIFO. Groups after a failed page are cancelled ("An earlier
+page of the same sync did not commit") and re-frozen once it is fixed. A lock or statement timeout in a lane costs one lane for
+the rest of the run.
+
+A lane drain ends with a `[sync] lanes:` line naming what limited it and what
+setting, if any, raises it. Turn bulk off with
 `--no-bulk`, `GBRAIN_SYNC_BULK=0` or `gbrain config set sync.bulk false`. The
 final JSON reports `drain.bulk` (`enabled`, `reason` when off, `groups`,
-`largest_group`, `admitted_ahead`, and `lanes`: `configured`, `effective`,
-`reason` when fewer, `step_down`, `overlapped_groups` and `fallbacks`, the
-lane groups that published singly or went back to the queue). Finish a drain before downgrading gbrain:
-an older version refuses a group this version admitted ahead, and the sync
-stops there instead of publishing a page twice. PGLite publishes without network round trips and does not
-use bulk groups.
+`largest_group`, `admitted_ahead`, and `lanes`: `maximum`, `configured`,
+`effective`, `reason` when fewer, `step_down`, `overlapped_groups`,
+`fallbacks`, `busy`, `apply_ms_per_page`, `turn_wait_share` and `limited_by`). Finish a drain before downgrading gbrain: an older
+version refuses a group this version admitted ahead, and the sync stops there
+instead of publishing a page twice. PGLite publishes without network round
+trips and does not use bulk groups.
 
 *Written* pages published a change. *Waived* entries needed no write (an
 unchanged file, or a delete of a page that is already deleted) and advanced
@@ -257,11 +256,13 @@ vars — incident-time escape hatches, not everyday knobs.
    server is down when a push happens, that sync is missed. Pair webhooks
    with a cron fallback that catches anything the webhook missed.
 
+<a id="held-files"></a>
 4. **One broken file never blocks a sync: it is held.** When a file's content
    refuses deterministically (frontmatter gbrain cannot read without guessing,
-   a frontmatter `slug:` naming another page, a file over the size limit, or
-   content the operator's `content_sanity.junk_disposition=reject` refuses),
-   sync holds that file and keeps going: every other file imports, the
+   a frontmatter `slug:` naming another page, a file over the size limit,
+   content the operator's `content_sanity.junk_disposition=reject` refuses, or
+   on managed sync a facts or takes fence that cannot be imported without
+   dropping rows), sync holds that file and keeps going: every other file imports, the
    checkpoint advances, and the run reports the hold (`Held <path>: <code> …
    Next: <command>`; JSON `held`, `held_count`, `holds_outstanding`). Files
    gbrain can read exactly after quoting an unquoted value (`author: a (b)
@@ -274,21 +275,52 @@ vars — incident-time escape hatches, not everyday knobs.
    repaired. A hold clears when the file changes, is deleted, or a newer
    gbrain can read it; `gbrain sync --dry-run` lists would-be holds
    (`would_hold`) without writing anything. The backlog fix is one previewed,
-   hash-bound command:
+   hash-bound command per kind of hold:
 
    ```bash
    gbrain sources status <source-id>                 # what is held and why
-   gbrain repair frontmatter --source <source-id>    # preview; writes nothing
+   gbrain repair frontmatter --source <source-id>    # frontmatter holds: preview; writes nothing
+   gbrain repair fences --source <source-id>         # fence holds: preview; writes nothing, no model call
    ```
+
+   A fence whose meaning is unambiguous (a missing end marker after the
+   table, duplicate row numbers, an invented kind, an assistant holder, ...)
+   is not held: managed sync rewrites it losslessly, commits the file and
+   reports `fences_normalized` (`gbrain sync --dry-run` lists
+   `would_normalize`; `gbrain config set fences.normalize false` turns it off).
+   A fence hold (`invalid_fence`) names the fence, section, reason and row
+   numbers, never a cell, and clears by itself: the maintenance run's
+   `fence_repair` phase repairs it on the owner host (exact rules first, then
+   the configured chat model for rows only a rewrite can realign, within
+   the daily spend cap) and commits the file.
+   `gbrain repair fences --source <source-id>` previews the same repair and
+   prints its apply command, which needs no extra consent; frontmatter repair
+   does not touch fences. A hold whose reason is `manual` needs a person: read
+   the page (`gbrain get --source <source-id> -- <slug>`), edit that fence in
+   the file, commit, and run `gbrain sync --source <source-id> --no-pull`. A
+   fence refused only while being prepared against the stored page (for
+   example a takes row number a stored take already uses) is held in the same
+   run as `prepare_time`. See [fence holds](write-refusals.md#invalid_fence)
+   and [fence repair](repair.md#fences).
 
    Walkthrough with real output: [held files](repair.md#held-files); codes:
    [content refusals](write-refusals.md#held-files-and-content-refusals).
-   Managed and legacy sync behave the same, and holds never count toward the
+   Managed and legacy sync behave the same for frontmatter, size and content
+   holds; for fences, legacy sync stores the normalized fence in the database
+   (it never rewrites the file), keeps importing a page whose fence cannot be
+   normalized with its bad rows skipped (reported in `fence_issues`), and
+   never holds it. The fence repair still repairs such a file: on a legacy
+   source it re-reads the file, backs it up under `~/.gbrain/backups/`,
+   writes and imports it, and leaves the change for you to commit
+   (`gbrain sources status` names the `git add`/`git commit` command until
+   you do). Holds never count toward the
    legacy auto-skip streak below. A source blocked by such a file before this
    release recovers on its next sync, or now with
    `gbrain sync --source <source-id> --no-pull`. Teams that want fail-closed
-   blocking set `gbrain config set sync.holds fail`. Company-brain profile
-   sources never hold: their approved manifest keeps blocking.
+   blocking set `gbrain config set sync.holds fail` (a fence refusal then
+   blocks with its typed `invalid_fence` text). Company-brain profile
+   sources never hold: their approved manifest keeps blocking, and a fence
+   refusal there is fixed in the repository and committed.
 
    Other failures still fail closed. In legacy sync a file that fails the
    same way `GBRAIN_SYNC_AUTOSKIP_AFTER` consecutive syncs (default 3, set `0`

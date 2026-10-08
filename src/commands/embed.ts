@@ -1,5 +1,5 @@
 import { sanitizeRemoteBody } from '../core/remote-body.ts';
-import { prepareEmbeddingProjections, countArchivedEmbeddingWork } from '../core/embedding-readiness.ts';
+import { prepareEmbeddingProjections, countArchivedEmbeddingWork, reportBlockedProjections } from '../core/embedding-readiness.ts';
 import { embedStaleFacts, type EmbedFactsResult } from '../core/embed-facts.ts';
 import { embedTakesForStaleDrain, type EmbedTakesResult } from '../core/embed-takes.ts';
 import { parseFactEmbedArgs } from './embed-facts-delegate.ts';
@@ -1373,19 +1373,20 @@ async function embedAll(
     }
   }
 
-  // v0.41.15.0: sliding worker pool extracted into src/core/worker-pool.ts.
-  // Throughput characteristics unchanged from the prior inline pool — N
-  // workers atomically claim the next page; the helper is the canonical
-  // primitive. embedOnePage handles its own per-page errors via try/catch
-  // and stderr log (no rethrow), so we don't need failures[] here and
-  // omitting onError means the default 'continue' policy applies cleanly
-  // even though no errors should reach the pool's catch.
+  // Sliding worker pool (src/core/worker-pool.ts). #3037: embedOnePage reads the snapshot before its own
+  // try, so a failed read lands here as a page that never embedded; count it unless the run is aborting.
   await runSlidingPool({
     items: pages,
     workers: CONCURRENCY,
     ...(signal && { signal }), // #1737: pool stops claiming pages once aborted
     onItem: (page) => embedOnePage(page),
     failureLabel: (page) => page.slug,
+    onError: (e, page) => {
+      if (isAborted(signal)) return 'continue';
+      recordFailure(result, 1, page.slug, e);
+      serr(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
+      return 'continue';
+    },
   });
 
   // Stdout summary preserved for scripts/tests that grep for counts.
@@ -1645,11 +1646,8 @@ async function embedAllStale(
     readiness = await prepareEmbeddingProjections(engine, { ...readinessOptions, repair: true, assertOwned: staleOpts?.assertOwned });
     if (isAborted(externalSignal) || Date.now() >= (readinessOptions.deadline ?? Infinity)) return await noteBudgetStop();
   }
-  if (readiness.blocked && !dryRun) {
-    result.failures += readiness.blocked;
-    result.failure_samples.push('Projection recovery remains blocked; rerun embed --stale for bounded recovery or restore unsupported media with its source importer.');
-    return;
-  }
+  // #6223: pages still blocked after bounded recovery never stop the run; the guarded drain counts them.
+  const blockedProjections = readiness.blocked && !dryRun ? await reportBlockedProjections(engine, readinessOptions, readiness.blocked, result.failure_samples) : new Set<string>();
 
   // Chunkless-page safety net: pre-flight count mirrors the countStaleChunks
   // short-circuit just below — a healthy brain pays one extra SELECT
@@ -2025,7 +2023,7 @@ async function embedAllStale(
             // #5804: a page edited, deleted or unsealed mid-run is a counted failure, not a silent
             // skip. An archived source is left to reportArchived, which already counts its pages.
             const [source] = await observed(pacer, () => engine.executeRaw<{ archived: boolean }>('SELECT archived FROM sources WHERE id = $1', [keySourceId]));
-            if (!source?.archived) { result.failures += stale.length; unavailablePages.set(key, slug); }
+            if (!source?.archived) { result.failures += stale.length; if (!blockedProjections.has(key)) unavailablePages.set(key, slug); }
             return;
           }
           const selected = new Map(stale.map(c => [c.chunk_index, c]));

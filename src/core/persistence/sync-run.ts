@@ -8,7 +8,8 @@ import type { RegistryCode } from '../error-registry.ts';
 import { currentSourceFilesystemSignal } from '../minions/source-filesystem.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { digest, sha256 } from './digest.ts';
-import { getWriteRequest, admitWriteInTransaction, receiptFor } from './journal.ts';
+import { getWriteRequest, admitWriteInTransaction, foregroundPriority, intentDigest, receiptFor } from './journal.ts';
+import { preparationConfigView } from './config-snapshot.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
 import { assertPersistenceAccepting, awaitWrite, foregroundWriteCompletions, startPersistenceConsumer, type WriteWait } from './service.ts';
 import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type SyncDiscovery } from './sync-discovery.ts';
@@ -17,28 +18,35 @@ import { assertSyncPageOrigin, sameSyncOrigin, syncOriginScope } from './sync-or
 import { assertManagedSyncActive, assertSyncDispatchActive, managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, syncProcessingOptions, SYNC_PROCESSING_KEYS, type SyncAuthority, type SyncProcessingOptions } from './sync-authority.ts';
 import { prepareManagedSyncMutation, type SyncCursorOptions, type SyncIntent } from './sync-prepare.ts';
 import { screeningRequest } from './noop-kernel.ts';
-import { waiveNoopEntry, type NoopWaiver } from './sync-waivers.ts';
+import { noopWaiversEnabled, screenWaiver, waiveNoopEntry, waiveNoopRun, waiverBatchEnabled, type NoopWaiver, type WaiverRunEntry } from './sync-waivers.ts';
 import { resolve } from 'node:path';
 import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan } from '../company-brain/profile.ts';
 import { readCommittedBlob } from '../company-brain/revision.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
 import { importAnalyzeEveryPages, maybeRefreshPlannerStats } from '../planner-stats.ts';
-import { recordManagedSyncFailure, clearManagedSyncFailureAfterSuccess, formatManagedSyncFailure, type ManagedSyncFailure } from './sync-failures.ts';
+import { recordManagedSyncFailure, clearManagedSyncFailureAfterSuccess, formatManagedSyncFailure, managedSyncRetryCommand, type ManagedSyncFailure } from './sync-failures.ts';
 import { writeFailureDiagnostic } from './verb-errors.ts';
 import { extractManagedStaleLinks } from './links-maintenance.ts';
 import { CHECKPOINT_VALIDATION_TIMEOUT, checkpointRetryCommand, checkpointTimeoutHint } from './checkpoint-validation.ts';
 import { isTerminalWriteState, publicWriteReceipt, type WriteReceipt } from './types.ts';
-import type { WriteRequest } from './model.ts';
+import { principalKey, type WriteRequest } from './model.ts';
+import { readJournalLimits } from './limits.ts';
 import { assertManagedSyncAllowed } from './worktree-refresh.ts';
 import type { GBrainConfig } from '../config.ts';
 import { admitGroup, freezeFollowers, groupableIntent, nextGroupSize, type BulkSettings } from './sync-group.ts';
 import { cancelWindow } from './sync-window.ts';
-import { lanePolicy, openLanes } from './sync-lanes.ts';
+import { laneApplyMsPerMember, lanePolicy, openLanes } from './sync-lanes.ts';
 import { isContentRefusal } from '../import-screen.ts';
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
-import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
+import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
+import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
+import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
 import { faultPoint } from './fault-points.ts';
-import { addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, readSyncHoldPolicy, recordSyncConversion, recoveredReport, writeGitHold } from './sync-holds.ts';
+import { pipelined } from '../page-state/transactions.ts';
+import { withCoordinatedWrite } from './context.ts';
+import { principalAttribution } from './attribution.ts';
+import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
+import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, readSyncHoldPolicy, recordSyncConversion, recoveredReport, writeGitHold, type FencesTally } from './sync-holds.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -68,7 +76,9 @@ interface Cursor extends SyncDiscovery { runId: string; index: number; authority
     /** DX-A7: entries advanced without an admission because their publication would change nothing. */
     waived?: { imports: number; deletes: number };
     /** #5988: imports held, and files imported only after quoting frontmatter. */
-    held?: number; recovered?: { count: number; sample_paths: string[]; comment_values?: number } };
+    held?: number; recovered?: { count: number; sample_paths: string[]; comment_values?: number };
+    /** #6188: files whose fences Tier 1 rewrote (and the Git effect committed). */
+    fences?: FencesTally };
   /** #5988: failed content-refusal requests this run converted in place. */
   convertedFromFailed?: string[];
   /** #5984: the active drain window (reset when a new drain starts), so a backlog ETA never counts downtime. */
@@ -117,6 +127,11 @@ async function saveCursor(engine: BrainEngine, key: string, before: Cursor | nul
   inTx?: (tx: BrainEngine) => Promise<unknown>): Promise<Cursor> {
   const saved = await engine.transaction(async tx => {
     assertActive?.();
+    if (!requireIdle) {
+      const current = await writeCursor(tx, key, before, next, inTx, true);
+      assertActive?.();
+      return current;
+    }
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     if (requireIdle) {
       await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR UPDATE', [next.binding.worktree_id]);
@@ -135,16 +150,26 @@ async function saveCursor(engine: BrainEngine, key: string, before: Cursor | nul
   return saved;
 }
 /** Compare-and-swap inside the caller's transaction; a lost swap returns the cursor that won. */
-async function writeCursor(tx: BrainEngine, key: string, before: Cursor | null, next: Cursor, inTx?: (tx: BrainEngine) => Promise<unknown>): Promise<Cursor> {
+async function writeCursor(tx: BrainEngine, key: string, before: Cursor | null, next: Cursor, inTx?: (tx: BrainEngine) => Promise<unknown>, synchronous = false): Promise<Cursor> {
   if (before === null) {
+    if (synchronous) await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT DO NOTHING`, [`${OP}-manifest`, next.runId, JSON.stringify(next.entries)]);
     await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT DO NOTHING`, [OP, key, JSON.stringify([header(next)])]);
   } else {
-    const saved = await tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now()
-      WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb RETURNING fingerprint`, [OP, key, JSON.stringify([header(before)]), JSON.stringify([header(next)])]);
-    await tx.executeRaw('UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2', [`${OP}-manifest`, next.runId]);
+    // #5984: the settings, the compare-and-swap and the manifest touch go out together; a won swap is the saved cursor.
+    const [, saved] = await pipelined(tx, [
+      () => synchronous ? tx.executeRaw("SELECT set_config('synchronous_commit','on',true)") : Promise.resolve([]),
+      () => tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now()
+      WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb RETURNING fingerprint`, [OP, key, JSON.stringify([header(before)]), JSON.stringify([header(next)])]),
+      () => tx.executeRaw('UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2', [`${OP}-manifest`, next.runId]),
+    ]) as [unknown, unknown[]];
     // #5988: a hold write or clear commits with the cursor step that passes its entry, never without it.
     if (saved.length) await inTx?.(tx);
+    // #6188 (E33): the run's fences_normalized total commits with the cursor step that counts it, so the trend never differs from the cursor.
+    const fences = next.counts.fences;
+    if (saved.length && fences?.count && fences.count !== before.counts.fences?.count) await recordSyncRunTrend(tx, { sourceId: next.sourceId, runId: next.runId,
+      day: new Date().toISOString().slice(0, 10), count: fences.count, byClass: fences.by_class, writers: fences.dirs });
+    if (saved.length) return next;
   }
   return currentCursor(tx, key, next);
 }
@@ -219,7 +244,10 @@ function writeDiagnostic(cursor: Cursor, pending: Pending, row: WriteRequest): M
   };
   const diagnostic: ManagedSyncWriteDiagnostic = { source_id: cursor.sourceId, slug: pending.slug,
     path: pending.intent.path, write_error: code, ...detail, write_request: publicWriteReceipt(receiptFor(row)) };
-  if (terminal) diagnostic.suggestion += ' After repair, run gbrain sync with the same source/options and --retry-failed to start a new request. Without --retry-failed, the frozen terminal request returns the same outcome. Skipping failures cannot bypass a managed write.';
+  // #6194: an import that lost to a database write the hold could not prove; --retry-failed re-imports the Git version over it.
+  if (terminal && code === 'revision_conflict' && pending.intent.kind === 'managed_sync_import') diagnostic.suggestion = `The page changed in the database after this import was frozen. `
+    + `Before retrying, compare the file and the page with gbrain sources reconcile ${cursor.sourceId} ${pending.slug} --preview (it writes nothing): a retry re-imports the Git version over the database one. ${diagnostic.suggestion}`;
+  if (terminal) diagnostic.suggestion += ` After repair, run ${checkpointRetryCommand({ sourceId: cursor.sourceId, processingOptions: cursor.processingOptions, syncOptions: cursor.syncOptions ?? null, repoPath: pending.intent.repoPath })} to start a new request. Without --retry-failed, the frozen terminal request returns the same outcome. Skipping failures cannot bypass a managed write.`;
   if (diagnostic.reason === 'pinned_git_worktree_conflict' && pending.intent.path && pending.intent.content !== null) {
     try {
       const bytes = readSyncFile(cursor.root, pending.intent.path);
@@ -373,12 +401,20 @@ function advanceHeld(held: Cursor, converted?: string[]): Cursor {
  * options: held when the screen holds the frozen entry, re-frozen under a new request when it
  * passes, but only once for the same bytes, so a refusal the screen misses stays blocked
  * without minting a receipt per run.
+ * #6188: a failed fence refusal (typed, or a message an older gbrain stored) holds the same
+ * bytes even when the screen admits them (`prepare_time`: the refusal read stored rows). A
+ * compacted `invalid_params` / `take_row_collision` receipt, whose message is gone, converts
+ * only when the re-screen of the current bytes holds them; an arbitrary `invalid_params` is
+ * never a fence hold.
  */
 async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: string, assertActive: () => void,
   run: Parameters<typeof freezeEntry>[4] & { observedAt?: string }): Promise<Cursor> {
   const previous = blocked.pending!;
   const failed = await getWriteRequest(engine, blocked.authority.writer.principal, previous.requestId);
-  if (!failed || !['failed', 'conflict', 'cancelled'].includes(failed.state) || !isContentRefusal(failed.error_code, failed.error_message)) return blocked;
+  if (!failed || !['failed', 'conflict', 'cancelled'].includes(failed.state)) return blocked;
+  const fence = fenceReceiptLocation(failed);
+  const compacted = !fence && failed.compacted === true && failed.error_message == null && ['invalid_params', 'take_row_collision'].includes(failed.error_code ?? '');
+  if (!fence && !compacted && !isContentRefusal(failed.error_code, failed.error_message)) return blocked;
   const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [blocked.sourceId]);
   assertActive();
   if (unfinished.length) return blocked;
@@ -387,12 +423,79 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
   const converted = [...(blocked.convertedFromFailed ?? []), previous.requestId];
   const logged = (outcome: 'held' | 'refrozen') => (tx: BrainEngine) => recordSyncConversion(tx, blocked.sourceId, blocked.incarnation,
     { request_id: previous.requestId, path: previous.intent.path ?? null, slug: previous.slug, run_id: blocked.runId, outcome });
-  if ('hold' in again) {
-    return saveCursor(engine, key, blocked, advanceHeld(base, converted), false, assertActive,
-      async tx => { await heldWrite(blocked, again.hold, run.observedAt!)(tx); await logged('held')(tx); });
+  const holdWith = (hold: HeldEntry) => saveCursor(engine, key, blocked, advanceHeld(base, converted), false, assertActive,
+    async tx => { await heldWrite(blocked, hold, run.observedAt!)(tx); await logged('held')(tx); });
+  if ('hold' in again) return holdWith(again.hold);
+  const sameBytes = again.intent.rawHash === previous.intent.rawHash && again.intent.content === previous.intent.content;
+  const entry = base.entries[base.index];
+  if (fence && sameBytes && again.intent.kind === 'managed_sync_import' && again.intent.content !== null && entry?.path === again.intent.path) {
+    return holdWith(prepareTimeFenceHold(entry, again.slug, again.pageId, fence, again.intent.content, again.intent.blobOid));
   }
-  if (previous.converted && again.intent.rawHash === previous.intent.rawHash && again.intent.content === previous.intent.content) return blocked;
+  if (compacted || (previous.converted && sameBytes)) return blocked;
   return saveCursor(engine, key, blocked, { ...blocked, convertedFromFailed: converted, pending: { ...again, converted: true } }, false, assertActive, logged('refrozen'));
+}
+
+/**
+ * #6188 (E10): a page request of this run that failed with a fence refusal (or, #6194, a
+ * `revision_conflict` proven to come from a concurrent database-only write) is held in the
+ * same run instead of blocking it (the single path, and a bulk group's failed member, which
+ * the group step leaves as the single pending entry). Other requests of the source settle
+ * first, within the run's wait budget; when they are still running the run returns
+ * `partial` and the next run's start-of-run conversion holds the entry. The failed request
+ * is converted once (`convertedFromFailed`, so it no longer blocks the checkpoint), gets no
+ * failure-ledger row, and is logged as a conversion. Null when it is not a fence refusal or
+ * the run does not hold files (`sync.holds=fail`, company-brain sources).
+ */
+async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: string, pending: Pending, done: WriteRequest, assertActive: () => void,
+  run: { screen?: SyncScreenRun | null; observedAt?: string }, waitMs: number): Promise<Cursor | 'pending' | null> {
+  if (!run.screen || cursor.companyPlan || pending.intent.kind !== 'managed_sync_import' || typeof pending.intent.content !== 'string') return null;
+  const fence = fenceReceiptLocation(done);
+  const entry = cursor.entries[cursor.index];
+  if (!entry || entry.path !== pending.intent.path) return null;
+  // #6194 (D4): a revision conflict proven to come from a concurrent database-only write is held the same way (sync-concurrent-write.ts).
+  const proof = fence ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
+  if (!fence && !proof) return null;
+  const deadline = performance.now() + waitMs;
+  for (;;) {
+    const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [cursor.sourceId]);
+    assertActive();
+    if (!unfinished.length) break;
+    if (performance.now() >= deadline) return 'pending';
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  const hold = fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content, pending.intent.blobOid)
+    : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
+  const base: Cursor = { ...cursor }; delete base.group;
+  return saveCursor(engine, key, cursor, advanceHeld(base, [...(cursor.convertedFromFailed ?? []), pending.requestId]), false, assertActive, async tx => {
+    await heldWrite(cursor, hold, run.observedAt!)(tx);
+    await recordSyncConversion(tx, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path ?? null, slug: pending.slug, run_id: cursor.runId, outcome: 'held' });
+  });
+}
+
+/**
+ * A page request of the run ended without committing. #6188: a fence refusal is held in the same
+ * run (or the run returns `partial` while the source's other requests settle); anything else is
+ * recorded in the failure ledger and blocks the run with its diagnostic.
+ */
+async function settleFailedRequest(engine: BrainEngine, input: { cursor: Cursor; key: string; pending: Pending; done: WriteRequest; assertActive: () => void;
+  run: { screen?: SyncScreenRun | null; observedAt?: string; repoPath?: string }; syncOptions: SyncCursorOptions; processingOptions: SyncProcessingOptions;
+  remote: boolean; waitMs: number; signal?: AbortSignal }): Promise<{ cursor: Cursor } | { result: SyncResult }> {
+  const { cursor, key, pending, done, syncOptions, processingOptions, remote } = input;
+  const converted = await holdFailedFenceRequest(engine, cursor, key, pending, done, input.assertActive, input.run, input.waitMs);
+  if (converted === 'pending') return { result: result(cursor, 'partial', input.signal?.aborted ? 'timeout' : 'writer_pending') };
+  if (converted) { input.assertActive(); return { cursor: converted }; }
+  const { failure, ledgerRecorded } = await recordManagedSyncFailure(engine, { source_id: cursor.sourceId, source_incarnation: cursor.incarnation, path: pending.intent.path ?? '<checkpoint>',
+    code: done.error_code ?? (done.state === 'cancelled' ? 'cancelled' : 'storage_error'), message: done.error_message ?? 'The accepted sync request did not commit.',
+    request_id: pending.requestId, run_id: cursor.runId, target: cursor.target, cursor_key: key,
+    syncOptions: cursor.syncOptions ?? syncOptions, processingOptions: cursor.processingOptions ?? processingOptions,
+    phase: pending.intent.kind === 'managed_sync_checkpoint' ? 'checkpoint' : 'receipt', state: done.state, observation_id: pending.requestId,
+    first_seen: new Date(done.completed_at ?? done.updated_at).toISOString() });
+  // #5762: the hint is built after the failed transaction, from a fresh read of the request indexes.
+  const hint = done.error_code === CHECKPOINT_VALIDATION_TIMEOUT && !remote ? await checkpointTimeoutHint(engine,
+    { requestId: pending.requestId, sourceId: cursor.sourceId, processingOptions: pending.intent.processingOptions, syncOptions: pending.intent.syncOptions ?? syncOptions, repoPath: pending.intent.repoPath ?? input.run.repoPath }) : null;
+  return { result: { ...result(cursor, 'blocked_by_failures'), failedFiles: 1,
+    failureCodes: [{ code: failure.code, count: 1 }], ...(remote ? {} : { failures: [failure],
+      managedWrite: { ...writeDiagnostic(cursor, pending, done), ...hint, ledger_recorded: ledgerRecorded } }) } };
 }
 
 /**
@@ -444,23 +547,127 @@ function countCommitted(counts: Cursor['counts'], pending: Pending, outcome: Wri
   counts.chunks += Number(outcome?.chunks ?? 0);
   if ((outcome?.recovered_frontmatter || outcome?.comment_value) && pending.intent.path) counts.recovered = addRecovered(counts.recovered,
     { paths: outcome.recovered_frontmatter ? [pending.intent.path] : [], commentValues: outcome.comment_value ? 1 : 0 });
+  const fences = outcome?.fences_normalized;
+  if (Array.isArray(fences) && fences.length && pending.intent.path) counts.fences = addFencesNormalized(counts.fences, pending.intent.path, fences as Array<{ class: string }>);
 }
 interface BulkPass { settings: BulkSettings; perMemberMs: number | null;
+  /** Groups this pass formed, and the heads of window groups it admitted (saved and admitted in one transaction). */
+  formed?: number; admitted?: Set<string>;
   /** #5984 admit-ahead: when this pass last saw a foreground write queued on the worktree. */
-  foregroundAt?: number }
+  foregroundAt?: number;
+  /** #5984 Phase 4.5 (`foreground_priority`): foreground writes go first at claim time, so the sync side does not pause for them. */
+  foregroundFirst?: boolean }
 /** While foreground writes are recent, nothing is admitted ahead, so a new foreground write waits behind at most the publishing group. */
 const FOREGROUND_RECENT_MS = 60_000;
+/** A foreground write queued or committed this recently sizes new lane groups to the foreground budget. */
+const FOREGROUND_BUDGET_RECENT_MS = 5_000;
 type FreezeAt = (base: Cursor) => (index: number) => Promise<Pending | null>;
+
+/** The most consecutive no-op entries one waiver transaction passes. */
+const WAIVER_RUN_MAX = 64;
+/**
+ * #5984 Phase 3: when the frozen head would be waived, freezes and screens the entries after it four at a time
+ * (stopping at the first that would not be waived, is held, is overtaken, refuses to freeze, or at the checkpoint)
+ * and waives the run in one transaction, without a `pending` cursor save per entry. Returns null to take the
+ * per-entry path for the head (its screen admits it, or the run's transaction validated nothing or timed out);
+ * otherwise the cursor past the waived prefix (or as another run moved it), with the entry that ended the prefix
+ * saved as pending.
+ */
+async function waiveRun(engine: BrainEngine, cursor: Cursor, head: Pending, key: string, config: GBrainConfig, assertActive: () => void,
+  frozenRun: Parameters<typeof freezeEntry>[4], drainStartedAt: number, limit: number, onProgress: SyncOpts['onProgress']): Promise<Cursor | null> {
+  const first = await screenWaiver(engine, cursor, head, config);
+  if (!first) return null;
+  assertActive();
+  const run: WaiverRunEntry[] = [{ pending: head, waived: first }];
+  const max = Math.max(1, Math.min(WAIVER_RUN_MAX, limit));
+  extend: for (let next = cursor.index + 1; run.length < max && next < cursor.entries.length;) {
+    const batch = Array.from({ length: Math.min(4, max - run.length, cursor.entries.length - next) }, (_, i) => next + i);
+    const frozen = await Promise.all(batch.map(index => freezeEntry(engine, { ...cursor, index }, key, assertActive, frozenRun).catch(() => null)));
+    const screened = await Promise.all(frozen.map((entry, i) => entry && !('hold' in entry) && !entry.rebound
+      ? screenWaiver(engine, { ...cursor, index: batch[i]! }, entry, config).catch(() => null) : null));
+    for (const [i, waived] of screened.entries()) {
+      if (!waived) break extend;
+      run.push({ pending: frozen[i] as Pending, waived });
+    }
+    next += batch.length;
+  }
+  assertActive();
+  const observedAt = frozenRun.observedAt ?? new Date().toISOString();
+  const done = await waiveNoopRun(engine, cursor, run, key, async (tx, prefix) => {
+    let next: Cursor = cursor;
+    for (const { waived } of prefix) next = waivedCursor(next, waived);
+    const paths = prefix.map(({ pending }) => pending.intent.path).filter((path): path is string => typeof path === 'string');
+    return writeCursor(tx, key, cursor, { ...next, progress: stampProgress(cursor.progress, cursor.index, cursor.index + prefix.length, drainStartedAt) }, async inner => {
+      for (const path of await heldGitPaths(inner, cursor.sourceId, cursor.incarnation, paths)) await holdClear(cursor, path, observedAt)!(inner);
+    });
+  }, tx => currentCursor(tx, key, cursor));
+  if (!done) return null;
+  for (let index = cursor.index + 1; index <= cursor.index + done.waived; index++) onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: index, total: cursor.entries.length, waived: true });
+  assertActive();
+  return done.next && done.cursor.index === cursor.index + done.waived
+    ? saveCursor(engine, key, done.cursor, { ...done.cursor, pending: done.next as Pending }, false, assertActive) : done.cursor;
+}
 
 /** #5984 bulk: freezes the followers of an eligible head and records them with it as the cursor's group. */
 async function formGroup(engine: BrainEngine, head: Cursor, pending: Pending, key: string, bulk: BulkPass, config: GBrainConfig, freezeAt: FreezeAt,
   assertActive: () => void): Promise<Cursor> {
-  const followers = await freezeFollowers(engine, head, config, nextGroupSize(bulk.settings, bulk.perMemberMs) - 1, freezeAt(head));
+  const followers = await freezeFollowers(engine, head, config, groupSize(head, bulk) - 1, freezeAt(head));
   if (!followers.length) return head;
   // Members name their group (the head's request ID), so a consumer can claim them together.
   const lane = laneRunOf(head, bulk);
-  const members = [pending, ...followers].map(member => ({ ...member, intent: { ...member.intent, group: pending.requestId, ...(lane ? { lane } : {}) } }));
-  return saveCursor(engine, key, head, { ...head, pending: members[0], group: members }, false, assertActive);
+  const members = [pending, ...followers].map(member => ({ ...member, intent: groupedIntent(member.intent, pending.requestId, lane) }));
+  await faultPoint('sync:before_group_admission', { sourceId: head.sourceId });
+  try {
+    return await admitAndSave(engine, key, head, { ...head, pending: members[0], group: members }, members, assertActive) ?? currentCursor(engine, key, head);
+  } catch (error) {
+    // #6075: a pass that read the head before this one grouped it admitted it first on the single path, with the head's
+    // ungrouped intent. The group is not formed (nothing was admitted) and the single path takes that request; any
+    // other intent under the head's request ID stays an idempotency_conflict.
+    if (!(error instanceof OperationError && error.code === 'idempotency_conflict')) throw error;
+    const prior = await getWriteRequest(engine, head.authority.writer.principal, pending.requestId);
+    if (prior?.digest !== intentDigest({ operation: 'submit_job', sourceId: head.sourceId, slug: pending.slug, callerIntent: pending.intent })) throw error;
+    return currentCursor(engine, key, head);
+  }
+}
+/** The size of the next group this pass forms: the drain's first group is small; lanes size by their measured apply time. */
+function groupSize(cursor: Cursor, bulk: BulkPass): number {
+  const lanes = (bulk.settings.lanes ?? 1) > 1;
+  const first = !bulk.formed && !(cursor.counts.added + cursor.counts.modified + cursor.counts.deleted);
+  bulk.formed = (bulk.formed ?? 0) + 1;
+  return nextGroupSize(bulk.settings, lanes ? laneApplyMsPerMember(cursor.binding.worktree_id) : bulk.perMemberMs,
+    // With foreground priority a foreground write publishes beside lane groups instead of waiting for them, so
+    // groups keep their full budget; without it they shrink while foreground writes are recent.
+    { first, foreground: !bulk.foregroundFirst && bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_BUDGET_RECENT_MS });
+}
+/**
+ * #5984 Phase 1: admits a group's requests and saves the cursor that records them in one transaction: the
+ * admission first, then the cursor compare-and-swap, so a lost swap rolls the admission back and no request is
+ * admitted that the cursor does not hold. Returns the saved cursor, or null when another run moved the cursor.
+ */
+async function admitAndSave(engine: BrainEngine, key: string, before: Cursor, next: Cursor, members: Pending[], assertActive: () => void): Promise<Cursor | null> {
+  const rows = await admitGroup(engine, members, before, async tx => {
+    assertActive();
+    const [saved] = await pipelined(tx, [
+      () => tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now()
+        WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb RETURNING fingerprint`, [OP, key, JSON.stringify([header(before)]), JSON.stringify([header(next)])]),
+      () => tx.executeRaw('UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2', [`${OP}-manifest`, next.runId]),
+    ]) as [unknown[]];
+    return saved.length > 0;
+  });
+  if (!rows) return null;
+  // The sync loop's own admission: the consumer's next tick claims it directly, leaving its scans to their cadence.
+  startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake(true);
+  await faultPoint('sync:mid_checkpoint', { sourceId: next.sourceId });
+  return next;
+}
+/** The keys formGroup adds to a frozen intent; `ungroupedIntent` removes exactly these. */
+function groupedIntent(intent: SyncIntent, group: string, lane: string | null): SyncIntent {
+  return { ...intent, group, ...(lane ? { lane } : {}) };
+}
+/** #6075: the intent a head carried before formGroup named its group, as a single-path pass admits it. */
+function ungroupedIntent(intent: SyncIntent): SyncIntent {
+  const { group: _group, lane: _lane, ...single } = intent;
+  return single;
 }
 
 /** #5984 lanes: the drain's lane run, opened for this cursor's worktree on first use; null when lanes are off. */
@@ -479,17 +686,32 @@ function laneRunOf(cursor: Cursor, bulk: BulkPass): string | null {
  * while foreground writes are recent (one was queued on the worktree in the last minute), or when the next
  * entry is not groupable (renames, holds, waivers, the checkpoint and overtaken entries stay on the single path).
  */
+/** Requests the sync writer may still admit before its principal or the brain reaches the outstanding-request limit, less a reserve of 10. */
+async function admissionRoom(engine: BrainEngine, cursor: Cursor): Promise<number> {
+  const [limits, counters] = await Promise.all([readJournalLimits(engine),
+    engine.executeRaw<{ key: string; outstanding: string }>('SELECT key,outstanding_count::text AS outstanding FROM persistence_counters WHERE key=ANY($1::text[])',
+      [['brain', principalKey(cursor.authority.writer.principal)]])]);
+  const used = (key: string) => Number(counters.find(row => row.key === key)?.outstanding ?? 0);
+  return Math.min(limits.principalOutstanding - used(principalKey(cursor.authority.writer.principal)), limits.brainOutstanding - used('brain')) - 10;
+}
 async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk: BulkPass, config: GBrainConfig, freezeAt: FreezeAt,
   assertActive: () => void): Promise<Cursor> {
   if (!bulk.settings.enabled || !cursor.group?.length) return cursor;
   const lane = laneRunOf(cursor, bulk);
-  // With lanes, twice the lane count stays admitted, so lanes never wait for the sync side to freeze the next group.
-  const depth = lane ? 2 * Math.max(1, lanePolicy(cursor.binding.worktree_id)?.effective ?? 1) : 1;
+  // With lanes, twice the lane count stays admitted, so lanes never wait for the sync side to freeze the next group;
+  // until the run's first page commits only one, so freezing the window does not delay the first group (#5984 G3).
+  const committed = cursor.counts.added + cursor.counts.modified + cursor.counts.deleted > 0;
+  const depth = lane && committed ? 2 * Math.max(1, lanePolicy(cursor.binding.worktree_id)?.effective ?? 1) : 1;
   let current = cursor, foregroundChecked = false;
   for (let slot = 0; ; slot++) {
     const window = current.window ?? [];
     // A group admits only after the group before it: a failed admission ends this pass (it is retried on the next).
-    if (slot < window.length) { if (!await admitWindowGroup(engine, current, key, slot)) break; continue; }
+    if (slot < window.length) {
+      if (bulk.admitted?.has(window[slot]![0]!.requestId)) continue;
+      if (!await admitWindowGroup(engine, current, key, slot)) break;
+      (bulk.admitted ??= new Set()).add(window[slot]![0]!.requestId);
+      continue;
+    }
     if (window.length >= depth) break;
     const start = current.index + current.group!.length + window.reduce((sum, group) => sum + group.length, 0);
     if (start >= current.entries.length) break;
@@ -499,17 +721,32 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
         AND state IN ('queued','running','recovering') AND NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1`, [current.binding.worktree_id]);
       if (foreground) bulk.foregroundAt = performance.now();
     }
-    if (bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) break;
-    const base: Cursor = { ...current, index: start - 1 };
-    // A freeze refusal here is left for the single path to raise in order, after the publishing groups.
-    const frozen = await freezeFollowers(engine, base, config, nextGroupSize(bulk.settings, bulk.perMemberMs), freezeAt(base)).catch(() => []);
-    if (!frozen.length) break;
-    const after = (window.at(-1) ?? current.group!).at(-1)!.requestId;
-    const members = frozen.map(member => ({ ...member, intent: { ...member.intent, group: frozen[0]!.requestId, after, ...(lane ? { lane } : {}) } }));
-    const saved = await saveCursor(engine, key, current, { ...current, window: [...window, members] }, false, assertActive);
-    if (saved.window?.[window.length]?.[0]?.requestId !== members[0]!.requestId) return saved;
+    if (!bulk.foregroundFirst && bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) break;
+    // The admission must fit the writer's outstanding-request capacity (a refused admission would end admit-ahead):
+    // the groups admitted at once take only the room left after the cursor's next group and the agent's own writes.
+    const room = await admissionRoom(engine, current) - bulk.settings.size;
+    // The window's free slots are frozen and then admitted and saved in one transaction, up to a lane count of
+    // groups at a time, so lanes start on the first ones while the rest are frozen.
+    const formed: Pending[][] = [];
+    let next = start;
+    while (window.length + formed.length < depth && formed.length < Math.max(1, depth / 2) && next < current.entries.length) {
+      const base: Cursor = { ...current, index: next - 1 };
+      const size = Math.min(groupSize(base, bulk), room - formed.flat().length);
+      if (size < 1) break;
+      // A freeze refusal here is left for the single path to raise in order, after the publishing groups.
+      const frozen = await freezeFollowers(engine, base, config, size, freezeAt(base)).catch(() => []);
+      if (!frozen.length) break;
+      const after = (formed.at(-1) ?? window.at(-1) ?? current.group!).at(-1)!.requestId;
+      formed.push(frozen.map(member => ({ ...member, intent: { ...member.intent, group: frozen[0]!.requestId, after, ...(lane ? { lane } : {}) } })));
+      next += frozen.length;
+    }
+    if (!formed.length) break;
+    // A failed admission ends this pass (the groups are frozen again on the next); a lost cursor returns the winner's.
+    const saved = await admitAndSave(engine, key, current, { ...current, window: [...window, ...formed] }, formed.flat(), assertActive).catch(() => undefined);
+    if (saved === undefined) break;
+    if (saved === null) return currentCursor(engine, key, current);
+    for (const group of formed) (bulk.admitted ??= new Set()).add(group[0]!.requestId);
     current = saved;
-    slot--;
   }
   assertActive();
   return current;
@@ -525,7 +762,7 @@ async function admitWindowGroup(engine: BrainEngine, cursor: Cursor, key: string
     const [held] = await tx.executeRaw<{ request_id: string | null }>(`SELECT completed_keys->0->'window'->($3::int)->0->>'requestId' AS request_id FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR SHARE`, [OP, key, slot]);
     return held?.request_id === members[0]!.requestId;
   }).catch(() => null);
-  if (rows) startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake();
+  if (rows) startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake(true);
   return rows !== null;
 }
 /**
@@ -541,6 +778,15 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
   let rows = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=ANY($3::uuid[])',
     [principal.kind, principal.id, members.map(member => member.requestId)]);
   if (rows.length < members.length) {
+    // #6075: a pass that froze the head before it was grouped may have admitted it on the single path. The group is
+    // dropped and the single path takes that request; the followers were never admitted (a group admits in one
+    // transaction) and are frozen again. Any other intent under the head's request ID stays an idempotency_conflict.
+    const head = members[0]!, single = ungroupedIntent(head.intent);
+    const prior = rows.find(row => row.request_id === head.requestId);
+    if (prior && !cursor.window && prior.digest === intentDigest({ operation: 'submit_job', sourceId: cursor.sourceId, slug: head.slug, callerIntent: single })) {
+      const next: Cursor = { ...cursor, pending: { ...head, intent: single } }; delete next.group;
+      return { cursor: await saveCursor(engine, key, cursor, next) };
+    }
     const admitted = await admitGroup(engine, members, cursor, async tx => {
       const [held] = await tx.executeRaw<{ request_id: string | null }>(`SELECT completed_keys->0->'pending'->>'requestId' AS request_id FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR SHARE`, [OP, key]);
       return held?.request_id === members[0]!.requestId;
@@ -577,6 +823,21 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
   const stuck = members[committed];
   const stuckRow = stuck ? states.get(stuck.requestId) : undefined;
   const failed = !!stuck && !!stuckRow && isTerminalWriteState(stuckRow.state);
+  if (!stuck && next.window?.length) {
+    next.window = [...next.window];
+    // Window groups that lanes already committed are passed in this same save: the feeder's cost per wait stays
+    // one save however many groups committed meanwhile. It stops at the first group not wholly committed.
+    const ids = next.window.flat().map(member => member.requestId);
+    const done = new Map((await engine.executeRaw<WriteRequest>(`SELECT request_id,state,outcome FROM persistence_requests
+      WHERE principal_kind=$1 AND principal_id=$2 AND request_id=ANY($3::uuid[]) AND state='committed'`, [principal.kind, principal.id, ids])).map(row => [row.request_id, row]));
+    while (next.window.length && next.window[0]!.every(member => done.has(member.requestId))) {
+      const group = next.window.shift()!;
+      for (const member of group) countCommitted(next.counts, member, done.get(member.requestId)!.outcome);
+      onProgress?.({ phase: 'managed_sync.group', bankedFiles: next.index, total: cursor.entries.length, group: group.length });
+      next.index += group.length;
+    }
+    if (next.index !== cursor.index + committed) next.progress = stampProgress(cursor.progress, cursor.index, next.index, drainStartedAt);
+  }
   if (!stuck) {
     // The window's first group becomes the cursor's group; its requests are already admitted and queued.
     const [promoted, ...rest] = next.window ?? [];
@@ -592,6 +853,19 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
       managedWrite: writeDiagnostic(saved, stuck, stuckRow), writeWait: writeWaitOf(last.request_id === stuckRow.request_id ? waited : { kind: 'pending', row: stuckRow }) }) } };
   }
   return { cursor: saved };
+}
+
+/**
+ * A single-path admission that lost its cursor resolves to null (the caller re-reads the cursor): ENG-A7's
+ * CursorMoved, or #6075's idempotency_conflict when a bulk pass admitted the head first with its grouped intent.
+ */
+async function cursorMovedAdmission(engine: BrainEngine, key: string, admitting: Cursor, pending: Pending, error: unknown): Promise<null> {
+  if (error instanceof CursorMoved) return null;
+  if (error instanceof OperationError && error.code === 'idempotency_conflict') {
+    const current = await readCursor(engine, key, admitting);
+    if (current?.pending?.requestId === pending.requestId && digest(current.pending.intent) !== digest(pending.intent)) return null;
+  }
+  throw error;
 }
 
 /** A finished cursor is deleted (compare-and-swap) before the next run discovers; returns whichever cursor replaced it. */
@@ -612,6 +886,22 @@ interface HoldRunState { sourceId?: string; incarnation?: string; remote?: boole
  * One immutable page is admitted at a time; foreground writes can never sit behind a whole scan.
  * #5988: every result (resumed, no-change and blocked runs included) carries this run's holds and the source's outstanding total.
  */
+
+/** The cursor-selecting options of a managed run; part of its durable cursor key. */
+function cursorSyncOptions(opts: SyncOpts): SyncCursorOptions {
+  return { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
+    exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null };
+}
+function managedCursorKey(incarnation: string, authority: SyncAuthority, company: ReturnType<typeof currentCompanyBrainSync>, syncOptions: SyncCursorOptions): string {
+  return digest({ source: incarnation, principal: authority.writer.principal, authority, ...(company ? { company: { receiptId: company.receiptId, planDigest: company.plan.plan_digest } } : {}),
+    options: syncOptions });
+}
+/** The durable cursor key performManagedSync would use for these options, so --retry-failed can count only the failures it retries. */
+export async function managedSyncCursorKey(engine: BrainEngine, opts: SyncOpts): Promise<string> {
+  const context = await resolveManagedSyncContext(engine, opts);
+  const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, opts.repoPath ?? context.root);
+  return managedCursorKey(context.incarnation, authority, currentCompanyBrainSync(context.sourceId), cursorSyncOptions(opts));
+}
 export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
   const state: HoldRunState = {};
   const synced = await runManagedSync(engine, opts, slice, state);
@@ -622,8 +912,9 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
       policy: await readSyncHoldPolicy(engine), pendingScreen: synced.reason === 'writer_yield',
       screened: 'entries' in (cursor ?? {}) ? (cursor as Cursor).entries.slice(0, cursor!.index).filter(entry => entry.action === 'import').length : 0 });
     const recovered = state.remote ? undefined : recoveredReport(state.sourceId, cursor?.counts.recovered);
+    const fences = fencesNormalizedReport(state.sourceId, cursor?.counts.fences, state.remote === true);
     return { ...synced, ...report, ...(!state.remote && cursor?.convertedFromFailed?.length ? { converted_from_failed: cursor.convertedFromFailed } : {}),
-      ...(recovered ? { recovered_frontmatter: recovered } : {}) };
+      ...(recovered ? { recovered_frontmatter: recovered } : {}), ...(fences ? { fences_normalized: fences } : {}) };
   } catch {
     return synced;
   }
@@ -641,12 +932,10 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
   const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, opts.repoPath ?? context.root);
   const company = currentCompanyBrainSync(context.sourceId);
   const processingOptions = syncProcessingOptions(opts);
-  const syncOptions: SyncCursorOptions = { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
-    exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null };
+  const syncOptions = cursorSyncOptions(opts);
   const frozenRun: { syncOptions: SyncCursorOptions; repoPath?: string; screen?: SyncScreenRun | null; observedAt?: string } = { syncOptions, ...(opts.repoPath ? { repoPath: resolve(opts.repoPath) } : {}) };
   const runStartedAt = new Date().toISOString();
-  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority, ...(company ? { company: { receiptId: company.receiptId, planDigest: company.plan.plan_digest } } : {}),
-    options: syncOptions });
+  const key = managedCursorKey(context.incarnation, authority, company, syncOptions);
   let cursor: Cursor | null = null;
   let missingManifestCursor: CursorHeader | null = null;
   if (!company) Object.assign(state, { sourceId: context.sourceId, incarnation: context.incarnation, remote: authority.writer.remote, cursor: () => cursor });
@@ -726,15 +1015,21 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
       return result(cursor, cursor.from === null ? 'first_sync' : 'synced');
     }
     if (cursor?.done) cursor = await retireCompletedCursor(engine, key, cursor, assertActive);
+    const startupConfig = await preparationConfigView(engine); // #5984 G3: one config read answers the startup's config reads
     if (!cursor) {
       assertActive();
       phase = 'discovery';
       discoveryTarget = company?.plan.revision?.commit ?? syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
-      const discovery = await discoverManagedSync(engine, opts, context);
+      const discovery = await discoverManagedSync(startupConfig, opts, context);
       assertActive();
       const fresh: Cursor = { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 }, ...(company ? { companyReceiptId: company.receiptId } : {}) };
       if (opts.dryRun) return dryRun(fresh);
       if (!fresh.entries.length && fresh.from === fresh.target) {
+        // A complete check that found nothing is still a sync: stamp the freshness heartbeat for this incarnation only.
+        await engine.transaction(tx => withCoordinatedWrite(tx, [context.sourceId], () => {
+          assertActive();
+          return tx.executeRaw('UPDATE sources SET last_sync_at=now() WHERE id=$1 AND incarnation=$2::uuid', [context.sourceId, context.incarnation]);
+        }, principalAttribution(authority.writer.principal)));
         await clearManagedSyncFailureAfterSuccess(engine, key);
         assertActive();
         return result(fresh, 'up_to_date');
@@ -754,18 +1049,18 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     }
     assertCursorProcessingOptions(cursor, processingOptions, opts.explicitProcessing);
     if (opts.dryRun) return dryRun(cursor);
-    frozenRun.screen = company ? null : await loadSyncScreenRun(engine, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote);
+    frozenRun.screen = company ? null : await loadSyncScreenRun(startupConfig, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote);
     const observedAt = frozenRun.observedAt = cursor.discoveredAt ?? runStartedAt;
     if (frozenRun.screen && !opts.retryFailed && cursor.pending && !cursor.done) {
       phase = 'freeze';
       cursor = await convertBlockedCursor(engine, cursor, key, assertActive, frozenRun);
     }
-    const config = loadConfig() ?? { engine: engine.kind };
-    const analyzeEvery = await importAnalyzeEveryPages(engine);
+    const config = loadConfig() ?? { engine: engine.kind }, analyzeEvery = await importAnalyzeEveryPages(engine);
     let batchStart = performance.now(), batchPages = 0, foregroundWaitStart = 0, foregroundBaseline = 0;
     let creditedPages = 0, creditStarted = 0, foregroundQueued = false;
     const sliceStarted = performance.now(), sliceFirstIndex = cursor.index, drainStartedAt = opts.drainStartedAt ?? Date.now();
-    const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null };
+    const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null, foregroundFirst: await foregroundPriority(engine) };
+    const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(startupConfig);
     opts.onProgress?.({ phase: 'managed_sync.start', bankedFiles: cursor.index, total: cursor.entries.length });
     while (!cursor.done) {
       assertActive();
@@ -777,7 +1072,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           AND state IN ('queued','running','recovering') AND NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1`, [cursor.binding.worktree_id]);
         assertActive();
         if ((foregroundQueued = Boolean(foreground))) bulk.foregroundAt = performance.now();
-        if (foreground && creditedPages === 0) {
+        if (foreground && creditedPages === 0 && !bulk.foregroundFirst) {
           startPersistenceConsumer(engine, config);
           if (!foregroundWaitStart) {
             foregroundWaitStart = performance.now();
@@ -799,6 +1094,10 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           if (slice && (cursor.index - sliceFirstIndex >= slice.maxPages || performance.now() - sliceStarted >= slice.maxMs)) return result(cursor, 'partial', 'writer_yield');
           continue;
         }
+        const waived: Cursor | null = waiveBatch && !frozen.rebound ? await waiveRun(engine, cursor, frozen, key, config, assertActive, frozenRun, drainStartedAt,
+          slice ? slice.maxPages - (cursor.index - sliceFirstIndex) : WAIVER_RUN_MAX, opts.onProgress) : null;
+        if (waived && slice && (waived.index - sliceFirstIndex >= slice.maxPages || performance.now() - sliceStarted >= slice.maxMs)) return result(waived, 'partial', 'writer_yield');
+        if (waived) { cursor = waived; continue; }
         cursor = await saveCursor(engine, key, cursor, { ...cursor, ...(frozen.rebound ? { overtaken: true as const } : {}), pending: frozen }, false, assertActive);
       }
       if (!cursor.pending) continue; // another owner-loop advanced the cursor
@@ -820,7 +1119,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         continue;
       }
       const freezeAt: FreezeAt = base => async index => { const frozen = await freezeEntry(engine, { ...base, index }, key, assertActive, frozenRun); return 'hold' in frozen ? null : frozen; };
-      if (bulk.settings.enabled && !foregroundQueued && !prior && !cursor.group && !pending.rebound && groupableIntent(pending.intent)) cursor = await formGroup(engine, cursor, pending, key, bulk, config, freezeAt, assertActive);
+      if (bulk.settings.enabled && (bulk.foregroundFirst || !foregroundQueued) && !prior && !cursor.group && !pending.rebound && groupableIntent(pending.intent)) cursor = await formGroup(engine, cursor, pending, key, bulk, config, freezeAt, assertActive);
       if (cursor.group?.[0]?.requestId === pending.requestId && cursor.pending?.requestId === pending.requestId) {
         const step = await groupStep(engine, cursor, key, bulk, config, opts.drainStartedAt ? { waitMs: 30_000, signal } : { waitMs: 5000 }, drainStartedAt, opts.onProgress,
           opts.drainStartedAt ? next => admitAhead(engine, next, key, bulk, config, freezeAt, assertActive) : undefined);
@@ -838,13 +1137,14 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           sourceId: admitting.sourceId, sourceIncarnation: admitting.incarnation, slug: pending.slug, pageId: pending.pageId,
           worktreeId: admitting.binding.worktree_id, topologyGeneration: admitting.binding.topology_generation,
           principal: admitting.authority.writer.principal, authority: admitting.authority.writer, callerIntent: pending.intent, intent: pending.intent });
-        // ENG-A7: after the counter locks (the publication lock order), admit only while the cursor still holds this entry.
-        const [held] = await tx.executeRaw<{ request_id: string | null }>(`SELECT completed_keys->0->'pending'->>'requestId' AS request_id
-          FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR SHARE`, [OP, key]);
-        if (held?.request_id !== pending.requestId) throw new CursorMoved();
+        // ENG-A7: after the counter locks (the publication lock order), admit only while the cursor still holds this entry
+        // with this intent (#6075: a bulk pass may have grouped the head since this pass read it).
+        const [held] = await tx.executeRaw<{ request_id: string | null; same: boolean | null }>(`SELECT completed_keys->0->'pending'->>'requestId' AS request_id,
+          completed_keys->0->'pending'->'intent' = $3::text::jsonb AS same FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR SHARE`, [OP, key, JSON.stringify(pending.intent)]);
+        if (held?.request_id !== pending.requestId || held.same !== true) throw new CursorMoved();
         assertActive();
         return accepted;
-      })).catch(error => { if (error instanceof CursorMoved) return null; throw error; });
+      })).catch(error => cursorMovedAdmission(engine, key, admitting, pending, error));
       if (!row) { cursor = await currentCursor(engine, key, cursor); continue; }
       await validateSyncAuthority(engine, cursor.authority, pending.slug);
       assertSyncDispatchActive();
@@ -859,17 +1159,12 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           ...(authority.writer.remote ? {} : { managedWrite: writeDiagnostic(cursor, pending, done), writeWait: writeWaitOf(waited) }) };
       }
       if (done.state !== 'committed') {
-        const { failure, ledgerRecorded } = await recordManagedSyncFailure(engine, { source_id: cursor.sourceId, source_incarnation: cursor.incarnation, path: pending.intent.path ?? '<checkpoint>',
-          code: done.error_code ?? (done.state === 'cancelled' ? 'cancelled' : 'storage_error'), message: done.error_message ?? 'The accepted sync request did not commit.',
-        request_id: pending.requestId, run_id: cursor.runId, target: cursor.target, cursor_key: key,
-        phase: pending.intent.kind === 'managed_sync_checkpoint' ? 'checkpoint' : 'receipt', state: done.state, observation_id: pending.requestId,
-        first_seen: new Date(done.completed_at ?? done.updated_at).toISOString() });
-        // #5762: the hint is built after the failed transaction, from a fresh read of the request indexes.
-        const hint = done.error_code === CHECKPOINT_VALIDATION_TIMEOUT && !authority.writer.remote ? await checkpointTimeoutHint(engine,
-          { requestId: pending.requestId, sourceId: cursor.sourceId, processingOptions: pending.intent.processingOptions, syncOptions: pending.intent.syncOptions ?? syncOptions, repoPath: pending.intent.repoPath ?? frozenRun.repoPath }) : null;
-        return { ...result(cursor, 'blocked_by_failures'), failedFiles: 1,
-          failureCodes: [{ code: failure.code, count: 1 }], ...(authority.writer.remote ? {} : { failures: [failure],
-            managedWrite: { ...writeDiagnostic(cursor, pending, done), ...hint, ledger_recorded: ledgerRecorded } }) };
+        const settled = await settleFailedRequest(engine, { cursor, key, pending, done, assertActive, run: frozenRun, syncOptions, processingOptions,
+          remote: authority.writer.remote, waitMs: opts.drainStartedAt ? 30_000 : 5000, signal });
+        if ('result' in settled) return settled.result;
+        cursor = settled.cursor;
+        opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length });
+        continue;
       }
       if (pending.intent.kind === 'managed_sync_checkpoint') {
         cursor = (await readCursor(engine, key))!;
@@ -916,9 +1211,10 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         const failedCursor = cursor ?? stored?.completed_keys?.[0];
         const { failure } = await recordManagedSyncFailure(engine, { source_id: context.sourceId, source_incarnation: context.incarnation, path: cursor?.entries[cursor.index]?.path ?? failedCursor?.pending?.intent.path ?? `<${phase}>`, code,
           message: error instanceof Error ? error.message : String(error), request_id: failedCursor?.pending?.requestId ?? null,
-          run_id: failedCursor?.runId ?? discoveryRun, target: failedCursor?.target ?? discoveryTarget, cursor_key: key, phase, state: 'failed',
+          run_id: failedCursor?.runId ?? discoveryRun, target: failedCursor?.target ?? discoveryTarget, cursor_key: key,
+          syncOptions: failedCursor?.syncOptions ?? syncOptions, processingOptions: failedCursor?.processingOptions ?? processingOptions, phase, state: 'failed',
           observation_id: failedCursor ? `${failedCursor.runId}:${failedCursor.index}:${phase}:${code}` : `${key}:discovery:${discoveryTarget}:${code}` });
-        if (error instanceof Error) error.message = authority.writer.remote ? 'Managed sync is blocked; ask the host operator to inspect doctor.' : formatManagedSyncFailure(failure) + ' Fix the cause, then run gbrain sync --no-pull --retry-failed with the same source and options.';
+        if (error instanceof Error) error.message = authority.writer.remote ? 'Managed sync is blocked; ask the host operator to inspect doctor.' : `${formatManagedSyncFailure(failure)} Fix the cause, then run: ${managedSyncRetryCommand(failure, frozenRun.repoPath)}`;
       }
     }
     throw error;

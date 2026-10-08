@@ -297,6 +297,71 @@ describe('importFromContent — soft-block (D9 transition + embed_skip)', () => 
   });
 });
 
+describe('importFromContent — stale size-gate recovery', () => {
+  test('trusted export with an obsolete oversized marker regains chunks', async () => {
+    await withIsolatedHome(async () => {
+      const content = FRONTMATTER.replace('---\n\n', 'embed_skip:\n  reason: oversized\ncontent_flag:\n  reason: oversized\n---\n\n') + 'A small, useful note about garden planning.';
+      const result = await importFromContent(engine, 'notes/recovered', content, { noEmbed: true, remote: false });
+      expect(result.status).toBe('imported');
+      const page = await engine.getPage('notes/recovered');
+      expect(isEmbedSkipped(page!.frontmatter)).toBe(false);
+      expect(getContentFlag(page!.frontmatter)).toBeNull();
+      expect((await engine.getChunks('notes/recovered')).length).toBeGreaterThan(0);
+    });
+  });
+
+  test('threshold changes rebuild identical content in both directions without force', async () => {
+    await withIsolatedHome(async () => {
+      const content = FRONTMATTER + 'Useful garden planning observations. '.repeat(100);
+      await engine.setConfig('content_sanity.bytes_block', '1000');
+      try {
+        await importFromContent(engine, 'notes/threshold', content, { noEmbed: true });
+        expect((await engine.getChunks('notes/threshold')).length).toBe(0);
+        await engine.setConfig('content_sanity.bytes_block', '10000');
+        const recovered = await importFromContent(engine, 'notes/threshold', content, { noEmbed: true });
+        expect(recovered.status).toBe('imported');
+        expect(isEmbedSkipped((await engine.getPage('notes/threshold'))!.frontmatter)).toBe(false);
+        expect((await engine.getChunks('notes/threshold')).length).toBeGreaterThan(0);
+        expect((await importFromContent(engine, 'notes/threshold', content, { noEmbed: true })).status).toBe('skipped');
+        await engine.setConfig('content_sanity.bytes_block', '1000');
+        expect((await importFromContent(engine, 'notes/threshold', content, { noEmbed: true })).status).toBe('imported');
+        expect((await engine.getChunks('notes/threshold')).length).toBe(0);
+      } finally {
+        await engine.unsetConfig('content_sanity.bytes_block');
+      }
+    });
+  });
+
+  test('a remote writer still has every gate marker stripped (it cannot plant or keep one)', async () => {
+    await withIsolatedHome(async () => {
+      const content = FRONTMATTER.replace('---\n\n', 'embed_skip:\n  reason: manual\ncontent_flag:\n  reason: markup_heavy\n---\n\n') + 'A small useful note.';
+      expect((await importFromContent(engine, 'notes/remote-marker', content, { noEmbed: true, remote: true })).status).toBe('imported');
+      const page = await engine.getPage('notes/remote-marker');
+      expect(isEmbedSkipped(page!.frontmatter)).toBe(false);
+      expect(getContentFlag(page!.frontmatter)).toBeNull();
+      expect((await engine.getChunks('notes/remote-marker')).length).toBeGreaterThan(0);
+    });
+  });
+
+  test('with the sanity gate bypassed (GBRAIN_NO_SANITY=1) a stale oversized marker is left alone', async () => {
+    await withIsolatedHome(async () => withEnv({ GBRAIN_NO_SANITY: '1' }, async () => {
+      const content = FRONTMATTER.replace('---\n\n', 'embed_skip:\n  reason: oversized\n---\n\n') + 'A small useful note.';
+      await importFromContent(engine, 'notes/bypassed', content, { noEmbed: true, remote: false, preserveGateMarkers: true });
+      expect(isEmbedSkipped((await engine.getPage('notes/bypassed'))!.frontmatter)).toBe(true);
+      expect((await engine.getChunks('notes/bypassed')).length).toBe(0);
+    }));
+  });
+
+  test('unknown local skip reasons stay skipped', async () => {
+    await withIsolatedHome(async () => {
+      const content = FRONTMATTER.replace('---\n\n', 'embed_skip:\n  reason: manual\n---\n\n') + 'A small useful note.';
+      await importFromContent(engine, 'notes/manual-skip', content, { noEmbed: true, remote: false, preserveGateMarkers: true });
+      expect(isEmbedSkipped((await engine.getPage('notes/manual-skip'))!.frontmatter)).toBe(true);
+      expect((await engine.getChunks('notes/manual-skip')).length).toBe(0);
+    });
+  });
+});
+
 describe('importFromContent — gate markers excluded from content_hash (no re-sync churn, #1699)', () => {
   test('re-importing identical markup-heavy content is SKIPPED (stable hash despite fresh assessed_at)', async () => {
     await withIsolatedHome(async () => {
@@ -356,7 +421,9 @@ A perfectly normal note with real prose and nothing wrong with it.`;
     });
   });
 
-  test('trusted caller (remote unset) preserves a user-authored marker', async () => {
+  // #6259: only an owner-tier path (sync or import of the owner's own file) keeps gate markers;
+  // a call that does not say so strips them (test/gate-marker-strip.test.ts).
+  test('an owner-tier caller (preserveGateMarkers) preserves a user-authored marker', async () => {
     await withIsolatedHome(async () => {
       // A local user deliberately editing their own file is trusted.
       const content = `---
@@ -368,7 +435,7 @@ content_flag:
 ---
 
 my own note.`;
-      await importFromContent(engine, 'notes/mine', content, { noEmbed: true });
+      await importFromContent(engine, 'notes/mine', content, { noEmbed: true, preserveGateMarkers: true });
       const page = await engine.getPage('notes/mine');
       expect(getContentFlag(page!.frontmatter as Record<string, unknown>)?.reason).toBe('markup_heavy');
     });

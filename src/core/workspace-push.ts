@@ -189,7 +189,9 @@ export type PushLockResult =
   | { acquired: false; holderPid: number | null };
 
 export function pushLockDir(repoRoot: string): string {
-  const hash = createHash('sha256').update(repoRoot).digest('hex').slice(0, 16);
+  let canonical = repoRoot;
+  try { canonical = realpathSync(repoRoot); } catch { /* absent or unresolvable: hash the raw path */ }
+  const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 16);
   return join(ensureGbrainHome(), 'locks', `push-${hash}.lock`);
 }
 
@@ -424,6 +426,8 @@ export interface PushStatusEntry {
   reason?: string;
   ahead?: number;
   repoRoot?: string;
+  /** #6083: machine code of a refusal (`writer_coordinator_required` on a managed worktree). */
+  code?: string;
   /** Absolute path of the status file (per-root announce-state keying). */
   file: string;
 }
@@ -633,7 +637,7 @@ export function summarizePushStatuses(entries: PushStatusEntry[]): {
 }
 
 function writePushStatus(
-  status: { ts: string; ok: boolean; reason?: string; ahead?: number; repoRoot: string },
+  status: { ts: string; ok: boolean; reason?: string; ahead?: number; repoRoot: string; code?: string },
 ): void {
   try {
     const p = pushStatusPathForRoot(status.repoRoot);
@@ -675,7 +679,7 @@ export async function workspacePush(opts: WorkspacePushOpts): Promise<WorkspaceP
     // No lock winner can be in flight here: the same guard refuses every legacy
     // push of this root.
     if (root && e instanceof OperationError) {
-      writePushStatus({ ts: new Date().toISOString(), ok: false, reason: `${e.code}: ${e.message}`, repoRoot: root });
+      writePushStatus({ ts: new Date().toISOString(), ok: false, code: e.code, reason: `${e.code}: ${e.message}`, repoRoot: root });
     }
     throw e;
   }

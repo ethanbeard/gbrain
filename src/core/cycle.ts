@@ -55,6 +55,7 @@ import { isManagedBrain } from './cycle/phase-table.ts';
 import { managedPullWarning, type UpstreamRefresh } from './sync-upstream.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
+import { acquireLeaseSet, maintenanceLockBusySkip, MAINTENANCE_LEASE_ID } from './cycle/lock-set.ts';
 import { assertEmbedNotStalled } from './embed-stall.ts';
 import { anyAbortSignal } from './abort-signals.ts';
 import { maybeRefreshPlannerStats } from './planner-stats.ts';
@@ -66,6 +67,7 @@ export { anyAbortSignal } from './abort-signals.ts';
 
 export type CyclePhase =
   | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
+  | 'fence_repair' // #6188: repairs held and stored malformed facts/takes fences (global maintenance lane)
   | 'resolve_symbol_edges'
   | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
   // v0.36.1.0 Hindsight calibration wave:
@@ -121,6 +123,8 @@ export const ALL_PHASES: CyclePhase[] = [
   'lint',
   'backlinks',
   'sync',
+  // #6188: right after sync, so a fence the sync just held is repaired before extract and extract_facts read the page.
+  'fence_repair',
   'synthesize',
   'extract',
   // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
@@ -319,6 +323,7 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'lint',
   'backlinks',
   'sync',
+  'fence_repair', // #6188: writes repaired fences through coordinated writes
   'synthesize',
   'extract',
   // v0.32.2 — wipes + re-inserts facts per affected page.
@@ -617,7 +622,7 @@ export interface CycleOpts {
  */
 export const CYCLE_STALE_DRAIN_BUDGET_MS = 3 * 60 * 1000;
 
-const LEGACY_CYCLE_LOCK_ID = 'gbrain-cycle';
+const LEGACY_CYCLE_LOCK_ID = MAINTENANCE_LEASE_ID;
 // v0.41.19.0 (T2 of ops-fix-wave): dropped from 30 min to 5 min so a
 // crashed cycle releases the lock within 5 min instead of holding it for
 // the full 30-min TTL. Wired with active in-phase refresh via
@@ -710,14 +715,28 @@ function cycleLockIdLabelFor(sourceId?: string): string {
  *     boundaries; replacing it with a background timer drops the Minion
  *     side).
  */
-async function acquireDbCycleLock(engine: BrainEngine, sourceId?: string): Promise<LockHandle | null> {
-  const lockId = cycleLockIdFor(sourceId);
-  const handle: DbLockHandle | null = await tryAcquireDbLock(engine, lockId, LOCK_TTL_MINUTES);
-  if (handle === null) return null;
-  return {
-    refresh: handle.refresh,
-    release: handle.release,
+async function acquireDbCycleLock(engine: BrainEngine, sourceId: string | undefined, phases: CyclePhase[]): Promise<{ lock: LockHandle; maintenanceBusy: boolean } | { lock: null; busyId: string }> {
+  // #6242: a source-scoped cycle that selects brain-wide phases also tries the
+  // shared lease; when another cycle holds it, it runs its source phases only.
+  const shared = sourceId !== undefined && phases.some(needsMaintenanceLease) ? [LEGACY_CYCLE_LOCK_ID] : [];
+  const acquire = async (id: string): Promise<LockHandle | null> => {
+    const handle: DbLockHandle | null = await tryAcquireDbLock(engine, id, LOCK_TTL_MINUTES);
+    return handle && { refresh: handle.refresh, release: handle.release };
   };
+  const set = await acquireLeaseSet([cycleLockIdFor(sourceId)], acquire, shared);
+  return set.status === 'busy' ? { lock: null, busyId: set.busyId } : { lock: set.lease, maintenanceBusy: set.busyOptional !== null };
+}
+
+/** Brain-wide (mixed or global) phases that write: they run only under the shared `gbrain-cycle` lease. */
+function needsMaintenanceLease(phase: CyclePhase): boolean {
+  return NEEDS_LOCK_PHASES.has(phase) && PHASE_SCOPE[phase] !== 'source';
+}
+
+/** #6242: the shared lease is busy — report each brain-wide phase skipped and return the source phases to run. */
+async function skipBrainWidePhases(engine: BrainEngine, phases: CyclePhase[], results: PhaseResult[]): Promise<CyclePhase[]> {
+  const holder = await inspectLock(engine, LEGACY_CYCLE_LOCK_ID).catch(() => null);
+  results.push(...phases.filter(needsMaintenanceLease).map(p => maintenanceLockBusySkip(p, holder)));
+  return phases.filter(p => !needsMaintenanceLease(p));
 }
 
 /**
@@ -1023,14 +1042,14 @@ function checkAborted(signal?: AbortSignal): void {
 // going through runCycle's full setup cost.
 export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal, sourceId?: string): Promise<PhaseResult> {
   try {
-    const [{ runLintCore }, { cycleLintFixEnabled }] = await Promise.all([import('../commands/lint.ts'), import('./cycle/lint-fix-setting.ts')]);
+    const [{ runLintCore }, { cycleLintFixEnabled, cycleLintExcludes }] = await Promise.all([import('../commands/lint.ts'), import('./cycle/lint-fix-setting.ts')]);
     // issue #1678: pass the cycle's live engine so lint's content-sanity
     // DB-plane lift REUSES it instead of creating + disconnecting a
     // competing module-style engine that nulls the shared db singleton
     // mid-cycle (which broke every phase after lint with a misleading
     // "connect() has not been called").
-    const lintFix = await cycleLintFixEnabled(engine); // `cycle.lint_fix=false`: report-only (CLI `gbrain lint --fix` unaffected)
-    const result = await runLintCore({ target: brainDir, fix: lintFix, dryRun, engine: engine ?? undefined, signal, sourceId }); // #5180: sourceId scopes the managed-brain coordinator write path
+    const [lintFix, exclude] = await Promise.all([cycleLintFixEnabled(engine), cycleLintExcludes(engine)]); // `cycle.lint_fix=false`: report-only; #6134 `cycle.lint_exclude`
+    const result = await runLintCore({ target: brainDir, fix: lintFix, dryRun, engine: engine ?? undefined, signal, sourceId, exclude }); // #5180: sourceId scopes the managed-brain coordinator write path
     const issues = result.total_issues ?? 0;
     const fixed = result.total_fixed ?? 0;
     const remaining = Math.max(0, issues - fixed);
@@ -1046,7 +1065,7 @@ export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: B
       summary: dryRun
         ? `${issues} issue(s) found (dry-run, no writes)`
         : lintFix ? `${fixed} fix(es) applied, ${remaining} remaining` : `${issues} issue(s) found (report-only: cycle.lint_fix=false)`,
-      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun, lint_fix: lintFix, write_path: result.write_path, fix_pending: result.fix_pending, ...(result.pending_issues?.length ? { pending: result.pending_issues } : {}) },
+      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun, lint_fix: lintFix, excluded: exclude, write_path: result.write_path, fix_pending: result.fix_pending, ...(result.pending_issues?.length ? { pending: result.pending_issues } : {}) },
     };
   } catch (e) {
     return {
@@ -1860,7 +1879,7 @@ export async function runCycle(
 ): Promise<CycleReport> {
   const start = performance.now();
   const requestedPhases = opts.phases ?? ALL_PHASES;
-  const phases = resolveCyclePhases(opts.phases, opts.sourceId, opts.fullImplicitSourceCycle);
+  let phases = resolveCyclePhases(opts.phases, opts.sourceId, opts.fullImplicitSourceCycle);
   const excludedPhases = requestedPhases.filter((phase) => !phases.includes(phase));
   const dryRun = !!opts.dryRun;
   const pull = !!opts.pull;
@@ -1948,12 +1967,12 @@ export async function runCycle(
         }
       }
 
-      let dbLock: LockHandle | null = null;
+      let dbLease: Awaited<ReturnType<typeof acquireDbCycleLock>>;
       try {
         // v0.38: per-source lock ID when opts.sourceId is set; legacy
         // `gbrain-cycle` otherwise (autopilot still passes nothing).
         // cycleLockIdFor validates the sourceId via assertValidSourceId.
-        dbLock = await acquireDbCycleLock(engine, opts.sourceId);
+        dbLease = await acquireDbCycleLock(engine, opts.sourceId, phases);
       } catch (e) {
         // Lock acquisition failed catastrophically (e.g., migration missing).
         // Release the PGLite file lock before returning so it doesn't strand
@@ -1982,13 +2001,13 @@ export async function runCycle(
         };
       }
 
-      if (dbLock === null) {
+      if (dbLease.lock === null) {
         // Busy DB lock (another cycle for the same source already running).
         // Release the file lock before returning skipped.
         if (pgliteFileLock) {
           try { await pgliteFileLock.release(); } catch { /* best effort */ }
         }
-        const holder = await inspectLock(engine, cycleLockIdFor(opts.sourceId)).catch(() => null);
+        const holder = await inspectLock(engine, dbLease.busyId).catch(() => null);
         return {
           schema_version: '1',
           timestamp,
@@ -2001,6 +2020,8 @@ export async function runCycle(
           totals: emptyTotals(),
         };
       }
+      const dbLock = dbLease.lock;
+      if (dbLease.maintenanceBusy) phases = await skipBrainWidePhases(engine, phases, phaseResults);
 
       // Compose the two handles into one so the existing release/refresh
       // sites at the cycle body's finally block don't need to know about
@@ -2223,6 +2244,12 @@ export async function runCycle(
         progress.finish();
       }
       await safeYield(opts.yieldBetweenPhases);
+    }
+
+    if (phases.includes('fence_repair')) { // #6188: one bounded run of the `fences` repair kind (src/core/cycle/fence-repair.ts)
+      checkAborted(cycleSignal);
+      const { result, duration_ms } = await timePhase(async () => (await import('./cycle/fence-repair.ts')).runFenceRepairPhase(engine, { dryRun, signal: cycleSignal, deadlineAtMs: opts.deadlineAtMs ?? null }), 'fence_repair');
+      phaseResults.push({ ...result, duration_ms }); await safeYield(opts.yieldBetweenPhases);
     }
 
     // ── Phase 4: synthesize (v0.23) ─────────────────────────────
@@ -3216,6 +3243,8 @@ export function deriveStatus(phases: PhaseResult[], totals: CycleReport['totals'
   );
   if (attempted.length > 0) phases = attempted;
   if (phases.length === 0) return 'failed';
+  // #6242: nothing ran because every selected phase needed the busy maintenance lease.
+  if (phases.every(p => p.details?.reason === 'maintenance_lock_busy')) return 'skipped';
   const anyFailed = phases.some(p => p.status === 'fail');
   const allFailed = phases.every(p => p.status === 'fail');
   const anyWarn = phases.some(p => p.status === 'warn');

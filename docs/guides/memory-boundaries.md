@@ -21,7 +21,12 @@ instructions. Do not put secrets in memory pages. A durable decision about a
 setup can be recorded without copying its credentials or assuming that setup is
 active in another harness.
 
-Automatic capture is opt-in. Time-limited facts need an explicit TTL; ordinary
+Automatic capture is opt-in. Installing the harness hooks opts into the
+compaction and SessionEnd capture lanes; `gbrain config set
+memory.auto_writeback off` stops every capture lane, and `gbrain bootstrap
+harness --remove` stops the hooks from banking session text at all (see
+[ambient writeback](ambient-writeback.md#capture-lanes-and-the-off-switch)).
+Time-limited facts need an explicit TTL; ordinary
 saved facts do not expire just because they describe a temporary situation.
 `forget` withdraws a fact from active recall, not from all source material,
 history, or private backups. See [ambient writeback](ambient-writeback.md).
@@ -35,7 +40,10 @@ just after the save). With default settings each saved page of an
 extraction-eligible type (note, meeting, email and similar) also gets one facts
 extraction call after it is saved; it runs as a queued job, is attributed to the
 write that caused it, and stops with `gbrain config set facts.extraction_enabled
-false`. Image OCR, when turned on (`embedding_image_ocr`), runs before the save.
+false`.
+`gbrain config set facts.page_write_notability_filter medium-and-up` keeps
+only high- and medium-notability facts from page writes (`high-only` keeps the
+high tier, as sync does; `all`, the default, keeps every tier). Image OCR, when turned on (`embedding_image_ocr`), runs before the save.
 Set `GBRAIN_AI_CALL_LOG=<path>` to record every model call a process makes (kind,
 model, tokens, duration, and the write request, job or cycle phase it served; no
 prompt or response text).

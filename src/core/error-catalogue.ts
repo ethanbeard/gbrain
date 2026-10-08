@@ -38,6 +38,7 @@ export const ERROR_CATALOGUE = {
   preview_changed: { code: 'preview_changed', docs: 'docs/guides/repair.md#preview-changed' },
   projection_owner_resident: { code: 'projection_owner_resident', docs: 'docs/guides/repair.md#projection-owner-resident' },
   file_removed_during_scan: { code: 'file_removed_during_scan', docs: 'docs/guides/repair.md#file-removed-during-scan' },
+  fix_not_writable: { code: 'fix_not_writable', docs: 'docs/guides/repair.md#fix-not-writable' },
   page_projection_conflict: { code: 'page_projection_conflict', docs: 'docs/guides/repair.md#page-projection-conflict' },
   explicit_kind_required: { code: 'explicit_kind_required', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
   repair_kind_unavailable: { code: 'unavailable', docs: 'docs/guides/repair.md#explicit-only-repair-kinds' },
@@ -48,6 +49,10 @@ export const ERROR_CATALOGUE = {
   source_checkout_missing: { code: 'recovery_required', docs: 'docs/guides/write-refusals.md#source_checkout_missing' },
   managed_pull_skipped: { code: 'managed_pull_skipped', docs: 'docs/guides/write-refusals.md#managed_pull_skipped' },
   no_pricing: { code: 'no_pricing', docs: 'docs/guides/write-refusals.md#no_pricing' },
+  timeline_comment_markup: { code: 'timeline_comment_markup', docs: 'docs/guides/repair.md#timeline-comments' },
+  timeline_rows_would_be_removed: { code: 'timeline_rows_would_be_removed', docs: 'docs/guides/write-refusals.md#timeline_rows_would_be_removed' },
+  reconcile_private_facts: { code: 'permission_denied', docs: 'docs/guides/write-refusals.md#reconcile-private-facts' },
+  maintenance_backpressure: { code: 'maintenance_backpressure', docs: 'docs/guides/write-refusals.md#maintenance_backpressure' },
   // F0 `gbrain sources refresh` (worktree-wide coordinated ff-only refresh).
   refresh_not_managed: { code: 'refresh_not_managed', docs: 'docs/guides/write-refusals.md#refresh_not_managed' },
   refresh_not_owner: { code: 'refresh_not_owner', docs: 'docs/guides/write-refusals.md#refresh_not_owner' },

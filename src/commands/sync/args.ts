@@ -19,13 +19,18 @@ export function printSyncHelp(): void {
 Sync the brain repo's text content into the engine, then embed.
 
 A file whose content refuses deterministically (frontmatter gbrain cannot
-read without guessing, a conflicting frontmatter slug, over-size, or a
-content_sanity reject) is held: the rest of the source imports, the
-checkpoint advances, and each hold prints its code, line, key and next
-command. Inspect holds with 'gbrain sources status <id>'; preview the fix
-with 'gbrain repair frontmatter --source <id>'. A source a file blocked
-before this release recovers on its next sync ('--no-pull' on a managed
-brain). 'gbrain config set sync.holds fail' restores fail-closed blocking.
+read without guessing, a conflicting frontmatter slug, over-size, a
+content_sanity reject, or on a managed brain a facts or takes fence that
+cannot be imported) is held: the rest of the source imports, the
+checkpoint advances, and each hold prints its code, location and next
+command. Inspect holds with 'gbrain sources status <id>'. Preview a
+frontmatter fix with 'gbrain repair frontmatter --source <id>'. A fence hold
+(invalid_fence) is repaired by the next maintenance run when one is active;
+preview it with 'gbrain repair fences --source <id>' (read-only, no model
+call), which prints the apply command, or the exact edit for a fence gbrain
+will not guess. A source a file blocked before this release recovers on its
+next sync ('--no-pull' on a managed brain).
+'gbrain config set sync.holds fail' restores fail-closed blocking.
 
 Options:
   --no-embed           Skip the embed step. Use this when the embed
@@ -94,10 +99,11 @@ Options:
                        'gbrain config set sync.bulk false' or
                        GBRAIN_SYNC_BULK=0; tune with sync.bulk_size and
                        sync.bulk_max_txn_ms.
-  --lanes N            Managed Postgres sync: publish up to N bulk groups at
-                       once (1-8, default 6, capped by the connection pool).
-                       Pages still commit in file order. Persist with
-                       'gbrain config set sync.lanes N' or GBRAIN_SYNC_LANES.
+  --lanes N            Managed Postgres sync: publish at most N bulk groups at
+                       once (1-16, default 16, capped by the connection pool:
+                       GBRAIN_POOL_SIZE minus 4). Pages still commit in file
+                       order. Persist with 'gbrain config set sync.lanes N' or
+                       GBRAIN_SYNC_LANES; the drain reports what limited it.
   --no-lanes           Same as --lanes 1: one bulk group at a time.
   --no-delegate        On a PGLite brain with a live 'gbrain serve', sync
                        normally delegates the run to the serve process over
@@ -152,7 +158,8 @@ See also:
   gbrain embed --stale    Re-embed all stale chunks (post --no-embed).
   gbrain doctor           Diagnose dim mismatches and other sync issues.
   gbrain sources status <id>              Held files with their next command.
-  gbrain repair frontmatter --source <id> Preview the fix for held files.
+  gbrain repair frontmatter --source <id> Preview the fix for frontmatter holds.
+  gbrain repair fences --source <id>      Preview the repair of fence holds.
   docs/guides/repair.md#held-files        Walkthrough.
 `);
 }
@@ -189,7 +196,7 @@ export function parseSyncFlags(args: string[]) {
   const noPull = args.includes('--no-pull');
   const noBulk = args.includes('--no-bulk');
   const lanesAt = args.indexOf('--lanes');
-  const lanes = args.includes('--no-lanes') ? 1 : lanesAt === -1 ? undefined : intFlagValue(args[lanesAt + 1], '--lanes', { min: 1, max: 8, example: 4 });
+  const lanes = args.includes('--no-lanes') ? 1 : lanesAt === -1 ? undefined : intFlagValue(args[lanesAt + 1], '--lanes', { min: 1, max: 16, example: 8 });
   let noEmbed = resolveNoEmbed(args, loadConfig());
   const noExtract = args.includes('--no-extract'); // v0.42.7 #1696
   const skipFailed = args.includes('--skip-failed');

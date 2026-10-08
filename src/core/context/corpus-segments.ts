@@ -94,6 +94,10 @@ const SEAT_ORPHAN_GRACE_MS = 10 * 60 * 1000;
  * publish). Lives HERE so the engine-free hook lane can GC orphaned receipts
  * without importing the engine-typed harvest module. */
 export const HARVEST_RECEIPT_SUFFIX = '.receipt.json';
+/** #6091: capture-time consent record (capture-consent.ts); reaped with its corpus file after a grace period.
+ * `<file>.capture-off.json` is the pre-wave-12 single record; W4.2 records are `<file>.capture-off.<brain>.json`. */
+export const CAPTURE_OFF_SUFFIX = '.capture-off.json';
+export const CAPTURE_OFF_INFIX = '.capture-off.';
 /** #5887 window-progress sidecar (context/corpus-windows.ts) and its CAS
  * lock. Engine-free home so the hook's GC reaps both with the `.txt`; the
  * hook's resume rewrite never deletes them. */
@@ -428,7 +432,11 @@ export async function bankCompactSegment(
   sessionId: string,
   allTurns: WindowTurn[],
   boundaryTurnIndexes: number[],
-  opts: { remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number },
+  opts: {
+    remainingMs: () => number; minScanMs: number; minWriteMs: number; maxTurns?: number;
+    /** #6091: runs before the segment is renamed into place (capture-time consent record); a throw banks nothing. */
+    beforeWrite?: (file: string, text: string) => void;
+  },
 ): Promise<{ segment: string; flushCorpusFile?: string; hash?: string; ordinal?: number }> {
   try {
     const windowTurns = sliceBoundaryWindow(allTurns, boundaryTurnIndexes, {
@@ -440,6 +448,7 @@ export async function bankCompactSegment(
     if (!rendered) return { segment: 'scan_unavailable' };
     if (!rendered.text.trim()) return { segment: 'empty_window' };
     if (opts.remainingMs() < opts.minWriteMs) return { segment: 'deadline_write' };
+    opts.beforeWrite?.(join(dir, segmentFileName(sessionId, segmentHash(rendered.text))), rendered.text);
     const w = writeSegment(dir, sessionId, rendered.text);
     const ordinal = appendSegmentLedger(dir, sessionId, w.hash);
     return {
@@ -578,6 +587,12 @@ export function gcCorpusArtifacts(
           if (!liveSessions.has(name.slice(0, -SEAT_SIDECAR_SUFFIX.length)) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) {
             rmSync(p, { force: true });
           }
+          continue;
+        }
+        const offAt = name.endsWith('.json') ? name.lastIndexOf(CAPTURE_OFF_INFIX) : -1;
+        if (offAt > 0) {
+          // Written BEFORE its corpus file lands: only an orphan past the grace period is reaped (every brain's record alike).
+          if (!existsSync(join(dir, name.slice(0, offAt))) && statSync(p).mtimeMs < Date.now() - SEAT_ORPHAN_GRACE_MS) rmSync(p, { force: true });
           continue;
         }
         if (name.endsWith('.ledger.json')) {

@@ -14,15 +14,40 @@
 //    The allowlist is a ratchet: it may shrink, never silently grow — add a
 //    line only with a review-visible commit. An entry whose file has no donor
 //    hit (cleaned or deleted) fails as stale, so the list shrinks with it.
-// 3. CLI REFS (warn only): `gbrain <cmd>` tokens inside fenced code blocks are
-//    checked against the CLI's --tools-json surface. Warnings never fail the
-//    build; they exist so a skill body promising a nonexistent command is
-//    visible in CI logs before a user hits it.
+// 3. CLI REFS (fail): `gbrain <cmd>` tokens inside fenced code blocks AND
+//    inline code spans must name a real top-level command (the CLI's
+//    --tools-json surface, CLI_FLAG_REGISTRY, src/cli.ts dispatch, the
+//    command table and op cliHints). A curated list of known-bad
+//    subcommands (`gbrain embed refresh` parses `refresh` as a page slug)
+//    fails too. Skill bodies are agent-executed instructions, so a command
+//    that cannot run is a broken instruction, not a style nit. If the CLI
+//    surface cannot be loaded the lane warns and skips.
+// 4. OUTSIDE-ROOT LINKS (fail): a relative markdown link whose resolved
+//    target lies outside the skills root breaks the moment the skills are
+//    copied into a host workspace or a plugin tree (#6198). Links inside the
+//    skills tree stay relative; repo docs use absolute URLs (fix:
+//    `bun scripts/portable-skill-links.ts`). skills/migrations/** is exempt.
+//    The same rule runs over the generated plugin/skills and
+//    plugin-variants/*/skills trees next to the skills dir.
+//    W4.7: link targets are read in every Markdown form: `](./x.md)`,
+//    `](x.md)` (a bare `.md` target that is not a placeholder),
+//    `](<x.md>)`, `](x.md "title")` and reference definitions `[id]: x.md`.
+// 5. PAID CONSENT (fail, W4.7): a `gbrain` command that pre-approves paid
+//    work (`--yes`, `--max-usd`, `--max-cost`, `--max-cost-usd` on embed,
+//    reindex, reindex-code, enrich, extract-conversation-facts, book-mirror,
+//    jobs submit, doctor --remediate, dream) needs approval wording (ask,
+//    agree, approve, consent, confirm, permission) on its line or in the 8
+//    lines before it. This lane covers skills/migrations/** too: migration
+//    notes are agent-executed during upgrades.
+//
+// The CLI-ref lane fails closed (W4.7): when the CLI surface cannot be
+// loaded the check FAILS instead of warning; pass --no-cli-refs to skip it
+// deliberately.
 //
 // Usage: bun scripts/check-skill-refs.mjs [--skills-dir skills/] [--allowlist scripts/skill-refs-allowlist.txt] [--no-cli-refs]
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
-import { join, relative, dirname } from 'node:path';
+import { join, relative, dirname, resolve } from 'node:path';
 import { execSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
@@ -58,6 +83,38 @@ function isPlaceholderLinkTarget(target) {
   if (BRAIN_CONTENT_DIRS.has(segs[0])) return true; // brain-page path example
   if (segs.some((s) => /-example(\.|\/|$)/.test(s))) return true; // alice-example, acme-example, ...
   return false;
+}
+
+const SKILLS_ROOT = resolve(SKILLS_DIR);
+const PORTABLE_FIX = 'bun scripts/portable-skill-links.ts';
+
+/** A relative link that escapes `root` once resolved from `file`'s directory, or null. */
+function outsideRootLink(root, file, raw) {
+  const target = raw.split('#')[0];
+  if (!relative(root, resolve(dirname(file), target)).startsWith('..')) return null;
+  const line = readFileSync(file, 'utf8').split('\n').findIndex((l) => l.includes(raw)) + 1;
+  return {
+    line,
+    message: `\`](${raw})\` resolves outside the skills root, so it dangles once the skills are copied into a host workspace or plugin. Fix: ${PORTABLE_FIX} (protocol links point at skills/conventions/agent-operator-protocol.md; other repo docs become absolute URLs)`,
+  };
+}
+
+/** Relative link targets in `text` (W4.7): inline links (bare, `<…>`, titled) and reference definitions; URLs and anchors excluded. */
+const BARE_PLACEHOLDER_SEGMENT = /^(?:path|to|type|slug|relative|page|link|url|file|name|sibling[-\w]*|[\w-]*slug[\w-]*)(?:\.md)?$/i;
+function linkTargets(text) {
+  const out = [];
+  const add = (raw) => {
+    if (!raw || /^(?:[a-z][a-z0-9+.-]*:|#|\/)/i.test(raw)) return;
+    if (!raw.startsWith('./') && !raw.startsWith('../')) {
+      // A bare target is a link only when it names a .md file and is not a documentation placeholder.
+      const target = raw.split('#')[0];
+      if (!target.endsWith('.md') || target.split('/').some((seg) => BARE_PLACEHOLDER_SEGMENT.test(seg))) return;
+    }
+    out.push(raw);
+  };
+  for (const m of text.matchAll(/\]\(\s*(?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"\n]*")?\s*\)/g)) add(m[1] ?? m[2]);
+  for (const m of text.matchAll(/^\s{0,3}\[[^\]\n]+\]:\s*(?:<([^>\n]+)>|(\S+))/gm)) add(m[1] ?? m[2]);
+  return out;
 }
 
 function walk(dir) {
@@ -137,11 +194,15 @@ for (const file of files) {
   // `](./x.md)` / `](../x/y.md)` targets must resolve against the linking
   // file's own directory. http(s) and anchor-only targets never match the
   // leading ./ or ../ pattern; placeholder/example targets are exempt.
-  for (const m of text.matchAll(/\]\((\.{1,2}\/[^)\s]+)\)/g)) {
-    const raw = m[1];
+  for (const raw of linkTargets(text)) {
     const target = raw.split('#')[0];
     if (!target) continue; // anchor-only after a ./ prefix — nothing to resolve
     if (isPlaceholderLinkTarget(target)) continue;
+    const outside = outsideRootLink(SKILLS_ROOT, file, raw);
+    if (outside) {
+      failures.push(`[outside-root-link] ${rel}:${outside.line} — ${outside.message}`);
+      continue;
+    }
     if (!existsSync(join(dirname(file), target))) {
       const line = text.split('\n').findIndex((l) => l.includes(raw)) + 1;
       failures.push(`[dangling-md-link] ${rel}:${line} — \`](${raw})\` does not resolve from ${rel}'s directory`);
@@ -191,7 +252,35 @@ if (existsSync(resolverPath)) {
   }
 }
 
-// --- 3. CLI refs (warn-only) ---
+// --- 3. CLI refs (fail) ---
+// `gbrain embed` takes flags or a page slug, so a bare word after it is read
+// as a slug: `embed refresh` runs the paid-consent gate, then "Page not found".
+const KNOWN_BAD_SUBCOMMANDS = {
+  embed: { refresh: 'gbrain embed --stale --dry-run (preview), then gbrain embed --stale --yes --max-usd <cap> after the user approves' },
+};
+// A command position: line/span start, after a shell separator or `$ ` prompt,
+// past `nohup`/`exec`/`time` and env assignments. Prose that merely mentions
+// gbrain mid-sentence ("turned off gbrain update checks") is not a command.
+const GBRAIN_CMD_RE = /(?:^|[|&;(]|\$)\s*(?:(?:nohup|exec|time)\s+|[A-Z_][A-Z0-9_]*=\S*\s+)*gbrain\s+([a-z][a-z0-9-]*)(?:\s+([a-z][a-z0-9-]*))?/g;
+
+/** `gbrain <cmd> [<sub>]` in fenced code lines and inline code spans. */
+function cliRefs(text) {
+  const refs = [];
+  let fence = null;
+  for (const line of text.split('\n')) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker && (!fence || marker[1].startsWith(fence))) {
+      fence = fence ? null : marker[1];
+      continue;
+    }
+    const snippets = fence ? [line.trim()] : [...line.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim());
+    for (const snippet of snippets) {
+      for (const m of snippet.matchAll(GBRAIN_CMD_RE)) refs.push({ cmd: m[1], sub: m[2], snippet });
+    }
+  }
+  return refs;
+}
+
 if (RUN_CLI_REFS) {
   let known = null;
   try {
@@ -205,10 +294,10 @@ if (RUN_CLI_REFS) {
       for (const a of (t.cliHints && t.cliHints.aliases) || []) known.add(String(a));
     }
   } catch {
-    warnings.push('[cli-refs] could not load --tools-json; skipping CLI-ref check');
+    failures.push('[cli-refs] could not load the CLI surface (bun src/cli.ts --tools-json), so no gbrain command in a skill was checked. Fix: make `bun src/cli.ts --tools-json` run (bun install; the Bun version in package.json engines), or pass --no-cli-refs to skip this lane deliberately');
   }
   if (known && known.size === 0) {
-    warnings.push('[cli-refs] --tools-json parsed to an EMPTY command set; skipping CLI-ref check (the warn-only lane is not running)');
+    failures.push('[cli-refs] --tools-json parsed to an EMPTY command set, so no gbrain command in a skill was checked. Fix: make `bun src/cli.ts --tools-json` print the tool list, or pass --no-cli-refs to skip this lane deliberately');
   }
   if (known && known.size > 0) {
     // top-level commands defined directly in src/cli.ts (not ops): derive from source
@@ -218,6 +307,10 @@ if (RUN_CLI_REFS) {
       // Refactor wave 1: CLI-only commands are records in the command table.
       const tableSrc = readFileSync('src/cli/command-table.ts', 'utf8');
       for (const m of tableSrc.matchAll(/\{ name: '([a-z][a-z0-9-]*)'/g)) known.add(m[1]);
+      // Every CLI-only command has a row in the generated flag registry.
+      const registrySrc = readFileSync('src/core/cli-flag-registry.generated.ts', 'utf8');
+      const registry = registrySrc.slice(registrySrc.indexOf('CLI_FLAG_REGISTRY'), registrySrc.indexOf('CLI_ROUTING_FLAGS'));
+      for (const m of registry.matchAll(/^\s+'([a-z][a-z0-9-]*)': \[/gm)) known.add(m[1]);
     } catch {}
     // ops cliHints that --tools-json does not serialize: read them from source.
     // operations.ts is a façade post-peel — the op declarations (and their
@@ -239,16 +332,64 @@ if (RUN_CLI_REFS) {
     } catch {}
     for (const file of files) {
       if (file.includes('/migrations/')) continue;
-      if (!file.endsWith('.md')) continue; // fenced gbrain-cmd scan is markdown-only
-      const rel = relative('.', file);
-      const text = readFileSync(file, 'utf8');
-      for (const block of text.matchAll(/```[a-z]*\n([\s\S]*?)```/g)) {
-        for (const cmd of block[1].matchAll(/(?:^|[|&;(]\s*)gbrain\s+([a-z][a-z0-9-]*)/gm)) {
-          if (!known.has(cmd[1])) warnings.push(`[cli-refs] ${rel} — \`gbrain ${cmd[1]}\` not found in CLI surface (warn-only)`);
+      if (!file.endsWith('.md')) continue; // gbrain-cmd scan is markdown-only
+      const rel = join('skills', relative(SKILLS_DIR, file));
+      for (const { cmd, sub, snippet } of cliRefs(readFileSync(file, 'utf8'))) {
+        if (!known.has(cmd)) {
+          failures.push(`[cli-refs] ${rel} — \`${snippet}\`: \`gbrain ${cmd}\` is not a gbrain command, so an agent following this skill gets "unknown command". Fix: name the real command (\`gbrain --help\` lists them)`);
+          continue;
         }
+        const replacement = sub && KNOWN_BAD_SUBCOMMANDS[cmd]?.[sub];
+        if (replacement) failures.push(`[cli-refs] ${rel} — \`${snippet}\`: \`gbrain ${cmd} ${sub}\` does not run as written. Fix: ${replacement}`);
       }
     }
   }
+}
+
+// --- 4. outside-root links in the generated plugin trees ---
+// The plugin trees ship to users verbatim; a link that escapes their skills
+// root dangles in every install. Only the link rule runs here: the variants
+// carry a subset of skills by design.
+const generatedRoots = [join(SKILLS_DIR, '..', 'plugin', 'skills')];
+const variantsDir = join(SKILLS_DIR, '..', 'plugin-variants');
+if (existsSync(variantsDir)) {
+  for (const v of readdirSync(variantsDir)) generatedRoots.push(join(variantsDir, v, 'skills'));
+}
+for (const root of generatedRoots.filter((r) => existsSync(r))) {
+  for (const file of walk(root)) {
+    const underRoot = relative(root, file);
+    if (underRoot.startsWith('migrations/') || !file.endsWith('.md')) continue;
+    for (const raw of linkTargets(readFileSync(file, 'utf8'))) {
+      if (isPlaceholderLinkTarget(raw.split('#')[0])) continue;
+      const outside = outsideRootLink(resolve(root), file, raw);
+      if (outside) failures.push(`[outside-root-link] ${relative(join(SKILLS_DIR, '..'), file)}:${outside.line} — ${outside.message}, then bun run regen:all`);
+    }
+  }
+}
+
+// --- 5. paid consent (fail, W4.7; migrations included) ---
+const PAID_COMMAND_RE = /(?:^|[|&;(]|\$)\s*(?:(?:nohup|exec|time)\s+|[A-Z_][A-Z0-9_]*=\S*\s+)*gbrain\s+(embed|reindex|reindex-code|enrich|extract-conversation-facts|book-mirror|dream|jobs\s+submit|doctor)(?![\w-])([^\n`]*)/;
+const PREAPPROVAL_RE = /(?:^|\s)--(?:yes|max-usd|max-cost|max-cost-usd)(?:[=\s]|$)/;
+const APPROVAL_WORDING_RE = /\b(?:ask|asks|asked|agree|agrees|agreed|approv\w*|consent\w*|confirm\w*|permission)\b/i;
+for (const file of files) {
+  if (!file.endsWith('.md')) continue;
+  const rel = join('skills', relative(SKILLS_DIR, file));
+  const lines = readFileSync(file, 'utf8').split('\n');
+  let fence = null;
+  lines.forEach((line, i) => {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker && (!fence || marker[1].startsWith(fence))) { fence = fence ? null : marker[1]; return; }
+    const snippets = fence ? [line.trim()] : [...line.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim());
+    for (const snippet of snippets) {
+      const m = snippet.match(PAID_COMMAND_RE);
+      if (!m || !PREAPPROVAL_RE.test(m[2])) continue;
+      if (m[1] === 'doctor' && !/--remediate\b/.test(m[2])) continue;
+      if (m[1] === 'dream' && !/--phase\s+(?:synthesize|patterns|chronicle)\b/.test(m[2]) && /--phase\b/.test(m[2])) continue;
+      const context = lines.slice(Math.max(0, i - 8), i + 1).join('\n');
+      if (APPROVAL_WORDING_RE.test(context)) continue;
+      failures.push(`[paid-consent] ${rel}:${i + 1} — \`${snippet}\` pre-approves paid work with no approval step near it, so an agent following this would spend without asking. Fix: say to ask the user first (for example "only after the user agrees:" on the line above), and show the free preview (--dry-run) before it`);
+    }
+  });
 }
 
 // The ratchet only shrinks if a clean file leaves the list: an entry whose

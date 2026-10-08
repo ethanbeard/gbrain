@@ -66,6 +66,7 @@ import { serializePageToMarkdown } from '../markdown.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import type { Page } from '../types.ts';
 import { materializedHistoryRanges, prepareCanonicalProjections } from '../persistence/canonical-projections.ts';
+import { normalizePageFences } from '../fence-repair/import-step.ts';
 import { prepareAutomaticLinks } from '../persistence/links-preparation.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { resolveCycleDate, utcDate } from './cycle-date.ts';
@@ -182,7 +183,8 @@ export function emptyQuoteVerifyStats(): QuoteVerifyStats {
  * buildTriageMapBlock's quote filter via the mapless `normForGrounding`).
  *
  * Folds: whitespace runs → single space, curly quotes/apostrophes → straight,
- * unicode dashes → '-', case → lower. `map[i]` = index in the ORIGINAL string
+ * unicode dashes → '-', case → lower; markdown inline markup (`*`, backticks,
+ * `~~`) is skipped (`foldSkipSet`). `map[i]` = index in the ORIGINAL string
  * of the character that produced `norm[i]`, so any match in normalized space
  * maps back to a VERBATIM original slice (outside-voice amendment: without
  * the map, "replace with verbatim span" would not be verbatim).
@@ -210,7 +212,7 @@ export function normalizeForGrounding(s: string, opts: { tolerant?: boolean } = 
 function foldForGrounding(s: string, withMap: boolean, tolerant = false): { norm: string; map: number[] } | string {
   const out: string[] = [];
   const map: number[] = [];
-  const skip = tolerant ? bracketMask(s) : null;
+  const skip = foldSkipSet(s, tolerant);
   let pendingSpace = false;
   // Iterate by CODE POINT (for..of), not code unit: a surrogate pair
   // lowercases as a pair (Deseret 𐐀 → 𐐨) but never half by half, so a
@@ -266,6 +268,37 @@ function bracketMask(s: string): Set<number> | null {
   }
   for (let i = 0; i < s.length; i++) if (s[i] === '[' || s[i] === ']') skip.add(i);
   return skip;
+}
+
+/**
+ * Code-unit offsets the fold skips: markdown inline markup (every `*`, every
+ * backtick, and `~` in a `~~` run) in both modes, so `**sync**`, `` `sync` ``
+ * and `sync` read alike; plus `bracketMask` in tolerant mode. `_` is kept:
+ * it is too common in identifiers and paths.
+ */
+function foldSkipSet(s: string, tolerant: boolean): Set<number> | null {
+  const brackets = tolerant ? bracketMask(s) : null;
+  if (!/[*`]|~~/.test(s)) return brackets;
+  const skip = brackets ?? new Set<number>();
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '*' || ch === '`' || (ch === '~' && (s[i - 1] === '~' || s[i + 1] === '~'))) skip.add(i);
+  }
+  return skip;
+}
+
+/**
+ * `s` without the inline markup `foldSkipSet` skips in strict mode. A source
+ * slice that differs from a quote only by these marks says the quote's exact
+ * words, so it grounds as exact rather than splicing in a `**` the slice may
+ * leave unbalanced.
+ */
+function withoutInlineMarkup(s: string): string {
+  const skip = foldSkipSet(s, false);
+  if (!skip) return s;
+  let out = '';
+  for (let i = 0; i < s.length; i++) if (!skip.has(i)) out += s[i];
+  return out;
 }
 
 /** A source slice as a reader sees it, ready to sit inside a quotation: link syntax reduced to the link text, inner double quotes as single. */
@@ -678,7 +711,8 @@ function groundQuoteSpan(inner: string, t: GroundedTranscript, near: boolean): G
     const [start, end] = normalized[0];
     const replacement = shown(t.content.slice(start, end));
     if (replacement.length === 0) return { status: 'none', reason: 'not_found' };
-    return replacement === inner ? { status: 'exact', spans: normalized } : { status: 'normalized', replacement, spans: normalized };
+    const same = replacement === inner || withoutInlineMarkup(replacement) === withoutInlineMarkup(inner);
+    return same ? { status: 'exact', spans: normalized } : { status: 'normalized', replacement, spans: normalized };
   }
 
   // Rung 3: near match. Anchor on word trigrams from the quote; score
@@ -795,10 +829,13 @@ function numericClaims(text: string): Array<{ raw: string; claim: string; keys: 
  * Numeric and date claims in `text` that no source states. `text` must
  * already be masked (code, links) and have grounded quotes blanked. A claim
  * is supported when any of its canonical keys appears among a source's
- * numbers, or its normalized text occurs in a source or its file name.
+ * numbers or in `exemptNumericKeys` (facts the writer's prompt supplied,
+ * such as `date:<cycle date>`), or its normalized text occurs in a source or
+ * its file name.
  */
-export function unsupportedNumericClaims(text: string, sources: GroundedSource[]): string[] {
+export function unsupportedNumericClaims(text: string, sources: GroundedSource[], exemptNumericKeys?: ReadonlySet<string>): string[] {
   return numericClaims(text)
+    .filter(({ keys }) => !keys.some(k => exemptNumericKeys?.has(k)))
     .filter(({ claim, keys }) => !sources.some(src =>
       keys.some(k => src.numbers.has(k)) || src.norm.includes(claim) || src.nameNorm.includes(claim)))
     .map(({ raw }) => raw);
@@ -905,7 +942,7 @@ export interface BodyVerification {
   quarantined: QuarantinedClaim[];
   provenance: QuoteProvenance[];
   failures: Record<ClaimFailure, number>;
-  /** New units that pass only because they carry no quote, number or attribution (System One S8 checks these). */
+  /** Substantive new units that pass the mechanical checks, with their final quote repairs (System One S8 checks these). */
   groundingUnits: string[];
 }
 
@@ -990,7 +1027,7 @@ function clip(s: string, n = PROVENANCE_TEXT_CHARS): string {
  * their speaker attribution only (no number, date or decision checks), for
  * writers whose prose legitimately derives numbers from its sources.
  */
-export function verifyBody(body: string, sources: GroundedSource[], opts: { priorNorm?: string; checks?: 'all' | 'quotes' } = {}): BodyVerification {
+export function verifyBody(body: string, sources: GroundedSource[], opts: { priorNorm?: string; checks?: 'all' | 'quotes'; exemptNumericKeys?: ReadonlySet<string> } = {}): BodyVerification {
   const { spans, unbalanced } = extractQuoteSpans(body);
   const masked = maskNonProse(body);
   const failures: Record<ClaimFailure, number> = { quote_not_in_source: 0, quote_crosses_speakers: 0, speaker_mismatch: 0, number_not_in_source: 0, decision_misattributed: 0 };
@@ -1050,7 +1087,7 @@ export function verifyBody(body: string, sources: GroundedSource[], opts: { prio
     }
     const unquoted = blank(masked.slice(u.start, u.end), quoteRanges);
     // Quotes-only mode (answers that legitimately compute numbers): no number or decision checks.
-    const numbers = opts.checks === 'quotes' ? [] : unsupportedNumericClaims(unquoted, sources);
+    const numbers = opts.checks === 'quotes' ? [] : unsupportedNumericClaims(unquoted, sources, opts.exemptNumericKeys);
     for (const n of numbers) fail('number_not_in_source', n);
     if (numbers.length === 0 && opts.checks !== 'quotes') {
       for (const n of misattributedDecisionClaims(unquoted, attribution, sources, [...mentioned.keys()])) {
@@ -1064,7 +1101,17 @@ export function verifyBody(body: string, sources: GroundedSource[], opts: { prio
     } else {
       edits.push(...unitEdits);
       provenance.push(...unitProvenance);
-      if (unitSpans.length === 0 && mentioned.size === 0 && isGroundingCandidate(body, u.start, unquoted)) groundingUnits.push(text);
+      // Mechanical evidence validates a quote or number, not the interpretation
+      // around it, so S8 judges every substantive new passing unit, attributed
+      // and numeric ones and labels around valid quotes included. It sees the
+      // final quote repairs: its quarantine reducer removes units by exact text.
+      if (isGroundingCandidate(body, u.start, masked.slice(u.start, u.end))) {
+        let repaired = text;
+        for (const e of [...unitEdits].sort((a, b) => b.start - a.start)) {
+          repaired = repaired.slice(0, e.start - u.start) + e.text + repaired.slice(e.end - u.start);
+        }
+        groundingUnits.push(repaired);
+      }
     }
   }
 
@@ -1077,12 +1124,11 @@ export function verifyBody(body: string, sources: GroundedSource[], opts: { prio
 /** Units shorter than this many words (labels, headings, fragments) are not claims S8 judges. */
 const MIN_GROUNDING_UNIT_WORDS = 5;
 
-/** A passing unit with no number, not a heading, long enough to be a claim. */
-function isGroundingCandidate(body: string, start: number, unquoted: string): boolean {
+/** A passing prose unit, not a heading, long enough to be a claim. */
+function isGroundingCandidate(body: string, start: number, prose: string): boolean {
   const lineStart = body.lastIndexOf('\n', start - 1) + 1;
   if (/^[ \t]*#{1,6}[ \t]/.test(body.slice(lineStart, start + 1))) return false;
-  if (numericFacts(unquoted).size > 0) return false;
-  return (unquoted.match(/\p{L}[\p{L}'-]*/gu) ?? []).length >= MIN_GROUNDING_UNIT_WORDS;
+  return (prose.match(/\p{L}[\p{L}'-]*/gu) ?? []).length >= MIN_GROUNDING_UNIT_WORDS;
 }
 
 /** Drop REMOVED markers and the empty list items / blank runs they leave, keeping the body's trailing newline. */
@@ -1119,7 +1165,7 @@ function recordList<T>(fm: Record<string, unknown> | undefined, key: string, pic
  */
 export interface VerifiedDreamPage extends VerifiablePage {
   changed: boolean;
-  /** New units that pass only for lack of a quote, number or attribution, per body (S8 input). */
+  /** Substantive new units that pass the mechanical checks, per body (S8 input). */
   groundingUnits: Array<{ body: 'compiled_truth' | 'timeline'; text: string }>;
 }
 
@@ -1132,6 +1178,11 @@ export interface GroundingPass {
   apply(page: VerifiedDreamPage, sources: GroundedSource[], subject: string, checkedAt: string): Promise<VerifiedDreamPage>;
 }
 
+/**
+ * Verify both bodies of one dream page. `checkedAt` is the cycle date the
+ * synthesis prompt gave the child as today's date, so a page stating that ISO
+ * date is not flagged `number_not_in_source`; every other date still is.
+ */
 export function verifyDreamPage(
   page: VerifiablePage,
   sources: GroundedSource[],
@@ -1139,8 +1190,9 @@ export function verifyDreamPage(
   stats: QuoteVerifyStats,
 ): VerifiedDreamPage {
   const priorNorm = opts.prior ? normForGrounding(`${opts.prior.compiled_truth}\n${opts.prior.timeline ?? ''}`) : undefined;
-  const truth = verifyBody(page.compiled_truth ?? '', sources, { priorNorm });
-  const timeline = verifyBody(page.timeline ?? '', sources, { priorNorm });
+  const exemptNumericKeys = new Set([`date:${opts.checkedAt}`]);
+  const truth = verifyBody(page.compiled_truth ?? '', sources, { priorNorm, exemptNumericKeys });
+  const timeline = verifyBody(page.timeline ?? '', sources, { priorNorm, exemptNumericKeys });
   stats.pages_checked++;
   for (const r of [truth, timeline]) {
     stats.quotes_total += r.quotes;
@@ -1357,6 +1409,9 @@ export async function verifyAndRepairDreamPages(
       if (verified.changed) {
         const tags = await engine.getTags(ref.slug, { sourceId: ref.source_id });
         const next = { ...page, compiled_truth: verified.compiled_truth, timeline: verified.timeline, frontmatter: verified.frontmatter };
+        // #6188: Tier 1 normalizes a fixable fence before the verified body is compiled and written.
+        const fences = await normalizePageFences(engine, { sourceId: ref.source_id, slug: ref.slug, page: next });
+        if (fences) Object.assign(next, fences.page);
         const md = serializePageToMarkdown(next, tags);
         // The children's put_page projected timeline, facts, takes and links
         // from the unverified body; re-project from the verified body in the
@@ -1370,7 +1425,7 @@ export async function verifyAndRepairDreamPages(
         // noEmbed: the phase-end embed sweep backfills. Provenance fields
         // null → engine COALESCE keeps the first-write record intact.
         await importFromContent(engine, ref.slug, md, {
-          noEmbed: true, remote: false, sourceId: ref.source_id,
+          noEmbed: true, remote: false, preserveGateMarkers: true, sourceId: ref.source_id,
           beforeCommit: async tx => { await project(tx); await links?.apply(tx); },
         });
         stats.pages_repaired++;

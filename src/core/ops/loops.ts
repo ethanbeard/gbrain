@@ -239,7 +239,27 @@ interface CounterpartyGroup {
   oldest_opened_at: string;
   nearest_due_at: string | null;
   loops: LoopView[];
+  /** #5871: loops beyond the LOOPS_PER_GROUP shown; loop_count stays the total. */
+  loops_omitted: number;
   context?: unknown;
+}
+
+/** #5871: loops with neither a counterparty slug nor an email. Not a person, so never ranked. */
+interface NoCounterpartyLoops {
+  loop_count: number;
+  by_type: Partial<Record<LoopType, number>>;
+  loops: LoopView[];
+  loops_omitted: number;
+}
+
+/** Loops shown per group (and in the no-counterparty section); the rest are counted in loops_omitted. */
+const LOOPS_PER_GROUP = 5;
+
+/** Due-soonest first (undated last), then the most recently active; keeps the first LOOPS_PER_GROUP. */
+function capLoops(loops: LoopView[]): { loops: LoopView[]; loops_omitted: number } {
+  const time = (v: string | null) => v === null ? Infinity : Date.parse(v);
+  const sorted = [...loops].sort((a, b) => time(a.due_at) - time(b.due_at) || Date.parse(b.last_activity_at) - Date.parse(a.last_activity_at));
+  return { loops: sorted.slice(0, LOOPS_PER_GROUP), loops_omitted: Math.max(0, loops.length - LOOPS_PER_GROUP) };
 }
 
 function rankGroups(groups: CounterpartyGroup[], backlinks: Map<string, number>, nowMs: number): CounterpartyGroup[] {
@@ -257,7 +277,26 @@ function rankGroups(groups: CounterpartyGroup[], backlinks: Map<string, number>,
   return [...groups].sort((a, b) => score(b) - score(a) || a.counterparty.localeCompare(b.counterparty));
 }
 
-function renderText(groups: CounterpartyGroup[], stale: boolean, noGoogleSources: boolean,
+function renderLoopLine(lines: string[], l: LoopView, nowMs: number): void {
+  const due = l.due_at ? ` — due ${l.due_at.slice(0, 10)}` : '';
+  // Age renders at READ time from last_activity_at — stored summaries
+  // deliberately carry no age (it would freeze at detection time).
+  const ageDays = Math.max(0, Math.floor((nowMs - Date.parse(l.last_activity_at)) / 86_400_000));
+  const age = Number.isFinite(ageDays) ? ` (${ageDays}d)` : '';
+  lines.push(`- [${l.loop_type}] ${l.summary}${age}${due}`);
+  if (l.quote) lines.push(`  > "${l.quote}"`);
+  if (l.deep_link) lines.push(`  ${l.deep_link}`);
+}
+
+function renderNoCounterparty(lines: string[], none: NoCounterpartyLoops | null, nowMs: number): void {
+  if (!none) return;
+  const types = Object.entries(none.by_type).map(([type, n]) => `${type} ${n}`).join(', ');
+  lines.push('', `## No counterparty (${none.loop_count} open: ${types})`);
+  for (const l of none.loops) renderLoopLine(lines, l, nowMs);
+  if (none.loops_omitted > 0) lines.push(`+${none.loops_omitted} more`);
+}
+
+function renderText(groups: CounterpartyGroup[], none: NoCounterpartyLoops | null, stale: boolean, noGoogleSources: boolean,
   coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[] }, nowMs: number,
   partialStaleSources: string[]): string {
   const lines: string[] = [];
@@ -270,11 +309,16 @@ function renderText(groups: CounterpartyGroup[], stale: boolean, noGoogleSources
   }
   const partial = coverage.completeness === 'partial';
   const what = held.length ? `${held.length} held item(s) could not be imported:` : 'the held-item state could not be read.';
-  if (partial && groups.length === 0) {
+  if (partial && groups.length === 0 && !none) {
     lines.push(`No open loops found, but coverage is partial: ${what}`, ...partialLines(held));
     return lines.join('\n');
   }
   if (partial) lines.push(`⚠ Coverage is partial: ${what}`, ...partialLines(held), '');
+  if (groups.length === 0 && none) {
+    lines.push('No person is waiting on you; these open loops name no counterparty:');
+    renderNoCounterparty(lines, none, nowMs);
+    return lines.join('\n');
+  }
   if (groups.length === 0) {
     if (noGoogleSources) {
       // Trust-critical copy: on a brain whose email arrives some other way
@@ -293,17 +337,10 @@ function renderText(groups: CounterpartyGroup[], stale: boolean, noGoogleSources
   lines.push(`${groups.length} ${groups.length === 1 ? 'person is' : 'people are'} waiting on you:`);
   for (const g of groups) {
     lines.push('', `## ${g.counterparty} (${g.loop_count} open)`);
-    for (const l of g.loops) {
-      const due = l.due_at ? ` — due ${l.due_at.slice(0, 10)}` : '';
-      // Age renders at READ time from last_activity_at — stored summaries
-      // deliberately carry no age (it would freeze at detection time).
-      const ageDays = Math.max(0, Math.floor((nowMs - Date.parse(l.last_activity_at)) / 86_400_000));
-      const age = Number.isFinite(ageDays) ? ` (${ageDays}d)` : '';
-      lines.push(`- [${l.loop_type}] ${l.summary}${age}${due}`);
-      if (l.quote) lines.push(`  > "${l.quote}"`);
-      if (l.deep_link) lines.push(`  ${l.deep_link}`);
-    }
+    for (const l of g.loops) renderLoopLine(lines, l, nowMs);
+    if (g.loops_omitted > 0) lines.push(`+${g.loops_omitted} more`);
   }
+  renderNoCounterparty(lines, none, nowMs);
   return lines.join('\n');
 }
 
@@ -314,7 +351,9 @@ const open_loops: Operation = {
   outputRedaction: 'retrieval',
   description:
     'The open-loop engine\'s killer output: who is waiting on you, what you promised, and the context ' +
-    'needed to respond. Grouped by counterparty (default, ranked) or flat. Loops come from the ' +
+    'needed to respond. Grouped by counterparty (default, ranked; each group shows at most 5 loops, the rest counted in ' +
+    'loops_omitted) or flat. Loops that name no counterparty are never ranked as a person: they come back in ' +
+    'no_counterparty (null when none). Loops come from the ' +
     'deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get ' +
     'redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, ' +
     'entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and ' +
@@ -322,7 +361,8 @@ const open_loops: Operation = {
     'answer as partial and name the held items and their retry command.',
   params: {
     group_by: { type: 'string', enum: ['counterparty', 'none'], description: "Default 'counterparty' (ranked groups)." },
-    status: { type: 'string', enum: ['open', 'done', 'dropped', 'stale'], description: "Default 'open'." },
+    status: { type: 'string', enum: ['open', 'done', 'dropped', 'stale'], description: "Default 'open', except with `id`, where any status matches." },
+    id: { type: 'number', description: 'Fetch the single loop with this id (ids come from earlier open_loops results). Matches any status unless `status` is passed; the source scope still applies, and the grouped view omits `text`.' },
     loop_type: { type: 'string', enum: ['commitment_owed_by_me', 'commitment_owed_to_me', 'unanswered_inbound', 'unanswered_outbound', 'decision_pending'], description: 'Filter to one loop type.' },
     counterparty: { type: 'string', description: 'Filter to one counterparty (slug or email).' },
     limit: { type: 'number', description: 'Grouped: max groups (default 3). Flat: max loops (default 50). The internal fetch is capped at 500 rows; `truncated: true` marks a hit.' },
@@ -341,7 +381,9 @@ const open_loops: Operation = {
         { def: open_loops.params.as_of, example: '2026-04-03T09:00:00Z' });
     }
     const groupBy = (p.group_by as string | undefined) ?? 'counterparty';
-    const status = ((p.status as string | undefined) ?? 'open') as LoopStatus;
+    const loopId = requestedLoopId(ctx, p.id);
+    let status = (p.status ?? undefined) as LoopStatus | undefined;
+    if (status === undefined && loopId === undefined) status = 'open';
     // Per-call scope via the canonical trust+grant resolver: an MCP caller
     // whose transport is bound to another source can point this read at the
     // google source (`source_id`) or, trusted-local, span the brain
@@ -390,6 +432,7 @@ const open_loops: Operation = {
       status,
       ...(p.loop_type ? { loopType: p.loop_type as LoopType } : {}),
       ...(p.counterparty ? { counterparty: p.counterparty as string } : {}),
+      ...(loopId === undefined ? {} : { loopId }),
       limit: 500,
     });
     const freshness = await googleSourceFreshness(ctx, scope);
@@ -416,8 +459,15 @@ const open_loops: Operation = {
     }
 
     const byKey = new Map<string, CounterpartyGroup>();
+    const unattributed: LoopView[] = [];
+    const byType: NoCounterpartyLoops['by_type'] = {};
     for (const l of loops) {
-      const key = l.counterparty_slug ?? l.counterparty_email ?? 'unknown';
+      const key = l.counterparty_slug ?? l.counterparty_email;
+      if (key === null) {
+        unattributed.push(loopView(l, trusted, deepLinks));
+        byType[l.loop_type] = (byType[l.loop_type] ?? 0) + 1;
+        continue;
+      }
       let g = byKey.get(key);
       if (!g) {
         g = {
@@ -429,6 +479,7 @@ const open_loops: Operation = {
           oldest_opened_at: l.opened_at,
           nearest_due_at: null,
           loops: [],
+          loops_omitted: 0,
         };
         byKey.set(key, g);
       }
@@ -465,7 +516,10 @@ const open_loops: Operation = {
     } catch { /* rank without backlinks */ }
 
     const limit = Math.min(Math.max((p.limit as number | undefined) ?? 3, 1), 50);
-    const groups = rankGroups([...byKey.values()], backlinks, nowMs).slice(0, limit);
+    const groups = rankGroups([...byKey.values()], backlinks, nowMs).slice(0, limit)
+      .map((g) => ({ ...g, ...capLoops(g.loops) }));
+    const noCounterparty: NoCounterpartyLoops | null = unattributed.length === 0 ? null
+      : { loop_count: unattributed.length, by_type: byType, ...capLoops(unattributed) };
 
     // Entity-card context (zero-LLM, trusted local only).
     if (trusted && (p.include_context as boolean | undefined) !== false) {
@@ -485,6 +539,7 @@ const open_loops: Operation = {
 
     return {
       groups,
+      no_counterparty: noCounterparty,
       count: loops.length,
       truncated,
       stale: freshness.stale,
@@ -495,10 +550,25 @@ const open_loops: Operation = {
       no_google_sources: noGoogleSources,
       redacted: !trusted,
       as_of: new Date(nowMs).toISOString(),
-      ...(trusted ? { text: renderText(groups, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources) } : {}),
+      ...(trusted && loopId === undefined
+        ? { text: renderText(groups, noCounterparty, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources) }
+        : {}),
     };
   },
 };
+
+/**
+ * open_loops `id`: absent or null means a list read. Anything else must be a
+ * positive safe integer. The refusal never echoes the raw value. The digest
+ * stays off for a lookup because it describes the open list ("waiting on
+ * you", "You are clean"), which is false for a closed or missing loop.
+ */
+function requestedLoopId(ctx: OperationContext, raw: unknown): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 1) return raw;
+  throw invalidParam(ctx, 'open_loops', 'id', 'open_loops: id must be a whole number of 1 or more.',
+    { def: open_loops.params.id, example: 42 });
+}
 
 function grantedSources(ctx: OperationContext): string[] {
   const allowed = ctx.auth?.allowedSources;

@@ -146,13 +146,16 @@ line naming the cap, its source and how to remove it, e.g.
 | Backfill per-job budget | `embed.backfill_max_usd` | `10` | caps the job's tracker | `off` (`0`/garbage → default, fail-closed) | uncapped (still ledgered) |
 | Backfill cooldown | `embed.backfill_cooldown_min` | `10` | skips re-submission inside window | — (latency knob, not spend) | **not** bypassed |
 | `reindex-code` cost gate | — (preview before re-embed) | — | TTY prompt / non-TTY refuse + exit 3 (`confirmation_required`) | `--max-cost off` | runs uncapped (still ledgered) |
+| `reindex --markdown` consent gate | — | — | TTY prompt / non-TTY exit 3; a queued job needs the approval stored at submit | `--dry-run`, `--no-embed` | derived cap |
 | `migrate embeddings` consent gate | — (plan + estimate before provider migration) | — | TTY y/N prompt / non-TTY refuse + exit 3 (`confirmation_required`) | `--yes` | estimate marked informational, but **still prompts** (guards a destructive schema rebuild, not just spend) |
-| `enrich` / `onboard --auto` | `--max-usd` (per-call) | — | non-TTY without `--yes`/`--max-usd`: refuse + exit 3 (`confirmation_required`); `--yes` runs under the derived cap | `--max-usd off` | runs uncapped (still ledgered) |
+| `enrich` | `--max-usd` (per-call) | — | non-TTY without `--yes`/`--max-usd`: refuse + exit 3 (`confirmation_required`); `--yes` runs under the derived cap | `--max-usd off` | runs uncapped (still ledgered) |
+| `onboard --auto` | `--max-usd` (per-call) | — | refuses without `--max-usd` (exit 2); manual-only steps (pack upgrade, takes bootstrap) never run, their commands are printed | `--max-usd off` | runs uncapped (still ledgered) |
 | Image-OCR per-run ceiling | `embedding_image_ocr_max_images` / `embedding_image_ocr_max_usd` | `200` images / `$1.00` (estimated) | skips OCR over-cap (import continues; skips counted in `ocr_skipped_budget`, surfaced by doctor `ocr_health`) | `0` disables that cap | **not** bypassed (per-run cap, not a tracker gate) |
 | Dream `extract_atoms` phase budget | `cycle.extract_atoms.budget_usd` | `0.30` | caps the phase's budget tracker (one tracker per drain attempt, across all its batches) | — | **not** consulted (phase budget enforces regardless) |
 | Atom auto-drain daily cap | `autopilot.auto_drain.max_usd_per_day` | `2.00` | daily cap on drain **attempts** (`floor(max / 0.30)` = 6), not a dollar ledger | `gbrain config set autopilot.auto_drain.enabled false` | **not** consulted |
 | Connector email/meeting atoms | `cycle.extract_atoms.connector_pages` | on (unset) | Gmail/Calendar `email`/`meeting` pages are extracted like other pages, under the auto-drain cap | `false` | **not** consulted |
 | Life Chronicle event extraction | `chronicle.job_budget_usd` (per page) / `chronicle.auto_daily_limit` (calls per rolling 24 h) | `0.25` / `200` | caps one extraction call; past the daily limit pending pages wait for a free slot | `gbrain config set auto_chronicle false` | **not** consulted |
+| [Fence model repair (Tier 3)](#fence-model-repair-tier-3) | `fences.repair.max_usd_per_page` / `fences.repair.max_usd_per_day` | `0.30` / `1.00` | refuses the call: a page whose estimate is over the per-page cap or over today's remainder in the durable USD ledger (`llm_repair`/`fences`, per UTC day across every process) waits as `budget_exhausted`, and `gbrain repair fences --apply` stops there with exit 1. `--max-usd <n>` lowers a run's cap, never raises it | `gbrain config set fences.repair.llm false` (`0` on a cap = no model spend) | **not** consulted |
 | Dream `synthesize` per-run budget | `dream.synthesize.budget_usd` | `5` | defers the transcript and the rest of the run before submission (estimate: prompt size + child output cap, x `max_turns` in agentic mode) | `unlimited` (`0` = submit nothing) | **not** consulted |
 | Dream `synthesize` daily submission cap | `dream.synthesize.max_submissions_per_source_per_day` | `0` (off) | skips whole files; a failed count query submits nothing that run | `0` | **not** consulted |
 | Dream `BudgetMeter` phases (auto_think, drift, propose/grade takes, calibration) | `dream.auto_think.budget`, `dream.drift.budget`, `cycle.<phase>.budget_usd` | per phase | refuses the next submit past the cap | `unlimited` (`0` = spend nothing) | **not** consulted |
@@ -167,6 +170,65 @@ the tracker cannot price — e.g. a local Ollama model selected via
 `models.dream.extract_atoms` — runs without a cost gate after a one-line stderr
 warning (a USD cap cannot be enforced on an unpriced model; local models incur
 no API spend).
+
+### Fence model repair (Tier 3)
+
+**Say to your agent:** *"How much did fence repair spend today?"* or *"Stop
+paying a model to repair my facts tables."*
+
+The maintenance run's `fence_repair` phase and `gbrain repair fences --apply`
+send a malformed facts or takes fence that only a rewrite can realign to the
+repair model. Only the fence header and the rows it must realign leave the
+machine, never valid rows or the rest of the page. Every other fence repair
+is free.
+
+- **Model.** `models.fence_repair` when set (any model, priced or not, always
+  runs). Unset, the first model the fence-repair eval measured as accurate
+  enough whose provider key the brain has: `openai:gpt-6.1-sol` with an
+  OpenAI key, else `anthropic:claude-opus-5-5` with an Anthropic key
+  (`anthropic:claude-fable-5-1` also met the bar). With neither key, model repair is off by
+  default and those fences wait as `no_measured_model`; choosing a model is
+  the user's call.
+
+- **Ledger.** Each call reserves its estimate in the durable daily USD ledger
+  before it is sent and settles the measured cost after. Failed and retried
+  calls settle against it too, and a call whose usage is unknown is charged
+  its reserved maximum. The ledger is per UTC day and shared by every process
+  on the brain (the maintenance cycle and the CLI), so concurrent runs never
+  exceed the cap together. When the ledger cannot be read, no call is made
+  (`ledger_unavailable`).
+- **Caps.** `fences.repair.max_usd_per_page` (default $0.30) and
+  `fences.repair.max_usd_per_day` (default $1.00), validated at
+  `config set`; `0` means no model spend. A call's estimate is its worst
+  case: the prompt plus the full output ceiling, which leaves a reasoning
+  model 2,048 tokens to think before it writes the table. The per-page
+  default covers the worst case of every measured model for the largest
+  page in the eval (`anthropic:claude-fable-5-1`, two fences, $0.27); measured
+  spend per model repair was about $0.003 (`openai:gpt-6.1-sol`), $0.008
+  (`anthropic:claude-opus-5-5`) and $0.02 (`anthropic:claude-fable-5-1`). A page over either cap waits as
+  `budget_exhausted`; `gbrain repair fences --apply` stops with exit 1,
+  naming the spend, the cap, the reset time (next 00:00 UTC) and the pages
+  waiting. Raising a cap is the user's call.
+- **`--max-usd <n>`** on `gbrain repair fences` lowers the cap for that run
+  below today's remainder and never raises it; `--no-llm` keeps a run to the
+  free tiers. `gbrain doctor --remediate --max-usd <n>` passes what is left of
+  its allowance to the fences step.
+- **Off switches.** `gbrain config set fences.repair.llm false` stops model
+  repair everywhere; those fences wait as `llm_disabled` while the free
+  tiers keep running. `gbrain config set fences.repair.enabled false` pauses
+  the maintenance phase (an explicit `gbrain repair fences --apply` still
+  runs).
+- **`spend.posture` is not consulted.** `tokenmax` neither lifts these caps
+  nor skips the ledger.
+- **Unpriced models.** Under the default caps, a repair model gbrain has no
+  price for still runs: each call is metered at an estimated ceiling, the
+  highest chat rate in the canonical price table, and the run carries a
+  notice naming `gbrain pricing set` to make the metering exact. When the user
+  set either cap, it is refused with `no_pricing` and the pricing guidance
+  instead ([registering a model price](#registering-a-model-price)), and
+  nothing is sent.
+
+`gbrain doctor --only fence_integrity` shows both caps and today's spend.
 
 ### Sync inline-embed cost gate
 
@@ -264,7 +326,10 @@ tracker cannot price, the default cap is not enforced: extraction warns and
 runs, bounded only by the call count. When you set `chronicle.job_budget_usd`
 yourself, an unpriced model refuses with `no_pricing` until you register its
 price with `gbrain pricing set`. `gbrain chronicle-backfill` (history, on
-request) is exempt from the daily limit and bounded by its `--limit`.
+request) is exempt from the daily limit and bounded by its `--limit`;
+`--max-usd` adds a hard spend bound that counts retries (an unpriced model then
+refuses with `no_pricing`; see the
+[chronicle guide](../guides/life-chronicle.md#bound-the-spend-with---max-usd)).
 
 ```bash
 gbrain config set auto_chronicle false              # opt out
@@ -316,6 +381,13 @@ gbrain config set dream.breaker.max_dead_submissions 5   # raise the limit; 0 di
 - The check happens before synthesis submission. Transcript triage for that run may
   already have happened, so the promise is "no synthesis submission", not "no
   model call at all".
+- Patterns digests its reflection set into its key, so the key changes whenever a
+  reflection does. Patterns deaths therefore count per source, under
+  `dream:patterns:source:<source id>`, whatever reflections each run read. A
+  patterns child cancelled at its timeout after paid work counts as a death; one
+  cancelled before any work does not. A completed run resets the count, so only
+  deaths in a row trip it; reset a tripped source with
+  `gbrain dream reset-key 'dream:patterns:source:<source id>'`.
 - Not covered: a transcript that keeps growing gets a new content-hashed key each
   cycle, and patterns runs outside maintenance carry no key.
 - If the count query fails, the breaker is skipped for that run with a warning, the

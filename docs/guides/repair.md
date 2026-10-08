@@ -8,8 +8,8 @@ can load, and Google source files other local users can read. `gbrain repair`
 fixes those and the other kinds listed in
 [What each kind fixes](#what-each-kind-fixes). Every run is a preview unless
 you pass `--apply`.
-Eight explicit-only kinds, `google-file-modes`, `stale-atoms`, `extractor-facts`,
-`captured-facts`, `loop-facts`, `orphan-children`, `failed-writes` and `frontmatter`, run only when you name them (see [Explicit-only repair kinds](#explicit-only-repair-kinds)).
+Nine explicit-only kinds, `google-file-modes`, `stale-atoms`, `extractor-facts`,
+`captured-facts`, `loop-facts`, `ontology-facts`, `orphan-children`, `failed-writes` and `frontmatter`, run only when you name them (see [Explicit-only repair kinds](#explicit-only-repair-kinds)).
 `gbrain doctor --remediation-plan` lists the same kinds as repair steps, and
 `gbrain doctor --remediate --yes --include-repairs --expect <plan_hash>` runs them under a budget
 (see [Run repairs through doctor](#run-repairs-through-doctor)).
@@ -376,6 +376,27 @@ doctor's `revision_backfill` check names those pages, and
 `gbrain apply-migrations --force-schema` resumes the backfill for the rest and
 prints its progress.
 
+<a id="timeline-comments"></a>
+### Timeline comments
+
+Earlier releases filed an HTML comment next to a `[Source: ..., YYYY-MM-DD]`
+citation (such as `<!-- AUTO:slack END -->`) as a timeline row and wrote it
+back into the page. The parser now skips comments, and a row still carrying
+`<!--` or `-->` is never written back (`timeline_comment_markup`). This
+explicit-only kind cleans what is already stored.
+
+**Say to your agent:** *"Preview the timeline comment cleanup, tell me how many
+rows and pages it touches, then apply after I agree."*
+
+```bash
+gbrain repair timeline-comments --source <id>          # preview: comment_only_rows, comment_bearing_rows, pages_with_comment_bullets
+gbrain repair timeline-comments --source <id> --apply  # clean them
+```
+
+It drops generated bullets that carry markup (yours are left alone), deletes
+markup-only rows and strips the rest, under the page lock. A second apply finds
+nothing, and a timeline-only rewrite queues no facts extraction.
+
 ### Timeline history scan coverage
 
 Doctor's `timeline_history` check classifies at most 2,000 pages or 10
@@ -472,6 +493,80 @@ The preview warns, naming the host, when a consumer older than v0.60.11.0
 published writes after `writer_version_cutoff`: an old consumer expires
 restored facts again. Upgrade and restart it first.
 
+<a id="conversation-labels"></a>
+### Conversation labels
+
+Before v0.60.69 the conversation parser read meeting-note labels such as
+`**Date:**`, `**Attendees:**` and `**Summary:**` as speakers, so
+`gbrain extract-conversation-facts` stored facts like "Date said the review is
+on Monday", dated at 1970-01-01 when the page had no date. The parser is
+fixed, but those pages stay marked complete, so an upgrade never re-extracts
+them. `gbrain repair conversation-labels` retires those facts. It is
+explicit-only, preview-bound and destructive (it needs the user's consent),
+and it makes no model calls.
+
+**Say to your agent:** *"Doctor says some conversation facts came from
+meeting-note labels. Show me which ones before removing anything."* The agent
+runs the preview, shows you the list and, after you agree, runs the printed
+apply command with `--yes`.
+
+```bash
+gbrain doctor                                          # conversation_label_facts
+gbrain repair conversation-labels                      # preview: every candidate, per-page outcome, hash
+gbrain repair conversation-labels --apply --expect <hash> --yes
+gbrain extract-conversation-facts --source-id <id> --slugs <pages> --dry-run      # printed by the preview
+gbrain extract-conversation-facts --source-id <id> --slugs <pages> --max-cost-usd <n>
+gbrain doctor
+```
+
+Candidates are active conversation-extractor facts on pages that carry a bold
+metadata label line. Each gets one class:
+
+| Class | Meaning | Retired |
+| --- | --- | --- |
+| `evidenced` | Its context names a `segment 1970-01-01` window, which only the pre-fix parser wrote (the fixed one records an undated page as not extractable). | By `--apply --expect <hash> --yes` |
+| `ambiguous` | Any other fact of a label page: a post-fix transcript with a `**Date:**` header, a model-written context, a fact that legitimately mentions a label. Nothing on the row proves the misattribution. | Only with `--include-ambiguous` and that preview's hash |
+| `excluded:<reason>` | `current_extractor` (the page's outcome carries `extractor_version`, so the fixed parser extracted it), `withdrawn`, `superseded`, `superseded_by_reference` (another fact names it), `open_loop_reference` (an open loop points at it). | Never |
+
+The preview also gives each page its outcome:
+
+| Outcome | What the apply does | Cost |
+| --- | --- | --- |
+| `non_extractable` | Retires the facts, expires the completion marker and records the page as not extractable (prose notes, an undated page, a single email), as the fixed parser would. | $0 |
+| `awaiting_reextraction` | Retires the facts and expires the completion marker; the page re-enters the ordinary extraction backlog. | The next extraction, under its own cap |
+| `cleaned` | Retires the facts; the page had no completion marker. | $0 |
+
+A per-fact apply outcome of `changed_since_preview` means the fact changed (it
+was edited, withdrawn, superseded or already expired); it stays as it is.
+
+There is no `--reextract` or `--max-usd` here: `gbrain repair` never spends.
+The preview prints the hand-off, one dry run and one capped run per 50 pages
+waiting for extraction:
+`gbrain extract-conversation-facts --source-id <id> --slugs <a,b,…> --dry-run`,
+then the same command with `--max-cost-usd <n>` (default $5 when omitted; the
+opt-in `cycle.conversation_facts_backfill` also picks them up at $1 per run and
+$5 in total). Nothing re-extracts automatically.
+
+Retired facts are expired, not deleted: each keeps its id and gains
+`retired: conversation-labels <hash>` in its context, recall stops returning
+it, and a later extraction, its orphan cleanup and `gbrain repair
+extractor-facts` leave it alone. To bring a page's facts back, re-extract the
+page with the commands above. Pages apply in batches of up to 25: on a
+managed brain each batch publishes one database-only
+`managed_maintenance_conversation_label_retire` request (one receipt for the
+batch, each page rechecked on its own), and a rerun after a crash skips
+batches whose request already committed. A non-interactive
+apply without `--yes` exits 3 with the consent payload and changes nothing;
+`preview_changed` means the hash names no saved preview, the preview is older
+than 7 days, or the apply's `--source` or `--include-ambiguous` differs from
+the preview's. Under a live `gbrain serve` on PGLite the command is refused at
+once: stop the serve, run the repair, then restart the serve (the refusal's
+`fix` names the steps).
+
+Conversation outcomes now record the parser version (`extractor_version=<n>`
+in the outcome row). Doctor `conversation_outcomes_stale` counts outcomes a
+later parser version would reconsider; they are never reopened automatically.
+
 <a id="captured-facts"></a>
 ### Captured facts
 
@@ -544,6 +639,42 @@ in one coordinated write, exactly for the previewed set; a loop or fact that
 changed since the preview reports `changed_since_preview` and is kept. No
 withdrawal is recorded, so the same promise made again is stored normally.
 
+<a id="ontology-facts"></a>
+### Ontology facts
+
+From v0.60.53.0 until v0.60.104.0 the facts step of the maintenance run (the
+`gbrain serve` sweep and the dream cycle) moved ontology observations
+(`ontology_propose`) onto their entity page's `## Facts` table: each took the
+page as its source, and the next rewrite of the page that did not list it
+retired it, so `ontology_get` stopped returning it (#6264). `gbrain repair
+ontology-facts` restores them. It is explicit-only and preview-bound.
+
+**Say to your agent:** *"Doctor says some ontology observations were moved onto
+page tables. Preview restoring them, then apply after I agree."* The agent runs
+`gbrain repair ontology-facts` and, after you agree, the printed apply command.
+
+```bash
+gbrain doctor --only ontology_facts_fenced      # fenced=N retired=N
+gbrain repair ontology-facts                    # preview: one line per observation
+gbrain repair ontology-facts --apply --expect <hash>
+gbrain doctor --only ontology_facts_fenced
+```
+
+A candidate is an ontology row with a fence row number, or whose
+`source_markdown_slug` differs from its `source`; ontology writes produce
+neither. The preview classes each one `fenced` (still on the table) or
+`retired` (a page write retired it), or excludes it: `withdrawn` (its claim
+was forgotten), `consolidated`, or `duplicate` (the same observation was
+proposed again after it went missing, so restoring it would make a second
+copy). The apply gives each restorable row its own source back, takes it off
+the table and clears its expiry, exactly for the previewed set; validity dates
+and supersession links stay as they are. A row that changed since the preview
+reports `changed_since_preview` and is kept. It writes the database only:
+the line the old step added to the page's Facts table stays in the page as an
+ordinary page fact. An observation whose source was already the page's own
+slug and that a page write detached carries no trace of the move, so it is not
+found.
+
 <a id="failed-writes"></a>
 ### Failed writes
 
@@ -578,25 +709,35 @@ candidate one class:
 | `replay` | No later write supersedes it. | Replayed on apply. |
 | `already_written` | A later request with the same intent committed, or an earlier apply replayed it. | Kept. |
 | `duplicate` | A later request with the same intent exists; that one is the candidate. | Kept. |
-| `superseded` | A later write or delete of the page committed or is still pending; for `put_page`, also a later failed `put_page` of the page (the newer content) or a page that changed after the revision the caller read. | Kept. Read the page and re-issue the change by hand if it is still wanted. |
+| `superseded` | A later write or delete of the page committed or is pending; for `put_page`, also a later failed `put_page` (newer content) or a page changed since the caller read it. | Kept; re-issue by hand if still wanted. |
 | `unpinned_target` | A `remember` saved unattributed; replaying would infer its subject again and could pick another page. | Kept. Re-issue it with an explicit `entity` if it is still wanted. |
-| `producer_owned` | gbrain produced it (sync or file import, reconcile, relink, maintenance page, job). | Kept. The preview prints the command that produces it again from current content, such as `gbrain sync --source <id> --no-pull --retry-failed --json`. |
+| `file_database_drift` | Its last replay hit `source_changed` (file and database differ). | Kept until the page changes; reconcile it first. |
+| `producer_owned` | gbrain produced it (sync or file import, reconcile, relink, maintenance page, job). | Kept. The preview prints the command that produces it again from current content (sync: `gbrain sync --source <id> --no-pull --retry-failed`). |
 
 The apply replays exactly the previewed set. Each write is classified again
 and its original caller's authority is checked again first: a write that
 changed class since the preview reports `changed_since_preview`, and one whose
 caller lost its grant or whose source was re-created reports
 `authority_revoked`; both are kept. A replay goes through the operation's
-normal path on the original caller's trust lane: a write an agent sent over MCP
-is prepared as a remote write again, with its take-holder and delegated
-namespace limits, so it can do no more than the original could. A `put_page`
+normal path on the original caller's trust lane and under its stored authority:
+the same writer (an OAuth client stays that client), delegation, scopes,
+take-holder and delegated namespace limits and link trust, for the same source
+incarnation, checked against the live grant at admission and again at
+publication. A write an agent sent over MCP is prepared as a remote write
+again, so it can do no more than the original could; a grant revoked or
+narrowed between admission and publication refuses the replay at publication.
+A subagent or restricted-namespace write gets back the identity it recorded
+(the job id of an OAuth-delegated job, or the `wiki/agents/<id>/` namespace of
+a legacy subagent, which stays database-only); one that recorded neither is
+confined to exactly its stored namespace allow-list. Live subagent dispatches
+without a job id are still refused. A `put_page`
 replay is bound to the page revision the preview saw (an original `force: true`
 is dropped), so a page changed since the preview reports `changed_since_preview`
 or `conflict` instead of being overwritten. A `remember` replay targets the
 subject the original resolved. Each replay uses a new request id derived from
 the failed one, so a rerun after a crash resumes the same request and a second
 apply never writes it twice (`pending_elsewhere` when another writer holds that
-request). Attribution names the local owner's writer for that lane. A replay the
+request). Attribution names the original writer. A replay the
 brain refuses reports `refused` with the code. The failed receipts stay as
 history.
 
@@ -819,6 +960,216 @@ step. Per-file outcomes report `written`, `imported`, `hold_cleared` and
 `committed`. Repair stays explicit-only: `gbrain repair --all` and
 `gbrain doctor --remediate` never run it.
 
+<a id="fences"></a>
+### Fences
+
+A facts or takes fence gbrain cannot import without guessing never blocks a
+sync: sync holds the one file and imports the rest, and a fence with one exact
+meaning is rewritten in the same write. `gbrain repair fences` repairs what is
+left, and the maintenance run (cycle phase `fence_repair`) applies the same
+repair by itself on the brain's owner host, so a fence hold usually clears with
+no command. It finds held files, stored pages whose fence does not parse, and
+checkout files not yet synced. The preview is read-only and makes no model
+call; applying needs no extra consent. What each reason means and who acts:
+[fence holds](write-refusals.md#invalid_fence); the format and every rule:
+[fence format](fence-format.md).
+
+**Say to your agent:** *"Sync held some pages because of their facts or takes
+tables. Show me what gbrain would change, then repair them."* or *"How many
+broken facts tables are left, and what will fixing them cost?"*
+
+Each candidate gets the cheapest tier that repairs it exactly:
+
+| Tier | What it does | Cost |
+| --- | --- | --- |
+| `deterministic` | The lossless rules every write already runs (missing end marker, stray empty cells with one valid removal, row numbers, header aliases and order, enum and kind synonyms, assistant holders, percent confidences). | Free. |
+| `resolver` | A holder written as a display name becomes the `people/` or `companies/` page it names, only on an exact match (slug, unique slug basename or alias; never a guess, never a private page on a world-visible page). | Free. |
+| `llm` | Rows only a rewrite can realign (no header, a header column with no canonical name, rows above the header, short rows). The repair model sees only the fence header and those rows, never valid rows of a row-level problem and never the rest of the page, with no tools, and answers HOLD instead of guessing when a row has two readings. | Paid, within `fences.repair.max_usd_per_page` ($0.30) and `fences.repair.max_usd_per_day` ($1.00). |
+| `manual` | Anything gbrain never guesses (a stray end marker, an unknown takes kind, a weight out of range, a holder no page matches, extra cells that removing empty cells cannot line up, a sentence in the facts `kind` column). The preview names the exact edit. | Your edit. |
+
+Every proposal, whichever tier made it, must pass the validation
+[gates (a) to (g)](fence-format.md#gates) against the bytes as read (claims,
+existing row numbers and valid cells unchanged, no row more visible, nothing the
+fence hid shown) and be a normalizer fixed point, or it is not written. A model
+proposal that does not parse or changes the row count (gates (a) and (e)) gets
+one corrective re-ask naming the gate and rows; any other gate rejection, a
+HOLD, or a failed re-ask leaves the file held, and the same bytes are never
+sent again until the file, the model or the rules change.
+
+The repair model is `models.fence_repair` when set. Unset, it is the first
+model the fence-repair eval measured as accurate enough whose provider key the
+brain has: `openai:gpt-6.1-sol` with an OpenAI key, else
+`anthropic:claude-opus-5-5` with an Anthropic key. With neither key, model-tier fences wait as
+`no_measured_model` until the user picks a model.
+
+The gates check that no text is lost or rewritten; they cannot tell which of two
+free-text columns a moved cell belongs in, which is why only measured models
+are defaults. On 40 held-out synthetic malformed fences over three runs
+(`evals/fence-repair-tier3`), `openai:gpt-6.1-sol` and
+`anthropic:claude-opus-5-5` each repaired 95 of the 99 attempts that reached
+the model, none with a cell in the wrong column, and answered HOLD on the
+other 4; rows with stray empty cells were lined up by the free rule instead.
+
+The session below is real output (volatile ids, hashes and times shown as
+`<id>`, `<hash>`, `<time>`; `test/fence-walkthrough.test.ts` runs these
+commands against a local stand-in for the model provider and checks every line
+shown). Before the upgrade a generator committed three notes to the `notes`
+source: a meeting note whose facts fence has no end marker and an invented
+kind, a company note whose facts rows have no header, and a project note whose
+takes row names its holder as `Alice Example` (a `people/alice-example` page
+exists). An older gbrain blocked the source on the first fence it refused.
+
+1. After upgrading, `gbrain post-upgrade` names the blocked source, the
+   malformed-fence count, the preview and the pause command. No maintenance
+   run is active on this brain yet, so nothing repairs the fences by itself.
+
+   ```console
+   $ gbrain post-upgrade
+   [AGENT]   fence_integrity: 3 (not repaired automatically (no maintenance run is active); preview with: gbrain repair fences)
+   [AGENT]   fence_holds: 1 source(s) are blocked by a file whose facts or takes fence gbrain could not import (notes). The next scheduled or manual sync recovers each with no command; to do it now run gbrain sync --source notes --no-pull. The file is then held and the rest of the source imports. 3 malformed fence(s) are known so far (gbrain doctor --only fence_integrity counts them by tier); nothing repairs them by itself until a maintenance run is active, so preview them and apply the plan the preview prints once the user agrees. Preview (read-only, no model call): gbrain repair fences. Pause automatic fence repair first with: gbrain config set fences.repair.enabled false. Recipe: docs/guides/repair.md#fences
+   ```
+
+2. One sync gets the source going again: the blocked request is converted in
+   place, the meeting note's fence is rewritten (claims and row numbers
+   unchanged), and the other two files are held while the rest imports.
+
+   ```console
+   $ gbrain sync --source notes --no-pull
+   +1 added, ~0 modified, -0 soft-deleted (recoverable 72h), R0 renamed
+   Held companies/acme-example.md: invalid_fence (no_header) in the facts fence (body), at line 6; its page is missing until the file imports. Next: gbrain repair fences --source notes --only companies/acme-example.md, then gbrain repair fences --source notes --only companies/acme-example.md --apply (docs/guides/write-refusals.md#fence-no_header)
+   Held projects/widget-launch.md: invalid_fence (holder_unresolved) in the takes fence (body), row 1, column who, at line 9; its page is missing until the file imports. Next: gbrain repair fences --source notes --only projects/widget-launch.md, then gbrain repair fences --source notes --only projects/widget-launch.md --apply (docs/guides/write-refusals.md#fence-holder_unresolved)
+   2 file(s) held this run, 2 held in source notes; they do not block sync. Inspect them with 'gbrain sources status notes'; then nothing repairs the fence holds by itself (no maintenance run is active), so preview the fence repairs with gbrain repair fences --source notes (read-only, no model call: it lists each held file with its planned repair or the exact edit, and prints the apply command with --expect <hash>), then run the apply command it prints. Preview the repair: gbrain repair fences --source notes
+   Converted 1 failed request(s) of the blocked cursor in place: <id>.
+   Normalized fences in 1 file(s) (kind_map x1, close_fence x1). 1 file(s) under meetings/ had a malformed facts or takes fence that sync rewrote losslessly and committed (claims and existing row numbers unchanged); whatever writes them emits fences gbrain has to repair. Write facts with `remember` and takes with `takes_add` (or emit the canonical columns) so rows never need normalizing. Re-read a normalized page before editing it.
+   ```
+
+3. `gbrain sources status <id>` lists each fence hold with its fence, section,
+   row, column, line and next step (`--json` adds the structured `fence` object:
+   reasons, rows, columns, tier, `auto_retry` and `next_attempt_after`).
+
+   ```console
+   $ gbrain sources status notes
+   Held companies/acme-example.md: invalid_fence (no_header) in the facts fence (body), at line 6; its page is missing until the file imports. Next: gbrain repair fences --source notes --only companies/acme-example.md, then gbrain repair fences --source notes --only companies/acme-example.md --apply (docs/guides/write-refusals.md#fence-no_header) Held since <time>.
+   ```
+
+4. Preview. Nothing is written and no model is called. The resolver tier shows
+   its exact diff; the model tier shows the rows it will rewrite and the
+   estimated cost against what is left of today's cap.
+
+   ```console
+   $ gbrain repair fences --source notes
+   cost: 2 request ID(s), 32768 receipt bytes, 2 page(s) to re-embed, paid model ~$0.0273 ($1.0000 left under today's cap)
+   llm: notes:companies/acme-example.md (no_header; rewritten by openai:gpt-6.1-sol at apply time, gated by (a)-(g); est. $0.0273)
+   resolver: notes:projects/widget-launch.md (holder_verified; rows 1)
+   tiers: deterministic=0, resolver=1, llm=1, held=0; model openai:gpt-6.1-sol
+   model caps: $0.30/page, $1.00/day ($1.0000 left today)
+   -| 1 | The launch slips a week | bet | Alice Example | 0.6 | 2026-04 | standup |
+   +| 1 | The launch slips a week | bet | people/alice-example | 0.6 | 2026-04 | standup |
+   next: gbrain repair fences --source notes --apply --expect <hash>
+   Kinds that may call a paid model: fences (estimated $0.0273; $1.0000 left under today's cap).
+   ```
+
+5. Apply exactly the previewed set. A file that changed since the preview is
+   skipped as `changed_since_preview`. Each file is one coordinated write: the
+   repaired bytes, the import and the hold clear commit together.
+
+   ```console
+   $ gbrain repair fences --source notes --apply --expect <hash>
+   cost: 2 request ID(s), 32768 receipt bytes, 2 page(s) to re-embed, paid model $0.0039 spent ($0.9961 left under today's cap)
+   applied 2, skipped 0, complete
+   repaired 2; nothing left in this selection
+   repaired: notes:companies/acme-example tier=llm, classes=no_header, slug=companies/acme-example, mode=managed, path=companies/acme-example.md, imported=created, hold_cleared=true, committed=queued
+   repaired: notes:projects/widget-launch tier=resolver, classes=holder_verified, slug=projects/widget-launch, mode=managed, path=projects/widget-launch.md, imported=created, hold_cleared=true, committed=queued
+   ```
+
+   `committed=queued` means the Git target effect records the change. On a
+   checkout with gbrain's Git durability hook (`gbrain sources harden <id>`)
+   the owner's persistence worker commits each repaired file with the subject
+   `gbrain: repair fence in <path> (<classes>)` (a commit that batches several
+   lists one `<path> (<classes>)` per body line). This checkout has no
+   durability hook, so the rewritten files (the meeting note sync normalized,
+   too) stay uncommitted: commit them the way you commit any edit.
+
+6. Commit and check. Doctor `fence_integrity` is `ok` once nothing is held,
+   stored malformed or waiting in the checkout.
+
+   ```console
+   $ git -C ~/brain/notes status --short
+   M companies/acme-example.md
+   M meetings/2026-04-03.md
+   M projects/widget-launch.md
+   $ git -C ~/brain/notes commit -qam "Repair fences"
+   $ gbrain doctor --only fence_integrity
+   [OK] fence_integrity: No malformed facts or takes fence is held, stored or waiting in a checkout (2 source(s) scanned).
+   ```
+
+One command got the source syncing again (the sync), and two repaired the rest
+(preview, apply), for $0.0039 of model spend.
+
+Selection and output:
+
+```bash
+gbrain repair fences --source <id> --only companies/acme-example.md   # one file; --skip <path> leaves one out
+gbrain repair fences --source <id> --slug notes/db-only               # a stored page with no file
+gbrain repair fences --source <id> --diff                             # every diff, not one sample per tier
+gbrain repair fences --source <id> --no-llm                           # free tiers only; model-tier items stay held (llm_disabled)
+gbrain repair fences --source <id> --max-usd 0.10                     # at most $0.10 on the model this run (lowers the cap only)
+gbrain repair fences --source <id> --json                             # every diff and the full result
+```
+
+The selection and `--no-llm`/`--max-usd` are bound into the preview hash and
+printed in its apply command. A bare `--apply` (what `gbrain repair --all`,
+`gbrain doctor --remediate` and the maintenance run use) applies the current
+plan. The result keeps the shared `complete` (every pending item was tried) and
+adds `repaired` (what this run repaired), `remaining` (what still waits, by
+reason), `scan` (`fresh_at`, `partial`: whether the census behind the plan
+finished) and `verification` (repairs per tier, holds per reason, the oldest
+hold and USD per model repair). A run whose every model proposal is rejected
+reports `repaired 0` with the gate reasons; a run that ends with only manual
+edits left exits 0. When the daily ledger refuses the next model call, the run
+stops with `budget_exhausted` and exits 1, naming what was spent against the
+cap, the reset time (the next 00:00 UTC), the pages still waiting and the fix
+`gbrain config set fences.repair.max_usd_per_day <usd>`: raising it is the
+user's call.
+
+Where each repair writes: a managed source through `managed_file_repair` (bound
+to the file's before-hash and page revision, committed through the Git effect);
+a legacy (unmanaged) source by backing the file up under
+`~/.gbrain/backups/fences/<run>/`, writing it, importing it and recording an
+"uncommitted fence repair" notice that `gbrain sources status` and doctor show
+with the exact `git add`/`git commit` step until the path is committed; a
+stored page with no file by a revision-bound page write; a read-only mirror in
+the database only (the file is never written). Every write's receipt carries
+the actor `fence-repair`, the tier, the classes, rows and columns, the model,
+the before and after sha256 and the cost, never a cell value. A source this
+host does not own is skipped (`owner_unavailable`), and so is one whose sync is
+still running (`sync_in_progress`); the next run picks them up. MCP and
+thin-client callers cannot run a repair or reach the model; a hold's fix hands
+them the owner-host command to give the user.
+
+Inspect or undo a repair:
+
+- Managed sources: `git log --grep 'repair fence in'` lists the repair commits,
+  `git show <commit>` the change, and `git revert <commit>` undoes it (for one
+  file of a batched commit, `git checkout <commit>^ -- <path>` and commit).
+- Stored pages: `gbrain history <slug>` shows every version, including the one
+  before the repair; `gbrain revert <slug> <version_id>` restores it.
+- Legacy sources: the original file is in the backup the apply output names;
+  copy it back and sync.
+
+Turning the settings off stops future repairs and does not undo past ones. A
+restored malformed fence is held again on the next sync and repaired again by
+the next maintenance run, so pause first if you want to keep the original.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `fences.repair.enabled` | `true` | `false` pauses the maintenance run's repair; `gbrain repair fences --apply` still works. |
+| `fences.repair.llm` | `true` | `false` keeps every repair to the free tiers; model-tier holds stay `llm_disabled`. |
+| `fences.repair.max_usd_per_page` | `0.30` | The most one page may spend on the model, checked against each call's worst case (the prompt plus the full output ceiling, with 2,048 tokens for a reasoning model to think). `0` means no model spend. |
+| `fences.repair.max_usd_per_day` | `1.00` | The most all processes together spend per UTC day, through a durable ledger. `0` means no model spend. |
+| `models.fence_repair` | unset: the first measured model with a key (`openai:gpt-6.1-sol` with an OpenAI key, else `anthropic:claude-opus-5-5` with an Anthropic key), else none | The model Tier 3 calls (`gbrain models` shows it). A model you set always runs; one gbrain has no price for runs under the default caps at an estimated ceiling (the highest chat rate gbrain knows; `gbrain pricing set` makes it exact) and waits for its price under a cap you set. |
+| `fences.normalize` | `true` | `false` stops the inline rewrite on writes and syncs: a fixable fence is held or refused like any other. |
+
 ## Resume
 
 Runs are resumable. After each page commits, the position is saved under the
@@ -831,6 +1182,12 @@ Request IDs are derived from the page and its revision, so rerunning after a
 crash replays the same write instead of making a second one. If the run stops
 with "still pending publication" or "the canonical writer ... is held", check
 `gbrain sources writer status <source>`, then rerun the printed apply command.
+
+Every applying kind waits for each publication with the CLI write wait: `--wait <seconds>`, then
+`GBRAIN_WRITE_WAIT_MS`, then `persistence.write_wait_ms`, else 30 seconds. That includes the doctor
+remediation run and the replay of a restore a previous `extractor-facts` apply left pending. A malformed
+`GBRAIN_WRITE_WAIT_MS` refuses the apply with `invalid_write_wait` before anything is written; a preview
+never reads it.
 
 ## Capacity stop
 
@@ -907,6 +1264,21 @@ read-only preview command (`stale-atoms: gbrain repair stale-atoms`), and
 `--json` lists them as `explicit_repairs[]` (`kind`, `code:
 "explicit_kind_required"`, `preview_command`, `docs`). Run each by name after
 the user agrees (see [Explicit-only repair kinds](#explicit-only-repair-kinds)).
+
+A repair kind whose preview errors (on a large brain this is usually a
+statement timeout) does not stop the plan. Every other kind is still
+previewed, and the failed kind is listed under `Repair kinds whose preview
+failed` with its error code, its error and the read-only command that
+repeats the preview. In `--json` it appears in `repair_preview_failures[]`,
+which is present only when a preview failed. Each entry is
+`{kind, code, message, why, fix}`: `code` is `timeout` for a statement
+timeout (raise `GBRAIN_STATEMENT_TIMEOUT`) and `preview_failed` for anything
+else, `message` is redacted and then capped at 300 characters, and `fix` is
+the read-only preview. A failed kind is never a step, so `gbrain doctor
+--remediate` runs the remaining steps, names the kinds it could not run and
+exits 1. An approval covers only the steps the user was shown: once the
+failed preview succeeds, the plan changes and the run refuses with
+`preview_changed`. Preview the plan again and ask the user.
 
 `gbrain doctor --remediate --yes` runs job steps only. Repair steps run only
 when you also pass `--include-repairs`, which records the user's agreement;
@@ -1105,6 +1477,7 @@ Then recover what doctor names, in this order (skip a step whose check is ok):
 | `[gbrain] warning: OPENAI_API_KEY in this process's environment differs from openai_api_key …`; doctor `embedding_key_source` warns | `embedding_key_source` ([provider key source](#embedding-key-source)) | `gbrain doctor` (`embedding_key_source`) | remove the variable and restart that process, or `gbrain config unset openai_api_key` | the warning no longer prints; `gbrain doctor` shows `embedding_key_source` ok | user (owns the key) | `credentials` |
 | `The OpenAI embedding provider rejected its key (HTTP 401)` | [`embedding_auth_failed`](write-refusals.md#embedding_auth_failed) | `gbrain doctor` (`embedding_key_source`, `embedding_provider`) | the printed fix for the key source in effect, then `gbrain embed --stale` | `gbrain doctor` shows `embedding_provider` ok | user (owns the key) | `credentials`; `paid` for `embed --stale` |
 | Conversation facts missing from recall after managed writes | `extractor_facts_expired` | `gbrain repair extractor-facts` | `gbrain repair extractor-facts --apply --expect <hash>` (ambiguous: add `--include-ambiguous` to both) | `gbrain doctor` | brain host, after the user agrees | `destructive` (rewrites expired facts) |
+| Recall returns conversation facts such as "Date said …" or "Attendees said …", or facts dated 1970-01-01; doctor `conversation_label_facts` warns; the upgrade banner prints `conversation_label_facts: N (explicit_kind_required; …)` | `gbrain repair conversation-labels` (ambiguous: add `--include-ambiguous`) | `gbrain repair conversation-labels --apply --expect <hash> --yes`, then the printed `gbrain extract-conversation-facts --slugs … --dry-run` | `gbrain doctor --only conversation_label_facts --json` | brain host, after the user agrees | `destructive` (retires facts; no model calls) |
 
 
 ### Upgrading to v0.60.20.0
@@ -1194,8 +1567,8 @@ Each heading below is the `docs` anchor a refusal carries.
 
 ### Explicit-only repair kinds
 
-`google-file-modes`, `stale-atoms`, `extractor-facts`, `captured-facts` and
-`loop-facts` run only when named: `gbrain repair <kind>` previews, and
+`google-file-modes`, `stale-atoms`, `extractor-facts`, `captured-facts`,
+`loop-facts` and `ontology-facts` run only when named: `gbrain repair <kind>` previews, and
 `gbrain repair <kind> --apply` applies (every kind but `google-file-modes`
 also needs `--expect <hash>`, so it applies exactly the previewed set; `google-file-modes` re-checks each file's owner,
 type and mode at apply time). They are excluded everywhere else:
@@ -1335,6 +1708,16 @@ to check the files that exist now. On a managed brain, `lint --fix` instead
 reports the page as a pending `canonical_file_missing` repair (counted in
 `fix_pending`); see
 [lint repairs waiting on a managed brain](concurrent-writes.md#lint-repairs-waiting-on-a-managed-brain).
+
+### Fix not writable
+
+`fix_not_writable` is a non-fixable `gbrain lint --fix` issue: lint found a
+fixable problem but the file refused the write (`EACCES`, `EPERM` or `EROFS`:
+its permissions or a read-only mount), so the file was left unchanged. The
+issue's `reason` is the lowercased errno. Lint continues with the remaining
+files and counts the page in `fix_pending`; the cycle's lint phase reports
+`warn`, not `fail`. Make the file writable by the user running gbrain, or pass
+its directory or file name to `gbrain lint --exclude`, then run lint again.
 
 ## Related
 

@@ -1264,6 +1264,38 @@ describe('stop-hook per-turn push [D3]', () => {
     expect(existsSync(join(home(), 'transcripts', 'live', 'sess-stop-push.txt'))).toBe(false);
   });
 
+  test('#5371: tree whose only change is the managed ownership stamp: push_clean, no spawn', async () => {
+    const repo = bootRepo('stop-stamp-only', { clean: true });
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_clean');
+  });
+
+  test('#5371: a real change beside the ownership stamp is still unpushed work (#6083: its persistence owner pushes it, so no detached push)', async () => {
+    const repo = bootRepo('stop-stamp-dirty', { clean: true });
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    writeFileSync(join(repo, 'note.md'), 'unpushed\n');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_managed_coordinator');
+  });
+
+  test('#6083: no hook spawns the refused sources push on a managed canonical worktree', async () => {
+    const repo = bootRepo('managed-all-hooks');
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    const spawned: string[] = [];
+    await runHook(['session-start'], { write: () => {}, spawnPush: (root: string) => { spawned.push(root); }, stdin: '', cwd: repo });
+    expect((await lastHeartbeat())?.reason).toBe('push_managed_coordinator');
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect((await lastHeartbeat())?.reason).toBe('push_managed_coordinator');
+    expect(spawned).toEqual([]);
+    await runHook(['session-end'], { write: () => {}, spawnPush: (root: string) => { spawned.push(root); }, stdin: JSON.stringify({ session_id: 'sess-managed-end', cwd: repo }) });
+    expect(spawned).toEqual([]);
+  });
+
   test('corrupt per-root state file is treated as due (fail-open)', async () => {
     process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '5';
     const repo = bootRepo('stop-corrupt');

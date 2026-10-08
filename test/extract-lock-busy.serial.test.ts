@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
-import postgres from 'postgres';
+import postgres from '#postgres';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { extractLockTimeoutMs, extractStaleFromDB, runExtract } from '../src/commands/extract.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';

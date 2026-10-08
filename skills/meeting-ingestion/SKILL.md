@@ -123,7 +123,10 @@ page with `type: source` at `sources/meetings/YYYY-MM-DD-{slug}-transcript`
 (the default pack files raw evidence as `source` under `sources/`; never
 invent `meeting-transcript`, and don't write the `transcript` alias) or keep
 the source file reachable, and link it from the meeting page. The transcript is the canonical
-evidence for every quote and claim check downstream.
+evidence for every quote and claim check downstream. Put
+`facts_backstop: false` in the sidecar's frontmatter: automatic fact
+extraction would otherwise mine the raw transcript, garbles and banter
+included, beside the verified meeting page (Phase 5).
 
 **Redact before you retain.** A raw transcript routinely captures pasted
 secrets and PII (a read-aloud API key, a screen-shared token, a private phone
@@ -229,6 +232,7 @@ and sometimes confidently WRONG names. Resolve by evidence:
 ---
 type: meeting
 attendees: [{comma-separated slugs of the same people, e.g. people/alice-example}]
+facts_backstop: false
 ---
 
 # {Meeting Title} — {Date}
@@ -283,6 +287,21 @@ next cycle extracts it (`gbrain dream --phase chronicle` runs it now, paid), and
 `life/events/` pages; edit the meeting page and extraction updates its events.
 See `docs/guides/life-chronicle.md`.
 
+Facts (what `recall` returns) are also extracted from saved pages in the
+background, on by default, one paid chat call each time a page's body changes.
+Extraction files each fact on the entity page it names, so it reaches people
+and company pages without passing Phase 6, and it never takes back facts it
+filed from an earlier version of the page. That is why the template drafts
+the meeting page with `facts_backstop: false` (the receipt reads
+`facts_backstop: { skipped: "opted_out" }`): nothing is extracted while the
+page is still being corrected. When the verification checklist passes, save
+the page once more without that line; the receipt then reads
+`facts_backstop: { queued: true }`. Everything on the verified page is
+extraction input, so an uncertain note kept under the downgrade protocol
+becomes a lower-confidence fact. The transcript sidecar keeps its
+`facts_backstop: false`. Don't call `extract_facts` for the meeting or its
+transcript.
+
 ### Phase 6: Claim verification + consistency check (gate for every entity write)
 
 Recorder summaries inject false facts: speech-to-text garbles proper nouns,
@@ -322,7 +341,9 @@ it as an explicitly-uncertain note on the meeting page — never in an entity
 page's compiled truth or frontmatter.
 
 **Propagation rule:** a claim that fails verification must not fan out. Do not
-copy it to other entity pages or timeline entries. A false claim written to
+copy it to other entity pages or timeline entries, and keep it off the
+verified meeting page too: fact extraction carries that page's claims to entity
+pages (Phase 5). A false claim written to
 five pages costs five corrections.
 
 ### Phase 7: Attendee enrichment (MANDATORY)
@@ -351,10 +372,15 @@ person on the `Attendees:` line and in `attendees:` frontmatter (Phase 5) gets a
 page are not recorded as attendance; a pack that overrides attendance, such as
 the older `gbrain-base`, sets its own rule and direction. Leave attendance to
 auto-link rather than `gbrain link` or `add_link`: a hand-written `attended`
-edge can point the wrong way. Over MCP, `put_page` skips auto-link: a stdio
-`gbrain serve` reconciles the page on its maintenance sweep, and behind
-`gbrain serve --http` you run `gbrain sweep --once` or
-`gbrain extract links --source db`.
+edge can point the wrong way. Over MCP, `put_page` does not auto-link inline
+(the receipt says `auto_links.skipped: remote`). It queues plain `mentions`
+edges to pages that already exist (`auto_links.mention_links: queued`), but
+never the typed `attended` edges. Those come from a maintenance pass: a stdio
+`gbrain serve` runs it on its startup and idle sweeps; behind
+`gbrain serve --http` the host runs `gbrain sweep --once` or
+`gbrain extract links --source db`. No MCP tool runs that pass for you, so
+over HTTP ask the host operator, and don't hand-write `attended` with
+`add_link`.
 
 A missing `attended` edge has one of two causes. Either the attendee record
 breaks a Phase 5 rule, or it names a person whose page did not exist when the
@@ -384,7 +410,17 @@ itself, chain into `skills/signal-detector/SKILL.md` after ingestion.
 
 ### Phase 9: Sync
 
-`gbrain sync` to update the index.
+The pages are already in the brain; this step catches the index up to the
+brain repo checkout. Use the form that matches the brain:
+
+- **Managed brain** (managed persistence on): `gbrain sync --source <id> --no-pull`.
+  A managed checkout moves only through `gbrain sources refresh <id>`, never
+  through sync, so a bare `gbrain sync` there would pull the checkout behind
+  the coordinator's back.
+- **Unmanaged brain:** `gbrain sync`.
+
+If you can't tell which, use `gbrain sync --source <id> --no-pull`: it is
+correct on both and never moves the checkout.
 
 ## Verify before declaring done (HARD GATE)
 
@@ -484,13 +520,15 @@ failure axes, and V1–V5 never look at order. Verify the narrated sequence:
      in the report, don't block on it.
 
 **The loop:** fix → re-check → fix, until every item passes (or V6 is
-explicitly waived). Only then report.
+explicitly waived). Then save the meeting page without the draft
+`facts_backstop: false` line (Phase 5), and report.
 
 ## Sensitive meetings
 
 If the title or transcript signals legal or deeply personal content
 (deposition, attorney, counsel, privileged, health): keep the page minimal and
-factual, do not extract biographical color into other pages, and prefer
+factual, keep its `facts_backstop: false` unless the user agrees to fact
+extraction, do not extract biographical color into other pages, and prefer
 restraint on back-links. When in doubt about whether content should propagate,
 ask the user.
 
@@ -501,14 +539,16 @@ ingested: {N} attendees enriched, {N} entities updated, {N} action items
 captured. Verification: passed. Sequence: PASS." If the sequence check was
 waived, say so explicitly: "Sequence: WAIVED by user — {contradiction} stands
 (acknowledged, not resolved)." If the recording was split, report one line per
-resulting meeting page. If a claim was withheld or a contradiction flagged by
+resulting meeting page. Name the final meeting-page save's `facts_backstop`
+receipt: `queued`, or `opted_out` with the reason extraction stays off (a
+sensitive meeting the user did not clear). If a claim was withheld or a contradiction flagged by
 Phase 6, list each flag — the user resolves them, not silence. If any
 checklist item cannot be made to pass, report the meeting as NOT ingested and
 name the failing item.
 
 ## When it fails
 
-Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
 
 - A contradiction with an existing page blocks ingestion until the user fixes or waives it: show both sources and wait.
 - `add_link` / auto-link reports an error after the meeting page was written: the page is saved but the links are not; list the failed links and add them after fixing slugs.

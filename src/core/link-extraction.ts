@@ -15,10 +15,11 @@ import type { BrainEngine, LinkBatchInput } from './engine.ts';
 import type { PageType, EffectiveDateSource } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
 import { stripCodeBlocks } from './markdown-code.ts';
+import { targetTakesVerb } from './link-target-roles.ts';
 import { inSuppressedRange, rolePriorSuppressedRanges } from './machine-sections.ts';
 import { statedRelationTypes } from './line-grammar.ts';
 import { isValidSourceId } from './source-id.ts';
-import { parseInlineCitationTimelineEntries } from './timeline-citations.ts';
+import { isDatedTimelineLine, parseInlineCitationTimelineEntries, TIMELINE_LINE_RE, TIMELINE_LINE_RE_CN } from './timeline-citations.ts';
 import { isMaterializedMarkerLine } from './timeline-marker.ts';
 import { slugifyPath, slugifySegment } from './sync.ts';
 import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
@@ -1260,7 +1261,7 @@ const coordinated = (between: string) => {
   return !lead.trim() && gaps.length > 0 && gaps.every(gap => CONNECTOR_RE.test(gap));
 };
 const GLOBAL_VERB_RULES = VERB_RULES.map(([re, verb]) => [new RegExp(re.source, `${re.flags.replace('g', '')}g`), verb] as const);
-function attachedVerb(context: string, targetSlug?: string, anchor?: number): string | null | undefined {
+function attachedVerb(context: string, targetSlug?: string, anchor?: number, targetType?: string | null): string | null | undefined {
   const fromAnchor = targetSlug && anchor !== undefined ? context.indexOf(targetSlug, anchor) : -1;
   const at = fromAnchor >= 0 ? fromAnchor : targetSlug ? context.indexOf(targetSlug) : -1;
   if (at < 0) return undefined;
@@ -1274,7 +1275,7 @@ function attachedVerb(context: string, targetSlug?: string, anchor?: number): st
       if (end <= linkStart && LINK_MARK_RE.test(context.slice(end, linkStart))
         && !coordinated(context.slice(end, linkStart))) continue;
       if (start >= linkEnd && (LINK_MARK_RE.test(context.slice(linkEnd, start)) || /^\s*(?:(?:with|at|to|for|of|in|on)\s+)?\[/i.test(context.slice(end)))) continue;
-      return verb;
+      if (targetTakesVerb(verb, targetSlug, targetType)) return verb; // #6191: e.g. no works_at toward a meeting or person
     }
   }
   return null;
@@ -1312,9 +1313,9 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
   // Per-edge verb rules, precedence founded > invested_in > advises > works_at
   // (then the Chinese rules), over the verbs that belong to this link: in
   // "works at [A] and also advises [B]", A is works_at and B advises.
-  const attached = attachedVerb(context, targetSlug, anchor);
+  const attached = attachedVerb(context, targetSlug, anchor, targetType);
   if (attached) return attached;
-  if (attached === undefined) for (const [re, verb] of VERB_RULES) if (re.test(context)) return verb;
+  if (attached === undefined) for (const [re, verb] of VERB_RULES) if (re.test(context) && targetTakesVerb(verb, targetSlug, targetType)) return verb;
   // Page-role prior: only fires for person -> company links. Concept pages
   // about VC topics naturally contain "venture capital" in their text, but
   // their company refs are mentions, not investments. Partner pages mentioning
@@ -1473,9 +1474,8 @@ function basenameSort(a: string, b: string): number {
   return (a.length - b.length) || a.localeCompare(b);
 }
 
-/** Build a `key → slug[]` index over a slug collection. Keys: raw/lower/slugified tail. */
-export function buildBasenameIndex(slugs: Iterable<string>): Map<string, string[]> {
-  const idx = new Map<string, string[]>();
+/** Build a `key → slug[]` index over a slug collection, or add the slugs to `idx`. Keys: raw/lower/slugified tail. */
+export function buildBasenameIndex(slugs: Iterable<string>, idx = new Map<string, string[]>()): Map<string, string[]> {
   const addKey = (key: string, slug: string) => {
     const existing = idx.get(key);
     if (existing) { if (!existing.includes(slug)) existing.push(slug); }
@@ -1518,9 +1518,10 @@ export function queryBasenameIndex(idx: Map<string, string[]>, name: string): st
  */
 export function makeResolver(
   engine: BrainEngine,
-  opts: { mode: 'batch' | 'live'; sourceId?: string } = { mode: 'live' },
+  opts: { mode: 'batch' | 'live'; sourceId?: string; basenameIndex?: () => Promise<Map<string, string[]>> } = { mode: 'live' },
 ): SlugResolver {
   const cache = new Map<string, string | null>();
+  const basenameMatches = new Map<string, string[]>();
   const attendanceCache = new Map<string, string | null>();
   const attendanceCacheLimit = 256;
 
@@ -1535,6 +1536,10 @@ export function makeResolver(
   async function ensureBasenameIndex(): Promise<Map<string, string[]>> {
     if (basenameIndex !== null) return basenameIndex;
     const idx = new Map<string, string[]>();
+    if (opts.basenameIndex) {
+      basenameIndex = await opts.basenameIndex().catch(() => idx);
+      return basenameIndex;
+    }
     if (typeof engine.getAllSlugs !== 'function') {
       basenameIndex = idx;
       return idx;
@@ -1583,8 +1588,10 @@ export function makeResolver(
     },
     async resolveBasenameMatches(name: string): Promise<string[]> {
       // Issue #972 (codex [P2] DRY): shared query so resolver + FS + doctor
-      // return the same matches in the same stable order.
-      return queryBasenameIndex(await ensureBasenameIndex(), name);
+      // return the same matches in the same stable order. Memoized per
+      // resolver: a shared opts.basenameIndex may grow while a page extracts.
+      if (!basenameMatches.has(name)) basenameMatches.set(name, queryBasenameIndex(await ensureBasenameIndex(), name));
+      return [...basenameMatches.get(name)!];
     },
 
     async resolve(name: string, dirHint?: string | string[], resolveOpts?: ResolveOptions): Promise<string | null> {
@@ -1938,11 +1945,10 @@ export function findTimelineSourceDelimiter(text: string): number {
 // `Source — Summary` split ONLY to pipe-separated bullets (the canonical
 // shape the FS extractor matches); a dash-separated bullet's rest is one
 // summary and must not be shattered on its first interior dash.
-const TIMELINE_LINE_RE = /^\s*(?:-\s*)?\*\*(\d{4}-\d{2}-\d{2})\*\*\s*([|\-–—]+)\s*(.+?)\s*$/;
-// Chinese date lines: `- 2020年1月2日 | summary` (bold optional). Requires the
-// 年/月 markers so plain ASCII `- 2020-01-02 - text` does NOT match — non-bold
-// ASCII dates were never timeline entries and must stay that way.
-const TIMELINE_LINE_RE_CN = /^\s*(?:-\s*)?(?:\*\*)?(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\*\*)?\s*([|\-–—]+)\s*(.+?)\s*$/;
+// Chinese date lines (TIMELINE_LINE_RE_CN): `- 2020年1月2日 | summary` (bold
+// optional). Requires the 年/月 markers so plain ASCII `- 2020-01-02 - text`
+// does NOT match. Both live in timeline-citations.ts, whose inline-citation
+// pass skips the lines they read.
 
 // `### YYYY-MM-DD — summary` headings, as the FS extractor (timeline-extract.ts Format 2) accepts.
 const TIMELINE_HEADING_RE = /^\s*###\s+(\d{4}-\d{2}-\d{2})\s*[\-–—]+\s*(.+?)\s*$/;
@@ -2045,7 +2051,7 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   // Format 3 (the fs-source path). Blocks already captured by the timeline
   // bullet pass are skipped (a bullet often carries its own citation).
   for (const entry of parseInlineCitationTimelineEntries(content, {
-    skipLine: (line) => TIMELINE_LINE_RE.test(line) || TIMELINE_LINE_RE_CN.test(line),
+    skipLine: isDatedTimelineLine,
   })) {
     // #3957: carry the citation's source label in `source` (the dedup-key
     // column) so the row shape matches the FS extractor's Format 3; the

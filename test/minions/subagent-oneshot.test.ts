@@ -194,12 +194,54 @@ describe('runSubagentOneshot', () => {
       if (pending) return { request_id: id, state: 'queued', retry_after_ms: 100 };
       return realTool.execute(input, context);
     } };
-    await expect(runSubagentOneshot(args)).rejects.toMatchObject({ code: 'write_pending', writeRequest: { state: 'queued' } });
+    // 40 s from its deadline the job is inside the replay reserve, so the pending write leaves at once (#5474).
+    await expect(runSubagentOneshot({ ...args, ctx: { ...ctx, deadlineAtMs: Date.now() + 40_000 } }))
+      .rejects.toMatchObject({ code: 'write_pending', writeRequest: { state: 'queued' } });
     const rows = await engine.executeRaw<{ status: string }>('SELECT status FROM subagent_tool_executions WHERE job_id=$1', [ctx.id]);
     expect(rows).toHaveLength(2); expect(rows.every(row => row.status === 'pending')).toBe(true);
     pending = false;
     expect((await runSubagentOneshot(args)).kind).toBe('done');
     expect(chatCalls).toBe(1); expect(ids[1]).toBe(ids[0]);
+  });
+
+  describe('a write still pending after its own wait (#5474)', () => {
+    /** Wrap the real put_page so the next `stall` dispatches report the write still queued. */
+    function stallingWrites(args: OneshotArgs) {
+      const inner = args.putPageTool!; const innerChat = args._chat!;
+      const tally = { stall: 0, providerCalls: 0, requestIds: [] as unknown[] };
+      args._chat = (async (options: Parameters<typeof innerChat>[0]) => { tally.providerCalls++; return innerChat(options); }) as typeof innerChat;
+      args.putPageTool = { ...inner, execute: async (input, context) => {
+        const request_id = (input as Record<string, unknown>).request_id; tally.requestIds.push(request_id);
+        return tally.stall-- > 0 ? { request_id, state: 'recovering', retry_after_ms: 10 } : inner.execute(input, context);
+      } };
+      return tally;
+    }
+    const ledger = async (jobId: number) => (await engine.executeRaw<{ status: string; ordinal: number }>(
+      'SELECT status, ordinal FROM subagent_tool_executions WHERE job_id=$1 ORDER BY ordinal', [jobId])).map(row => row.status);
+
+    test('the write loop replays it and finishes the job in one run', async () => {
+      const ctx = await makeCtx(DATA); const args = makeArgs(ctx, DATA, VALID_RESPONSE);
+      const tally = stallingWrites(args);
+      tally.stall = 3;
+      expect((await runSubagentOneshot(args)).kind).toBe('done');
+      expect(tally.providerCalls).toBe(1);
+      expect(tally.requestIds.slice(0, 4).every(id => id === tally.requestIds[0])).toBe(true);
+      expect(await ledger(ctx.id)).toEqual(['complete', 'complete']);
+    });
+
+    test('recovery of a pending ledger row replays it rather than failing the attempt', async () => {
+      const ctx = await makeCtx(DATA); const args = makeArgs(ctx, DATA, VALID_RESPONSE);
+      const tally = stallingWrites(args);
+      tally.stall = Number.MAX_SAFE_INTEGER;
+      await expect(runSubagentOneshot({ ...args, ctx: { ...ctx, deadlineAtMs: Date.now() + 40_000 } })).rejects.toMatchObject({ code: 'write_pending' });
+      expect(await ledger(ctx.id)).toEqual(['pending', 'pending']);
+      const firstId = tally.requestIds[0];
+      tally.stall = 2; tally.requestIds.length = 0;
+      expect((await runSubagentOneshot(args)).kind).toBe('done');
+      expect(tally.providerCalls).toBe(1);
+      expect(tally.requestIds.slice(0, 3)).toEqual([firstId, firstId, firstId]);
+      expect(await ledger(ctx.id)).toEqual(['complete', 'complete']);
+    });
   });
 
   test('happy path: validates, writes both pages via put_page, ledger rows land, transcript persisted', async () => {
@@ -302,6 +344,28 @@ describe('runSubagentOneshot', () => {
     });
     const outcome = await runSubagentOneshot(makeArgs(ctx, DATA, resp));
     expect(outcome).toEqual({ kind: 'fallback', reason: 'bad_slug', tokens: FB_TOKENS });
+  });
+
+  // #6160: root-level and custom namespaces are task shapes too.
+  test('a root-level originals/ namespace from the allow-list validates (legacy job data)', async () => {
+    const data: SubagentHandlerData = { ...DATA, allowed_slug_prefixes: [...PREFIXES, 'personal/reflections/*', 'originals/*'] };
+    const ctx = await makeCtx(data);
+    const slug = `originals/2026-10-04-some-idea-${SUFFIX}`;
+    const resp = JSON.stringify({ pages: [{ slug, body: `An idea. [[${GOOD_SLUG_A}]]` }], skipped: false });
+    const outcome = await runSubagentOneshot(makeArgs(ctx, data, resp));
+    expect(outcome.kind).toBe('done');
+    expect(await engine.getPage(slug)).not.toBeNull();
+  });
+
+  test('explicit oneshot_task_prefixes admit a custom namespace and still refuse people pages', async () => {
+    const data: SubagentHandlerData = { ...DATA, allowed_slug_prefixes: [...PREFIXES, 'ideas/*'], oneshot_task_prefixes: ['ideas', 'wiki/personal/reflections'] };
+    const ok = `ideas/2026-10-04-custom-${SUFFIX}`;
+    const okCtx = await makeCtx(data);
+    expect((await runSubagentOneshot(makeArgs(okCtx, data, JSON.stringify({ pages: [{ slug: ok, body: `x [[${GOOD_SLUG_A}]]` }], skipped: false })))).kind).toBe('done');
+    const second = { ...data, prompt: `${data.prompt} (second job)` };
+    const badCtx = await makeCtx(second);
+    const bad = await runSubagentOneshot(makeArgs(badCtx, second, JSON.stringify({ pages: [{ slug: 'wiki/people/alice-example', body: `bio [[${GOOD_SLUG_A}]]` }], skipped: false })));
+    expect(bad).toEqual({ kind: 'fallback', reason: 'bad_slug', tokens: FB_TOKENS });
   });
 
   test('zero wikilinks → no_wikilink fallback', async () => {

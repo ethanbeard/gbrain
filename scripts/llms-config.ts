@@ -11,6 +11,7 @@
  * regenerate without manual URL rewrites:
  *   LLMS_REPO_BASE=https://raw.githubusercontent.com/fork-org/gbrain/main bun run build:llms
  */
+import { repoBaseOrThrow } from '../src/core/repo-base.ts';
 
 export type DocEntry = {
   title: string;
@@ -30,9 +31,7 @@ export const PROJECT = {
   summary:
     "GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, fat-markdown skills, and one agent operator contract for every error and recommendation. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.",
   repoUrl: "https://github.com/garrytan/gbrain",
-  rawBaseUrl:
-    process.env.LLMS_REPO_BASE ??
-    "https://raw.githubusercontent.com/garrytan/gbrain/master",
+  rawBaseUrl: repoBaseOrThrow(process.env.LLMS_REPO_BASE, "https://raw.githubusercontent.com/garrytan/gbrain/master"),
 };
 
 export const SECTIONS: DocSection[] = [
@@ -203,6 +202,13 @@ export const SECTIONS: DocSection[] = [
         includeInFull: false,
       },
       {
+        title: "docs/guides/dream-patterns.md",
+        description:
+          "Dream patterns phase: settings (min_evidence, subagent timeouts), in-cycle budget sizing from the recorded `dream.patterns.last_run` (first batch, timeout halving, `insufficient_cycle_budget` skip, probe after 3 skips), reset with `gbrain config unset dream.patterns.last_run`.",
+        path: "docs/guides/dream-patterns.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/facts-drain.md",
         description:
           "Automatic facts drain on PGLite (on by default): queued facts-absorb jobs run inside gbrain serve, serve --http and the facts_drain cycle phase with no command; per-run, daily and job-count caps, deferrals that never drop work, doctor facts_drain, opt-out `gbrain config set facts.extraction_enabled false`.",
@@ -239,6 +245,12 @@ export const SECTIONS: DocSection[] = [
         title: "docs/mcp/DEPLOY.md",
         description: "MCP server deployment.",
         path: "docs/mcp/DEPLOY.md",
+        // Fix wave 12: 42KB operator deployment runbook. Web index entry
+        // stays; the single-fetch bundle drops it to stay under
+        // FULL_SIZE_BUDGET (wave 12's onboard, dream and memory-verb doc
+        // additions passed 800KB). Operators read it once when deploying;
+        // agents follow the llms.txt link when they need it.
+        includeInFull: false,
       },
       {
         title: "docs/protocol/MEMORY_VERBS_v1.md",
@@ -310,6 +322,13 @@ export const SECTIONS: DocSection[] = [
         description:
           "Refusal reasons (file_database_drift, ambiguous_source_path, physical_root_device_changed, cursor_processing_options_conflict, take_row_collision, invalid_source_uri, queue_capacity, parked effects) and held-file content refusals (invalid_frontmatter and its reasons, frontmatter_slug_conflict, file_too_large, content_rejected, rename_held, sync_parser_regression) with the exact recovery command. Every refusal's `docs` field links its row directly.",
         path: "docs/guides/write-refusals.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/fence-format.md",
+        description:
+          "Facts and takes fence format, generated from the parser: markers, columns and layouts, allowed values, holders, row-number rules, one valid example per fence, what gbrain fixes by itself and what it never guesses, and the repair gates.",
+        path: "docs/guides/fence-format.md",
         includeInFull: false,
       },
       {

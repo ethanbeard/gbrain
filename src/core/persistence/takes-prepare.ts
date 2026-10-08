@@ -12,6 +12,10 @@ import type { WriteRequest } from './model.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import { assertPageRevision } from '../page-state/types.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
+import { normalizeTargetFences, storedFenceRows } from '../fence-repair/import-step.ts';
+import { nextFreeRowNum } from '../fence-repair/normalize.ts';
+import { scanCanonicalFences, targetFenceRefusal } from '../fence-repair/refusal.ts';
+import { pageFencesNormalized } from '../fence-repair/report.ts';
 
 /** Server-derived values are frozen after replay lookup, before admission. */
 export async function normalizeTakesIntent(ctx: OperationContext, params: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -55,7 +59,13 @@ async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainCon
     `Page ${row.slug} was deleted or replaced after the takes request was accepted.`);
   const p = row.intent!;
   if (p.expected_revision !== undefined) assertPageRevision(snapshot,engineMutationPrecondition(parseMutationPrecondition(p)));
-  const body = serializePageToMarkdown(snapshot.page,snapshot.tags);
+  // #6188 (D19, D20): takes_add / takes_update normalize the stored takes fence in this write; every other
+  // takes write refuses typed `target_fence_malformed` (location only) while the fence does not compile.
+  const appends = row.operation === 'takes_add' || row.operation === 'takes_update';
+  const defect = appends ? undefined : scanCanonicalFences(snapshot.page).defects.find(d => d.fence === 'takes');
+  if (defect) throw targetFenceRefusal(defect, row.slug, row.source_id);
+  const target = appends ? await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'takes', page: snapshot.page }) : null;
+  const body = serializePageToMarkdown(target ? { ...snapshot.page, ...target.page } : snapshot.page,snapshot.tags);
   const parsed = parseTakesFence(body);
   edit.assertFenceRoundTrips(parsed);
   for (const key of ['claim','kind','holder','source','evidence','unit','resolved_by']) {
@@ -71,13 +81,17 @@ async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainCon
   let result: Record<string, unknown>;
   let oldRow: number | undefined;
   let removedRow: number | undefined;
+  // W9F item 4: a new row number never seen on this page, fence rows (reservations included) and stored rows alike.
+  let allocated: number | undefined;
+  const nextRow = async () => nextFreeRowNum({ compiled_truth: body, timeline: '' },
+    await storedFenceRows(engine, row.source_id, row.slug, snapshot.page.id));
   if (row.operation === 'takes_add') {
     if (typeof p.claim !== 'string' || !p.claim.trim() || typeof p.kind !== 'string' || typeof p.holder !== 'string') throw takesRefusal('invalid_params','claim, kind and holder are required.',row,
       'takes_add needs claim, kind and holder as non-empty text.');
     edit.assertHolderAllowed(p.holder,holders); requiredHolders.add(p.holder);
     const added = upsertTakeRow(body,{claim:p.claim,kind:p.kind,holder:p.holder,weight:p.weight as number ?? 0.5,
-      source:p.source as string | undefined,sinceDate:p.since as string,active:true});
-    next=added.body; changed=parseTakesFence(next).takes.filter(t=>t.rowNum===added.rowNum);
+      source:p.source as string | undefined,sinceDate:p.since as string,active:true,rowNum:await nextRow()});
+    next=added.body; allocated=added.rowNum; changed=parseTakesFence(next).takes.filter(t=>t.rowNum===added.rowNum);
     result={slug:row.slug,row_num:added.rowNum,holder:p.holder};
   } else {
     if (!Number.isSafeInteger(p.row_num) || Number(p.row_num)<1) throw takesRefusal('invalid_params','row_num must be a positive integer.',row,
@@ -94,7 +108,7 @@ async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainCon
       if (stored && stored.claim!==target.claim) throw takesRefusal('invalid_params',`Row #${number}'s database copy disagrees with the page's takes fence; run gbrain takes rebuild ${row.slug} --source-id ${row.source_id} first.`,row,
         `Rebuild the page's takes index from its fence first with gbrain takes rebuild ${row.slug} --source-id ${row.source_id}, check the row, then remove it again.`);
       removedRow=number;
-      next=edit.replaceFence(body,parsed.takes.filter(t=>t.rowNum!==number));
+      next=edit.replaceFence(body,parsed.takes.filter(t=>t.rowNum!==number),[number]);
       result={slug:row.slug,row_num:number,removed:true};
     } else if (!target.active) throw new TakesWriteError('row_inactive','The take was superseded.');
     else if (row.operation==='takes_supersede') {
@@ -103,8 +117,8 @@ async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainCon
       const holder=typeof p.holder==='string'?p.holder:target.holder;
       edit.assertHolderAllowed(holder,holders); requiredHolders.add(holder);
       const superseded=supersedeRow(body,number,{claim:p.claim,kind:p.kind as string ?? target.kind,holder,
-        weight:p.weight as number ?? Math.max(0,target.weight-0.1),source:p.source as string | undefined,sinceDate:p.since as string});
-      next=superseded.body; oldRow=number;
+        weight:p.weight as number ?? Math.max(0,target.weight-0.1),source:p.source as string | undefined,sinceDate:p.since as string},await nextRow());
+      next=superseded.body; oldRow=number; allocated=superseded.newRowNum;
       changed=parseTakesFence(next).takes.filter(t=>t.rowNum===number || t.rowNum===superseded.newRowNum);
       result={slug:row.slug,old_row:number,new_row:superseded.newRowNum};
     } else {
@@ -128,10 +142,17 @@ async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainCon
       result={slug:row.slug,row_num:number,...(row.operation==='takes_resolve'?{quality:p.quality,resolved_by:p.resolved_by}:{})};
     }
   }
+  // Rows Tier 1 rewrote are re-indexed with the row this write changes.
+  const normalizedRows=new Set((target?.fixes ?? []).filter(f=>f.fence==='takes' && f.row!==null).map(f=>f.row!));
+  if (normalizedRows.size) changed=[...changed,...parseTakesFence(next).takes.filter(t=>normalizedRows.has(t.rowNum) && !changed.some(c=>c.rowNum===t.rowNum))];
   for (const holder of requiredHolders) await authorizeTakeHolder(engine,row.authority,holder);
   const prepared=await preparePageMutation(engine,row,config,{content:next,expectedRevision:snapshot.revision});
   return {...prepared,validate:async tx=>{
     await prepared.validate?.(tx);
+    if (allocated!==undefined && (await tx.executeRaw('SELECT 1 FROM takes WHERE page_id=$1 AND row_num=$2',[snapshot.page.id,allocated])).length) {
+      throw takesRefusal('revision_conflict',`Take row #${allocated} was recorded on ${row.slug} while this write was prepared.`,row,
+        `Another writer recorded take row #${allocated} on ${row.slug} after this request read the page.`);
+    }
     for (const holder of requiredHolders) await authorizeTakeHolder(tx,row.authority,holder);
     await tx.executeRaw(`UPDATE persistence_requests
       SET authority=jsonb_set(authority,'{takeHoldersUsed}',$2::text::jsonb)
@@ -150,6 +171,8 @@ async function prepare(engine: BrainEngine, row: WriteRequest, config: GBrainCon
         await tx.executeRaw('UPDATE takes SET resolved_at=$3::timestamptz WHERE page_id=$1 AND row_num=$2',[snapshot.page.id,t.rowNum,t.resolvedAt]);
       }
     }
-    return {...outcome,...result,mirror_written:!!prepared.file};
+    return {...outcome,...result,mirror_written:!!prepared.file,...(target?.fixes.length?{fences_normalized:pageFencesNormalized({sourceId:row.source_id,slug:row.slug,
+      // A remote caller may not see every holder's rows, so its report names classes and columns, never row numbers.
+      fixes:row.authority.remote?target.fixes.map(f=>({...f,row:null})):target.fixes,writer:row.principal_kind,path:snapshot.page.source_path ?? null,remote:row.authority.remote})}:{})};
   }};
 }

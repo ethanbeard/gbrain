@@ -17,6 +17,7 @@ import type { AuthInfo, Operation, OperationContext } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { hostFix, invalidParam, paramUse, readFix } from './op-fix.ts';
 import { CJK_SLUG_CHARS, SLUG_WORD_CHARS } from '../cjk.ts';
+import { validateSlug } from '../utils.ts';
 import { ALL_SOURCES, NO_SOURCES, isValidSourceId } from '../source-id.ts';
 import { encodeDeepResearchId } from '../deep-research-id.ts';
 import { isSearchMode } from '../search/mode.ts';
@@ -206,6 +207,7 @@ export function validateUploadPath(filePath: string, root: string, strict = true
 // Dot stays continuation-only — `..` traversal remains impossible.
 const OP_PAGE_SLUG_PART = `[${SLUG_WORD_CHARS}_][${SLUG_WORD_CHARS}._\\-]*`;
 const OP_PAGE_SLUG_SEG = `${OP_PAGE_SLUG_PART}(?::${OP_PAGE_SLUG_PART})*`;
+const OP_PAGE_SLUG_RE = new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu');
 
 /**
  * Allowlist validator for page slugs. Rejects URL-encoded traversal, backslashes,
@@ -223,10 +225,28 @@ export function validatePageSlug(slug: string): void {
   // #3417: letters/numbers from any script allowed in segments (u flag required
   // for the \p{...} classes in OP_PAGE_SLUG_SEG). Shape rules (word-char lead,
   // dot/underscore/hyphen continuation) preserved.
-  if (!new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu').test(slug)) {
+  if (!OP_PAGE_SLUG_RE.test(slug)) {
     throw opError('invalid_params', `Invalid page_slug: ${slug} (allowed: letters/numbers in any script, with '.', '_', '-' after the first character of a part, optional colon-separated namespace parts, and forward-slash separated segments)`,
       'Use a slug shaped like people/alice-example or notes/v1.0.0: no spaces, backslashes, percent-encoding or dot-led segments.');
   }
+}
+
+/** True when `slug` passes validatePageSlug's op-boundary grammar. */
+export function isOpPageSlug(slug: string): boolean {
+  return typeof slug === 'string' && slug.length > 0 && slug.length <= 255 && OP_PAGE_SLUG_RE.test(slug);
+}
+
+/**
+ * #6212: a slug an older gbrain stored that today's grammar refuses (a space,
+ * as in `people/jane doe`). Admitted only to delete or restore that exact
+ * existing row, and only if it still passes the storage guard (validateSlug:
+ * no traversal, leading `/`, backslash, control or bidi characters, or encoded
+ * separators). Such a row is published database-only (page-prepare.ts): its
+ * recorded file path may belong to another page.
+ */
+export function isLegacyStoredPageSlug(slug: string): boolean {
+  if (isOpPageSlug(slug) || typeof slug !== 'string' || slug.length > 255) return false;
+  try { validateSlug(slug); return true; } catch { return false; } // refused by the storage guard too: not a legacy slug
 }
 
 /**
@@ -265,10 +285,14 @@ export function matchesSlugAllowList(slug: string, prefixes: readonly string[]):
  *   - Legacy default: slug must live under `wiki/agents/<subagentId>/...`
  *     (anchored, slash-boundary \u2014 `wiki/agents/12evil/*` can't impersonate
  *     subagent 12).
+ *
+ * #5994: the one exception to the missing-`subagentId` refusal is the trusted
+ * local failed-writes replay of a stored restricted authority that recorded no
+ * job id (`replayedAllowList`); it still checks the slug against that list.
  */
 export function enforceSubagentSlugFence(ctx: OperationContext, slug: string, opName: string): void {
   if (ctx.viaSubagent !== true) return;
-  if (typeof ctx.subagentId !== 'number' || Number.isNaN(ctx.subagentId)) {
+  if ((typeof ctx.subagentId !== 'number' || Number.isNaN(ctx.subagentId)) && !replayedAllowList(ctx)) {
     throw opError('permission_denied', `${opName} via subagent requires ctx.subagentId`,
       'This is a gbrain dispatch fault, not a caller mistake: report it to the user instead of resubmitting the write.');
   }
@@ -284,6 +308,14 @@ export function enforceSubagentSlugFence(ctx: OperationContext, slug: string, op
       ? `Write to a slug matching one of: ${allowList.join(', ')}.`
       : `Write under wiki/agents/${ctx.subagentId}/ (for example wiki/agents/${ctx.subagentId}/notes).`,
   );
+}
+
+/** A failed-writes replay of a restricted authority, confined to exactly the stored, non-empty allow-list. */
+function replayedAllowList(ctx: OperationContext): boolean {
+  const stored = ctx.replayAuthority;
+  const list = ctx.allowedSlugPrefixes;
+  return !!stored?.restrictedNamespace && !!list?.length && !!stored.delegatedPrefixes?.length
+    && list.length === stored.delegatedPrefixes.length && list.every((prefix, i) => prefix === stored.delegatedPrefixes![i]);
 }
 
 /**

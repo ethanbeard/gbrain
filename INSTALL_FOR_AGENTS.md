@@ -59,7 +59,9 @@ restart the shell or add the PATH export to the shell profile.
 > occasionally blocks the top-level postinstall hook on global installs, so schema
 > migrations don't run automatically), the CLI prints a recovery hint pointing at
 > [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain apply-migrations --yes --no-autopilot-install`
-> to recover. If that doesn't work, fall back to the deterministic install path:
+> to recover. It exits 0 only when the schema is at head. Exit 1 with `migrations_pending` means the schema
+> is still behind: another `--yes` repeats the failure, so run `gbrain doctor --json`, tell the user what it
+> reports, and fall back to the deterministic install path:
 >
 > ```bash
 > git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
@@ -628,7 +630,7 @@ gbrain onboard --check --json
 The JSON envelope (`schema_version: 1`) carries `recommendations[]` with
 `apply_policy` per item: `auto_apply` (safe to run unattended),
 `prompt_required` (needs explicit user consent), or `manual_only`
-(LLM-bearing, user must run themselves).
+(pack upgrade, paid takes bootstrap: the user runs it).
 
 **After every `gbrain upgrade`:**
 ```bash
@@ -642,9 +644,10 @@ step regardless.
 ```bash
 gbrain onboard --auto --max-usd 5
 ```
-Refuses without `--max-usd N`. Runs auto-eligible items only. The
-autopilot daemon also consults onboard recommendations on its tick — no
-explicit agent action needed for the autonomous path.
+Refuses without `--max-usd N`. Never runs `manual_only` items; it
+lists them in `manual_only_skipped`. The autopilot daemon also consults
+onboard recommendations on its tick — no explicit agent action needed
+for the autonomous path.
 
 **Remote / federated brain installs (MCP):**
 The `run_onboard` MCP op (admin scope) lets thin-client agents probe

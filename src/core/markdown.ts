@@ -6,6 +6,7 @@ import {
   commentValueKeys, frontmatterKeyHazard, recoverFrontmatter, unclosedFenceProtectedKey, yamlLocationMessage,
   RECOVERY_VERSION, type FrontmatterRecovery, type RecoveryKind,
 } from './frontmatter-recovery.ts';
+import { findLineOutsideFencedCode } from './fence-scan.ts';
 
 export {
   recoverFrontmatter, RECOVERY_VERSION, PROTECTED_FRONTMATTER_KEYS, IDENTITY_FRONTMATTER_KEYS,
@@ -648,6 +649,13 @@ function collectValidationErrors(
     });
   }
 
+  // #6157: parse the whole block once. The per-line NESTED_QUOTES heuristic
+  // below only runs when the block fails to parse; a block-scalar
+  // continuation line that looks like `Key: "a", "b"` is valid YAML. A block
+  // over the alias limit counts as not parsing (the heuristics apply).
+  const blockParseError = yamlBlockError(fmBody);
+  const blockParses = blockParseError === null && yamlAliasesWithinLimit(fmBody);
+
   // 5. NESTED_QUOTES — common breakage pattern: `title: "Name "Nick" Last"`.
   //    The heuristic: a frontmatter `key: value` line with 3+ unescaped
   //    double-quote characters is suspicious. But raw quote-counting is
@@ -657,7 +665,7 @@ function collectValidationErrors(
   //    Disambiguate by running js-yaml on just the value; only flag
   //    lines that genuinely fail to parse. The full-frontmatter YAML
   //    parse error is caught separately by check 6 (YAML_PARSE) below.
-  for (let i = firstNonEmpty + 1; i < closeLine; i++) {
+  for (let i = firstNonEmpty + 1; !blockParses && i < closeLine; i++) {
     const line = lines[i];
     const m = line.match(/^\s*[A-Za-z_][\w-]*\s*:\s*(.*)$/);
     if (!m) continue;
@@ -695,14 +703,7 @@ function collectValidationErrors(
   // body with empty data, so the validation surface must not depend only on
   // gray-matter's parse path. Gate this on frontmatter-shaped fields so a
   // leading Markdown thematic break / epigraph is preserved as body content.
-  let detectedYamlParseError = looksLikeFrontmatter ? ctx.yamlParseError : null;
-  if (!detectedYamlParseError && looksLikeFrontmatter) {
-    try {
-      yamlLoad(fmBody);
-    } catch (e) {
-      detectedYamlParseError = e as Error;
-    }
-  }
+  const detectedYamlParseError = looksLikeFrontmatter ? (ctx.yamlParseError ?? blockParseError) : null;
   if (detectedYamlParseError) {
     // #5988: location only. js-yaml's own message quotes the document, and
     // this text reaches receipts, sync results and remote callers.
@@ -746,6 +747,33 @@ function collectValidationErrors(
         message: `Frontmatter "${field}" should be a string but is ${typeof v} (${JSON.stringify(v)}); quote the value (e.g. ${field}: "${String(v)}").`,
       });
     }
+  }
+}
+
+/**
+ * Most YAML aliases (`*name`) a frontmatter block may hold before the #6157
+ * whole-block checks treat it as not parsing. Frontmatter is untrusted: a few
+ * hundred bytes of nested `&a [*b, *b]` anchors expand exponentially once the
+ * parsed value is walked (compared, stringified). Real frontmatter rarely
+ * uses aliases at all.
+ */
+export const MAX_FRONTMATTER_YAML_ALIASES = 16;
+
+/** False when the text holds more than MAX_FRONTMATTER_YAML_ALIASES aliases outside quoted strings. */
+export function yamlAliasesWithinLimit(text: string): boolean {
+  const unquoted = text.replace(/"(?:[^"\\\n]|\\.)*"|'(?:[^'\n]|'')*'/g, '');
+  let count = 0;
+  for (const _ of unquoted.matchAll(/(?:^|[\s,[{])\*[^\s,[\]{}]/g)) if (++count > MAX_FRONTMATTER_YAML_ALIASES) return false;
+  return true;
+}
+
+/** The js-yaml error for a frontmatter block, or null when the whole block parses. */
+export function yamlBlockError(block: string): Error | null {
+  try {
+    yamlLoad(block);
+    return null;
+  } catch (e) {
+    return e as Error;
   }
 }
 
@@ -826,30 +854,34 @@ export function splitBody(body: string): { compiled_truth: string; timeline: str
  * shape) so the frontmatter's `---` delimiters can't false-positive rule 3.
  */
 export function findTimelineSplitIndex(lines: string[]): number {
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
+  // A sentinel quoted inside a fenced code block (a markdown example) is not
+  // a separator. Mispaired fences (see MarkdownCodeMap) leave every candidate
+  // live, as before.
+  return findLineOutsideFencedCode(lines, (i) => isTimelineSentinelLine(lines, i));
+}
 
-    if (trimmed === '<!-- timeline -->' || trimmed === '<!--timeline-->') {
-      return i;
-    }
+function isTimelineSentinelLine(lines: string[], i: number): boolean {
+  const trimmed = lines[i].trim();
 
-    if (trimmed === '--- timeline ---' || /^---\s+timeline\s+---$/i.test(trimmed)) {
-      return i;
-    }
+  if (trimmed === '<!-- timeline -->' || trimmed === '<!--timeline-->') {
+    return true;
+  }
 
-    if (trimmed === '---') {
-      const beforeContent = lines.slice(0, i).join('\n').trim();
-      if (beforeContent.length === 0) continue;
+  if (trimmed === '--- timeline ---' || /^---\s+timeline\s+---$/i.test(trimmed)) {
+    return true;
+  }
 
-      for (let j = i + 1; j < lines.length; j++) {
-        const next = lines[j].trim();
-        if (next.length === 0) continue;
-        if (/^##\s+(timeline|history)\s*$/i.test(next)) return i;
-        break;
-      }
+  if (trimmed === '---') {
+    const beforeContent = lines.slice(0, i).join('\n').trim();
+    if (beforeContent.length === 0) return false;
+
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j].trim();
+      if (next.length === 0) continue;
+      return /^##\s+(timeline|history)\s*$/i.test(next);
     }
   }
-  return -1;
+  return false;
 }
 
 /** A timeline entry line: a bullet whose text starts with a 4-digit year
@@ -1161,7 +1193,8 @@ function inferSlug(filePath?: string): string {
 function extractTags(frontmatter: Record<string, unknown>): string[] {
   const tags = frontmatter.tags;
   if (!tags) return [];
-  if (Array.isArray(tags)) return tags.map(String);
+  // Only scalar items are tags: stringifying a nested array would expand a YAML alias bomb.
+  if (Array.isArray(tags)) return tags.filter(t => t instanceof Date || (t !== null && typeof t !== 'object')).map(String);
   if (typeof tags === 'string') return tags.split(',').map(t => t.trim()).filter(Boolean);
   return [];
 }

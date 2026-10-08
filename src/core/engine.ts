@@ -1,4 +1,5 @@
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
+import type { GetVersionsOpts, PageVersionRows } from './page-state/version-types.ts';
 import type { LinkReadScope } from './link-validity.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
 import type { DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
@@ -480,7 +481,7 @@ export const DREAM_VERDICT_TTL_SECONDS = 30 * 86400;
 export interface DreamVerdictInput {
   worth_processing: boolean;
   reasons: string[];
-  score: number;
+  score: number | null; // NULL only on a triage backoff marker (cycle/triage-backoff.ts): a miss to every reader
   content_type: string | null;
   segments: TriageSegment[];
   entities: string[];
@@ -1167,9 +1168,11 @@ export interface BrainEngine {
    * pre-registry brains. `embedding_image` routing is unaffected.
    * `sealChunkerVersion` (#5984): the caller deleted every chunk of the page
    * earlier in this transaction; the stale-row work is skipped and the page is
-   * sealed at that chunker version after the insert.
+   * sealed at that chunker version after the insert. With `pageId` (the
+   * caller's own write of that page in this transaction) the seal and the
+   * insert are sent together and the seal's page is checked against it.
    */
-  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number } & BatchOpts): Promise<void>;
+  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number } & BatchOpts): Promise<void>;
   /**
    * Read every chunk for a page. Scope precedence mirrors getPage (#2555):
    * a federated grant (`sourceIds[]`) wins over scalar `sourceId`; with
@@ -2320,7 +2323,7 @@ export interface BrainEngine {
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
    */
-  getVersions(slug: string, opts?: PageReadScope): Promise<PageVersion[]>;
+  getVersions<B extends boolean = true>(slug: string, opts?: GetVersionsOpts<B>): Promise<PageVersionRows<B>>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
    * and the page revert. Without it, multi-source brains can revert the
@@ -2433,6 +2436,8 @@ export interface BrainEngine {
     slug: string,
     sourceId: string,
     aliasNorms: string[],
+    /** #5984: `inline` writes in the caller's page transaction, without a savepoint. */
+    opts?: { inline?: boolean },
   ): Promise<void>;
 
   /**

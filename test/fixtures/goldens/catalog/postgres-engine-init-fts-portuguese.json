@@ -11,6 +11,7 @@
       "chat_usage_log.chat_usage_log_pkey": "p PRIMARY KEY (id)",
       "chronicle_judge_reservations.chronicle_judge_reservations_pkey": "p PRIMARY KEY (id)",
       "chronicle_page_state.chronicle_page_state_attempts_check": "c CHECK ((attempts >= 0))",
+      "chronicle_page_state.chronicle_page_state_max_attempts_check": "c CHECK ((max_attempts > 0))",
       "chronicle_page_state.chronicle_page_state_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "chronicle_page_state.chronicle_page_state_pkey": "p PRIMARY KEY (source_id, page_id, content_hash, extractor_version)",
       "chronicle_page_state.chronicle_page_state_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
@@ -1025,12 +1026,14 @@
       "pages_coalesce_date_idx": "CREATE INDEX pages_coalesce_date_idx ON public.pages USING btree (COALESCE(effective_date, updated_at))",
       "pages_dedup_idx": "CREATE INDEX pages_dedup_idx ON public.pages USING btree (source_id, content_hash) WHERE (deleted_at IS NULL)",
       "pages_deleted_at_purge_idx": "CREATE INDEX pages_deleted_at_purge_idx ON public.pages USING btree (deleted_at) WHERE (deleted_at IS NOT NULL)",
+      "pages_file_uri_name_idx": "CREATE INDEX pages_file_uri_name_idx ON public.pages USING btree (source_id, regexp_replace(source_uri, '^.*/'::text, ''::text)) WHERE (source_uri ~~ 'file:%'::text)",
       "pages_generation_idx": "CREATE INDEX pages_generation_idx ON public.pages USING btree (generation)",
       "pages_last_retrieved_at_idx": "CREATE INDEX pages_last_retrieved_at_idx ON public.pages USING btree (last_retrieved_at)",
       "pages_links_extracted_at_idx": "CREATE INDEX pages_links_extracted_at_idx ON public.pages USING btree (source_id, links_extracted_at)",
       "pages_pkey": "CREATE UNIQUE INDEX pages_pkey ON public.pages USING btree (id)",
       "pages_safe_chunk_pending_idx": "CREATE INDEX pages_safe_chunk_pending_idx ON public.pages USING btree (source_id) WHERE (chunker_version < 4)",
       "pages_source_path_idx": "CREATE INDEX pages_source_path_idx ON public.pages USING btree (source_path) WHERE (source_path IS NOT NULL)",
+      "pages_source_path_name_idx": "CREATE INDEX pages_source_path_name_idx ON public.pages USING btree (source_id, regexp_replace(replace(btrim(source_path), chr(92), '/'::text), '^.*/'::text, ''::text)) WHERE (source_path IS NOT NULL)",
       "pages_source_slug_key": "CREATE UNIQUE INDEX pages_source_slug_key ON public.pages USING btree (source_id, slug)",
       "persistence_brain_pkey": "CREATE UNIQUE INDEX persistence_brain_pkey ON public.persistence_brain USING btree (singleton)",
       "persistence_counters_pkey": "CREATE UNIQUE INDEX persistence_counters_pkey ON public.persistence_counters USING btree (key)",
@@ -1311,7 +1314,13 @@
           "17 event_slugs ARRAY/_text NOT NULL DEFAULT '{}'::text[]",
           "18 event_hashes ARRAY/_text NOT NULL DEFAULT '{}'::text[]",
           "19 decided_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
-          "20 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+          "20 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "21 campaign_id text/text NULL",
+          "22 attempt_cap_usd numeric/numeric NULL",
+          "23 max_attempts integer/int4 NULL",
+          "24 pricing_policy text/text NULL",
+          "25 campaign_max_usd numeric/numeric NULL",
+          "26 cost_attempts ARRAY/_int4 NOT NULL DEFAULT '{}'::integer[]"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
@@ -2568,7 +2577,8 @@
           "36 consumer_version text/text NULL",
           "37 consumer_host_id uuid/uuid NULL",
           "38 published_at timestamp with time zone/timestamptz NULL",
-          "39 error_detail jsonb/jsonb NULL"
+          "39 error_detail jsonb/jsonb NULL",
+          "40 claim_phase jsonb/jsonb NULL"
         ],
         "flags": "relkind=r rls=true force_rls=false"
       },
