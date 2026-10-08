@@ -30,7 +30,7 @@ export async function lockPageKeys(engine: Pick<BrainEngine, 'executeRaw'> & { k
   // the guards take the incarnation from the locked row, and a missing source is reported before anything else.
   if (!hinted && ordered.length === 1) {
     const key = ordered[0]!;
-    await pipelined({ kind: engine.kind ?? '' }, [
+    await pipelined({ kind: engine.kind ?? '', get sql() { return (engine as { sql?: unknown }).sql } }, [
       async () => {
         const rows = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation FROM sources WHERE id=$1 FOR SHARE', [key.sourceId]);
         if (!rows.length) throw new Error(`Page source does not exist: ${key.sourceId}`);
@@ -42,7 +42,7 @@ export async function lockPageKeys(engine: Pick<BrainEngine, 'executeRaw'> & { k
     ]);
     return;
   }
-  const run = (calls: Array<() => Promise<unknown>>) => pipelined({ kind: engine.kind ?? '' }, calls);
+  const run = (calls: Array<() => Promise<unknown>>) => pipelined({ kind: engine.kind ?? '', get sql() { return (engine as { sql?: unknown }).sql } }, calls);
   const sources = new Map<string, string>(hinted ? expected : []);
   const reads: Array<() => Promise<unknown>> = [];
   for (const sourceId of new Set(ordered.map(key => key.sourceId))) {

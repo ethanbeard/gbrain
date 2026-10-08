@@ -8,7 +8,7 @@ import { lockUnheldPageKeys, withHeldPageKeys, type HeldPageKeys } from './page-
 import { readPageSnapshot as readCanonicalPageSnapshot } from './page-state/snapshot.ts';
 import { createPageVersion } from './page-state/versions.ts';
 import { moveSlugBindings, recordRenameAlias } from './page-state/rename-alias.ts';
-import { composablePostgresTransaction, transactionMemo } from './page-state/transactions.ts';
+import { beginRestoringDeadline, composablePostgresTransaction, transactionMemo } from './page-state/transactions.ts';
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
 import { readRelationalFanout, readChainHop, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores } from './search/read-enrichment.ts';
@@ -615,9 +615,9 @@ export class PostgresEngine implements BrainEngine {
     // .begin), which would skip a chained .finally and leak the counter.
     if (!this._pageTransaction) this.checkoutGauge.acquire('tx');
     try {
-      return await withHeldPageKeys(this._pageTransaction ? this._heldPageKeys : null, held => conn.begin(async (handle) => {
+      return await withHeldPageKeys(this._pageTransaction ? this._heldPageKeys : null, held => beginRestoringDeadline(conn, async (handle) => {
         if (!this._pageTransaction) this.checkoutGauge.checkedOut();
-        const tx = composablePostgresTransaction(handle);
+        const tx = composablePostgresTransaction(handle, conn);
         // Create a scoped engine with tx as its connection, no shared state mutation
         const txEngine = Object.create(this) as PostgresEngine;
         Object.defineProperty(txEngine, '_chunkWritesInTransaction', { value: true });

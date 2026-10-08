@@ -106,7 +106,7 @@ const STABLE_IN_GROUP = new Set([
  * transaction unchanged. It lives only for one group transaction, so nothing
  * survives a rollback.
  */
-function groupReads(tx: BrainEngine): BrainEngine {
+export function groupReads(tx: BrainEngine): BrainEngine {
   const reads = new Map<string, Promise<unknown>>();
   const once = <T>(id: string, read: () => Promise<T>): Promise<T> => {
     let value = reads.get(id) as Promise<T> | undefined;
@@ -114,6 +114,7 @@ function groupReads(tx: BrainEngine): BrainEngine {
     return value;
   };
   return new Proxy(tx, { get(target, key) {
+    if (key === 'sql' || key === '_sql') return Reflect.get(target, key, target);
     if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) =>
       STABLE_IN_GROUP.has(flat(sql)) ? once(JSON.stringify([flat(sql), params ?? null]), () => target.executeRaw(sql, params, opts)) : target.executeRaw(sql, params, opts);
     if (key === 'getConfig') return (name: string) => once(`config:${name}`, () => target.getConfig(name));
