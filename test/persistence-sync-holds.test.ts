@@ -12,11 +12,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
-import { GIT_HOLD_OP, SYNC_IMPORT_PROVENANCE_OP, readGitSourceHolds, requestGitHoldRetry } from '../src/core/persistence/sync-holds.ts';
+import { GIT_HOLD_OP, SYNC_IMPORT_PROVENANCE_OP, readGitHoldRetryPaths, readGitSourceHolds, requestGitHoldRetry } from '../src/core/persistence/sync-holds.ts';
 import { printSyncResult, type SyncOpts, type SyncResult } from '../src/commands/sync.ts';
 import { gitHoldStatusLines, readGitHoldStatuses } from '../src/core/persistence/connector-status.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -146,21 +146,29 @@ test('dry run lists every would-be hold, writes nothing, and leaves hold rows by
   expect(printed(dry)).toContain('Would hold notes/new.md');
 }), 180_000);
 
-test('a sliced run that has not reached a held file leaves its hold untouched; a failed publication keeps the hold', () => each(async engine => {
+test('a sliced run that has not reached a held file leaves its hold untouched; a deferred publication keeps the hold', () => each(async engine => {
   const s = await source(engine, { 'notes/a.md': note('A'), 'notes/z.md': note('Z') });
   await s.sync();
   s.write('notes/z.md', FOLDED); commit(s.root, 'break z');
   expect((await s.sync()).held_count).toBe(1);
   s.write('notes/a.md', note('A2')); s.write('notes/z.md', note('Z fixed')); commit(s.root, 'fix z');
   const before = await s.holdRows();
+  const nonRetryHoldRows = () => engine.executeRaw<{ op: string; completed_keys: unknown; updated_at: unknown }>(
+    "SELECT op,completed_keys,updated_at FROM op_checkpoints WHERE op LIKE 'sync-hold%' AND op<>'sync-hold-retry' AND fingerprint LIKE $1 ORDER BY op,fingerprint", [`${s.id}:%`]);
+  const beforeNonRetry = await nonRetryHoldRows();
   const partial = await performManagedSync(engine, { sourceId: s.id, noPull: true, noEmbed: true, noExtract: true }, { maxPages: 1, maxMs: 60_000 });
   expect(partial).toMatchObject({ status: 'partial', reason: 'writer_yield', holds_pending_screen: true });
   expect(await s.holdRows()).toEqual(before);
-  // The committed fix is admitted, but newer uncommitted working-tree bytes make its publication refuse: the hold stays.
+  // The committed fix is admitted, but newer uncommitted working-tree bytes defer its publication: the hold stays.
   s.write('notes/z.md', note('Z newer uncommitted edit'));
-  const blocked = await s.sync();
-  expect(blocked.status).toBe('blocked_by_failures');
-  expect(await s.holdRows()).toEqual(before);
+  const deferred = await s.sync();
+  expect(deferred.status).toBe('synced');
+  expect(deferred.deferred).toEqual(expect.arrayContaining([
+    expect.objectContaining({ path: 'notes/z.md', reason: 'pinned_git_worktree_conflict' }),
+  ]));
+  expect(await nonRetryHoldRows()).toEqual(beforeNonRetry);
+  const incarnation = (await getWorktreeBinding(engine, s.id))!.source_incarnation;
+  expect(await readGitHoldRetryPaths(engine, s.id, incarnation)).toContain('notes/z.md');
 }), 180_000);
 
 test('renamed to a broken file keeps the old page, a later fix moves it with its id, and a full walk never deletes it meanwhile', () => each(async engine => {
@@ -300,7 +308,12 @@ test('a flagless sync converts a --no-embed cursor with its stored options, and 
   await t.sync();
   t.write('notes/z.md', note('Z committed')); commit(t.root, 'change z');
   t.write('notes/z.md', note('Z newer uncommitted edit'));
-  expect((await t.sync()).status).toBe('blocked_by_failures');
+  process.env.GBRAIN_TEST_DISABLE_SOURCE_CHANGED_DEFERRAL = '1';
+  try {
+    expect((await t.sync()).status).toBe('blocked_by_failures');
+  } finally {
+    delete process.env.GBRAIN_TEST_DISABLE_SOURCE_CHANGED_DEFERRAL;
+  }
   await engine.executeRaw("UPDATE persistence_requests SET error_code='invalid_params',error_message='Invalid YAML frontmatter: bad indentation of a mapping entry (3:1)' WHERE source_id=$1 AND state IN ('failed','conflict')", [t.id]);
   await engine.executeRaw(`UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,pending,converted}','true'::jsonb)
     WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1`, [t.id]);

@@ -29,6 +29,8 @@ import type { OperationContext } from '../src/core/ops/contract.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
 import { renderFactsTable, parseFactsFence } from '../src/core/facts-fence.ts';
+import { readGitHoldRetryPaths } from '../src/core/persistence/sync-holds.ts';
+import { deferralExitCode } from '../src/commands/sync/run.ts';
 
 const backends = testBackends();
 const home = mkdtempSync(join(tmpdir(), 'gbrain-sync-failures-'));
@@ -131,8 +133,11 @@ test('CRLF checkout is not newer divergent content, but substantive edits remain
     expect(readFileSync(join(f.root, 'note.md'), 'utf8')).toBe(next.replace(/\n/g, '\r\n'));
     writeFileSync(join(f.root, 'note.md'), 'Another committed observation.\n'); commit(f.root);
     writeFileSync(join(f.root, 'note.md'), 'Divergent uncommitted observation.\n');
-    expect(await performManagedSync(engine, options)).toMatchObject({ status: 'blocked_by_failures', failureCodes: [{ code: 'source_changed', count: 1 }] });
+    const working = readFileSync(join(f.root, 'note.md'), 'utf8');
+    expect(await performManagedSync(engine, options)).toMatchObject({ status: 'synced', deferred: [{ path: 'note.md', reason: 'pinned_git_worktree_conflict' }] });
     expect((await engine.getPage('note', { sourceId: f.id }))?.compiled_truth).toContain('Updated');
+    expect(readFileSync(join(f.root, 'note.md'), 'utf8')).toBe(working);
+    expect(await readGitHoldRetryPaths(engine, f.id, (await getWorktreeBinding(engine, f.id))!.source_incarnation)).toContain('note.md');
   }
 }), 120_000);
 
@@ -143,19 +148,19 @@ test.each(['lone_cr', 'trailing_spaces', 'bom', 'content'] as const)('fresh CRLF
     const options = { sourceId: f.id, noPull: true };
     await performManagedSync(engine, options);
     const pinned = 'Updated canonical observation.\n';
-    writeFileSync(join(f.root, 'note.md'), pinned); commit(f.root);
+    writeFileSync(join(f.root, 'note.md'), pinned); const pinnedHead = commit(f.root);
     const working = difference === 'lone_cr' ? pinned.replace(/\n/g, '\r')
       : difference === 'trailing_spaces' ? pinned.replace(/\n/g, ' \r\n')
       : difference === 'bom' ? '\ufeff' + pinned.replace(/\n/g, '\r\n')
       : pinned.replace('Updated', 'Divergent').replace(/\n/g, '\r\n');
     writeFileSync(join(f.root, 'note.md'), working);
-    const blocked = await performManagedSync(engine, options);
-    expect(blocked).toMatchObject({ status: 'blocked_by_failures', failureCodes: [{ code: 'source_changed', count: 1 }],
-      managedWrite: { write_error: 'source_changed', reason: 'pinned_git_worktree_conflict' } });
-    expect(blocked.managedWrite?.line_endings).toBeUndefined();
+    const deferred = await performManagedSync(engine, options);
+    expect(deferred).toMatchObject({ status: 'synced', deferred: [{ path: 'note.md', reason: 'pinned_git_worktree_conflict' }] });
+    expect(deferred.managedWrite?.line_endings).toBeUndefined();
     expect(readFileSync(join(f.root, 'note.md'), 'utf8')).toBe(working);
     expect((await engine.getPage('note', { sourceId: f.id }))?.compiled_truth).toBe(original.trim());
-    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
+    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(pinnedHead);
+    expect(await readGitHoldRetryPaths(engine, f.id, (await getWorktreeBinding(engine, f.id))!.source_incarnation)).toContain('note.md');
   }
 }), 120_000);
 
@@ -169,15 +174,20 @@ test('CRLF checkout of a newer commit does not replace the stale blob pinned by 
     const pinned = commit(f.root);
     expect(await performManagedSync(engine, options, { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial', filesImported: 1, toCommit: pinned });
     const newer = 'Newer last observation.\n';
-    writeFileSync(join(f.root, 'z.md'), newer); commit(f.root);
+    writeFileSync(join(f.root, 'z.md'), newer); const newerHead = commit(f.root);
     writeFileSync(join(f.root, 'z.md'), newer.replace(/\n/g, '\r\n'));
-    const blocked = await performManagedSync(engine, options);
-    expect(blocked).toMatchObject({ status: 'blocked_by_failures', toCommit: pinned, failureCodes: [{ code: 'source_changed', count: 1 }] });
-    expect(blocked.managedWrite?.line_endings).toBeUndefined();
+    const deferred = await performManagedSync(engine, options);
+    expect(deferred).toMatchObject({ status: 'synced', toCommit: pinned, deferred: [{ path: 'z.md', reason: 'pinned_git_worktree_conflict' }] });
+    expect(deferred.managedWrite?.line_endings).toBeUndefined();
     expect((await engine.getPage('z', { sourceId: f.id }))?.compiled_truth).toBe('Original last observation.');
     expect(readFileSync(join(f.root, 'z.md'), 'utf8')).toBe(newer.replace(/\n/g, '\r\n'));
-    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
-    expect(await performManagedSync(engine, options)).toEqual(blocked);
+    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(pinned);
+    const imported = await performManagedSync(engine, options);
+    expect(imported).toMatchObject({ status: 'synced', toCommit: newerHead });
+    expect(imported.deferred).toBeUndefined();
+    expect((await engine.getPage('z', { sourceId: f.id }))?.compiled_truth).toBe('Newer last observation.');
+    expect(await readGitHoldRetryPaths(engine, f.id, (await getWorktreeBinding(engine, f.id))!.source_incarnation)).toEqual([]);
+    expect(deferralExitCode(imported)).toBe(0);
   }
 }), 120_000);
 

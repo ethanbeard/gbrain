@@ -36,7 +36,7 @@ import { isUnboundSourcePage, UNBOUND_COLLISION_MESSAGE } from './unbound-source
 import { checkpointRetryCommand, findIncompleteSyncReceipt } from './checkpoint-validation.ts';
 import { frontmatterSlugConflictMessage } from './verb-errors.ts';
 import { CHUNKER_VERSION } from '../chunkers/code.ts';
-import { clearGitHold, countGitHolds, recordSyncImportProvenance } from './sync-holds.ts';
+import { cleanupSyncDeferrals, clearGitHold, countGitHolds, recordSyncImportProvenance } from './sync-holds.ts';
 import { fenceWhere } from '../fence-repair/refusal.ts';
 import { fencesNormalizeEnabled } from '../fence-repair/config.ts';
 import { describeFixes } from '../fence-repair/report.ts';
@@ -71,6 +71,10 @@ export interface SyncIntent extends Record<string, unknown> {
   blobOid?: string;
   /** #5988 checkpoint only: failed content-refusal requests of this run converted in place; they no longer block the checkpoint. */
   supersededRequests?: string[];
+  /** Checkpoint only: paths this run explicitly deferred and re-queued. */
+  deferredPaths?: string[];
+  /** Checkpoint only: discovery time used to avoid clearing a concurrent newer deferral. */
+  discoveredAt?: string;
   syncAuthority: SyncAuthority; cursorKey: string; runId: string; index: number;
   from: string | null; target: string; total: number; slugMode: 'git-root' | 'source-root';
 }
@@ -350,6 +354,8 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
       AND (config->>'slug_root_mode' IS NULL OR config->>'slug_root_mode'=$5) RETURNING id`, [row.source_id, row.source_incarnation, p.target, p.from, p.slugMode, p.overtaken === true]);
     if (!changed.length) throw syncPublicationRefusal('revision_conflict', 'The source checkpoint changed during this sync.', row, p,
       `Another sync moved the commit checkpoint of ${row.source_id} while this run published.`);
+    await cleanupSyncDeferrals(tx, { sourceId: row.source_id, incarnation: row.source_incarnation!, runId: p.runId,
+      deferredPaths: p.deferredPaths ?? [], discoveredAt: p.discoveredAt ?? new Date(0).toISOString() });
     // #5566: a full walk re-chunked every stale page, so acknowledge the chunker version as the legacy gate does.
     if (p.from === null || p.syncOptions?.full === true) await tx.executeRaw('UPDATE sources SET chunker_version=$2 WHERE id=$1', [row.source_id, String(CHUNKER_VERSION)]);
     await tx.executeRaw("UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,done}','true'::jsonb),updated_at=now() WHERE op='managed-sync' AND fingerprint=$1", [p.cursorKey]);

@@ -37,7 +37,8 @@ import {
   isFailedPartial,
 } from './report.ts';
 import { runSyncTrigger } from './trigger.ts';
-import { drainJsonFields, formatDrainSummary, syncOutcome } from '../../core/persistence/sync-drain.ts';
+import { deferralExitCode, drainJsonFields, formatDrainSummary, syncOutcome } from '../../core/persistence/sync-drain.ts';
+export { deferralExitCode } from '../../core/persistence/sync-drain.ts';
 import { writeJsonDocument } from '../../core/cli-force-exit.ts';
 
 /** D2: under the `--json` guard only writeStdoutFinal reaches fd 1 (writeJsonDocument). */
@@ -827,7 +828,7 @@ async function runSingleSourceSync(
     // which PGLite's Emscripten runtime clobbers mid-run — see
     // src/core/cli-force-exit.ts).
     // #5984: the managed drain's verdict decides; a drain that stopped at its deadline with a pending write is resumable (exit 0).
-    if (syncOutcome(result) === 'blocked' || isFailedPartial(result)) {
+    if (syncOutcome(result) === 'blocked' || isFailedPartial(result) || deferralExitCode(result)) {
       const { setCliExitVerdict } = await import('../../core/cli-force-exit.ts');
       setCliExitVerdict(1);
     }
@@ -888,7 +889,8 @@ async function runSingleSourceSync(
     }
     if (jsonOut) {
       emitJson(JSON.stringify({ ...buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill, singleCostGate),
-        ...(result.managedWrite ? { managed_write: result.managedWrite } : {}), ...drainJsonFields(result, resumeCommand, sourceId) }));
+        ...(result.managedWrite ? { managed_write: result.managedWrite } : {}),
+        ...drainJsonFields(result, resumeCommand, sourceId) }));
     }
     return;
   }

@@ -116,6 +116,10 @@ export interface SyncResult {
   holds_fix?: import('../core/agent-output.ts').Action;
   /** Requests of a blocked cursor this run converted in place (held, or re-frozen after the file was fixed). */
   converted_from_failed?: string[];
+  /** Source-changed page requests skipped without publication and durably re-queued. */
+  deferred?: Array<{ slug: string | null; path: string; reason: string; request_id: string }>;
+  /** Pinned working-tree conflicts seen in at least three distinct sync runs. */
+  persistent_deferrals?: Array<{ path: string; reason: string; runs: number }>;
   /** Files imported by quoting unquoted frontmatter values, and (#6188) files whose fences Tier 1 rewrote, cumulative for the run. */
   recovered_frontmatter?: import('../core/persistence/sync-holds.ts').RecoveredFrontmatter; fences_normalized?: import('../core/fence-repair/report.ts').FencesNormalized; fence_issues?: ReturnType<ReturnType<typeof import('../core/fence-repair/report.ts').importFenceTally>['fields']>['fence_issues'];
   /** Dry run: files the run would hold or (#6188) normalize, and entries the screen could not judge (never holds). */
@@ -328,7 +332,7 @@ export interface SyncOpts {
    * `sync_status` IPC polls read. Absent for direct CLI runs (stderr
    * breadcrumbs already cover that surface).
    */
-  onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; group?: number;
+  onProgress?: (p: { phase: string; bankedFiles?: number; total?: number; waived?: boolean; deferred?: boolean; held?: boolean; group?: number;
     /** #5984 lanes (phase `managed_sync.lanes`). */ lanes?: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } }) => void;
   /**
    * #5984: managed sync only. Re-enter the single-pass managed sync until the

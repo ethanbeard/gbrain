@@ -142,7 +142,7 @@ export function gitHoldStatusLines(sourceId: string, status: GitHoldStatus): str
   }
   if (status.recent_conversions?.length) {
     lines.push(`  ${sourceId}: ${status.recent_conversions.length} blocked sync request(s) recently converted in place (the file was held or re-read instead of blocking the source):`);
-    for (const c of status.recent_conversions) lines.push(`    ${c.request_id}${c.path ? ` (${c.path})` : ''}: ${c.outcome === 'held' ? 'held' : 're-read and resubmitted'}, ${day(c.converted_at)}, run ${c.run_id}`);
+    for (const c of status.recent_conversions) lines.push(`    ${c.request_id}${c.path ? ` (${c.path})` : ''}: ${c.outcome === 'held' ? 'held' : c.outcome === 'deferred' ? `deferred (${c.reason ?? 'source_changed'}), re-queued` : 're-read and resubmitted'}, ${day(c.converted_at)}, run ${c.run_id}`);
   }
   return lines;
 }

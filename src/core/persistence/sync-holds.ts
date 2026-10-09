@@ -42,6 +42,8 @@ export const GIT_HOLD_RETRY_OP = 'sync-hold-retry';
 export const SYNC_IMPORT_PROVENANCE_OP = 'sync-import-provenance';
 /** One row per source incarnation: the blocked requests recent managed syncs converted in place. */
 export const SYNC_CONVERSION_OP = 'sync-conversions';
+/** One row per source incarnation: paths intentionally re-queued after a source_changed refusal. */
+export const SYNC_DEFERRALS_OP = 'sync-deferrals';
 /** How many conversions the log keeps per source. */
 export const SYNC_CONVERSION_KEEP = 20;
 /** Default for `sync.hold_cap`: how many holds a result lists in detail. Storage is never capped. */
@@ -426,7 +428,7 @@ export async function fenceAutoRepairFor(engine: Exec, records: ReadonlyArray<Pi
 }
 
 /** A blocked sync request a run converted in place: held (the file is refused) or re-frozen (the file now imports). */
-export interface SyncConversion { request_id: string; path: string | null; slug: string | null; run_id: string; outcome: 'held' | 'refrozen'; converted_at: string }
+export interface SyncConversion { request_id: string; path: string | null; slug: string | null; run_id: string; outcome: 'held' | 'refrozen' | 'deferred'; reason?: string; converted_at: string }
 
 /** Appends a conversion to the source's log (newest first, bounded); call it in the transaction that saves the converted cursor. */
 export async function recordSyncConversion(tx: Exec, sourceId: string, incarnation: string, conversion: Omit<SyncConversion, 'converted_at'>): Promise<void> {
@@ -447,6 +449,69 @@ export async function readSyncConversions(engine: Exec, sourceIds: string[], lim
     FROM sources s JOIN op_checkpoints c ON c.op=$1 AND c.fingerprint=s.id||':'||s.incarnation::text WHERE s.id=ANY($2::text[])`, [SYNC_CONVERSION_OP, sourceIds]);
   for (const row of rows) if (Array.isArray(row.conversions) && row.conversions.length) out.set(row.source_id, row.conversions.slice(0, limit));
   return out;
+}
+
+export interface SyncDeferralRecord {
+  reason: string;
+  first_run_id: string;
+  last_run_id: string;
+  runs: number;
+  first_deferred_at: string;
+  last_deferred_at: string;
+}
+export interface SyncDeferrals {
+  source_id: string;
+  incarnation: string;
+  paths: Record<string, SyncDeferralRecord>;
+}
+
+/** Record one path deferral. Repeated observations in one run count once; a changed reason starts a new streak. */
+export async function recordSyncDeferral(tx: Exec, sourceId: string, incarnation: string,
+  input: { path: string; reason: string; run_id: string }): Promise<void> {
+  const fingerprint = summaryFingerprint(sourceId, incarnation);
+  const [row] = await tx.executeRaw<{ completed_keys: [SyncDeferrals] }>(
+    'SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR UPDATE', [SYNC_DEFERRALS_OP, fingerprint]);
+  const now = new Date().toISOString();
+  const current = row?.completed_keys?.[0];
+  const paths = { ...(current?.paths ?? {}) };
+  const previous = paths[input.path];
+  paths[input.path] = !previous || previous.reason !== input.reason ? {
+    reason: input.reason, first_run_id: input.run_id, last_run_id: input.run_id, runs: 1,
+    first_deferred_at: now, last_deferred_at: now,
+  } : {
+    ...previous, last_run_id: input.run_id, last_deferred_at: now,
+    runs: previous.runs + (previous.last_run_id === input.run_id ? 0 : 1),
+  };
+  const value: SyncDeferrals = { source_id: sourceId, incarnation, paths };
+  await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)
+    ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=excluded.completed_keys,updated_at=now()`,
+  [SYNC_DEFERRALS_OP, fingerprint, JSON.stringify([value])]);
+}
+
+export async function readSyncDeferrals(engine: Exec, sourceId: string, incarnation: string): Promise<SyncDeferrals | null> {
+  const [row] = await engine.executeRaw<{ completed_keys: [SyncDeferrals] }>(
+    'SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [SYNC_DEFERRALS_OP, summaryFingerprint(sourceId, incarnation)]);
+  return row?.completed_keys?.[0] ?? null;
+}
+
+/** Clear resolved manifest paths atomically with the successful source checkpoint. */
+export async function cleanupSyncDeferrals(tx: Exec, input: { sourceId: string; incarnation: string; runId: string;
+  deferredPaths: string[]; discoveredAt: string }): Promise<void> {
+  const fingerprint = summaryFingerprint(input.sourceId, input.incarnation);
+  const [row] = await tx.executeRaw<{ completed_keys: [SyncDeferrals] }>(
+    'SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR UPDATE', [SYNC_DEFERRALS_OP, fingerprint]);
+  const current = row?.completed_keys?.[0];
+  if (!current) return;
+  const [manifest] = await tx.executeRaw<{ completed_keys: Array<{ path?: unknown }> }>(
+    "SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync-manifest' AND fingerprint=$1", [input.runId]);
+  const pathsInRun = new Set((manifest?.completed_keys ?? []).flatMap(entry => typeof entry?.path === 'string' ? [entry.path] : []));
+  const deferred = new Set(input.deferredPaths);
+  const paths = Object.fromEntries(Object.entries(current.paths).filter(([path, record]) =>
+    !pathsInRun.has(path) || deferred.has(path) || record.last_run_id === input.runId || record.last_deferred_at >= input.discoveredAt));
+  if (Object.keys(paths).length) {
+    await tx.executeRaw('UPDATE op_checkpoints SET completed_keys=$3::text::jsonb,updated_at=now() WHERE op=$1 AND fingerprint=$2',
+      [SYNC_DEFERRALS_OP, fingerprint, JSON.stringify([{ ...current, paths }])]);
+  } else await tx.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [SYNC_DEFERRALS_OP, fingerprint]);
 }
 
 /** `sources retry-held` on a Git source: the next sync re-screens these paths even if Git did not touch them. */
@@ -644,6 +709,8 @@ export async function buildHoldReport(engine: Exec, input: { sourceId: string; i
 export function syncHoldJsonFields(result: object): Record<string, unknown> {
   const fields = result as Record<string, unknown>;
   return Object.fromEntries(['held', 'held_count', 'holds_outstanding', 'holds_escalated', 'holds_truncated', 'holds_pending_screen', 'holds_fix',
-    'converted_from_failed', 'recovered_frontmatter', 'fences_normalized', 'fence_issues', 'dry_run', 'would_hold', 'would_hold_count', 'would_normalize', 'would_normalize_count', 'screen_skipped']
-    .filter(key => fields[key] !== undefined).map(key => [key, fields[key]]));
+    'converted_from_failed', 'recovered_frontmatter', 'fences_normalized', 'fence_issues', 'dry_run', 'would_hold', 'would_hold_count', 'would_normalize', 'would_normalize_count', 'screen_skipped',
+    'deferred', 'persistent_deferrals']
+    .filter(key => fields[key] !== undefined && (!['deferred', 'persistent_deferrals'].includes(key) || (Array.isArray(fields[key]) && fields[key].length > 0)))
+    .map(key => [key, fields[key]]));
 }

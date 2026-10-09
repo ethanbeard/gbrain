@@ -39,10 +39,12 @@ export interface DrainReport {
   outcome: DrainOutcome;
   stop_reason?: DrainStopReason;
   passes: number;
-  /** Entries processed by this drain (written + waived). */
+  /** Entries processed by this drain (written + waived + deferred + held). */
   processed: number;
   written: number;
   waived: number;
+  deferred: number;
+  held: number;
   remaining: number | null;
   rate_pages_per_min: number | null;
   /** Indexing ETA for the remaining manifest at the observed rate; null while the rate is unknown. */
@@ -90,6 +92,11 @@ export function syncOutcome(result: Pick<SyncResult, 'status' | 'reason' | 'mana
   if (result.status === 'blocked_by_failures' || result.managedWrite) return 'blocked';
   if (result.reason === 'pull_failed' || result.reason === 'connector_item_failures' || result.reason === 'connector_partial') return 'blocked';
   return 'resumable';
+}
+
+/** Deferrals are successful re-queues unless a pinned conflict persisted for three distinct runs. */
+export function deferralExitCode(result: Pick<SyncResult, 'persistent_deferrals'>): 0 | 1 {
+  return result.persistent_deferrals?.length ? 1 : 0;
 }
 
 /**
@@ -171,7 +178,7 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
   const startedAt = Date.now();
   const coop = cooperativeDeadline();
   const signal = coop.signal && input.signal ? AbortSignal.any([input.signal, coop.signal]) : coop.signal ?? input.signal;
-  let passes = 0, attempt = 0, readFailures = 0, refreshWaitedMs = 0, written = 0, waived = 0, index = 0, total: number | null = null;
+  let passes = 0, attempt = 0, readFailures = 0, refreshWaitedMs = 0, written = 0, waived = 0, deferred = 0, held = 0, index = 0, total: number | null = null;
   let announcedStart = false, lastLine = 0, groups = 0, groupedPages = 0, largestGroup = 0, admittedAhead = 0;
   let lanes: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } | null = null;
   let stall: { key: string; since: number; passes: number } | null = null;
@@ -189,12 +196,12 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
     if (event.phase === 'managed_sync.group_ahead') admittedAhead += typeof event.group === 'number' ? 1 : 0;
     if (event.phase === 'managed_sync.lanes' && event.lanes) lanes = { effective: event.lanes.effective, stepDown: event.lanes.stepDown, overlapped: event.lanes.overlapped, fallbacks: event.lanes.fallbacks };
     if (event.phase !== 'managed_sync.page_committed') return;
-    if (event.waived) waived++; else written++;
+    if (event.deferred) deferred++; else if (event.held) held++; else if (event.waived) waived++; else written++;
     noteForwardProgress();
     if (input.announce && Date.now() - lastLine >= PROGRESS_EVERY_MS) {
       lastLine = Date.now();
-      const estimate = drainEstimate(remaining(), written + waived, Date.now() - startedAt);
-      serr(`[sync] ${index}/${total ?? '?'} processed (${written} written, ${waived} waived this run) · `
+      const estimate = drainEstimate(remaining(), written + waived + deferred + held, Date.now() - startedAt);
+      serr(`[sync] ${index}/${total ?? '?'} processed (${written} written, ${waived} waived, ${deferred} deferred, ${held} held this run) · `
         + `${estimate.rate_pages_per_min ?? '?'} pages/min · indexing ETA ${estimate.eta_seconds === null ? 'unknown' : formatDuration(estimate.eta_seconds)}`);
     }
   };
@@ -202,8 +209,8 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
     if (result.managedCursor) { index = result.managedCursor.index; total = result.managedCursor.total; }
     const left = outcome === 'synced' ? 0 : remaining();
     if (stopReason === 'deadline' && continues(result)) result = { ...result, reason: 'timeout' };
-    return { ...result, drain: { outcome, ...(stopReason ? { stop_reason: stopReason } : {}), passes, processed: written + waived, written, waived,
-      remaining: left, ...drainEstimate(left, written + waived, Date.now() - startedAt),
+    return { ...result, drain: { outcome, ...(stopReason ? { stop_reason: stopReason } : {}), passes, processed: written + waived + deferred + held, written, waived, deferred, held,
+      remaining: left, ...drainEstimate(left, written + waived + deferred + held, Date.now() - startedAt),
       ...(input.bulk ? { bulk: { enabled: input.bulk.enabled, reason: input.bulk.reason, groups, grouped_pages: groupedPages, largest_group: largestGroup, admitted_ahead: admittedAhead,
         lanes: { maximum: input.bulk.lanesMax ?? input.bulk.lanes ?? 1, configured: input.bulk.lanes ?? 1, effective: lanes?.effective ?? input.bulk.lanes ?? 1, reason: input.bulk.lanesReason ?? null,
           step_down: lanes?.stepDown ?? null, overlapped_groups: lanes?.overlapped ?? 0, fallbacks: lanes?.fallbacks ?? 0 } } } : {}), ...extra } };
@@ -408,7 +415,8 @@ export function drainJsonFields(result: SyncResult, resumeCommand: string, sourc
 export function formatDrainSummary(result: SyncResult, resumeCommand: string, sourceId: string): string[] {
   const d = result.drain;
   if (!d) return [];
-  const lines = [`Managed sync ${d.outcome}: ${d.processed} entries this run (${d.written} written, ${d.waived} waived)`
+  const lines = [`Managed sync ${d.outcome}: ${d.processed} entries this run (${d.written} written, ${d.waived} waived`
+    + (d.deferred ? `, ${d.deferred} deferred` : '') + (d.held ? `, ${d.held} held` : '') + ')'
     + (d.remaining ? `, ${d.remaining} remaining` : '') + (d.rate_pages_per_min !== null ? `, ${d.rate_pages_per_min} pages/min` : '')
     + (d.remaining && d.eta_seconds !== null ? `, indexing ETA ${formatDuration(d.eta_seconds)}` : '') + '.'];
   if (d.stall) lines.push(`  Oldest unfinished request ${d.stall.head_request_id ?? d.stall.request_id} (${d.stall.head_state ?? d.stall.state})`

@@ -39,6 +39,22 @@ async function cli(args:string[],childHome=home,extraEnv:Record<string,string>={
   try {const [out,err,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);return{out,err,code};}
   finally{clearTimeout(timer);}
 }
+async function stopOwner() {
+  if(!owner)return;
+  owner.kill('SIGTERM');
+  const timer=setTimeout(()=>owner?.kill('SIGKILL'),10000);
+  await owner.exited;
+  clearTimeout(timer);
+  owner=undefined;
+}
+async function startOwner(extraEnv:Record<string,string>={}) {
+  stdout='';stderr='';
+  owner=Bun.spawn([process.execPath,join(import.meta.dir,'fixtures/persistence-stdio-owner.ts')],{cwd:home,env:{...env,...extraEnv},stdin:'pipe',stdout:'pipe',stderr:'pipe'});
+  readers.push(read(owner.stdout as ReadableStream<Uint8Array>,s=>{stdout+=s;}),read(owner.stderr as ReadableStream<Uint8Array>,s=>{stderr+=s;}));
+  await until(async()=>{try{await requestPersistenceCapabilities(persistenceSocketPathForConfig(config)!,250);return true;}catch{return false;}});
+  (owner.stdin as {write:(value:string)=>unknown}).write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'example-test',version:'1'}}})+'\n');
+  await until(()=>stdout.split('\n').some(line=>{try{return JSON.parse(line).id===1;}catch{return false;}}));
+}
 beforeAll(async()=>{
   mkdirSync(join(home,'.gbrain'),{recursive:true});mkdirSync(root);
   writeFileSync(join(home,'.gbrain','config.json'),JSON.stringify(config));
@@ -57,14 +73,10 @@ beforeAll(async()=>{
     sourceBinding=await claimWorktree(setup,'workspace',root);await registerLocalWriter(setup,'cli');await registerLocalWriter(setup,'stdio');
     await setup.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');await setup.disconnect();
   });
-  owner=Bun.spawn([process.execPath,join(import.meta.dir,'fixtures/persistence-stdio-owner.ts')],{cwd:home,env,stdin:'pipe',stdout:'pipe',stderr:'pipe'});
-  readers.push(read(owner.stdout as ReadableStream<Uint8Array>,s=>{stdout+=s;}),read(owner.stderr as ReadableStream<Uint8Array>,s=>{stderr+=s;}));
-  await until(async()=>{try{await requestPersistenceCapabilities(persistenceSocketPathForConfig(config)!,250);return true;}catch{return false;}});
-  (owner.stdin as {write:(value:string)=>unknown}).write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'example-test',version:'1'}}})+'\n');
-  await until(()=>stdout.split('\n').some(line=>{try{return JSON.parse(line).id===1;}catch{return false;}}));
+  await startOwner();
 },120000);
 afterAll(async()=>{
-  if(owner){owner.kill('SIGTERM');const timer=setTimeout(()=>owner?.kill('SIGKILL'),10000);await owner.exited;clearTimeout(timer);}
+  await stopOwner();
   await Promise.allSettled(readers);await setup?.disconnect();rmSync(home,{recursive:true,force:true});
 },30000);
 
@@ -104,8 +116,47 @@ test('remote stdio credentials cannot request trusted stale extraction',async()=
     .rejects.toMatchObject({code:'permission_denied'});
 });
 
+test('resident-owner pinned conflict defers and becomes persistent on the third run',async()=>{
+  const path=join(root,'a.md');
+  const baseline=await cli(['sync','--source','workspace','--no-pull','--no-embed','--exclude','excluded.md','--exclude','example.ts','--json','--no-hard-deadline']);
+  expect(baseline.code).toBe(0);
+  const pinned=execFileSync('git',['-C',root,'show','HEAD:a.md'],{encoding:'utf8'});
+  const current=await cli(['call','get_page',JSON.stringify({slug:'a',source_id:'workspace'})]);
+  expect(current.code).toBe(0);
+  const updated=await cli(['call','put_page',JSON.stringify({slug:'a',source_id:'workspace',
+    expected_revision:JSON.parse(current.out).revision,content:'A still newer coordinated database observation.\n'})]);
+  expect(updated.code).toBe(0);
+  expect(JSON.parse(updated.out).state).toBe('committed');
+  writeFileSync(path,'PRIVATE_RESIDENT_DEFERRAL_CONTENT_CANARY\n');
+  const args=['sync','--source','workspace','--full','--no-pull','--no-embed','--exclude','excluded.md','--exclude','example.ts','--json','--no-hard-deadline'];
+  try {
+    const deferred=await cli(args);
+    expect(deferred.code).toBe(0);
+    expect(JSON.parse(deferred.out)).toMatchObject({sync_status:'synced',
+      deferred:[{path:'a.md',reason:'pinned_git_worktree_conflict'}]});
+    const second=await cli(args);
+    expect(second.code).toBe(0);
+    expect(JSON.parse(second.out)).toMatchObject({sync_status:'synced',
+      deferred:[{path:'a.md',reason:'pinned_git_worktree_conflict'}]});
+    const third=await cli(args);
+    expect(third.code).toBe(1);
+    expect(JSON.parse(third.out)).toMatchObject({sync_status:'synced',
+      persistent_deferrals:[{path:'a.md',reason:'pinned_git_worktree_conflict',runs:expect.any(Number)}]});
+    expect(JSON.parse(third.out).persistent_deferrals[0].runs).toBeGreaterThanOrEqual(3);
+  } finally {
+    writeFileSync(path,pinned);
+    const resolved=await cli(args);
+    expect(resolved.code).toBe(0);
+  }
+},90000);
+
 test('resident-owner failure JSON retains safe scoped diagnostics and the frozen receipt without a local ledger',async()=>{
   const path=join(root,'a.md');
+  writeFileSync(path,'A fresh pinned source observation for resident-owner failure diagnostics.\n');
+  execFileSync('git',['-C',root,'add','a.md']);
+  execFileSync('git',['-C',root,'-c','user.name=Example','-c','user.email=example@example.invalid','commit','-qm','fresh diagnostic source']);
+  const baseline=await cli(['sync','--source','workspace','--no-pull','--no-embed','--exclude','excluded.md','--exclude','example.ts','--json','--no-hard-deadline']);
+  expect(baseline.code).toBe(0);
   const pinned=execFileSync('git',['-C',root,'show','HEAD:a.md'],{encoding:'utf8'});
   const current=await cli(['call','get_page',JSON.stringify({slug:'a',source_id:'workspace'})]);
   expect(current.code).toBe(0);
@@ -115,29 +166,38 @@ test('resident-owner failure JSON retains safe scoped diagnostics and the frozen
   expect(JSON.parse(updated.out).state).toBe('committed');
   writeFileSync(path,'PRIVATE_RESIDENT_DIAGNOSTIC_CONTENT_CANARY\n');
   const args=['sync','--source','workspace','--full','--no-pull','--no-embed','--exclude','excluded.md','--exclude','example.ts','--json','--no-hard-deadline'];
-  const blocked=await cli(args);
-  expect(blocked.code).toBe(1);
-  const body=JSON.parse(blocked.out);
-  expect(body).toMatchObject({sync_status:'blocked_by_failures',managed_write:{source_id:'workspace',slug:'a',path:'a.md',
-    write_error:'source_changed',reason:'pinned_git_worktree_conflict',write_request:{state:'conflict',retry_after_ms:null}}});
-  const id=body.managed_write.write_request.request_id;
-  expect(id).toMatch(/^[0-9a-f-]{36}$/);
-  expect(blocked.err).toContain(id);
-  expect(blocked.err).toContain('source_changed');
-  expect(blocked.out+blocked.err).not.toContain('PRIVATE_RESIDENT_DIAGNOSTIC_CONTENT_CANARY');
-  expect(blocked.out+blocked.err).not.toContain(root);
-  writeFileSync(path,pinned);
-  rmSync(join(home,'sync-failures.jsonl'),{force:true});
-  const replay=await cli(args);
-  expect(replay.code).toBe(1);
-  expect(JSON.parse(replay.out).managed_write.write_request).toEqual(body.managed_write.write_request);
-  const corrected=await cli([...args,'--retry-failed']);
-  expect(corrected.code).toBe(0);
-  expect(JSON.parse(corrected.out).sync_status).toBe('synced');
-  const original=await cli(['call','get_write_request',JSON.stringify({request_id:id})]);
-  expect(original.code).toBe(0);
-  expect(JSON.parse(original.out)).toMatchObject({request_id:id,state:'conflict'});
-  expect(inspectLockHolder(databasePath).pid).toBe(owner!.pid);
+  const disableDeferral={GBRAIN_TEST_DISABLE_SOURCE_CHANGED_DEFERRAL:'1'};
+  await stopOwner();
+  await startOwner(disableDeferral);
+  try {
+    const blocked=await cli(args,home,disableDeferral);
+    expect(blocked.code).toBe(1);
+    const body=JSON.parse(blocked.out);
+    expect(body).toMatchObject({sync_status:'blocked_by_failures',managed_write:{source_id:'workspace',slug:'a',path:'a.md',
+      write_error:'source_changed',reason:'pinned_git_worktree_conflict',write_request:{state:'conflict',retry_after_ms:null}}});
+    const id=body.managed_write.write_request.request_id;
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(blocked.err).toContain(id);
+    expect(blocked.err).toContain('source_changed');
+    expect(blocked.out+blocked.err).not.toContain('PRIVATE_RESIDENT_DIAGNOSTIC_CONTENT_CANARY');
+    expect(blocked.out+blocked.err).not.toContain(root);
+    writeFileSync(path,pinned);
+    rmSync(join(home,'sync-failures.jsonl'),{force:true});
+    const replay=await cli(args,home,disableDeferral);
+    expect(replay.code).toBe(1);
+    expect(JSON.parse(replay.out).managed_write.write_request).toEqual(body.managed_write.write_request);
+    const corrected=await cli([...args,'--retry-failed']);
+    expect(corrected.code).toBe(0);
+    expect(JSON.parse(corrected.out).sync_status).toBe('synced');
+    const original=await cli(['call','get_write_request',JSON.stringify({request_id:id})]);
+    expect(original.code).toBe(0);
+    expect(JSON.parse(original.out)).toMatchObject({request_id:id,state:'conflict'});
+    expect(inspectLockHolder(databasePath).pid).toBe(owner!.pid);
+  } finally {
+    writeFileSync(path,pinned);
+    await stopOwner();
+    await startOwner();
+  }
 },90000);
 
 test('resident-owner pending timeout is resumable (exit 0, #5984) and resumes the same durable request after lock release',async()=>{

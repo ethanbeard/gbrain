@@ -17,7 +17,7 @@ import type { SyncResult } from './sync.ts';
 import { buildSingleSyncJsonEnvelope } from '../core/sync-embed-backfill.ts';
 import { printManagedSyncDiagnostic } from './sync-diagnostics.ts';
 import { parseDurationSeconds } from '../core/sync-concurrency.ts';
-import { runDrain, drainJsonFields, formatDrainSummary, syncOutcome } from '../core/persistence/sync-drain.ts';
+import { deferralExitCode, runDrain, drainJsonFields, formatDrainSummary, syncOutcome } from '../core/persistence/sync-drain.ts';
 import { resolveStallAbortSeconds, resolveSyncHardDeadline, syncResumeCommand } from '../core/sync-reconcile.ts';
 import { noteForwardProgress } from '../core/forward-progress.ts';
 
@@ -151,7 +151,7 @@ export async function maybeDelegateSyncToPersistence(hostConfig:GBrainConfig|nul
         console.error('[sync] embeds deferred — the owner drains them using its configured provider and keys.');
       }
     }
-    if(syncOutcome(result)==='blocked')setCliExitVerdict(1);
+    if(syncOutcome(result)==='blocked'||deferralExitCode(result))setCliExitVerdict(1);
     return true;
   }catch(error){
     if(error instanceof PersistenceIpcTransportError&&error.sent)error=new OperationError('write_pending','The sync acknowledgment was lost; accepted page requests retain their IDs.','Repeat the same sync options to resume the durable cursor.');

@@ -95,6 +95,10 @@ export async function maybeExtractionNudge(engine: BrainEngine, sourceId?: strin
 export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = process.stdout) {
   if (printManagedSyncDiagnostic(result, sink)) {
     if (result.runId) sink.write(`  Committed counts are cumulative for run ${result.runId}: added=${result.added}, modified=${result.modified}, deleted=${result.deleted}.\n`);
+    if (result.deferred?.length) {
+      sink.write(`Deferred ${result.deferred.length} page(s) whose source file changed during the run; re-queued for the next sync:\n`);
+      for (const item of result.deferred) sink.write(`  ${item.slug || item.path} (${item.path}): ${item.reason}\n`);
+    }
     return;
   }
   const write = (line: string) => sink.write(line + '\n');
@@ -104,6 +108,15 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       `(${u.added} untracked/added, ${u.modified} modified, ${u.deleted} deleted) — ` +
       `commit them or run 'gbrain sync --working-tree'.`,
     );
+  const writeDeferrals = () => {
+    if (result.deferred?.length) {
+      write(`Deferred ${result.deferred.length} page(s) whose source file changed during the run; re-queued for the next sync:`);
+      for (const item of result.deferred) write(`  ${item.slug || item.path} (${item.path}): ${item.reason}`);
+    }
+    for (const item of result.persistent_deferrals ?? []) {
+      write(`  ${item.path}: the working-tree file has disagreed with its committed version for ${item.runs} syncs.`);
+    }
+  };
   switch (result.status) {
     case 'up_to_date':
       write('Already up to date.');
@@ -195,6 +208,7 @@ export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = p
       break;
   }
   const holds = result.connectorHolds;
+  writeDeferrals();
   if (holds) write(`  ${holds.held} connector item(s) held after repeated failures${holds.newly_held ? ` (${holds.newly_held} new)` : ''}; they do not block freshness. See them with '${holds.status_command}', re-attempt with '${holds.retry_command}'.`);
   printManagedSyncNotes(result, write);
 }

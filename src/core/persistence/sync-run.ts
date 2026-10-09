@@ -46,7 +46,8 @@ import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
-import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, readSyncHoldPolicy, recordSyncConversion, recoveredReport, writeGitHold, type FencesTally } from './sync-holds.ts';
+import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, readGitHoldRetryPaths, readSyncDeferrals, readSyncHoldPolicy, recordSyncConversion, recordSyncDeferral, requestGitHoldRetry, recoveredReport, writeGitHold, type FencesTally } from './sync-holds.ts';
+import type { SyncEntry } from './sync-discovery.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -77,10 +78,12 @@ interface Cursor extends SyncDiscovery { runId: string; index: number; authority
     waived?: { imports: number; deletes: number };
     /** #5988: imports held, and files imported only after quoting frontmatter. */
     held?: number; recovered?: { count: number; sample_paths: string[]; comment_values?: number };
+    deferred?: number;
     /** #6188: files whose fences Tier 1 rewrote (and the Git effect committed). */
     fences?: FencesTally };
   /** #5988: failed content-refusal requests this run converted in place. */
   convertedFromFailed?: string[];
+  deferred?: Array<{ path: string; slug: string | null; reason: string; request_id: string }>;
   /** #5984: the active drain window (reset when a new drain starts), so a backlog ETA never counts downtime. */
   progress?: CursorProgress;
   /** #5984 bulk: the frozen head (also `pending`) and the members admitted with it, in manifest order. */
@@ -230,6 +233,7 @@ function result(cursor: Cursor | CursorHeader, status: SyncResult['status'], rea
     filesImported: cursor.index, bankedFiles: cursor.index,
     managedCursor: { index: cursor.index, total: 'total' in cursor ? cursor.total : cursor.entries.length, ...(cursor.progress ? { progress: cursor.progress } : {}) },
     ...(cursor.uncommitted ? { uncommitted: cursor.uncommitted } : {}), ...(reason ? { reason } : {}),
+    ...('deferred' in cursor && cursor.deferred?.length ? { deferred: cursor.deferred } : {}),
     ...(cursor.counts.skippedContextualMode || cursor.counts.skippedCanonicalBytes ? { legacySkips: {
       contextualMode: cursor.counts.skippedContextualMode ?? 0, canonicalBytes: cursor.counts.skippedCanonicalBytes ?? 0 } } : {}) };
 }
@@ -344,6 +348,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
     ...(run.observedAt ? { holdObservedAt: run.observedAt } : {}), ...(blob ? { blobOid: blob.oid } : {}),
     ...(!entry && cursor.releasedHolds?.length ? { releasedHolds: cursor.releasedHolds } : {}),
     ...(!entry && cursor.convertedFromFailed?.length ? { supersededRequests: cursor.convertedFromFailed } : {}),
+    ...(!entry ? { deferredPaths: cursor.deferred?.map(item => item.path) ?? [], discoveredAt: cursor.discoveredAt ?? run.observedAt } : {}),
     processingOptions: cursor.processingOptions,
     // A cursor created before its options were recorded has the same key, so this run's options are its options.
     ...(!entry ? { syncOptions: cursor.syncOptions ?? run.syncOptions, ...(run.repoPath ? { repoPath: run.repoPath } : {}) } : {}),
@@ -412,6 +417,11 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
   const previous = blocked.pending!;
   const failed = await getWriteRequest(engine, blocked.authority.writer.principal, previous.requestId);
   if (!failed || !['failed', 'conflict', 'cancelled'].includes(failed.state)) return blocked;
+  const deferred = await deferSourceChangedRequest(engine, key, blocked, previous, failed, assertActive, 5000);
+  if (deferred === 'pending') return blocked;
+  if (deferred) return deferred;
+  // Content-refusal conversion retains its screen gate; only source_changed deferral runs without one.
+  if (!run.screen) return blocked;
   const fence = fenceReceiptLocation(failed);
   const compacted = !fence && failed.compacted === true && failed.error_message == null && ['invalid_params', 'take_row_collision'].includes(failed.error_code ?? '');
   if (!fence && !compacted && !isContentRefusal(failed.error_code, failed.error_message)) return blocked;
@@ -433,6 +443,59 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
   }
   if (compacted || (previous.converted && sameBytes)) return blocked;
   return saveCursor(engine, key, blocked, { ...blocked, convertedFromFailed: converted, pending: { ...again, converted: true } }, false, assertActive, logged('refrozen'));
+}
+
+export interface DeferralEligibilityInput {
+  receipt: Pick<WriteRequest, 'error_code' | 'error_message'>;
+  pending: Pick<Pending, 'intent'>;
+  entry: SyncEntry | undefined;
+  entries: SyncEntry[];
+  company?: boolean;
+}
+
+/** Pure, fail-closed eligibility check for skipping one source_changed page request. */
+export function deferralEligible(input: DeferralEligibilityInput): { reason: 'raw_file_changed' | 'pinned_git_worktree_conflict' } | null {
+  if (input.receipt.error_code !== 'source_changed') return null;
+  const reason = writeFailureDiagnostic(input.receipt.error_code, input.receipt.error_message).reason;
+  if (reason !== 'raw_file_changed' && reason !== 'pinned_git_worktree_conflict') return null;
+  if (input.pending.intent.kind !== 'managed_sync_import' && input.pending.intent.kind !== 'managed_sync_delete') return null;
+  if (!input.entry || input.pending.intent.path !== input.entry.path || input.company) return null;
+  if (input.pending.intent.renameFrom || input.entry.renameFrom) return null;
+  if (input.entry.action === 'delete' && input.entries.some(entry => entry.renameFrom?.sourcePath === input.entry!.path)) return null;
+  return { reason };
+}
+
+function advanceDeferred(cursor: Cursor, pending: Pending, reason: 'raw_file_changed' | 'pinned_git_worktree_conflict'): Cursor {
+  const base: Cursor = { ...cursor }; delete base.group;
+  const next: Cursor = { ...base, index: cursor.index + 1,
+    counts: { ...cursor.counts, deferred: (cursor.counts.deferred ?? 0) + 1 },
+    deferred: [...(cursor.deferred ?? []), { path: pending.intent.path!, slug: pending.slug || null, reason, request_id: pending.requestId }],
+    convertedFromFailed: [...(cursor.convertedFromFailed ?? []), pending.requestId] };
+  delete next.pending;
+  return next;
+}
+
+/** Convert an eligible terminal source_changed request into an atomic re-queue plus cursor advance. */
+export async function deferSourceChangedRequest(engine: BrainEngine, key: string, cursor: Cursor, pending: Pending, done: WriteRequest,
+  assertActive: () => void, waitMs: number): Promise<Cursor | 'pending' | null> {
+  if (process.env.GBRAIN_TEST_DISABLE_SOURCE_CHANGED_DEFERRAL === '1') return null;
+  const eligible = deferralEligible({ receipt: done, pending, entry: cursor.entries[cursor.index], entries: cursor.entries, company: Boolean(cursor.companyPlan) });
+  if (!eligible || !pending.intent.path) return null;
+  const deadline = performance.now() + waitMs;
+  for (;;) {
+    const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [cursor.sourceId]);
+    assertActive();
+    if (!unfinished.length) break;
+    if (performance.now() >= deadline) return 'pending';
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  const next = advanceDeferred(cursor, pending, eligible.reason);
+  return saveCursor(engine, key, cursor, next, false, assertActive, async tx => {
+    await requestGitHoldRetry(tx, cursor.sourceId, cursor.incarnation, [pending.intent.path!]);
+    await recordSyncConversion(tx, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path!, slug: pending.slug,
+      run_id: cursor.runId, outcome: 'deferred', reason: eligible.reason });
+    await recordSyncDeferral(tx, cursor.sourceId, cursor.incarnation, { path: pending.intent.path!, reason: eligible.reason, run_id: cursor.runId });
+  });
 }
 
 /**
@@ -484,6 +547,9 @@ async function settleFailedRequest(engine: BrainEngine, input: { cursor: Cursor;
   const converted = await holdFailedFenceRequest(engine, cursor, key, pending, done, input.assertActive, input.run, input.waitMs);
   if (converted === 'pending') return { result: result(cursor, 'partial', input.signal?.aborted ? 'timeout' : 'writer_pending') };
   if (converted) { input.assertActive(); return { cursor: converted }; }
+  const deferred = await deferSourceChangedRequest(engine, key, cursor, pending, done, input.assertActive, input.waitMs);
+  if (deferred === 'pending') return { result: result(cursor, 'partial', input.signal?.aborted ? 'timeout' : 'writer_pending') };
+  if (deferred) { input.assertActive(); return { cursor: deferred }; }
   const { failure, ledgerRecorded } = await recordManagedSyncFailure(engine, { source_id: cursor.sourceId, source_incarnation: cursor.incarnation, path: pending.intent.path ?? '<checkpoint>',
     code: done.error_code ?? (done.state === 'cancelled' ? 'cancelled' : 'storage_error'), message: done.error_message ?? 'The accepted sync request did not commit.',
     request_id: pending.requestId, run_id: cursor.runId, target: cursor.target, cursor_key: key,
@@ -908,12 +974,17 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
   if (!state.sourceId || !state.incarnation || synced.status === 'dry_run') return synced;
   const cursor = state.cursor?.() ?? null;
   try {
+    const history = cursor ? await readSyncDeferrals(engine, cursor.sourceId, cursor.incarnation) : null;
+    const persistent = Object.entries(history?.paths ?? {}).flatMap(([path, item]) =>
+      item.reason === 'pinned_git_worktree_conflict' && item.runs >= 3 ? [{ path, reason: item.reason, runs: item.runs }] : []);
     const report = await buildHoldReport(engine, { sourceId: state.sourceId, incarnation: state.incarnation, runId: cursor?.runId ?? '', remote: state.remote === true,
       policy: await readSyncHoldPolicy(engine), pendingScreen: synced.reason === 'writer_yield',
       screened: 'entries' in (cursor ?? {}) ? (cursor as Cursor).entries.slice(0, cursor!.index).filter(entry => entry.action === 'import').length : 0 });
     const recovered = state.remote ? undefined : recoveredReport(state.sourceId, cursor?.counts.recovered);
     const fences = fencesNormalizedReport(state.sourceId, cursor?.counts.fences, state.remote === true);
-    return { ...synced, ...report, ...(!state.remote && cursor?.convertedFromFailed?.length ? { converted_from_failed: cursor.convertedFromFailed } : {}),
+    return { ...synced, ...report, ...(cursor?.deferred?.length ? { deferred: cursor.deferred } : {}),
+      ...(persistent.length ? { persistent_deferrals: persistent } : {}),
+      ...(!state.remote && cursor?.convertedFromFailed?.length ? { converted_from_failed: cursor.convertedFromFailed } : {}),
       ...(recovered ? { recovered_frontmatter: recovered } : {}), ...(fences ? { fences_normalized: fences } : {}) };
   } catch {
     return synced;
@@ -998,11 +1069,19 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         const recorded = await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1 AND completed_keys->0->>'run_id'=$2", [key, cursor.runId]);
         assertActive();
         if ((failed && ['failed', 'conflict', 'cancelled'].includes(failed.state)) || (recorded.length && (failed?.state === 'committed' || !failed))) {
-          phase = 'discovery';
-          discoveryTarget = syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
-          const discovery = await discoverManagedSync(engine, opts, context);
-          assertActive();
-          cursor = await replaceCursor(engine, key, header(cursor), { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } }, assertActive);
+          const deferred = failed && cursor.pending
+            ? await deferSourceChangedRequest(engine, key, cursor, cursor.pending, failed, assertActive, 5000) : null;
+          if (deferred && deferred !== 'pending') {
+            cursor = deferred;
+            opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length, deferred: true });
+          }
+          else if (deferred !== 'pending') {
+            phase = 'discovery';
+            discoveryTarget = syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
+            const discovery = await discoverManagedSync(engine, opts, context);
+            assertActive();
+            cursor = await replaceCursor(engine, key, header(cursor), { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } }, assertActive);
+          }
         }
       }
     }
@@ -1037,7 +1116,11 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
       if (company) await company.protect([{ op: OP, fingerprint: key, kind: 'managed_cursor' }, { op: `${OP}-manifest`, fingerprint: fresh.runId, kind: 'manifest' }]);
       assertActive();
       cursor = await saveCursor(engine, key, null, fresh, false, assertActive);
-      if (fresh.retryTaken?.length) await clearGitHoldRetryPaths(engine, fresh.sourceId, fresh.incarnation, fresh.retryTaken);
+      // A retry path already selected by the ordinary Git delta is still taken into this immutable manifest.
+      const retryPaths = await readGitHoldRetryPaths(engine, fresh.sourceId, fresh.incarnation);
+      const manifested = new Set(fresh.entries.map(entry => entry.path));
+      const retryTaken = retryPaths.filter(path => manifested.has(path));
+      if (retryTaken.length) await clearGitHoldRetryPaths(engine, fresh.sourceId, fresh.incarnation, retryTaken);
     }
     assertActive();
     if (cursor.incarnation !== context.incarnation || cursor.binding.worktree_id !== context.binding.worktree_id ||
@@ -1051,9 +1134,13 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     if (opts.dryRun) return dryRun(cursor);
     frozenRun.screen = company ? null : await loadSyncScreenRun(startupConfig, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote);
     const observedAt = frozenRun.observedAt = cursor.discoveredAt ?? runStartedAt;
-    if (frozenRun.screen && !opts.retryFailed && cursor.pending && !cursor.done) {
+    if (!opts.retryFailed && cursor.pending && !cursor.done) {
       phase = 'freeze';
+      const blockedIndex = cursor.index;
       cursor = await convertBlockedCursor(engine, cursor, key, assertActive, frozenRun);
+      if (cursor.index > blockedIndex && cursor.deferred?.at(-1)?.request_id) {
+        opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length, deferred: true });
+      }
     }
     const config = loadConfig() ?? { engine: engine.kind }, analyzeEvery = await importAnalyzeEveryPages(engine);
     let batchStart = performance.now(), batchPages = 0, foregroundWaitStart = 0, foregroundBaseline = 0;
@@ -1090,7 +1177,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         const frozen = await freezeEntry(engine, cursor, key, assertActive, frozenRun);
         if ('hold' in frozen) {
           cursor = await saveCursor(engine, key, cursor, advanceHeld(cursor), false, assertActive, heldWrite(cursor, frozen.hold, observedAt));
-          opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index }); assertActive();
+          opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, held: true }); assertActive();
           if (slice && (cursor.index - sliceFirstIndex >= slice.maxPages || performance.now() - sliceStarted >= slice.maxMs)) return result(cursor, 'partial', 'writer_yield');
           continue;
         }
@@ -1163,7 +1250,8 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           remote: authority.writer.remote, waitMs: opts.drainStartedAt ? 30_000 : 5000, signal });
         if ('result' in settled) return settled.result;
         cursor = settled.cursor;
-        opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length });
+        opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length,
+          ...(cursor.deferred?.at(-1)?.request_id === pending.requestId ? { deferred: true } : {}) });
         continue;
       }
       if (pending.intent.kind === 'managed_sync_checkpoint') {
