@@ -20,6 +20,10 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { discoverManagedSync } from '../src/core/persistence/sync-discovery.ts';
+import { managedSyncAuthority } from '../src/core/persistence/sync-authority.ts';
+import { sha256 } from '../src/core/persistence/digest.ts';
+import type { SyncIntent } from '../src/core/persistence/sync-prepare.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { readGitSourceHolds } from '../src/core/persistence/sync-holds.ts';
 import { gitHoldStatusLines, readGitHoldStatuses } from '../src/core/persistence/connector-status.ts';
@@ -178,6 +182,52 @@ test('forced probe: a fence that passes the screen but collides with a stored ta
   expect(await s.sync()).toMatchObject({ status: 'up_to_date', holds_outstanding: 1 });
   expect(await s.failedRequests()).toHaveLength(1);
 }), 180_000);
+
+test('a legacy cursor (no stored options) whose admitted import hits a stored-row collision is held and keeps its options', () => each(async engine => {
+  const s = await source(engine, { 'people/probe.md': takesPage('Probe', take(1)) });
+  expect((await s.sync()).status).toBe('first_sync');
+  await s.storedTake('people/probe', 2, 'Database-only take');
+  const probe = takesPage('Probe', take(1), take(2, CLAIM));
+  s.write('people/probe.md', probe);
+  s.write('zz/after.md', note('After'));
+  commit(s.root, 'collide then continue');
+
+  const opts = { sourceId: s.id, noPull: true };
+  const { entries, ...discovery } = await discoverManagedSync(engine, opts);
+  expect(entries.map(entry => entry.path)).toEqual(['people/probe.md', 'zz/after.md']);
+  const [previous] = await engine.executeRaw<{ fingerprint: string }>(
+    "SELECT fingerprint FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 AND completed_keys->0->>'done'='true'", [s.id]);
+  expect(previous).toBeDefined();
+  const authority = await managedSyncAuthority(engine, s.id, discovery.incarnation, discovery.root);
+  const runId = randomUUID(), requestId = randomUUID(), entry = entries[0]!;
+  const legacyIntent: SyncIntent = { kind: 'managed_sync_import', expected_revision: entry.revision ?? null,
+    processingOptions: { noEmbed: true, noExtract: true, noSchemaPack: false },
+    sourcePath: entry.sourcePath, path: entry.path, rawHash: sha256(probe), content: probe,
+    ownerEpoch: String(discovery.binding.owner_epoch), syncAuthority: authority, cursorKey: previous!.fingerprint,
+    runId, index: 0, total: entries.length, from: discovery.from, target: discovery.target, slugMode: discovery.slugMode };
+  const legacyCursor = { ...discovery, authority, runId, index: 0, total: entries.length,
+    counts: { added: 0, modified: 0, deleted: 0, chunks: 0 },
+    pending: { requestId, slug: entry.slug!, pageId: entry.pageId ?? null, intent: legacyIntent } };
+  expect(legacyCursor).not.toHaveProperty('processingOptions');
+  await engine.transaction(async tx => {
+    await tx.executeRaw('INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)',
+      ['managed-sync-manifest', runId, JSON.stringify(entries)]);
+    await tx.executeRaw("UPDATE op_checkpoints SET completed_keys=$2::text::jsonb WHERE op='managed-sync' AND fingerprint=$1",
+      [previous!.fingerprint, JSON.stringify([legacyCursor])]);
+  });
+
+  const result = await performManagedSync(engine, { sourceId: s.id, noPull: true, explicitProcessing: [] });
+  expect(result).toMatchObject({ status: 'synced', held_count: 1 });
+  expect(result.held?.[0]).toMatchObject({ path: 'people/probe.md', reason: 'prepare_time' });
+  expect(result.converted_from_failed).toEqual([requestId]);
+  expect(await engine.getPage('zz/after', { sourceId: s.id })).not.toBeNull();
+  const requests = await engine.executeRaw<{ slug: string; state: string; error_message: string | null; intent: { path?: string; processingOptions?: unknown } }>(
+    'SELECT slug,state,error_message,intent FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [s.id]);
+  expect(requests.filter(row => row.error_message?.includes('no durable processing options'))).toHaveLength(0);
+  expect(requests.filter(row => row.slug === '__managed_sync_checkpoint__').at(-1)?.state).toBe('committed');
+  expect(requests.find(row => row.intent.path === 'zz/after.md')?.intent.processingOptions)
+    .toEqual({ noEmbed: true, noExtract: true, noSchemaPack: false });
+}), 240_000);
 
 test('sync.holds=fail blocks with the typed refusal; the next sync after the upgrade converts the legacy receipt with no --retry-failed', () => each(async engine => {
   await engine.setConfig('sync.holds', 'fail');

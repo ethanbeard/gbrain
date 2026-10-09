@@ -288,6 +288,63 @@ test('a cursor blocked by a pre-upgrade failed receipt converts in place: held w
     recent_conversions: [{ request_id: draft!.request_id, path: 'notes/draft.md', outcome: 'refrozen' }] });
 }), 240_000);
 
+test('a legacy cursor (no stored options) whose blocked entry converts to held keeps its options and finishes the run', () => each(async engine => {
+  await engine.setConfig('sync.holds', 'fail');
+  const s = await source(engine, { 'notes/broken.md': FOLDED, 'notes/ok.md': note('Ok') });
+  expect((await s.sync()).status).toBe('blocked_by_failures');
+  const [failed] = await engine.executeRaw<{ request_id: string }>("SELECT request_id::text AS request_id FROM persistence_requests WHERE source_id=$1 AND state='failed'", [s.id]);
+  await engine.executeRaw("UPDATE persistence_requests SET error_code='invalid_params',error_message=$2 WHERE request_id=$1::uuid",
+    [failed!.request_id, 'Invalid YAML frontmatter: bad indentation of a mapping entry (3:1)']);
+  // A cursor written before options were recorded: the pending intent holds the only copy.
+  const cursorRow = async () => (await engine.executeRaw<{ completed_keys: Array<{ processingOptions?: unknown; pending?: { intent: { processingOptions?: unknown } } }> }>(
+    "SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [s.id]))[0]!.completed_keys[0]!;
+  await engine.executeRaw("UPDATE op_checkpoints SET completed_keys=completed_keys #- '{0,processingOptions}' WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [s.id]);
+  const legacy = await cursorRow();
+  expect(legacy.processingOptions).toBeUndefined();
+  expect(legacy.pending?.intent.processingOptions).toEqual({ noEmbed: true, noExtract: true, noSchemaPack: false });
+  await engine.unsetConfig('sync.holds');
+
+  // Flagless run (defaults noEmbed=false,noExtract=false): the carried consent must win over the run's defaults.
+  const converted = await performManagedSync(engine, { sourceId: s.id, noPull: true, explicitProcessing: [] });
+  expect(converted.converted_from_failed).toEqual([failed!.request_id]);
+  expect(converted).toMatchObject({ status: 'first_sync', held_count: 1 });
+  expect(converted.managedWrite).toBeUndefined();
+  expect(await engine.getPage('notes/ok', { sourceId: s.id })).not.toBeNull();
+  const requests = await engine.executeRaw<{ slug: string; state: string; error_message: string | null }>(
+    'SELECT slug,state,error_message FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [s.id]);
+  expect(requests.filter(row => row.error_message?.includes('no durable processing options'))).toHaveLength(0);
+  expect(requests.filter(row => row.slug === '__managed_sync_checkpoint__').at(-1)?.state).toBe('committed');
+  expect((await cursorRow()).processingOptions).toEqual({ noEmbed: true, noExtract: true, noSchemaPack: false });
+}), 240_000);
+
+test('a legacy cursor (no stored options) whose blocked entry refreezes keeps its options', () => each(async engine => {
+  await engine.setConfig('sync.holds', 'fail');
+  const t = await source(engine, { 'notes/ok.md': note('Ok') });
+  t.write('notes/draft.md', FOLDED);
+  expect((await t.sync({ workingTree: true })).status).toBe('blocked_by_failures');
+  const [draft] = await engine.executeRaw<{ request_id: string }>("SELECT request_id::text AS request_id FROM persistence_requests WHERE source_id=$1 AND state='failed'", [t.id]);
+  const cursorRow = async () => (await engine.executeRaw<{ completed_keys: Array<{ processingOptions?: unknown; pending?: { intent: { processingOptions?: unknown } } }> }>(
+    "SELECT completed_keys FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [t.id]))[0]!.completed_keys[0]!;
+  await engine.executeRaw("UPDATE op_checkpoints SET completed_keys=completed_keys #- '{0,processingOptions}' WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [t.id]);
+  const legacy = await cursorRow();
+  expect(legacy.processingOptions).toBeUndefined();
+  expect(legacy.pending?.intent.processingOptions).toEqual({ noEmbed: true, noExtract: true, noSchemaPack: false });
+  await engine.unsetConfig('sync.holds');
+  t.write('notes/draft.md', AUTHOR);
+
+  const converted = await performManagedSync(engine, { sourceId: t.id, noPull: true, workingTree: true, explicitProcessing: [] });
+  expect(converted.converted_from_failed).toEqual([draft!.request_id]);
+  expect(converted.status).not.toBe('blocked_by_failures');
+  expect((await engine.getPage('notes/draft', { sourceId: t.id }))?.title).toBe('Payments roundup');
+  const requests = await engine.executeRaw<{ error_message: string | null }>(
+    'SELECT error_message FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [t.id]);
+  expect(requests.filter(row => row.error_message?.includes('no durable processing options'))).toHaveLength(0);
+  const imports = await engine.executeRaw<{ intent: { processingOptions?: unknown } }>(
+    "SELECT intent FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_sync_import' AND request_id<>$2::uuid", [t.id, draft!.request_id]);
+  expect(imports.length).toBeGreaterThan(0);
+  expect(imports.every(row => JSON.stringify(row.intent.processingOptions) === JSON.stringify({ noEmbed: true, noExtract: true, noSchemaPack: false }))).toBe(true);
+}), 240_000);
+
 test('a flagless sync converts a --no-embed cursor with its stored options, and the loop guard mints no receipt per run', () => each(async engine => {
   await engine.setConfig('sync.holds', 'fail');
   const s = await source(engine, { 'notes/broken.md': FOLDED });

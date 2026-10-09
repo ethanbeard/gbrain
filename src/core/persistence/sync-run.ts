@@ -429,7 +429,7 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
   const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [blocked.sourceId]);
   assertActive();
   if (unfinished.length) return blocked;
-  const base: Cursor = { ...blocked }; delete base.pending;
+  const base: Cursor = { ...blocked, ...carriedProcessingOptions(blocked, previous) }; delete base.pending;
   const again = await freezeEntry(engine, base, key, assertActive, run);
   const converted = [...(blocked.convertedFromFailed ?? []), previous.requestId];
   const logged = (outcome: 'held' | 'refrozen') => (tx: BrainEngine) => recordSyncConversion(tx, blocked.sourceId, blocked.incarnation,
@@ -539,7 +539,7 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
       done.error_message ?? `Preparation of ${pending.slug} was abandoned three times.`)
     : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content, pending.intent.blobOid)
       : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
-  const base: Cursor = { ...cursor }; delete base.group;
+  const base: Cursor = { ...cursor, ...carriedProcessingOptions(cursor, pending) }; delete base.group;
   return saveCursor(engine, key, cursor, advanceHeld(base, [...(cursor.convertedFromFailed ?? []), pending.requestId]), false, assertActive, async tx => {
     await heldWrite(cursor, hold, run.observedAt!)(tx);
     await recordSyncConversion(tx, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path ?? null, slug: pending.slug, run_id: cursor.runId, outcome: 'held' });
