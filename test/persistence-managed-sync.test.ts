@@ -506,6 +506,58 @@ test('a legacy cursor (no stored options, pending old-shape intent) deferred on 
     }
   }), 120_000);
 
+test('a legacy cursor (no stored options, pending old-shape intent) whose pending import commits still writes its checkpoint', async () =>
+  withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+    for (const engine of engines) {
+      const f = await fixture(engine, { 'notes/example.md': 'An original observation about the example system.\n' });
+      await performManagedSync(engine, { sourceId: f.id, noPull: true });
+      const pinned = 'A newly committed observation about the example system.\n';
+      const path = join(f.root, 'notes/example.md');
+      writeFileSync(path, pinned);
+      commit(f.root);
+      const opts = { sourceId: f.id, noPull: true };
+      const { entries, ...discovery } = await discoverManagedSync(engine, opts);
+      expect(entries).toHaveLength(1);
+      const [previous] = await engine.executeRaw<{ fingerprint: string }>(
+        "SELECT fingerprint FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 AND completed_keys->0->>'done'='true'", [f.id]);
+      expect(previous).toBeDefined();
+      const authority = await managedSyncAuthority(engine, f.id, discovery.incarnation, discovery.root);
+      const runId = randomUUID(), requestId = randomUUID(), entry = entries[0];
+      const legacyIntent: SyncIntent = { kind: 'managed_sync_import', expected_revision: entry.revision ?? null,
+        processingOptions: { noEmbed: false, noExtract: false, noSchemaPack: false },
+        sourcePath: entry.sourcePath, path: entry.path, rawHash: sha256(pinned), content: pinned,
+        ownerEpoch: String(discovery.binding.owner_epoch), syncAuthority: authority, cursorKey: previous.fingerprint,
+        runId, index: 0, total: entries.length, from: discovery.from, target: discovery.target, slugMode: discovery.slugMode };
+      expect(legacyIntent).not.toHaveProperty('lineEndingOnly');
+      const legacyCursor = { ...discovery, authority, runId, index: 0, total: entries.length,
+        counts: { added: 0, modified: 0, deleted: 0, chunks: 0 },
+        pending: { requestId, slug: entry.slug!, pageId: entry.pageId ?? null, intent: legacyIntent } };
+      await engine.transaction(async tx => {
+        await tx.executeRaw('INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)',
+          ['managed-sync-manifest', runId, JSON.stringify(entries)]);
+        await tx.executeRaw("UPDATE op_checkpoints SET completed_keys=$2::text::jsonb WHERE op='managed-sync' AND fingerprint=$1",
+          [previous.fingerprint, JSON.stringify([legacyCursor])]);
+      });
+
+      const run = await performManagedSync(engine, opts);
+      expect(run.status).toBe('synced');
+      expect(run.failedFiles ?? 0).toBe(0);
+      expect(run.managedWrite).toBeUndefined();
+      expect(run.deferred ?? []).toHaveLength(0);
+      const requests = await engine.executeRaw<{ slug: string; state: string }>(
+        'SELECT slug,state FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [f.id]);
+      const checkpoints = requests.filter(row => row.slug === '__managed_sync_checkpoint__');
+      expect(checkpoints.filter(row => row.state === 'failed')).toHaveLength(0);
+      expect(checkpoints.at(-1)?.state).toBe('committed');
+      expect(await engine.executeRaw<{ request_id: string; state: string }>(
+        "SELECT request_id,state FROM persistence_requests WHERE request_id=$1::uuid AND intent->>'kind'='managed_sync_import'", [requestId]))
+        .toEqual([{ request_id: requestId, state: 'committed' }]);
+      expect((await engine.getPage('notes/example', { sourceId: f.id }))?.compiled_truth).toContain('newly committed observation');
+      expect(loadSyncFailures().filter(row => row.source_id === f.id)).toHaveLength(0);
+      rmSync(syncFailuresPath(), { force: true });
+    }
+  }), 120_000);
+
 test('pending durable sync retries keep the same request ID and do not claim committed imports', async () =>
   withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
     for (const engine of engines) {

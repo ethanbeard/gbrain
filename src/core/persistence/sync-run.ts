@@ -465,11 +465,15 @@ export function deferralEligible(input: DeferralEligibilityInput): { reason: 'ra
   return { reason };
 }
 
+// A legacy cursor's only processing consent is its pending intent; the checkpoint requires durable options.
+function carriedProcessingOptions(cursor: Cursor, pending: Pending): Pick<Cursor, 'processingOptions'> {
+  return cursor.processingOptions ? {} : pending.intent.processingOptions ? { processingOptions: pending.intent.processingOptions } : {};
+}
+
 function advanceDeferred(cursor: Cursor, pending: Pending, reason: 'raw_file_changed' | 'pinned_git_worktree_conflict'): Cursor {
   const base: Cursor = { ...cursor }; delete base.group;
   const next: Cursor = { ...base, index: cursor.index + 1,
-    // A legacy cursor's only processing consent is its pending intent; the checkpoint requires durable options.
-    ...(cursor.processingOptions ? {} : pending.intent.processingOptions ? { processingOptions: pending.intent.processingOptions } : {}),
+    ...carriedProcessingOptions(cursor, pending),
     counts: { ...cursor.counts, deferred: (cursor.counts.deferred ?? 0) + 1 },
     deferred: [...(cursor.deferred ?? []), { path: pending.intent.path!, slug: pending.slug || null, reason, request_id: pending.requestId }],
     convertedFromFailed: [...(cursor.convertedFromFailed ?? []), pending.requestId] };
@@ -1267,7 +1271,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         return withLinks(cursor, result(cursor, cursor.from === null ? 'first_sync' : 'synced'));
       }
       // The frozen manifest is shared; only the cursor header changes per page.
-      const next: Cursor = { ...cursor, index: cursor.index + 1, counts: { ...cursor.counts }, progress: stampProgress(cursor.progress, cursor.index, cursor.index + 1, drainStartedAt) }; delete next.pending; delete next.group;
+      const next: Cursor = { ...cursor, ...carriedProcessingOptions(cursor, pending), index: cursor.index + 1, counts: { ...cursor.counts }, progress: stampProgress(cursor.progress, cursor.index, cursor.index + 1, drainStartedAt) }; delete next.pending; delete next.group;
       countCommitted(next.counts, pending, done.outcome);
       cursor = await saveCursor(engine, key, cursor, next);
       opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length });
