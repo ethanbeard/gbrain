@@ -84,6 +84,8 @@ interface Cursor extends SyncDiscovery { runId: string; index: number; authority
     fences?: FencesTally };
   /** #5988: failed content-refusal requests this run converted in place. */
   convertedFromFailed?: string[];
+  /** Request ids of group members after a terminal failure and admit-ahead window members that it stopped publishing; re-freezing means their receipts never block the checkpoint. */
+  droppedRequests?: string[];
   deferred?: Array<{ path: string; slug: string | null; reason: string; request_id: string }>;
   /** #5984: the active drain window (reset when a new drain starts), so a backlog ETA never counts downtime. */
   progress?: CursorProgress;
@@ -342,13 +344,14 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
   }
   await validateSyncAuthority(engine, cursor.authority, slug);
   assertActive();
+  const supersededRequests = [...(cursor.convertedFromFailed ?? []), ...(cursor.droppedRequests ?? [])];
   return { requestId: randomUUID(), slug, pageId, ...(occupantRebound ? { rebound: true as const } : {}), intent: { kind: !entry ? 'managed_sync_checkpoint' : entry.action === 'import' ? 'managed_sync_import' : 'managed_sync_delete',
     expected_revision: revision, sourcePath: entry?.sourcePath ?? null, path: entry?.path ?? null, rawHash, content, lineEndingOnly,
     ...(entry?.unownedDeletion ? { unownedDeletion: true } : {}),
     ...(entry?.renameFrom ? { renameFrom: entry.renameFrom } : {}),
     ...(run.observedAt ? { holdObservedAt: run.observedAt } : {}), ...(blob ? { blobOid: blob.oid } : {}),
     ...(!entry && cursor.releasedHolds?.length ? { releasedHolds: cursor.releasedHolds } : {}),
-    ...(!entry && cursor.convertedFromFailed?.length ? { supersededRequests: cursor.convertedFromFailed } : {}),
+    ...(!entry && supersededRequests.length ? { supersededRequests } : {}),
     ...(!entry ? { deferredPaths: cursor.deferred?.map(item => item.path) ?? [], discoveredAt: cursor.discoveredAt ?? run.observedAt } : {}),
     processingOptions: cursor.processingOptions,
     // A cursor created before its options were recorded has the same key, so this run's options are its options.
@@ -921,6 +924,12 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
     if (promoted) { next.pending = promoted[0]; next.group = promoted; } else { delete next.pending; delete next.group; }
     if (rest.length) next.window = rest; else delete next.window;
   } else { next.pending = stuck; if (failed) delete next.group; else next.group = members.slice(committed); }
+  if (failed) {
+    const droppedRequests = [...(cursor.droppedRequests ?? [])];
+    droppedRequests.push(...members.slice(committed + 1).map(member => member.requestId));
+    droppedRequests.push(...(next.window ?? []).flat().map(member => member.requestId));
+    if (droppedRequests.length) next.droppedRequests = [...new Set(droppedRequests)];
+  }
   // A failed page stops the run: groups admitted ahead of it are cancelled, never published after it.
   if (failed && next.window) { await cancelWindow(engine, next.window, principal); delete next.window; }
   const saved = committed || failed || next.group?.length !== members.length ? await saveCursor(engine, key, cursor, next) : cursor;
