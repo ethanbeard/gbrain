@@ -23,6 +23,16 @@ export interface ClaimLeaseTiming {
 
 export const DEFAULT_CLAIM_LEASE_TIMING: Readonly<ClaimLeaseTiming> = { everyMs: 10_000, deadlineMs: 5_000 };
 
+/** Longest a claimed preparation may go without a member settling before the claim is given up. */
+export const DEFAULT_PREPARATION_MS = 30_000;
+export const PREPARATION_ABANDON_BOUND = 3;
+export const PREPARATION_ABANDONED_CODE = 'preparation_abandoned_3x';
+
+/** Emergency rollback for the group preparation deadline; read at execution time. */
+export function preparationDeadlineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.GBRAIN_SYNC_PREPARATION_DEADLINE !== '0';
+}
+
 /** What `whileHeld` yields when the claim is lost before the work finishes. */
 export const CLAIM_LOST: unique symbol = Symbol('claim_lost');
 
@@ -95,4 +105,3 @@ export async function endLostLease(lease: ClaimLease, boundMs = 1_000): Promise<
   await Promise.race([renewal, new Promise<void>(resolve => { timer = setTimeout(resolve, boundMs); })]);
   if (timer) clearTimeout(timer);
 }
-

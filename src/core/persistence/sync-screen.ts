@@ -85,6 +85,12 @@ export function prepareTimeFenceHold(entry: Pick<SyncEntry, 'path' | 'sourcePath
   return heldEntry(entry, slug, pageId, { code: 'invalid_fence', reason: 'prepare_time', fence, message: fenceMessage(fence) }, content, blobOid ? { oid: blobOid } : null);
 }
 
+/** A preparation that repeatedly made no progress becomes a normal managed-sync Git hold. */
+export function preparationAbandonedHold(entry: Pick<SyncEntry, 'path' | 'sourcePath' | 'working' | 'renameFrom' | 'renameHeld'>,
+  slug: string, pageId: number | null, content: string, blobOid: string | null | undefined, message: string): HeldEntry {
+  return heldEntry(entry, slug, pageId, { code: 'preparation_abandoned_3x', message }, content, blobOid ? { oid: blobOid } : null);
+}
+
 /**
  * #5493: managed sync has no image importer, so an image import is held as
  * incomplete coverage instead of refusing the run. The hold names the pinned

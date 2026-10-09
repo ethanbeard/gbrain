@@ -16,11 +16,12 @@
 import type { BrainEngine } from '../engine.ts';
 
 export type ClaimPhaseName = 'preparing' | 'publishing';
-export interface ClaimPhaseClock { phase: ClaimPhaseName; claimedAt: number; since: number }
+export interface ClaimPhaseClock { phase: ClaimPhaseName; claimedAt: number; since: number; progress: number }
 
 export function startClaimPhase(now = Date.now()): ClaimPhaseClock {
-  return { phase: 'preparing', claimedAt: now, since: now };
+  return { phase: 'preparing', claimedAt: now, since: now, progress: 0 };
 }
+export function noteClaimProgress(clock: ClaimPhaseClock): void { clock.progress++; }
 export function enterClaimPhase(clock: ClaimPhaseClock, phase: ClaimPhaseName, now = Date.now()): void {
   if (clock.phase === phase) return;
   clock.phase = phase;
@@ -28,7 +29,7 @@ export function enterClaimPhase(clock: ClaimPhaseClock, phase: ClaimPhaseName, n
 }
 /** The `claim_phase` jsonb a renewal stores for the claim holding `token`. */
 export function claimPhaseStamp(clock: ClaimPhaseClock, token: string | null): string {
-  return JSON.stringify({ phase: clock.phase, claimed_at: new Date(clock.claimedAt).toISOString(), since: new Date(clock.since).toISOString(), token });
+  return JSON.stringify({ phase: clock.phase, claimed_at: new Date(clock.claimedAt).toISOString(), since: new Date(clock.since).toISOString(), progress: clock.progress, token });
 }
 
 /** `persistence.max_claim_ms`: how long a write may hold its claim before doctor reports it as stalled. */

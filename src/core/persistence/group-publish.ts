@@ -38,11 +38,11 @@ import { localHostId } from './identity.ts';
 import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwnership, joinWorktreeLease } from './ownership.ts';
 import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, lanePolicy, stepDownLanes, type LaneState } from './sync-lanes.ts';
 import { cancelRows, windowPredecessor } from './sync-window.ts';
-import { clearResolvedRecoveries, completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, markRecovering, prepareRecoveries,
+import { abandonPreparation, clearResolvedRecoveries, completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, markRecovering, prepareRecoveries,
   foregroundPriority, publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
 import { principalKey, requestPrincipal, type FileRecoveryRecord, type WriteRequest } from './model.ts';
-import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
-import { claimPhaseStamp, enterClaimPhase, startClaimPhase } from './claim-phase.ts';
+import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, DEFAULT_PREPARATION_MS, PREPARATION_ABANDON_BOUND, endLostLease, preparationDeadlineEnabled, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
+import { claimPhaseStamp, enterClaimPhase, noteClaimProgress, startClaimPhase } from './claim-phase.ts';
 import { setMemberAttribution, withCoordinatedWrite } from './context.ts';
 import { requestAttribution } from './attribution.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
@@ -473,12 +473,14 @@ export interface GroupExecution {
   /** #5984 lanes: the open lane run this group belongs to in this process. */
   lane?: LaneState | null;
   /** `engine` answers the members' repeated preparation reads once (see preparationReads). */
-  prepare(row: WriteRequest, engine: BrainEngine): Promise<PreparedMutation>;
+  prepare(row: WriteRequest, engine: BrainEngine, signal?: AbortSignal): Promise<PreparedMutation>;
   settled(row: WriteRequest): void;
   hostId: string;
   hooks?: GroupHooks;
   /** #5373: renewal timing for the group's claims (default DEFAULT_CLAIM_LEASE_TIMING). */
   lease?: ClaimLeaseTiming;
+  /** Per-member no-progress preparation budget (default DEFAULT_PREPARATION_MS). */
+  preparationMs?: number;
   /**
    * #5373: receives work still running when the group lets go of its claims: the
    * renewal in flight, or (`blocksRoot`) the preparation abandoned after a lost claim.
@@ -493,33 +495,66 @@ export interface GroupExecution {
  * members are cancelled, and after one is released back to the queue the
  * later ones are released too, so nothing overtakes it. Claims are renewed
  * for the whole group while it runs (claim-lease.ts). If the group stops
- * holding every member's claim while it is still preparing, it lets go: each
- * member is released unpublished with `claim_lost` (token-fenced, so a member
- * another consumer took over keeps its new claim) and the unfinished
- * preparation goes to `leftRunning`, never to publication. Returns whether
- * any member settled.
+ * holding every member's claim while it is still preparing, it lets go. Group
+ * preparation is also bounded by a no-progress deadline, re-armed whenever a
+ * member settles; on expiry members are released with `preparation_deadline`.
+ * Releases are token-fenced, so a member another consumer took over keeps its
+ * new claim, and unfinished preparation goes to `leftRunning`, never to
+ * publication. Returns whether any member settled.
  */
 export async function executeClaimedGroup(engine: BrainEngine, rows: WriteRequest[], run: GroupExecution): Promise<boolean> {
   const clock = startClaimPhase();
+  const deadlineEnabled = preparationDeadlineEnabled();
+  const abort = new AbortController();
   const lease = startClaimLease(async signal => (await renewGroupClaims(engine, rows, 30_000, signal, claimPhaseStamp(clock, null))).size === rows.length,
-    run.lease ?? DEFAULT_CLAIM_LEASE_TIMING);
+    run.lease ?? DEFAULT_CLAIM_LEASE_TIMING, deadlineEnabled ? () => abort.abort({ code: 'claim_lost' }) : undefined);
   if (run.lane) laneClaimed(run.lane, rows);
+  let live = true;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     const prepared: Array<{ ok: PreparedMutation } | { error: unknown }> = new Array(rows.length);
+    const started: boolean[] = new Array(rows.length).fill(false);
     const reads = preparationReads(engine);
+    const deadline = Promise.withResolvers<void>();
+    const armDeadline = () => {
+      if (!live || !deadlineEnabled) return;
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      deadlineTimer = setTimeout(deadline.resolve, run.preparationMs ?? DEFAULT_PREPARATION_MS);
+      deadlineTimer.unref?.();
+    };
     // A put_pages group prepares all of its (at most PAGE_BATCH_GROUP_MAX) pages at once.
     const width = publicationGroupKey(rows[0]!)?.startsWith('batch:') ? PAGE_BATCH_GROUP_MAX : 4;
+    if (deadlineEnabled) armDeadline();
     const preparing = (async () => {
       for (let start = 0; start < rows.length; start += width) {
+        if (!live) break;
         await Promise.all(rows.slice(start, start + width).map(async (row, offset) => {
-          try { prepared[start + offset] = { ok: await run.prepare(row, reads) }; } catch (error) { prepared[start + offset] = { error }; }
+          const index = start + offset;
+          started[index] = true;
+          try { prepared[index] = { ok: await run.prepare(row, reads, deadlineEnabled ? abort.signal : undefined) }; } catch (error) { prepared[index] = { error }; }
+          if (live) { noteClaimProgress(clock); armDeadline(); }
         }));
       }
     })();
-    if (await lease.whileHeld(preparing) === CLAIM_LOST) {
+    const PREPARED = Symbol('prepared'), DEADLINE = Symbol('deadline');
+    const raced = await Promise.race([preparing.then(() => PREPARED), lease.lost.then(() => CLAIM_LOST),
+      ...(deadlineEnabled ? [deadline.promise.then(() => DEADLINE)] : [])]);
+    const result = raced === PREPARED && !lease.held ? CLAIM_LOST : raced;
+    live = false;
+    if (deadlineTimer) { clearTimeout(deadlineTimer); deadlineTimer = undefined; }
+    if (result === CLAIM_LOST || result === DEADLINE) {
       run.leftRunning?.(preparing, true);
+      // Snapshot before abort: an abort-aware preparer still earns the strike that caused its abort.
+      const stuck = result === DEADLINE ? rows.map((_row, i) => started[i] && prepared[i] === undefined) : [];
+      if (result === DEADLINE) abort.abort({ code: 'preparation_deadline' });
       await endLostLease(lease);
-      for (const row of rows) await releaseUnpublishedClaim(engine, row, 'claim_lost');
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]!;
+        if (result === DEADLINE && stuck[i]) {
+          const abandoned = await abandonPreparation(engine, row, PREPARATION_ABANDON_BOUND, run.preparationMs ?? DEFAULT_PREPARATION_MS);
+          if (abandoned === 'held') { const done = await getWriteRequestById(engine, row.id); if (done) run.settled(done); }
+        } else await releaseUnpublishedClaim(engine, row, result === DEADLINE ? 'preparation_deadline' : 'claim_lost');
+      }
       return false;
     }
     enterClaimPhase(clock, 'publishing');
@@ -563,6 +598,8 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
     }
     return progressed;
   } finally {
+    live = false;
+    if (deadlineTimer) clearTimeout(deadlineTimer);
     if (run.lane) laneFinished(run.lane, rows);
     const renewal = lease.end();
     if (renewal) run.leftRunning?.(renewal, false);

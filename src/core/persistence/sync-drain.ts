@@ -20,6 +20,7 @@ import { getCode, isRetryableConnError, isStatementTimeoutError } from '../retry
 import { currentRunDeadline, noteForwardProgress } from '../forward-progress.ts';
 import { serr } from '../console-prefix.ts';
 import { ERROR_CATALOGUE, type CatalogueName } from '../error-catalogue.ts';
+import { DEFAULT_CLAIM_LEASE_TIMING, DEFAULT_PREPARATION_MS, PREPARATION_ABANDON_BOUND, preparationDeadlineEnabled } from './claim-lease.ts';
 
 export type DrainOutcome = 'synced' | 'resumable' | 'blocked';
 /** Why a drain ended short of `synced`. Each value has an error-catalogue entry (DX-A4). */
@@ -31,6 +32,9 @@ export interface DrainStall {
   blocked_reason: string | null;
   head_request_id: string | null;
   head_state: string | null;
+  head_blocked_reason?: string | null;
+  head_path?: string | null;
+  head_preparation_abandoned?: number | null;
   claimable_here: boolean;
   owner_is_this_host: boolean | null;
   stalled_seconds: number;
@@ -70,7 +74,16 @@ export interface LanesLimit { kind: 'lanes_off' | 'database_contention' | 'feede
 const TERMINAL_STATUSES = new Set(['synced', 'first_sync', 'up_to_date', 'dry_run']);
 const BLOCKED_HEAD_REASONS = new Set(['recovery_required', 'owner_unavailable', 'unexpected_file_bytes', 'unexpected_staging_bytes']);
 const PENDING_PAUSE_MS = 250;
-const STALL_MS = 30_000;
+// Longest healthy silence in the persisted head key: members may settle up to
+// DEFAULT_PREPARATION_MS apart; the settle reaches the row only at the next
+// renewal (everyMs later), and that renewal may take up to deadlineMs to land.
+// The earlier stamp can land early and the later one late, so one more
+// renewal cycle is added as margin. 30 s + 10 s + 5 s + (10 s + 5 s) = 60 s.
+export const STALL_WINDOW_MS = DEFAULT_PREPARATION_MS + 2 * (DEFAULT_CLAIM_LEASE_TIMING.everyMs + DEFAULT_CLAIM_LEASE_TIMING.deadlineMs);
+export const LEGACY_STALL_MS = 30_000;
+export function defaultStallMs(env: NodeJS.ProcessEnv = process.env): number {
+  return preparationDeadlineEnabled(env) ? STALL_WINDOW_MS : LEGACY_STALL_MS;
+}
 const STALL_PASSES = 3;
 const TRANSIENT_ATTEMPTS = 3;
 const REFRESH_WAIT_MS = 5 * 60_000;
@@ -155,7 +168,7 @@ export interface StallProbe {
   /** A head that needs an operator stops the drain at once; otherwise null. */
   blockedHead(result: SyncResult): Promise<{ reason: DrainStopReason; stall: DrainStall } | null>;
   /** A fingerprint of the awaited request and the worktree head; unchanged across the stall window means no progress. */
-  fingerprint(result: SyncResult): Promise<{ key: string; stall: Omit<DrainStall, 'stalled_seconds'> } | null>;
+  fingerprint(result: SyncResult): Promise<{ key: string; stall: Omit<DrainStall, 'stalled_seconds'>; deadlined?: boolean } | null>;
 }
 
 export interface DrainInput {
@@ -175,6 +188,8 @@ export interface DrainInput {
 
 /** Re-enter `pass` until the managed cursor is done, the caller stops it, or it is blocked. */
 export async function runDrain(input: DrainInput): Promise<SyncResult> {
+  const deadlineEnabled = preparationDeadlineEnabled();
+  const stallWindow = input.stallMs ?? (deadlineEnabled ? STALL_WINDOW_MS : LEGACY_STALL_MS);
   const startedAt = Date.now();
   const coop = cooperativeDeadline();
   const signal = coop.signal && input.signal ? AbortSignal.any([input.signal, coop.signal]) : coop.signal ?? input.signal;
@@ -198,6 +213,7 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
     if (event.phase !== 'managed_sync.page_committed') return;
     if (event.deferred) deferred++; else if (event.held) held++; else if (event.waived) waived++; else written++;
     noteForwardProgress();
+    stall = null;
     if (input.announce && Date.now() - lastLine >= PROGRESS_EVERY_MS) {
       lastLine = Date.now();
       const estimate = drainEstimate(remaining(), written + waived + deferred + held, Date.now() - startedAt);
@@ -251,7 +267,8 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
         const print = await input.probe.fingerprint(result);
         if (print) {
           if (!stall || stall.key !== print.key) stall = { key: print.key, since: Date.now(), passes: 0 };
-          else if (++stall.passes >= STALL_PASSES && Date.now() - stall.since >= (input.stallMs ?? STALL_MS) && !print.stall.claimable_here) {
+          else if (++stall.passes >= STALL_PASSES && Date.now() - stall.since >= stallWindow
+            && (deadlineEnabled ? (print.deadlined || !print.stall.claimable_here) : !print.stall.claimable_here)) {
             return finish(result, 'blocked', 'drain_stalled', { stall: { ...print.stall, stalled_seconds: Math.round((Date.now() - stall.since) / 1000) } });
           }
         }
@@ -265,16 +282,22 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
 
 /** Engine-backed stall checks: the awaited request, the oldest unfinished request on its worktree, and claimability here. */
 export function engineStallProbe(engine: BrainEngine): StallProbe {
+  const deadlineEnabled = preparationDeadlineEnabled();
   const read = async (result: SyncResult) => {
     const requestId = result.managedWrite?.write_request.request_id;
     if (!requestId) return null;
-    const [row] = await engine.executeRaw<{ state: string; updated_at: string; claim_expires_at: string | null; blocked_reason: string | null; recovering: boolean;
-      worktree_id: string | null; head_id: string | null; head_state: string | null; head_updated_at: string | null; owner_host_id: string | null }>(
+    const [row] = await engine.executeRaw<{ state: string; updated_at: string; claim_expires_at: string | null; blocked_reason: string | null; recovering: boolean; worktree_id: string | null;
+      head_id: string | null; head_state: string | null; head_blocked_reason: string | null; head_token: string | null;
+      head_phase: string | null; head_phase_since: string | null; head_progress: string | null; head_updated_at: string | null;
+      head_path: string | null; head_preparation_abandoned: string | null; owner_host_id: string | null }>(
       `SELECT r.state, r.updated_at::text, r.claim_expires_at::text, r.blocked_reason, r.recovery IS NOT NULL AS recovering, r.worktree_id::text,
-         h.id::text AS head_id, h.state AS head_state, h.updated_at::text AS head_updated_at, w.owner_host_id::text
+         h.id::text AS head_id, h.state AS head_state, h.blocked_reason AS head_blocked_reason, h.execution_token::text AS head_token,
+         h.claim_phase->>'phase' AS head_phase, h.claim_phase->>'since' AS head_phase_since,
+         h.claim_phase->>'progress' AS head_progress, h.updated_at::text AS head_updated_at, h.intent->>'path' AS head_path,
+         h.claim_phase->>'preparation_abandoned' AS head_preparation_abandoned, w.owner_host_id::text
        FROM persistence_requests r
        LEFT JOIN persistence_worktrees w ON w.id = r.worktree_id
-       LEFT JOIN LATERAL (SELECT e.id, e.state, e.updated_at FROM persistence_requests e WHERE e.worktree_id = r.worktree_id
+       LEFT JOIN LATERAL (SELECT e.id, e.state, e.updated_at, e.blocked_reason, e.execution_token, e.claim_phase, e.intent FROM persistence_requests e WHERE e.worktree_id = r.worktree_id
          AND (e.state IN ('queued','running','recovering') OR e.recovery IS NOT NULL) ORDER BY e.sequence LIMIT 1) h ON r.worktree_id IS NOT NULL
        WHERE r.id = $1::uuid`, [requestId]);
     return row ? { requestId, row } : null;
@@ -284,6 +307,8 @@ export function engineStallProbe(engine: BrainEngine): StallProbe {
     const { hasClaimableWrite } = await import('./journal.ts');
     const host = localHostId();
     return { request_id: requestId, state: row.state, blocked_reason: row.blocked_reason, head_request_id: row.head_id, head_state: row.head_state,
+      head_blocked_reason: row.head_blocked_reason,
+      head_path: row.head_path, head_preparation_abandoned: row.head_preparation_abandoned === null ? null : Number(row.head_preparation_abandoned),
       claimable_here: await hasClaimableWrite(engine, host).catch(() => false), owner_is_this_host: row.owner_host_id === null ? null : row.owner_host_id === host };
   };
   return {
@@ -298,8 +323,12 @@ export function engineStallProbe(engine: BrainEngine): StallProbe {
       const found = await read(result);
       if (!found) return null;
       const { row } = found;
-      return { key: [row.state, row.updated_at, row.claim_expires_at, row.blocked_reason, row.head_id, row.head_state, row.head_updated_at].join('|'),
-        stall: await describe(found.requestId, row) };
+      const key = deadlineEnabled
+        ? [row.state, row.blocked_reason, row.head_id, row.head_state, row.head_blocked_reason, row.head_token,
+          row.head_phase, row.head_phase_since, row.head_progress].join('|')
+        : [row.state, row.updated_at, row.claim_expires_at, row.blocked_reason, row.head_id, row.head_state, row.head_updated_at].join('|');
+      return { key, stall: await describe(found.requestId, row),
+        deadlined: deadlineEnabled && row.head_state === 'queued' && row.head_blocked_reason === 'preparation_deadline' };
     },
   };
 }
@@ -394,7 +423,9 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
   if (writerBlocked) {
     return { command: `gbrain sources writer status ${sourceId}`, safe_to_loop: false, retry_after_ms: 0, ...estimate,
       why: d!.stop_reason === 'drain_stalled'
-        ? `No write for this source made progress for ${d!.stall?.stalled_seconds ?? 30}s and nothing here can claim it. Inspect the writer, fix what it names, then rerun: ${resumeCommand}`
+        ? d!.stall?.head_blocked_reason === 'preparation_deadline'
+          ? `The oldest write for this source gave up preparing after it went too long without progress, and nothing has re-claimed it for ${d!.stall?.stalled_seconds ?? Math.round(STALL_WINDOW_MS / 1000)}s (a preparation that ignored its deadline may still hold it in this process). Inspect the writer, fix what it names, then rerun: ${resumeCommand}`
+          : `No write for this source made progress for ${d!.stall?.stalled_seconds ?? Math.round(STALL_WINDOW_MS / 1000)}s and nothing here can claim it. Inspect the writer, fix what it names, then rerun: ${resumeCommand}`
         : `The source's writer needs intervention (${d!.stop_reason}) before more pages can publish. Inspect it, fix what it names, then rerun: ${resumeCommand}`,
       ...(docs ? { docs } : {}) };
   }
@@ -420,7 +451,11 @@ export function formatDrainSummary(result: SyncResult, resumeCommand: string, so
     + (d.remaining ? `, ${d.remaining} remaining` : '') + (d.rate_pages_per_min !== null ? `, ${d.rate_pages_per_min} pages/min` : '')
     + (d.remaining && d.eta_seconds !== null ? `, indexing ETA ${formatDuration(d.eta_seconds)}` : '') + '.'];
   if (d.stall) lines.push(`  Oldest unfinished request ${d.stall.head_request_id ?? d.stall.request_id} (${d.stall.head_state ?? d.stall.state})`
-    + `${d.stall.blocked_reason ? `, blocked_reason=${d.stall.blocked_reason}` : ''}; claimable here: ${d.stall.claimable_here ? 'yes' : 'no'}.`);
+    + `${d.stall.blocked_reason ? `, blocked_reason=${d.stall.blocked_reason}` : ''}`
+    + `${d.stall.head_blocked_reason ? `, head blocked_reason=${d.stall.head_blocked_reason}` : ''}`
+    + `${d.stall.head_path ? `, path=${d.stall.head_path}` : ''}`
+    + `${d.stall.head_preparation_abandoned != null ? `, preparation abandoned ${d.stall.head_preparation_abandoned}/${PREPARATION_ABANDON_BOUND}` : ''}`
+    + `; claimable here: ${d.stall.claimable_here ? 'yes' : 'no'}.`);
   const next = drainNext(result, resumeCommand, sourceId);
   if (next) lines.push(`  Next: ${next.command}${next.safe_to_loop ? ' (safe to rerun in a loop)' : ''}`, `  Why: ${next.why}`);
   return lines;

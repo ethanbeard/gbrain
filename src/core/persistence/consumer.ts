@@ -3,9 +3,9 @@ import type { GBrainConfig } from '../config.ts';
 import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
 import { finishUnpublishedFailure, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
-import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
+import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite, type GroupExecution } from './group-publish.ts';
 import { preparationConfigView } from './config-snapshot.ts';
-import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
+import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, DEFAULT_PREPARATION_MS, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
 import { claimPhaseStamp, enterClaimPhase, startClaimPhase } from './claim-phase.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { ownerExceptionLogText } from './publication-failure.ts';
@@ -13,7 +13,7 @@ import { refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { PROJECTION_RETRY_READY_SQL, rebuildPendingPageProjections } from '../page-state/projections.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { claimedHeadOrder } from './sync-window.ts';
-import { laneClaim, laneOf, laneRoots, laneTask } from './sync-lanes.ts';
+import { laneClaim, laneOf, laneRoots, laneTask, type LaneState } from './sync-lanes.ts';
 import { runPersistenceEffects } from './effects.ts';
 import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { isWriteErrorCode } from './types.ts';
@@ -624,7 +624,7 @@ export class PersistenceConsumer {
     this.abort.signal.addEventListener('abort', stop, { once: true });
     // edit_page (#5616) builds its content during preparation like put_page, so it shares the deadline.
     const bounded = row.operation === 'remember' || (row.operation === 'put_page' || row.operation === 'edit_page') && !row.intent?.kind;
-    const budget = this.opts.preparationMs ?? 30_000;
+    const budget = this.opts.preparationMs ?? DEFAULT_PREPARATION_MS;
     const deadline = performance.now() + budget;
     const timeout = bounded ? setTimeout(() => {
       observation.deadline_exceeded = true;
@@ -688,6 +688,22 @@ export class PersistenceConsumer {
       this.abort.signal.removeEventListener('abort', stop); this.preparing.delete(row.id); this.executing.delete(row.id);
     }
   }
+  private groupExecution(root: RootHold, lane: LaneState | null): GroupExecution {
+    return { hostId: this.hostId, lane, preparationMs: this.opts.preparationMs ?? DEFAULT_PREPARATION_MS,
+      prepare: (member, engine, signal) => this.prepare(engine, member, this.config, signal),
+      lease: this.leaseTiming(),
+      leftRunning: (work, blocksRoot) => {
+        const settled = this.keepUntilSettled(work);
+        if (blocksRoot) root.until = settled;
+      },
+      settled: done => {
+        this.executing.delete(done.id);
+        if (done.state === 'committed' && done.worktree_id && !String(done.intent?.kind).startsWith('managed_sync_')) {
+          this.foregroundCounts.set(done.worktree_id, this.foregroundCompletions(done.worktree_id) + 1);
+        }
+        this.settled(done);
+      } };
+  }
   /** #5984: a claimed bulk sync head takes its directly following group members along; one row runs the single path. */
   private async executeOrGroup(row: WriteRequest, root: RootHold): Promise<boolean> {
     // #5984 admit-ahead: a window group whose predecessor did not commit is cancelled, never published after it.
@@ -705,19 +721,7 @@ export class PersistenceConsumer {
     const rows = [row, ...followers];
     for (const member of rows) this.executing.add(member.id);
     try {
-      return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane, prepare: (member, engine) => this.prepare(engine, member, this.config),
-        lease: this.leaseTiming(),
-        leftRunning: (work, blocksRoot) => {
-          const settled = this.keepUntilSettled(work);
-          if (blocksRoot) root.until = settled;
-        },
-        settled: done => {
-          this.executing.delete(done.id);
-          if (done.state === 'committed' && done.worktree_id && !String(done.intent?.kind).startsWith('managed_sync_')) {
-            this.foregroundCounts.set(done.worktree_id, this.foregroundCompletions(done.worktree_id) + 1);
-          }
-          this.settled(done);
-        } });
+      return await executeClaimedGroup(this.engine, rows, this.groupExecution(root, lane));
     } finally { for (const member of rows) this.executing.delete(member.id); }
   }
   /** Mandatory barrier: engine.close must be sequenced AFTER this promise. */

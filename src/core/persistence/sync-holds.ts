@@ -55,7 +55,7 @@ export const GIT_HOLD_ESCALATE_MIN_SCREENED = 40;
 
 type Exec = Pick<BrainEngine, 'executeRaw'>;
 
-export type GitHoldCode = ContentRefusal['code'] | 'rename_held' | 'parser_regression' | 'managed_image_sync_unsupported' | 'concurrent_write';
+export type GitHoldCode = ContentRefusal['code'] | 'rename_held' | 'parser_regression' | 'managed_image_sync_unsupported' | 'concurrent_write' | 'preparation_abandoned_3x';
 export type GitHoldReason = InvalidFrontmatterReason | 'rename_source_changed' | FenceReason;
 
 export interface GitHoldMeta {
@@ -159,20 +159,22 @@ async function lockSummary(tx: Exec, sourceId: string, incarnation: string): Pro
  * `concurrent` the #6194 `concurrent_write` holds.
  */
 async function adjustSummary(tx: Exec, sourceId: string, incarnation: string, delta: number, staleDelta: number, imageDelta: number, fenceDelta: number,
-  concurrentDelta: number): Promise<void> {
+  concurrentDelta: number, retryDelta: number): Promise<void> {
   await tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=jsonb_build_array((completed_keys->0)||jsonb_build_object(
       'count',GREATEST(0,COALESCE((completed_keys->0->>'count')::int,0)+$3::int),
       'stale',GREATEST(0,COALESCE((completed_keys->0->>'stale')::int,0)+$4::int),
       'images',GREATEST(0,COALESCE((completed_keys->0->>'images')::int,0)+$5::int),
       'fences',GREATEST(0,COALESCE((completed_keys->0->>'fences')::int,0)+$6::int),
-      'concurrent',GREATEST(0,COALESCE((completed_keys->0->>'concurrent')::int,0)+$7::int))),updated_at=now() WHERE op=$1 AND fingerprint=$2`,
-  [GIT_HOLD_SUMMARY_OP, summaryFingerprint(sourceId, incarnation), delta, staleDelta, imageDelta, fenceDelta, concurrentDelta]);
+      'concurrent',GREATEST(0,COALESCE((completed_keys->0->>'concurrent')::int,0)+$7::int),
+      'retry',GREATEST(0,COALESCE((completed_keys->0->>'retry')::int,0)+$8::int))),updated_at=now() WHERE op=$1 AND fingerprint=$2`,
+  [GIT_HOLD_SUMMARY_OP, summaryFingerprint(sourceId, incarnation), delta, staleDelta, imageDelta, fenceDelta, concurrentDelta, retryDelta]);
 }
 
 const staleWeight = (record: Pick<GitHoldRecord, 'page_id'> | null) => record && record.page_id !== null ? 1 : 0;
 const imageWeight = (record: Pick<GitHoldRecord, 'code'> | null) => record?.code === 'managed_image_sync_unsupported' ? 1 : 0;
 const fenceWeight = (record: Pick<GitHoldRecord, 'code'> | null) => record?.code === 'invalid_fence' ? 1 : 0;
 const concurrentWeight = (record: Pick<GitHoldRecord, 'code'> | null) => record?.code === 'concurrent_write' ? 1 : 0;
+const retryWeight = (record: Pick<GitHoldRecord, 'code'> | null) => record?.code === 'preparation_abandoned_3x' ? 1 : 0;
 
 async function readRow(tx: Exec, sourceId: string, incarnation: string, path: string): Promise<GitHoldRecord | null> {
   const [row] = await tx.executeRaw<{ record: GitHoldRecord }>('SELECT completed_keys->0 AS record FROM op_checkpoints WHERE op=$1 AND fingerprint=$2',
@@ -197,13 +199,13 @@ export async function writeGitHold(tx: Exec, input: Omit<GitHoldRecord, 'version
   [GIT_HOLD_OP, gitHoldFingerprint(input.source_id, input.incarnation, input.path), JSON.stringify([record])]);
   if (existing) {
     if (staleWeight(input) !== staleWeight(existing) || imageWeight(input) !== imageWeight(existing) || fenceWeight(input) !== fenceWeight(existing)
-      || concurrentWeight(input) !== concurrentWeight(existing)) {
+      || concurrentWeight(input) !== concurrentWeight(existing) || retryWeight(input) !== retryWeight(existing)) {
       await adjustSummary(tx, input.source_id, input.incarnation, 0, staleWeight(input) - staleWeight(existing), imageWeight(input) - imageWeight(existing),
-        fenceWeight(input) - fenceWeight(existing), concurrentWeight(input) - concurrentWeight(existing));
+        fenceWeight(input) - fenceWeight(existing), concurrentWeight(input) - concurrentWeight(existing), retryWeight(input) - retryWeight(existing));
     }
     return 'updated';
   }
-  await adjustSummary(tx, input.source_id, input.incarnation, 1, staleWeight(input), imageWeight(input), fenceWeight(input), concurrentWeight(input));
+  await adjustSummary(tx, input.source_id, input.incarnation, 1, staleWeight(input), imageWeight(input), fenceWeight(input), concurrentWeight(input), retryWeight(input));
   return 'inserted';
 }
 
@@ -219,7 +221,7 @@ export async function clearGitHold(tx: Exec, input: { sourceId: string; incarnat
   const existing = await readRow(tx, input.sourceId, input.incarnation, input.path);
   if (!existing || existing.observed_at > input.observedAt) return false;
   await tx.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [GIT_HOLD_OP, gitHoldFingerprint(input.sourceId, input.incarnation, input.path)]);
-  await adjustSummary(tx, input.sourceId, input.incarnation, -1, -staleWeight(existing), -imageWeight(existing), -fenceWeight(existing), -concurrentWeight(existing));
+  await adjustSummary(tx, input.sourceId, input.incarnation, -1, -staleWeight(existing), -imageWeight(existing), -fenceWeight(existing), -concurrentWeight(existing), -retryWeight(existing));
   return true;
 }
 
@@ -325,7 +327,7 @@ export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, re
  * re-screen, every other hold to the frontmatter repair preview; a source with
  * several kinds names each.
  */
-export interface HoldRepairRoute { fences: number; others: number; concurrent?: number }
+export interface HoldRepairRoute { fences: number; others: number; concurrent?: number; retry?: number }
 
 /**
  * The source-level next step every surface prints for `route` (sync results,
@@ -343,11 +345,15 @@ export function holdRepairSteps(sourceId: string, route: HoldRepairRoute, auto?:
   const frontmatterText = `preview the frontmatter and other fixes with ${frontmatter.join(' ')} (writes nothing until a hash-bound apply)`;
   const concurrentText = `for each concurrent-write hold, preview the reconciliation with gbrain sources reconcile ${sourceId} <slug> --preview `
     + `(gbrain sources status ${sourceId} names each slug and the database write that raced the import), resolve and apply it, then run gbrain sources retry-held ${sourceId} and gbrain sync --source ${sourceId} --no-pull`;
-  if (route.concurrent) {
+  const retryText = `retry the abandoned preparations with gbrain sources retry-held ${sourceId}, then run gbrain sync --source ${sourceId} --no-pull`;
+  if (route.concurrent || route.retry) {
     const parts = [...(route.others ? [frontmatterText] : []), ...(route.fences ? [fenceText] : []), concurrentText];
+    if (!route.concurrent) parts.pop();
+    if (route.retry) parts.push(retryText);
     const commands = [...(route.others ? [frontmatter.join(' ')] : []), ...(route.fences ? [fences.join(' ')] : []),
-      `gbrain sources status ${sourceId} --json`, `gbrain sources retry-held ${sourceId}`, `gbrain sync --source ${sourceId} --no-pull`];
-    return { argv: route.others ? frontmatter : route.fences ? fences : ['gbrain', 'sources', 'status', sourceId, '--json'], commands, text: parts.join('; ') };
+      ...(route.concurrent ? [`gbrain sources status ${sourceId} --json`] : []), `gbrain sources retry-held ${sourceId}`, `gbrain sync --source ${sourceId} --no-pull`];
+    return { argv: route.others ? frontmatter : route.fences ? fences : route.retry ? ['gbrain', 'sources', 'retry-held', sourceId]
+      : ['gbrain', 'sources', 'status', sourceId, '--json'], commands, text: parts.join('; ') };
   }
   if (route.fences && !route.others) return { argv: fences, commands: [fences.join(' ')], text: fenceText };
   if (route.fences) return { argv: frontmatter, commands: [frontmatter.join(' '), fences.join(' ')], text: `${frontmatterText}; ${fenceText}` };
@@ -378,6 +384,12 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
           why: `Schedules ${record.path} for a re-screen on the next sync, after the page is reconciled.`, verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } },
         verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     }
+    case 'preparation_abandoned_3x':
+      return { argv: ['gbrain', 'sources', 'retry-held', source], consent: [], actor: 'agent', requires_exclusive: false,
+        why: `${record.path} was held after its preparation made no progress at the deadline three times, so the rest of the source could sync. A new commit of the file or retry-held re-attempts it.`,
+        then: { argv: ['gbrain', 'sync', '--source', source, '--no-pull'], consent: [], actor: 'agent', requires_exclusive: false,
+          why: `Re-runs source ${source} after scheduling ${record.path} for a fresh preparation.`, verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } },
+        verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     case 'file_too_large':
       return { argv: ['gbrain', 'config', 'get', 'sync.exclude'], consent: [], actor: 'agent', requires_exclusive: false,
         why: `The size limit is fixed. Split ${record.path} into smaller files and commit, or leave it out of the source: read the current sync.exclude list, then run gbrain config set sync.exclude '<current list>,${record.path}'. The next gbrain sync --source ${source} --no-pull clears the hold.`,
@@ -681,8 +693,9 @@ export function fencesNormalizedReport(sourceId: string, tally: FencesTally | un
 export async function buildHoldReport(engine: Exec, input: { sourceId: string; incarnation: string; runId: string; remote: boolean;
   policy: SyncHoldPolicy; screened: number; pendingScreen?: boolean }): Promise<Pick<import('../../commands/sync.ts').SyncResult,
   'held' | 'held_count' | 'holds_outstanding' | 'holds_escalated' | 'holds_truncated' | 'holds_pending_screen' | 'holds_fix'>> {
-  const [summary] = await engine.executeRaw<{ count: number | string; images: number | string; fences: number | string }>(`SELECT COALESCE((completed_keys->0->>'count')::int,0) AS count,
-      COALESCE((completed_keys->0->>'images')::int,0) AS images, COALESCE((completed_keys->0->>'fences')::int,0) AS fences FROM op_checkpoints WHERE op=$1 AND fingerprint=$2`,
+  const [summary] = await engine.executeRaw<{ count: number | string; images: number | string; fences: number | string; retry: number | string }>(`SELECT COALESCE((completed_keys->0->>'count')::int,0) AS count,
+      COALESCE((completed_keys->0->>'images')::int,0) AS images, COALESCE((completed_keys->0->>'fences')::int,0) AS fences,
+      COALESCE((completed_keys->0->>'retry')::int,0) AS retry FROM op_checkpoints WHERE op=$1 AND fingerprint=$2`,
   [GIT_HOLD_SUMMARY_OP, summaryFingerprint(input.sourceId, input.incarnation)]);
   const outstanding = Number(summary?.count ?? 0);
   const runHolds = (await readGitSourceHolds(engine, { sourceIds: [input.sourceId], runId: input.runId }))[0]?.holds ?? [];
@@ -690,8 +703,9 @@ export async function buildHoldReport(engine: Exec, input: { sourceId: string; i
   const escalated = holdsEscalated(input.policy, outstanding - Number(summary?.images ?? 0),
     { held: runHolds.filter(hold => !imageWeight(hold)).length, screened: input.screened });
   const fences = Math.max(Number(summary?.fences ?? 0), runHolds.filter(hold => fenceWeight(hold)).length);
+  const retry = Math.max(Number(summary?.retry ?? 0), runHolds.filter(hold => retryWeight(hold)).length);
   const auto = fences ? await readFenceAutoRepair(engine) : undefined;
-  const steps = holdRepairSteps(input.sourceId, { fences, others: Math.max(0, outstanding - fences) }, auto);
+  const steps = holdRepairSteps(input.sourceId, { fences, retry, others: Math.max(0, outstanding - fences - retry) }, auto);
   const verify = { argv: ['gbrain', 'sources', 'status', input.sourceId, '--json'] };
   if (input.remote) return { held_count: runHolds.length, holds_fix: { argv: steps.argv, consent: [], actor: 'host_admin', requires_exclusive: false, verify,
     why: `${outstanding} file(s) in source ${input.sourceId} are held and not imported; only the brain host can inspect and repair them.`,

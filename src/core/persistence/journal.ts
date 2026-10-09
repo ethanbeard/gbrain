@@ -18,6 +18,7 @@ import { catalogueError } from '../error-catalogue.ts';
 import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh-schema.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertGraduationAdmission } from './graduation-custody.ts';
+import { DEFAULT_PREPARATION_MS, PREPARATION_ABANDONED_CODE } from './claim-lease.ts';
 import {
   isTerminal, principalKey, requestPrincipal, recoveryFiles,
   type JournalLimits, type Principal, type RecoveryRecord, type RequestState,
@@ -342,7 +343,10 @@ export async function claimGroupFollowers(engine: BrainEngine, head: WriteReques
 /** Renews every claim of a group in one statement; returns the ids still held. */
 export async function renewGroupClaims(engine: SqlEngine, rows: WriteRequest[], leaseMs = 30_000, signal?: AbortSignal, phase: string | null = null): Promise<Set<string>> {
   const held = await engine.executeRaw<{ id: string }>(`UPDATE persistence_requests r SET claim_expires_at=now()+($3::double precision*interval '1 millisecond'),updated_at=now(),
-    claim_phase=COALESCE(jsonb_set($4::text::jsonb,'{token}',to_jsonb(t.token::text)),r.claim_phase)
+    claim_phase=CASE WHEN $4::text IS NULL THEN r.claim_phase
+      WHEN r.claim_phase ? 'preparation_abandoned' THEN jsonb_set(jsonb_set($4::text::jsonb,'{token}',to_jsonb(t.token::text)),
+        '{preparation_abandoned}',r.claim_phase->'preparation_abandoned')
+      ELSE jsonb_set($4::text::jsonb,'{token}',to_jsonb(t.token::text)) END
     FROM unnest($1::uuid[],$2::uuid[]) AS t(id,token) WHERE r.id=t.id AND r.execution_token=t.token AND r.state='running' AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING r.id`,
   [rows.map(row => row.id), rows.map(row => row.execution_token), leaseMs, phase], { signal });
   return new Set(held.map(row => row.id));
@@ -543,7 +547,9 @@ export async function claimNextLaneHead(engine: BrainEngine, hostId: string, wor
 /** `phase` (claim-phase.ts `claimPhaseStamp`, #6176) records the claim's current phase with the renewal. */
 export async function renewWriteClaim(engine: SqlEngine, id: string, token: string, leaseMs = 30_000, signal?: AbortSignal, phase: string | null = null): Promise<boolean> {
   const rows = await engine.executeRaw(`UPDATE persistence_requests SET
-    claim_expires_at=now()+($3::double precision*interval '1 millisecond'),updated_at=now(),claim_phase=COALESCE($4::text::jsonb,claim_phase)
+    claim_expires_at=now()+($3::double precision*interval '1 millisecond'),updated_at=now(),claim_phase=CASE WHEN $4::text IS NULL THEN claim_phase
+      WHEN claim_phase ? 'preparation_abandoned' THEN jsonb_set($4::text::jsonb,'{preparation_abandoned}',claim_phase->'preparation_abandoned')
+      ELSE $4::text::jsonb END
     WHERE id=$1::uuid AND execution_token=$2::uuid AND state='running' AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [id, token, leaseMs, phase], { signal });
   return rows.length === 1;
 }
@@ -551,6 +557,33 @@ export async function releaseUnpublishedClaim(engine: SqlEngine, row: WriteReque
   await engine.executeRaw(`UPDATE persistence_requests SET state='queued',execution_token=NULL,claim_expires_at=NULL,
     blocked_reason=$3,updated_at=now() WHERE id=$1::uuid AND execution_token=$2::uuid
     AND state='running' AND recovery IS NULL AND publication_started=false AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, [row.id, row.execution_token, reason]);
+}
+
+/** Count one preparation deadline and either requeue the fenced claim or fail it at the bound. */
+export async function abandonPreparation(engine: BrainEngine, row: WriteRequest, bound: number,
+  budgetMs = DEFAULT_PREPARATION_MS): Promise<'released' | 'held'> {
+  return engine.transaction(async tx => {
+    await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
+    await declarePersistenceProtocol(tx);
+    await lockCounters(tx, ['brain', principalKey(requestPrincipal(row)), ...(row.worktree_id ? [`worktree:${row.worktree_id}`] : [])]);
+    const [counted] = await tx.executeRaw<WriteRequest & { preparation_abandoned_count: number | string }>(`UPDATE persistence_requests SET
+      claim_phase=jsonb_set(COALESCE(claim_phase,'{}'::jsonb),'{preparation_abandoned}',
+        to_jsonb(COALESCE((claim_phase->>'preparation_abandoned')::int,0)+1),true),updated_at=now()
+      WHERE id=$1::uuid AND execution_token=$2::uuid AND state='running' AND recovery IS NULL
+        AND publication_started=false AND ${PERSISTENCE_PROTOCOL_PREDICATE}
+      RETURNING *, (claim_phase->>'preparation_abandoned')::int AS preparation_abandoned_count`, [row.id, row.execution_token]);
+    if (!counted) return 'released';
+    const count = Number(counted.preparation_abandoned_count);
+    if (count < bound) {
+      await tx.executeRaw(`UPDATE persistence_requests SET state='queued',execution_token=NULL,claim_expires_at=NULL,
+        blocked_reason='preparation_deadline',updated_at=now() WHERE id=$1::uuid AND execution_token=$2::uuid AND state='running'`,
+      [row.id, row.execution_token]);
+      return 'released';
+    }
+    await completeWrite(tx, counted, 'failed', {}, { code: PREPARATION_ABANDONED_CODE,
+      message: `Preparation of ${counted.slug} (request ${counted.request_id}) made no progress within ${budgetMs} ms on ${count} claims; held so the queue can move.` }, counted);
+    return 'held';
+  });
 }
 
 /** Called while holding the root lock; the durable record precedes any rename. */

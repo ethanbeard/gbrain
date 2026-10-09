@@ -38,7 +38,7 @@ import { cancelWindow } from './sync-window.ts';
 import { laneApplyMsPerMember, lanePolicy, openLanes } from './sync-lanes.ts';
 import { isContentRefusal } from '../import-screen.ts';
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
-import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
+import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, preparationAbandonedHold, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
 import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
 import { faultPoint } from './fault-points.ts';
@@ -48,6 +48,7 @@ import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
 import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, readGitHoldRetryPaths, readSyncDeferrals, readSyncHoldPolicy, recordSyncConversion, recordSyncDeferral, requestGitHoldRetry, recoveredReport, writeGitHold, type FencesTally } from './sync-holds.ts';
 import type { SyncEntry } from './sync-discovery.ts';
+import { PREPARATION_ABANDONED_CODE } from './claim-lease.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -518,12 +519,13 @@ export async function deferSourceChangedRequest(engine: BrainEngine, key: string
 async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: string, pending: Pending, done: WriteRequest, assertActive: () => void,
   run: { screen?: SyncScreenRun | null; observedAt?: string }, waitMs: number): Promise<Cursor | 'pending' | null> {
   if (!run.screen || cursor.companyPlan || pending.intent.kind !== 'managed_sync_import' || typeof pending.intent.content !== 'string') return null;
-  const fence = fenceReceiptLocation(done);
+  const preparationAbandoned = done.error_code === PREPARATION_ABANDONED_CODE;
+  const fence = preparationAbandoned ? null : fenceReceiptLocation(done);
   const entry = cursor.entries[cursor.index];
   if (!entry || entry.path !== pending.intent.path) return null;
   // #6194 (D4): a revision conflict proven to come from a concurrent database-only write is held the same way (sync-concurrent-write.ts).
-  const proof = fence ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
-  if (!fence && !proof) return null;
+  const proof = fence || preparationAbandoned ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
+  if (!fence && !proof && !preparationAbandoned) return null;
   const deadline = performance.now() + waitMs;
   for (;;) {
     const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [cursor.sourceId]);
@@ -532,8 +534,11 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
     if (performance.now() >= deadline) return 'pending';
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  const hold = fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content, pending.intent.blobOid)
-    : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
+  const hold = preparationAbandoned
+    ? preparationAbandonedHold(entry, pending.slug, pending.pageId, pending.intent.content, pending.intent.blobOid,
+      done.error_message ?? `Preparation of ${pending.slug} was abandoned three times.`)
+    : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content, pending.intent.blobOid)
+      : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
   const base: Cursor = { ...cursor }; delete base.group;
   return saveCursor(engine, key, cursor, advanceHeld(base, [...(cursor.convertedFromFailed ?? []), pending.requestId]), false, assertActive, async tx => {
     await heldWrite(cursor, hold, run.observedAt!)(tx);
@@ -1252,12 +1257,14 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           ...(authority.writer.remote ? {} : { managedWrite: writeDiagnostic(cursor, pending, done), writeWait: writeWaitOf(waited) }) };
       }
       if (done.state !== 'committed') {
+        const heldBefore = cursor.counts.held ?? 0;
         const settled = await settleFailedRequest(engine, { cursor, key, pending, done, assertActive, run: frozenRun, syncOptions, processingOptions,
           remote: authority.writer.remote, waitMs: opts.drainStartedAt ? 30_000 : 5000, signal });
         if ('result' in settled) return settled.result;
         cursor = settled.cursor;
+        const held = (cursor.counts.held ?? 0) > heldBefore;
         opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length,
-          ...(cursor.deferred?.at(-1)?.request_id === pending.requestId ? { deferred: true } : {}) });
+          ...(cursor.deferred?.at(-1)?.request_id === pending.requestId ? { deferred: true } : {}), ...(held ? { held: true } : {}) });
         continue;
       }
       if (pending.intent.kind === 'managed_sync_checkpoint') {
