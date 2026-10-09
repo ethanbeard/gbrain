@@ -15,6 +15,7 @@ import { prepareManagedSyncMutation, type SyncIntent } from '../src/core/persist
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { deferralExitCode } from '../src/core/persistence/sync-drain.ts';
 import { discoverManagedSync } from '../src/core/persistence/sync-discovery.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
@@ -106,8 +107,11 @@ test('a pinned import that trails the current page and its working-tree bytes is
     // Working-tree bytes that are neither the pinned commit nor the page are still protected.
     const foreign = '---\ntitle: Example note\n---\nA local edit that nothing imported.\n';
     writeFileSync(path, pinned.replace('older', 'still older')); commit(f.root, 'another trailing commit'); writeFileSync(path, foreign);
-    const blocked = await performManagedSync(engine, { sourceId: f.id, noPull: true });
-    expect(blocked).toMatchObject({ status: 'blocked_by_failures', managedWrite: { write_error: 'source_changed', reason: 'pinned_git_worktree_conflict' } });
+    const deferredRun = await performManagedSync(engine, { sourceId: f.id, noPull: true });
+    expect(deferredRun).toMatchObject({ status: 'synced', deferred: [
+      { path: 'notes/example.md', slug: 'notes/example', reason: 'pinned_git_worktree_conflict', request_id: expect.any(String) },
+    ] });
+    expect(deferredRun.managedWrite).toBeUndefined();
     expect(readFileSync(path, 'utf8')).toBe(foreign);
     expect((await engine.getPage('notes/example', { sourceId: f.id }))?.compiled_truth).toContain('current observation');
     rmSync(syncFailuresPath(), { force: true });
@@ -377,7 +381,7 @@ test.each([false, true])('raw bytes changing after preparation conflict without 
 }),120_000);
 
 test.each([false, true])('managed terminal receipts survive a missing ledger and corrected retry uses a new ID (CRLF=%s)', async crlf =>
-  withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+  withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home, GBRAIN_TEST_DISABLE_SOURCE_CHANGED_DEFERRAL: '1' }, async () => {
     for (const engine of engines) {
       const f = await fixture(engine, { 'notes/example.md': 'An original observation about the example system.\n' });
       await performManagedSync(engine, { sourceId: f.id, noPull: true });
@@ -447,6 +451,58 @@ test.each([false, true])('managed terminal receipts survive a missing ledger and
       expect(requests.at(-1)?.state).toBe('committed');
       expect(requests.at(-1)?.request_id).not.toBe(id);
       expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(target);
+    }
+  }), 120_000);
+
+test('a legacy cursor (no stored options, pending old-shape intent) deferred on source_changed still writes its checkpoint', async () =>
+  withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+    for (const engine of engines) {
+      const f = await fixture(engine, { 'notes/example.md': 'An original observation about the example system.\n' });
+      await performManagedSync(engine, { sourceId: f.id, noPull: true });
+      const pinned = 'A newly committed observation about the example system.\n';
+      const path = join(f.root, 'notes/example.md');
+      writeFileSync(path, pinned);
+      commit(f.root);
+      const working = pinned.replace(/\n/g, '\r\n');
+      writeFileSync(path, working);
+      const opts = { sourceId: f.id, noPull: true };
+      const { entries, ...discovery } = await discoverManagedSync(engine, opts);
+      expect(entries).toHaveLength(1);
+      const [previous] = await engine.executeRaw<{ fingerprint: string }>(
+        "SELECT fingerprint FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1 AND completed_keys->0->>'done'='true'", [f.id]);
+      expect(previous).toBeDefined();
+      const authority = await managedSyncAuthority(engine, f.id, discovery.incarnation, discovery.root);
+      const runId = randomUUID(), requestId = randomUUID(), entry = entries[0];
+      const legacyIntent: SyncIntent = { kind: 'managed_sync_import', expected_revision: entry.revision ?? null,
+        processingOptions: { noEmbed: false, noExtract: false, noSchemaPack: false },
+        sourcePath: entry.sourcePath, path: entry.path, rawHash: sha256(working), content: pinned,
+        ownerEpoch: String(discovery.binding.owner_epoch), syncAuthority: authority, cursorKey: previous.fingerprint,
+        runId, index: 0, total: entries.length, from: discovery.from, target: discovery.target, slugMode: discovery.slugMode };
+      expect(legacyIntent).not.toHaveProperty('lineEndingOnly');
+      const legacyCursor = { ...discovery, authority, runId, index: 0, total: entries.length,
+        counts: { added: 0, modified: 0, deleted: 0, chunks: 0 },
+        pending: { requestId, slug: entry.slug!, pageId: entry.pageId ?? null, intent: legacyIntent } };
+      await engine.transaction(async tx => {
+        await tx.executeRaw('INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)',
+          ['managed-sync-manifest', runId, JSON.stringify(entries)]);
+        await tx.executeRaw("UPDATE op_checkpoints SET completed_keys=$2::text::jsonb WHERE op='managed-sync' AND fingerprint=$1",
+          [previous.fingerprint, JSON.stringify([legacyCursor])]);
+      });
+
+      const run = await performManagedSync(engine, opts);
+      expect(run.status).toBe('synced');
+      expect(run.failedFiles ?? 0).toBe(0);
+      expect(run.managedWrite).toBeUndefined();
+      expect(run.deferred).toMatchObject([{ path: 'notes/example.md', reason: 'pinned_git_worktree_conflict' }]);
+      expect(deferralExitCode(run)).toBe(0);
+      const requests = await engine.executeRaw<{ slug: string; state: string }>(
+        'SELECT slug,state FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [f.id]);
+      const checkpoints = requests.filter(row => row.slug === '__managed_sync_checkpoint__');
+      expect(checkpoints.filter(row => row.state === 'failed')).toHaveLength(0);
+      expect(checkpoints.at(-1)?.state).toBe('committed');
+      expect(loadSyncFailures().filter(row => row.source_id === f.id)).toHaveLength(0);
+      expect(readFileSync(path, 'utf8')).toBe(working);
+      rmSync(syncFailuresPath(), { force: true });
     }
   }), 120_000);
 

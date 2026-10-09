@@ -468,6 +468,8 @@ export function deferralEligible(input: DeferralEligibilityInput): { reason: 'ra
 function advanceDeferred(cursor: Cursor, pending: Pending, reason: 'raw_file_changed' | 'pinned_git_worktree_conflict'): Cursor {
   const base: Cursor = { ...cursor }; delete base.group;
   const next: Cursor = { ...base, index: cursor.index + 1,
+    // A legacy cursor's only processing consent is its pending intent; the checkpoint requires durable options.
+    ...(cursor.processingOptions ? {} : pending.intent.processingOptions ? { processingOptions: pending.intent.processingOptions } : {}),
     counts: { ...cursor.counts, deferred: (cursor.counts.deferred ?? 0) + 1 },
     deferred: [...(cursor.deferred ?? []), { path: pending.intent.path!, slug: pending.slug || null, reason, request_id: pending.requestId }],
     convertedFromFailed: [...(cursor.convertedFromFailed ?? []), pending.requestId] };
