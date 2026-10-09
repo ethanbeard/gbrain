@@ -44,6 +44,10 @@ import { fenceFixesWire } from '../fence-repair/tier1.ts';
 import type { FenceFix } from '../fence-repair/types.ts';
 import { VERSION } from '../../version.ts';
 import { earlierGroupMemberFailed, windowPredecessor, windowPredecessorAllows } from './sync-window.ts';
+import { SCREENING_REQUEST_ID } from './noop-kernel.ts';
+
+/** Screening rows are never admitted; the waiver transaction fences the cursor. */
+export function screenUnadmittedEnabled(env = process.env): boolean { return env.GBRAIN_SYNC_SCREEN_UNADMITTED !== '0'; }
 
 /** The options that select a managed sync cursor (its key), recorded so a refusal can print the exact retry. */
 export interface SyncCursorOptions { full: boolean; workingTree: boolean; srcSubpath: string | null; exclude: string[]; includeHidden: string[]; strategy: string | null }
@@ -304,7 +308,8 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
       async () => { if (await earlierGroupMemberFailed(tx, row)) throw syncPublicationRefusal('revision_conflict', 'An earlier page of this sync did not commit.', row, p, `Request ${row.request_id} follows a page of the same bulk group that did not commit, so this page must not publish after it.`); },
       async () => {
         const cursor = await shared;
-        if (cursor && (cursor.run_id !== p.runId || (cursor.request_id !== row.request_id && !cursor.group?.includes(row.request_id)))) throw syncPublicationRefusal('revision_conflict', 'The accepted sync cursor changed before publication.', row, p,
+        const screening = row.id === SCREENING_REQUEST_ID && screenUnadmittedEnabled();
+        if (cursor && (cursor.run_id !== p.runId || (!screening && cursor.request_id !== row.request_id && !cursor.group?.includes(row.request_id)))) throw syncPublicationRefusal('revision_conflict', 'The accepted sync cursor changed before publication.', row, p,
           `Another sync run of ${row.source_id} replaced the cursor this request belongs to.`);
       },
       async () => { if (p.kind !== 'managed_sync_checkpoint') await assertKnowledgePublicationAllowed(tx, row, p.path === null ? undefined : { root, path: join(root, p.path) }); },

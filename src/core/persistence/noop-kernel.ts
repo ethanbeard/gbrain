@@ -46,10 +46,12 @@ export interface NoopKernelResult {
 }
 export type NoopKernelWaiver = 'contextual_mode' | 'canonical_file_differs';
 
+export const SCREENING_REQUEST_ID = '00000000-0000-4000-8000-000000000000';
+
 /** A request-shaped value for preparers; it is never admitted or persisted. */
 export function screeningRequest(fields: Pick<WriteRequest, 'source_id' | 'source_incarnation' | 'slug' | 'page_id' | 'worktree_id' | 'authority' | 'intent'>
   & Partial<WriteRequest>): WriteRequest {
-  return { id: '00000000-0000-4000-8000-000000000000', request_id: '00000000-0000-4000-8000-000000000000', operation: 'submit_job', state: 'queued',
+  return { id: SCREENING_REQUEST_ID, request_id: SCREENING_REQUEST_ID, operation: 'submit_job', state: 'queued',
     principal_kind: fields.authority.principal.kind, principal_id: fields.authority.principal.id, created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(), protocol_version: 1, target_kind: 'page', ...fields } as unknown as WriteRequest;
 }
